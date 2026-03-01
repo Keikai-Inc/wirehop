@@ -30,12 +30,18 @@ pub enum Command {
         /// Unix username the invited peer will log in as
         #[arg(long)]
         user: Option<String>,
+        /// Human-readable name for this host (defaults to system hostname)
+        #[arg(long)]
+        name: Option<String>,
     },
 
-    /// Connect to a host (NodeId or invite token)
+    /// Connect to a host (NodeId, invite token, or known host alias)
     Connect {
-        /// Host NodeId or invite token
+        /// Host NodeId, invite token, or known host alias
         target: String,
+        /// Override the name saved for this host in known_hosts
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List authorized peers or known hosts

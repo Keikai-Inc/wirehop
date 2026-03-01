@@ -22,6 +22,9 @@ pub struct InviteToken {
     /// Unix username the invited peer will log in as on the host.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Human-readable name for the host (e.g. system hostname).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub host_name: Option<String>,
 }
 
 /// A pending invite stored on the host side.
@@ -98,12 +101,30 @@ impl PendingInvitesStore {
     }
 }
 
+/// Get the system hostname via libc.
+#[cfg(unix)]
+pub fn system_hostname() -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+#[cfg(not(unix))]
+pub fn system_hostname() -> Option<String> {
+    None
+}
+
 /// Generate a new invite: returns the token string to share and stores the hash on disk.
 pub fn generate_invite(
     host_public_key: &PublicKey,
     config_dir: &Path,
     relay_url: Option<&str>,
     username: Option<&str>,
+    host_name: Option<&str>,
 ) -> Result<String> {
     // Validate the username early so bad values never reach storage
     #[cfg(unix)]
@@ -140,11 +161,15 @@ pub fn generate_invite(
     store.save(config_dir)?;
 
     // Build the token
+    let resolved_host_name = host_name
+        .map(String::from)
+        .or_else(system_hostname);
     let token = InviteToken {
         node_id: host_public_key.to_string(),
         secret: secret_hex,
         relay_url: relay_url.map(String::from),
         username: username.map(String::from),
+        host_name: resolved_host_name,
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());

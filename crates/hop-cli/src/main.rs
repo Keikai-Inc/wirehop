@@ -32,19 +32,20 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet).await
         }
-        Command::Invite { user } => {
+        Command::Invite { user, name } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_identity(&config_dir)?;
-            cmd_invite(secret_key, &config_dir, user.as_deref())
+            cmd_invite(secret_key, &config_dir, user.as_deref(), name.as_deref())
         }
-        Command::Connect { target } => {
+        Command::Connect { target, name } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_connect(secret_key, &target, &config_dir).await
+            cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
         }
         Command::Peers { action } => {
-            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            cmd_peers(action, &config_dir)
+            let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            let user_config_dir = config::default_config_dir()?;
+            cmd_peers(action, &host_config_dir, &user_config_dir)
         }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -159,12 +160,12 @@ async fn handle_incoming(
     Ok(())
 }
 
-fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>) -> Result<()> {
+fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>, host_name: Option<&str>) -> Result<()> {
     let public_key = secret_key.public();
 
     // Derive public key directly from identity — no endpoint needed.
     // relay_url is None; iroh discovers the host by NodeId automatically.
-    let token = invite::generate_invite(&public_key, config_dir, None, username)?;
+    let token = invite::generate_invite(&public_key, config_dir, None, username, host_name)?;
 
     println!("Invite token (share with the client):");
     println!();
@@ -182,18 +183,36 @@ async fn cmd_connect(
     secret_key: iroh::SecretKey,
     target: &str,
     config_dir: &std::path::Path,
+    cli_name: Option<&str>,
 ) -> Result<()> {
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
+    // 1. Check known_hosts for alias match
+    let hosts = KnownHostsStore::load(config_dir)?;
+    if let Some(node_id_str) = hosts.resolve_alias(target) {
+        let host_id: iroh::PublicKey = node_id_str
+            .parse()
+            .context("Invalid NodeId in known_hosts")?;
+
+        println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
+
+        let conn = net::connect_to_host(&endpoint, host_id, None).await?;
+        let (mut send, recv) = conn.open_bi().await?;
+
+        proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+
+        let exit_code = shell::client_shell_session(send, recv).await?;
+        std::process::exit(exit_code);
+    }
+
+    // 2. Check if invite token
     if invite::is_invite_token(target) {
-        // Invite flow
         let token = invite::decode_invite(target)?;
         let host_id: iroh::PublicKey = token
             .node_id
             .parse()
             .context("Invalid NodeId in invite token")?;
 
-        // Parse relay URL from invite token if present
         let relay_url: Option<iroh::RelayUrl> = token
             .relay_url
             .as_deref()
@@ -206,7 +225,6 @@ async fn cmd_connect(
         let conn = net::connect_to_host(&endpoint, host_id, relay_url.as_ref()).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Send the invite secret as auth response
         proto::write_message(
             &mut send,
             &ClientMessage::AuthResponse {
@@ -215,18 +233,22 @@ async fn cmd_connect(
         )
         .await?;
 
-        // Wait for auth result
         let result: proto::HostMessage = proto::read_message(&mut recv).await?;
         match result {
             proto::HostMessage::AuthResult { authorized: true } => {
                 println!("Authorized! Starting shell...");
 
-                // Save as known host
-                let mut hosts = KnownHostsStore::load(config_dir)?;
-                hosts.add_host(&host_id, format!("host-{}", host_id.fmt_short()));
-                hosts.save(config_dir)?;
+                // Determine name: --name > token host_name > host-{short_id}
+                let desired_name = cli_name
+                    .map(String::from)
+                    .or(token.host_name)
+                    .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
 
-                // Request shell
+                let mut hosts = KnownHostsStore::load(config_dir)?;
+                let actual_name = hosts.add_host_dedup(&host_id, desired_name);
+                hosts.save(config_dir)?;
+                println!("Saved as known host: {actual_name}");
+
                 proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
 
                 let exit_code = shell::client_shell_session(send, recv).await?;
@@ -239,28 +261,27 @@ async fn cmd_connect(
                 anyhow::bail!("Unexpected response from host: {other:?}");
             }
         }
-    } else {
-        // Direct connect (already authorized)
-        let host_id: iroh::PublicKey = target
-            .parse()
-            .context("Invalid NodeId (expected 64-char hex string or invite token)")?;
-
-        println!("Connecting to {}...", host_id.fmt_short());
-
-        let conn = net::connect_to_host(&endpoint, host_id, None).await?;
-        let (mut send, recv) = conn.open_bi().await?;
-
-        // Request shell directly
-        proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
-
-        let exit_code = shell::client_shell_session(send, recv).await?;
-        std::process::exit(exit_code);
     }
+
+    // 3. Parse as NodeId (64-char hex)
+    let host_id: iroh::PublicKey = target
+        .parse()
+        .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
+
+    println!("Connecting to {}...", host_id.fmt_short());
+
+    let conn = net::connect_to_host(&endpoint, host_id, None).await?;
+    let (mut send, recv) = conn.open_bi().await?;
+
+    proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+
+    let exit_code = shell::client_shell_session(send, recv).await?;
+    std::process::exit(exit_code);
 }
 
-fn cmd_peers(action: Option<PeersAction>, config_dir: &std::path::Path) -> Result<()> {
-    let mut peers = PeersStore::load(config_dir)?;
-    let hosts = KnownHostsStore::load(config_dir)?;
+fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, user_config_dir: &std::path::Path) -> Result<()> {
+    let mut peers = PeersStore::load(host_config_dir)?;
+    let hosts = KnownHostsStore::load(user_config_dir)?;
 
     match action {
         None => {
@@ -305,7 +326,7 @@ fn cmd_peers(action: Option<PeersAction>, config_dir: &std::path::Path) -> Resul
         }
         Some(PeersAction::Remove { id }) => {
             if peers.remove_peer(&id) {
-                peers.save(config_dir)?;
+                peers.save(host_config_dir)?;
                 println!("Peer removed.");
             } else {
                 println!("No peer found matching '{id}'.");

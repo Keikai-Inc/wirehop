@@ -305,6 +305,42 @@ impl KnownHostsStore {
             });
         }
     }
+
+    /// Add a host with deduplication: if the desired name is already taken by a
+    /// *different* node_id, auto-suffix with `-2`, `-3`, etc.
+    /// Skips if the node_id already exists. Returns the actual name used.
+    pub fn add_host_dedup(&mut self, node_id: &PublicKey, desired_name: String) -> String {
+        let id_str = node_id.to_string();
+
+        // Already known — return existing name
+        if let Some(existing) = self.hosts.iter().find(|h| h.node_id == id_str) {
+            return existing.name.clone();
+        }
+
+        // Find a unique name
+        let mut candidate = desired_name.clone();
+        let mut suffix = 2u32;
+        while self.hosts.iter().any(|h| h.name == candidate) {
+            candidate = format!("{desired_name}-{suffix}");
+            suffix += 1;
+        }
+
+        self.hosts.push(KnownHost {
+            node_id: id_str,
+            name: candidate.clone(),
+            added_at: chrono_now(),
+        });
+
+        candidate
+    }
+
+    /// Resolve an alias (host name) to its node_id. Returns `None` if not found.
+    pub fn resolve_alias(&self, name: &str) -> Option<&str> {
+        self.hosts
+            .iter()
+            .find(|h| h.name == name)
+            .map(|h| h.node_id.as_str())
+    }
 }
 
 fn chrono_now() -> String {
