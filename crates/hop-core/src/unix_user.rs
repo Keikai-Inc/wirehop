@@ -9,6 +9,18 @@ pub fn is_running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Returns the username of the current (real) user, or `None` on failure.
+pub fn current_username() -> Option<String> {
+    // SAFETY: getuid() is always safe; getpwuid is safe with a valid uid.
+    let uid = unsafe { libc::getuid() };
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) };
+    name.to_str().ok().map(String::from)
+}
+
 /// Returns `true` if `username` exists on the system (via `getpwnam`).
 pub fn user_exists(username: &str) -> bool {
     let Ok(c_name) = CString::new(username) else {

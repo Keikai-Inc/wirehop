@@ -285,8 +285,8 @@ async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Resu
                     Ok(HostMessage::AuthResult { .. }) => {
                         tracing::warn!("Unexpected auth result during shell session");
                     }
-                    Err(e) => {
-                        tracing::debug!("Connection closed: {e}");
+                    Err(_) => {
+                        eprintln!("Connection closed by host.");
                         return Ok(1);
                     }
                 }

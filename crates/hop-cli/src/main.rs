@@ -163,6 +163,19 @@ async fn handle_incoming(
 fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>, host_name: Option<&str>) -> Result<()> {
     let public_key = secret_key.public();
 
+    // Default to current user when --user is not specified.
+    // This ensures peers always have a bound username when the daemon runs as root.
+    #[cfg(unix)]
+    let default_user;
+    #[cfg(unix)]
+    let username = match username {
+        Some(u) => Some(u),
+        None => {
+            default_user = hop_core::unix_user::current_username();
+            default_user.as_deref()
+        }
+    };
+
     // Derive public key directly from identity — no endpoint needed.
     // relay_url is None; iroh discovers the host by NodeId automatically.
     let token = invite::generate_invite(&public_key, config_dir, None, username, host_name)?;
