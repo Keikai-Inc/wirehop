@@ -78,16 +78,17 @@ pub fn ensure_config_dir(override_path: Option<&Path>) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
-    // Restrict directory permissions so only the owner can list/enter it,
-    // but only if we own the directory (avoid clobbering system config permissions).
+    // Restrict directory permissions so only the owner can list/enter it.
+    // Skip if the setgid bit (0o2000) is set — that means postinstall
+    // intentionally configured the directory for shared daemon/CLI access.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(&dir)
             .with_context(|| format!("Failed to read metadata for {}", dir.display()))?;
-        // SAFETY: geteuid() is always safe to call
-        if meta.uid() == unsafe { libc::geteuid() } {
+        let current_mode = meta.mode();
+        if current_mode & 0o2000 == 0 {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
         }
