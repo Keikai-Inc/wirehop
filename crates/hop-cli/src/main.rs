@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Host { quiet } => cmd_host(secret_key, &config_dir, quiet).await,
-        Command::Invite => cmd_invite(&public_key, &config_dir),
+        Command::Invite => cmd_invite(secret_key, &config_dir).await,
         Command::Connect { target } => cmd_connect(secret_key, &target, &config_dir).await,
         Command::Peers { action } => cmd_peers(action, &config_dir),
         Command::Id => {
@@ -46,10 +46,17 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     let public_key = secret_key.public();
     let endpoint = net::create_host_endpoint(secret_key).await?;
 
+    let relay_url = net::host_relay_url(&endpoint);
     tracing::info!("Hosting as: {public_key}");
+    if let Some(ref url) = relay_url {
+        tracing::info!("Relay: {url}");
+    }
 
     if !quiet {
         println!("Hosting as: {public_key}");
+        if let Some(ref url) = relay_url {
+            println!("Relay: {url}");
+        }
         println!("Waiting for connections...");
         println!();
         println!("Clients can connect with:");
@@ -117,8 +124,16 @@ async fn handle_incoming(
     Ok(())
 }
 
-fn cmd_invite(public_key: &iroh::PublicKey, config_dir: &std::path::Path) -> Result<()> {
-    let token = invite::generate_invite(public_key, config_dir)?;
+async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path) -> Result<()> {
+    let public_key = secret_key.public();
+
+    // Create a temporary endpoint to discover our relay URL.
+    // This ensures the invite token includes connectivity info.
+    let endpoint = net::create_host_endpoint(secret_key).await?;
+    let relay_url = net::host_relay_url(&endpoint);
+    let relay_str = relay_url.as_ref().map(|u| u.as_str());
+
+    let token = invite::generate_invite(&public_key, config_dir, relay_str)?;
 
     println!("Invite token (share with the client):");
     println!();
@@ -129,6 +144,7 @@ fn cmd_invite(public_key: &iroh::PublicKey, config_dir: &std::path::Path) -> Res
     println!();
     println!("This invite expires in 15 minutes and is single-use.");
 
+    endpoint.close().await;
     Ok(())
 }
 
@@ -147,9 +163,17 @@ async fn cmd_connect(
             .parse()
             .context("Invalid NodeId in invite token")?;
 
+        // Parse relay URL from invite token if present
+        let relay_url: Option<iroh::RelayUrl> = token
+            .relay_url
+            .as_deref()
+            .map(|u| u.parse())
+            .transpose()
+            .context("Invalid relay URL in invite token")?;
+
         println!("Connecting to host {}...", host_id.fmt_short());
 
-        let conn = net::connect_to_host(&endpoint, host_id).await?;
+        let conn = net::connect_to_host(&endpoint, host_id, relay_url.as_ref()).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Send the invite secret as auth response
@@ -193,7 +217,7 @@ async fn cmd_connect(
 
         println!("Connecting to {}...", host_id.fmt_short());
 
-        let conn = net::connect_to_host(&endpoint, host_id).await?;
+        let conn = net::connect_to_host(&endpoint, host_id, None).await?;
         let (mut send, recv) = conn.open_bi().await?;
 
         // Request shell directly

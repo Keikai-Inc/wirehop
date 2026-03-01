@@ -16,6 +16,9 @@ pub struct InviteToken {
     pub node_id: String,
     /// 32-byte random secret, hex-encoded.
     pub secret: String,
+    /// Relay URL for the host (enables direct relay connection without DNS lookup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 /// A pending invite stored on the host side.
@@ -91,6 +94,7 @@ impl PendingInvitesStore {
 pub fn generate_invite(
     host_public_key: &PublicKey,
     config_dir: &Path,
+    relay_url: Option<&str>,
 ) -> Result<String> {
     // Generate 32 bytes of random secret
     let mut secret_bytes = [0u8; 32];
@@ -123,6 +127,7 @@ pub fn generate_invite(
     let token = InviteToken {
         node_id: host_public_key.to_string(),
         secret: secret_hex,
+        relay_url: relay_url.map(String::from),
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
