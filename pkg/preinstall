@@ -4,23 +4,24 @@
 
 set -e
 
-LABEL="com.hop.agent"
+# Stop the new-style LaunchDaemon if loaded
+DAEMON_LABEL="com.hop.daemon"
+if launchctl print "system/$DAEMON_LABEL" &>/dev/null; then
+    echo "Stopping hop daemon..."
+    launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+fi
 
-# Detect the console (GUI) user — may be empty during headless installs.
+# Also stop the legacy LaunchAgent if still present
+AGENT_LABEL="com.hop.agent"
 CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
-
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
-    echo "No GUI user logged in — skipping daemon stop (will start at next login)."
-    exit 0
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+    CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
+    if [ -n "$CONSOLE_UID" ]; then
+        launchctl bootout "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
+    fi
 fi
 
-CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
-if [ -z "$CONSOLE_UID" ]; then
-    echo "Could not resolve UID for $CONSOLE_USER — skipping daemon stop."
-    exit 0
-fi
-
-echo "Stopping hop daemon for $CONSOLE_USER (uid $CONSOLE_UID)..."
-launchctl bootout "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
+# Remove the legacy LaunchAgent plist if it exists
+rm -f "/Library/LaunchAgents/com.hop.agent.plist"
 
 exit 0

@@ -1,6 +1,6 @@
 //! Connection authentication and peer authorization.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use iroh::PublicKey;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -18,9 +18,15 @@ static INVITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// Result of authenticating a connecting client.
 pub enum AuthOutcome {
     /// Client is an already-authorized peer.
-    Authorized,
+    Authorized {
+        /// Unix username this peer is bound to (None = host's own user).
+        username: Option<String>,
+    },
     /// Client was authorized via invite (newly added).
-    InviteAccepted,
+    InviteAccepted {
+        /// Unix username from the invite (None = host's own user).
+        username: Option<String>,
+    },
     /// Client was rejected.
     Rejected,
 }
@@ -45,29 +51,30 @@ pub async fn authenticate_client(
             // Invite flow: verify the secret.
             // Hold a lock to prevent TOCTOU races (two connections consuming the same invite).
             let consumed = {
-                let _guard = INVITE_LOCK.lock().expect("invite lock poisoned");
+                let _guard = INVITE_LOCK
+                    .lock()
+                    .map_err(|e| anyhow!("invite lock poisoned: {e}"))?;
                 let mut invites = PendingInvitesStore::load(config_dir)?;
                 invites.prune_expired(15 * 60);
 
-                if invites.try_consume(secret) {
+                let result = invites.try_consume(secret);
+                if result.is_some() {
                     invites.save(config_dir)?;
-                    true
-                } else {
-                    false
                 }
+                result
             };
 
-            if consumed {
+            if let Some(username) = consumed {
                 // Add to authorized peers
                 let mut peers = peers;
-                peers.add_peer(remote_id, format!("peer-{}", remote_id.fmt_short()));
+                peers.add_peer(remote_id, format!("peer-{}", remote_id.fmt_short()), username.clone());
                 peers.save(config_dir)?;
 
                 // Tell client they're authorized
                 proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
 
                 tracing::info!("Invite accepted for peer {}", remote_id.fmt_short());
-                Ok((AuthOutcome::InviteAccepted, None))
+                Ok((AuthOutcome::InviteAccepted { username }, None))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;
@@ -77,11 +84,12 @@ pub async fn authenticate_client(
         }
         ClientMessage::RequestShell => {
             if peers.is_authorized(remote_id) {
+                let username = peers.peer_username(remote_id).map(String::from);
                 // Update last seen
                 let mut peers = peers;
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;
-                Ok((AuthOutcome::Authorized, Some(msg)))
+                Ok((AuthOutcome::Authorized { username }, Some(msg)))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;

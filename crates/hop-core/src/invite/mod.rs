@@ -19,6 +19,9 @@ pub struct InviteToken {
     /// Relay URL for the host (enables direct relay connection without DNS lookup).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    /// Unix username the invited peer will log in as on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// A pending invite stored on the host side.
@@ -28,6 +31,9 @@ pub struct PendingInvite {
     pub secret_hash: String,
     /// Unix timestamp when the invite was created.
     pub created_at: u64,
+    /// Unix username the invited peer will log in as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -61,14 +67,16 @@ impl PendingInvitesStore {
     }
 
     /// Try to consume an invite by verifying the client's secret against stored hashes.
-    /// Returns `true` if the invite was valid and has been consumed (removed).
+    /// Returns `Some(username)` if the invite was valid and has been consumed (removed),
+    /// where the inner `Option<String>` is the bound Unix username (if any).
+    /// Returns `None` if no matching invite was found.
     ///
     /// The client sends the raw hex-encoded secret. We hash it with Argon2 and
     /// compare against the stored hash (the plaintext secret is never persisted).
-    pub fn try_consume(&mut self, client_secret: &[u8]) -> bool {
+    pub fn try_consume(&mut self, client_secret: &[u8]) -> Option<Option<String>> {
         let client_secret_str = match std::str::from_utf8(client_secret) {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         let argon2 = Argon2::default();
@@ -82,10 +90,10 @@ impl PendingInvitesStore {
         });
 
         if let Some(idx) = idx {
-            self.invites.remove(idx);
-            true
+            let invite = self.invites.remove(idx);
+            Some(invite.username)
         } else {
-            false
+            None
         }
     }
 }
@@ -95,7 +103,14 @@ pub fn generate_invite(
     host_public_key: &PublicKey,
     config_dir: &Path,
     relay_url: Option<&str>,
+    username: Option<&str>,
 ) -> Result<String> {
+    // Validate the username early so bad values never reach storage
+    #[cfg(unix)]
+    if let Some(name) = username {
+        crate::unix_user::validate_username(name)?;
+    }
+
     // Generate 32 bytes of random secret
     let mut secret_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut secret_bytes);
@@ -120,6 +135,7 @@ pub fn generate_invite(
     store.invites.push(PendingInvite {
         secret_hash,
         created_at: unix_now(),
+        username: username.map(String::from),
     });
     store.save(config_dir)?;
 
@@ -128,6 +144,7 @@ pub fn generate_invite(
         node_id: host_public_key.to_string(),
         secret: secret_hex,
         relay_url: relay_url.map(String::from),
+        username: username.map(String::from),
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());

@@ -1,6 +1,6 @@
 //! PTY and terminal management.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use iroh::endpoint::{RecvStream, SendStream};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -8,10 +8,43 @@ use std::io::{Read, Write};
 use crate::proto::{self, ClientMessage, HostMessage};
 
 /// Host side: spawn a PTY and bridge I/O over the wire protocol.
+///
+/// If `username` is `Some`, the shell runs as that Unix user via `login -fp`
+/// (macOS) or `su -` (other Unix). This requires the host to run as root.
+/// If `None`, the shell runs as the current user (backward compatible).
 pub async fn host_shell_session(
     mut send: SendStream,
     mut recv: RecvStream,
+    username: Option<&str>,
 ) -> Result<()> {
+    // --- Pre-spawn security checks ---
+    #[cfg(unix)]
+    {
+        use crate::unix_user;
+
+        let is_root = unix_user::is_running_as_root();
+
+        if is_root && username.is_none() {
+            bail!(
+                "hop host is running as root but this peer has no bound username — \
+                 refusing to grant a root shell. Re-invite this peer with \
+                 `hop invite --user <username>` to bind them to a specific account."
+            );
+        }
+
+        if let Some(name) = username {
+            // Defense in depth: the user could have been deleted since invite time
+            unix_user::validate_username(name)?;
+
+            if !is_root {
+                bail!(
+                    "peer is bound to user '{name}' but hop host is not running as root — \
+                     restart with `sudo hop host` to enable per-user shell sessions."
+                );
+            }
+        }
+    }
+
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -23,10 +56,32 @@ pub async fn host_shell_session(
         })
         .context("Failed to open PTY")?;
 
-    // Get user's default shell
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l"); // login shell
+    let cmd = if let Some(user) = username {
+        // Spawn a login shell as the specified user.
+        // Requires the hop host process to run as root.
+        #[cfg(target_os = "macos")]
+        {
+            let mut c = CommandBuilder::new("login");
+            c.args(["-fp", user]);
+            c
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mut c = CommandBuilder::new("su");
+            c.args(["-", user]);
+            c
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("Per-user shell sessions are only supported on Unix");
+        }
+    } else {
+        // Default: run the host user's own login shell
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut c = CommandBuilder::new(&shell);
+        c.arg("-l");
+        c
+    };
 
     let mut child = pair
         .slave

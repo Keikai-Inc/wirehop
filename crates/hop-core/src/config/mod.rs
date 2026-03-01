@@ -108,6 +108,9 @@ pub struct Peer {
     pub authorized_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
+    /// Unix username this peer logs in as (None = host's own user).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// Authorized peers store.
@@ -139,7 +142,7 @@ impl PeersStore {
         self.peers.iter().any(|p| p.node_id == id_str)
     }
 
-    pub fn add_peer(&mut self, node_id: &PublicKey, name: String) {
+    pub fn add_peer(&mut self, node_id: &PublicKey, name: String, username: Option<String>) {
         let id_str = node_id.to_string();
         if !self.peers.iter().any(|p| p.node_id == id_str) {
             self.peers.push(Peer {
@@ -147,8 +150,18 @@ impl PeersStore {
                 name,
                 authorized_at: chrono_now(),
                 last_seen: None,
+                username,
             });
         }
+    }
+
+    /// Look up the Unix username bound to a peer (if any).
+    pub fn peer_username(&self, node_id: &PublicKey) -> Option<&str> {
+        let id_str = node_id.to_string();
+        self.peers
+            .iter()
+            .find(|p| p.node_id == id_str)
+            .and_then(|p| p.username.as_deref())
     }
 
     pub fn remove_peer(&mut self, node_id_prefix: &str) -> bool {

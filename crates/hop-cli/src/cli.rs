@@ -26,7 +26,11 @@ pub enum Command {
     },
 
     /// Generate a one-time invite token/URL
-    Invite,
+    Invite {
+        /// Unix username the invited peer will log in as
+        #[arg(long)]
+        user: Option<String>,
+    },
 
     /// Connect to a host (NodeId or invite token)
     Connect {

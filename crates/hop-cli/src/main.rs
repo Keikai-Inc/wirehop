@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Host { quiet } => cmd_host(secret_key, &config_dir, quiet).await,
-        Command::Invite => cmd_invite(secret_key, &config_dir).await,
+        Command::Invite { user } => cmd_invite(secret_key, &config_dir, user.as_deref()).await,
         Command::Connect { target } => cmd_connect(secret_key, &target, &config_dir).await,
         Command::Peers { action } => cmd_peers(action, &config_dir),
         Command::Id => {
@@ -50,6 +50,27 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     tracing::info!("Hosting as: {public_key}");
     if let Some(ref url) = relay_url {
         tracing::info!("Relay: {url}");
+    }
+
+    // Warn about legacy peers with no bound username when running as root
+    #[cfg(unix)]
+    if hop_core::unix_user::is_running_as_root() {
+        let peers = PeersStore::load(config_dir)?;
+        let unbound: Vec<_> = peers
+            .peers
+            .iter()
+            .filter(|p| p.username.is_none())
+            .collect();
+        if !unbound.is_empty() {
+            eprintln!("WARNING: running as root but {} peer(s) have no bound username:", unbound.len());
+            for p in &unbound {
+                eprintln!("  {} ({})", &p.node_id[..10], p.name);
+            }
+            eprintln!(
+                "These peers will be REJECTED until re-invited with `hop invite --user <username>`."
+            );
+            eprintln!();
+        }
     }
 
     if !quiet {
@@ -98,18 +119,18 @@ async fn handle_incoming(
     .await?;
 
     match outcome {
-        AuthOutcome::Authorized => {
+        AuthOutcome::Authorized { username } => {
             tracing::info!("Authorized peer {}, starting shell", remote_id.fmt_short());
             // first_msg should be RequestShell, already consumed
-            shell::host_shell_session(send, recv).await?;
+            shell::host_shell_session(send, recv, username.as_deref()).await?;
         }
-        AuthOutcome::InviteAccepted => {
+        AuthOutcome::InviteAccepted { username } => {
             tracing::info!("Invite accepted for {}, waiting for shell request", remote_id.fmt_short());
             // Client will send RequestShell next
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
             match msg {
                 ClientMessage::RequestShell => {
-                    shell::host_shell_session(send, recv).await?;
+                    shell::host_shell_session(send, recv, username.as_deref()).await?;
                 }
                 _ => {
                     tracing::warn!("Expected RequestShell after invite, got: {:?}", msg);
@@ -124,7 +145,7 @@ async fn handle_incoming(
     Ok(())
 }
 
-async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path) -> Result<()> {
+async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>) -> Result<()> {
     let public_key = secret_key.public();
 
     // Create a temporary endpoint to discover our relay URL.
@@ -133,7 +154,24 @@ async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path) -
     let relay_url = net::host_relay_url(&endpoint);
     let relay_str = relay_url.as_ref().map(|u| u.as_str());
 
-    let token = invite::generate_invite(&public_key, config_dir, relay_str)?;
+    let token = invite::generate_invite(&public_key, config_dir, relay_str, username)?;
+
+    // Warn if the user won't be able to switch users without root
+    #[cfg(unix)]
+    if let Some(name) = username {
+        if !hop_core::unix_user::is_running_as_root() {
+            let current_user = std::env::var("USER").unwrap_or_default();
+            if name != current_user {
+                eprintln!(
+                    "WARNING: invite bound to user '{name}' but you are not running as root."
+                );
+                eprintln!(
+                    "You will need to start the host with `sudo hop host` for this peer to connect."
+                );
+                eprintln!();
+            }
+        }
+    }
 
     println!("Invite token (share with the client):");
     println!();
@@ -241,8 +279,13 @@ fn cmd_peers(action: Option<PeersAction>, config_dir: &std::path::Path) -> Resul
                         .last_seen
                         .as_deref()
                         .unwrap_or("never");
+                    let user_info = peer
+                        .username
+                        .as_deref()
+                        .map(|u| format!(", user: {u}"))
+                        .unwrap_or_default();
                     println!(
-                        "  {} ({}) - authorized: {}, last seen: {}",
+                        "  {} ({}) - authorized: {}, last seen: {}{user_info}",
                         &peer.node_id[..10],
                         peer.name,
                         peer.authorized_at,

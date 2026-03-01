@@ -46,7 +46,7 @@ OUTPUT="$STAGING/output"
 
 rm -rf "$STAGING"
 mkdir -p "$PAYLOAD/usr/local/bin"
-mkdir -p "$PAYLOAD/Library/LaunchAgents"
+mkdir -p "$PAYLOAD/Library/LaunchDaemons"
 mkdir -p "$SCRIPTS"
 mkdir -p "$RESOURCES"
 mkdir -p "$OUTPUT"
@@ -97,7 +97,7 @@ echo "Binary size: $(du -h "$BINARY" | cut -f1)"
 
 # Assemble payload
 cp "$BINARY" "$PAYLOAD/usr/local/bin/hop"
-cp "$SCRIPT_DIR/com.hop.agent.plist" "$PAYLOAD/Library/LaunchAgents/com.hop.agent.plist"
+cp "$SCRIPT_DIR/com.hop.daemon.plist" "$PAYLOAD/Library/LaunchDaemons/com.hop.daemon.plist"
 
 # Copy install scripts
 cp "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
@@ -133,7 +133,7 @@ Welcome to the Hop installer (v${VERSION}).
 
 This will install:
   - /usr/local/bin/hop (the CLI binary)
-  - A LaunchAgent that runs "hop host" in the background at login
+  - A LaunchDaemon that runs "hop host" as root at boot
 
 After installation, hop will be available in any new terminal window.
 EOF

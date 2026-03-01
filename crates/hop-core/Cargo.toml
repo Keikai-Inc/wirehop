@@ -20,3 +20,4 @@ hex.workspace = true
 directories.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+libc = { workspace = true }

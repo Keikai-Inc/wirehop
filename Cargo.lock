@@ -1381,6 +1381,7 @@ dependencies = [
  "directories",
  "hex",
  "iroh",
+ "libc",
  "portable-pty",
  "rand",
  "serde",

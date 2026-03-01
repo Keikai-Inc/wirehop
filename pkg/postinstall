@@ -1,12 +1,13 @@
 #!/bin/bash
-# postinstall — Set permissions and start the hop daemon.
+# postinstall — Set permissions, migrate config, and start the hop daemon.
 # Runs as root during .pkg installation.
 
 set -e
 
-LABEL="com.hop.agent"
-PLIST="/Library/LaunchAgents/com.hop.agent.plist"
+LABEL="com.hop.daemon"
+PLIST="/Library/LaunchDaemons/com.hop.daemon.plist"
 BINARY="/usr/local/bin/hop"
+SYSTEM_CONFIG="/Library/Application Support/hop"
 
 # Ensure /usr/local/bin exists
 mkdir -p /usr/local/bin
@@ -17,28 +18,35 @@ chmod 755 "$BINARY"
 chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
 
-# Detect the console (GUI) user
+# Create system-level config directory
+mkdir -p "$SYSTEM_CONFIG"
+chmod 700 "$SYSTEM_CONFIG"
+
+# Migrate config from the installing user's per-user directory if the
+# system-level directory has no identity yet.
 CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+    USER_HOME=$(eval echo "~$CONSOLE_USER")
+    USER_CONFIG="$USER_HOME/Library/Application Support/hop"
 
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
-    echo "No GUI user logged in — daemon will start at next login."
-    exit 0
+    if [ ! -f "$SYSTEM_CONFIG/identity.json" ] && [ -f "$USER_CONFIG/identity.json" ]; then
+        echo "Migrating hop config from $USER_CONFIG to $SYSTEM_CONFIG..."
+        cp -n "$USER_CONFIG/identity.json" "$SYSTEM_CONFIG/identity.json" 2>/dev/null || true
+        cp -n "$USER_CONFIG/peers.json" "$SYSTEM_CONFIG/peers.json" 2>/dev/null || true
+        cp -n "$USER_CONFIG/pending_invites.json" "$SYSTEM_CONFIG/pending_invites.json" 2>/dev/null || true
+        chmod 600 "$SYSTEM_CONFIG"/*.json 2>/dev/null || true
+        echo "Config migrated. User copy left in place."
+    fi
 fi
 
-CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
-if [ -z "$CONSOLE_UID" ]; then
-    echo "Could not resolve UID for $CONSOLE_USER — daemon will start at next login."
-    exit 0
-fi
+echo "Starting hop daemon..."
 
-echo "Starting hop daemon for $CONSOLE_USER (uid $CONSOLE_UID)..."
-
-# Try to bootstrap (load) the agent; if already loaded, kickstart it instead
-if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null; then
+# Load the daemon into the system domain
+if launchctl bootstrap system "$PLIST" 2>/dev/null; then
     echo "Hop daemon loaded."
 else
     echo "Already loaded — restarting..."
-    launchctl kickstart -k "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
+    launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
 fi
 
 exit 0
