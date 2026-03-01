@@ -306,30 +306,30 @@ impl KnownHostsStore {
         }
     }
 
-    /// Add a host with deduplication: if the desired name is already taken by a
-    /// *different* node_id, auto-suffix with `-2`, `-3`, etc.
-    /// Skips if the node_id already exists. Returns the actual name used.
+    /// Add or update a host with deduplication: if the desired name is already
+    /// taken by a *different* node_id, auto-suffix with `-2`, `-3`, etc.
+    /// Updates the name if the node_id already exists. Returns the actual name used.
     pub fn add_host_dedup(&mut self, node_id: &PublicKey, desired_name: String) -> String {
         let id_str = node_id.to_string();
 
-        // Already known — return existing name
-        if let Some(existing) = self.hosts.iter().find(|h| h.node_id == id_str) {
-            return existing.name.clone();
-        }
-
-        // Find a unique name
+        // Find a unique name (exclude this node_id from collision check)
         let mut candidate = desired_name.clone();
         let mut suffix = 2u32;
-        while self.hosts.iter().any(|h| h.name == candidate) {
+        while self.hosts.iter().any(|h| h.name == candidate && h.node_id != id_str) {
             candidate = format!("{desired_name}-{suffix}");
             suffix += 1;
         }
 
-        self.hosts.push(KnownHost {
-            node_id: id_str,
-            name: candidate.clone(),
-            added_at: chrono_now(),
-        });
+        // Update existing or insert new
+        if let Some(existing) = self.hosts.iter_mut().find(|h| h.node_id == id_str) {
+            existing.name = candidate.clone();
+        } else {
+            self.hosts.push(KnownHost {
+                node_id: id_str,
+                name: candidate.clone(),
+                added_at: chrono_now(),
+            });
+        }
 
         candidate
     }
