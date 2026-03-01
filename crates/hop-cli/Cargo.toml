@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hop-core.workspace = true
+iroh.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

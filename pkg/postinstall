@@ -1,0 +1,44 @@
+#!/bin/bash
+# postinstall — Set permissions and start the hop daemon.
+# Runs as root during .pkg installation.
+
+set -e
+
+LABEL="com.hop.agent"
+PLIST="/Library/LaunchAgents/com.hop.agent.plist"
+BINARY="/usr/local/bin/hop"
+
+# Ensure /usr/local/bin exists
+mkdir -p /usr/local/bin
+
+# Set correct ownership and permissions
+chown root:wheel "$BINARY"
+chmod 755 "$BINARY"
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+# Detect the console (GUI) user
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    echo "No GUI user logged in — daemon will start at next login."
+    exit 0
+fi
+
+CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
+if [ -z "$CONSOLE_UID" ]; then
+    echo "Could not resolve UID for $CONSOLE_USER — daemon will start at next login."
+    exit 0
+fi
+
+echo "Starting hop daemon for $CONSOLE_USER (uid $CONSOLE_UID)..."
+
+# Try to bootstrap (load) the agent; if already loaded, kickstart it instead
+if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null; then
+    echo "Hop daemon loaded."
+else
+    echo "Already loaded — restarting..."
+    launchctl kickstart -k "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
+fi
+
+exit 0

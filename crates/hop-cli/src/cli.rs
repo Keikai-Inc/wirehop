@@ -12,10 +12,6 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Override default relay server URL
-    #[arg(long, global = true)]
-    pub relay_url: Option<String>,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -23,7 +19,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start hosting (listen for connections)
-    Host,
+    Host {
+        /// Suppress interactive output (for daemon/LaunchAgent use)
+        #[arg(long)]
+        quiet: bool,
+    },
 
     /// Generate a one-time invite token/URL
     Invite,
