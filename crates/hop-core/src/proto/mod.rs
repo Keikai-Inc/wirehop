@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
@@ -24,7 +26,12 @@ pub enum ClientMessage {
     /// Shell input data.
     Input(Vec<u8>),
     /// Terminal window size changed.
-    WindowSize { cols: u16, rows: u16 },
+    WindowSize {
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    },
     /// Auth response during invite flow (client proves knowledge of invite secret).
     AuthResponse {
         /// The raw invite secret (hex-encoded). Verified by the host against
@@ -34,6 +41,8 @@ pub enum ClientMessage {
     },
     /// Request a shell session (after auth).
     RequestShell,
+    /// Client environment variables (TERM, LANG, LC_*, COLORTERM).
+    SetEnv { vars: HashMap<String, String> },
 }
 
 /// Write a length-prefixed bincode frame to a QUIC send stream.

@@ -1,9 +1,11 @@
 //! PTY and terminal management.
 
+use std::collections::HashMap;
+use std::io::{Read, Write};
+
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{RecvStream, SendStream};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::io::{Read, Write};
 
 use crate::proto::{self, ClientMessage, HostMessage};
 
@@ -45,18 +47,56 @@ pub async fn host_shell_session(
         }
     }
 
+    // --- Read initial setup messages from the client (WindowSize, SetEnv) ---
+    let mut initial_size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut env_vars = HashMap::new();
+    let mut leftover_msg: Option<ClientMessage> = None;
+
+    for _ in 0..2 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            proto::read_message::<ClientMessage>(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(ClientMessage::WindowSize {
+                cols,
+                rows,
+                pixel_width,
+                pixel_height,
+            })) => {
+                initial_size.cols = cols;
+                initial_size.rows = rows;
+                initial_size.pixel_width = pixel_width;
+                initial_size.pixel_height = pixel_height;
+            }
+            Ok(Ok(ClientMessage::SetEnv { vars })) => {
+                env_vars = vars;
+            }
+            Ok(Ok(other)) => {
+                // Non-setup message — save it and break out
+                leftover_msg = Some(other);
+                break;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Read error or timeout — old client or done sending setup
+                break;
+            }
+        }
+    }
+
     let pty_system = native_pty_system();
 
     let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+        .openpty(initial_size)
         .context("Failed to open PTY")?;
 
-    let cmd = if let Some(user) = username {
+    let mut cmd = if let Some(user) = username {
         // Spawn a login shell as the specified user.
         // Requires the hop host process to run as root.
         #[cfg(target_os = "macos")]
@@ -82,6 +122,28 @@ pub async fn host_shell_session(
         c.arg("-l");
         c
     };
+    // Apply environment variables from client through a security allowlist
+    const ENV_ALLOWLIST: &[&str] = &[
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "COLORTERM",
+    ];
+    for key in ENV_ALLOWLIST {
+        if let Some(val) = env_vars.get(*key) {
+            cmd.env(key, val);
+        }
+    }
+    // Default TERM if not received (old client compat)
+    if !env_vars.contains_key("TERM") {
+        cmd.env("TERM", "xterm-256color");
+    }
 
     let mut child = pair
         .slave
@@ -165,6 +227,36 @@ pub async fn host_shell_session(
         }
     });
 
+    // Process any leftover message from the setup phase
+    if let Some(msg) = leftover_msg {
+        match msg {
+            ClientMessage::Input(data) => {
+                let writer = pty_writer.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = w.write_all(&data);
+                        let _ = w.flush();
+                    }
+                });
+            }
+            ClientMessage::WindowSize {
+                cols,
+                rows,
+                pixel_width,
+                pixel_height,
+            } => {
+                let _ = _master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                });
+                let _ = proto::write_message(&mut send, &HostMessage::WindowSizeAck).await;
+            }
+            _ => {}
+        }
+    }
+
     // Main loop: multiplex between PTY output, client input, and child exit
     loop {
         tokio::select! {
@@ -187,12 +279,17 @@ pub async fn host_shell_session(
                             }
                         });
                     }
-                    Ok(ClientMessage::WindowSize { cols, rows }) => {
+                    Ok(ClientMessage::WindowSize {
+                        cols,
+                        rows,
+                        pixel_width,
+                        pixel_height,
+                    }) => {
                         let _ = _master.resize(PtySize {
                             rows,
                             cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
+                            pixel_width,
+                            pixel_height,
                         });
                         let _ = proto::write_message(&mut send, &HostMessage::WindowSizeAck).await;
                     }
@@ -227,9 +324,44 @@ pub async fn client_shell_session(
 ) -> Result<i32> {
     use crossterm::terminal;
 
-    // Send initial window size
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    proto::write_message(&mut send, &ClientMessage::WindowSize { cols, rows }).await?;
+    // Send initial window size (with pixel dimensions for sixel/kitty image support)
+    let (cols, rows, pixel_width, pixel_height) = match terminal::window_size() {
+        Ok(size) => (size.columns, size.rows, size.width, size.height),
+        Err(_) => (80, 24, 0, 0),
+    };
+    proto::write_message(
+        &mut send,
+        &ClientMessage::WindowSize {
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        },
+    )
+    .await?;
+
+    // Collect environment variables to propagate
+    let mut vars = HashMap::new();
+    for key in &[
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "COLORTERM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            vars.insert(key.to_string(), val);
+        }
+    }
+    // Ensure TERM always has a value
+    vars.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
+    proto::write_message(&mut send, &ClientMessage::SetEnv { vars }).await?;
 
     // Enter raw mode
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
@@ -243,6 +375,8 @@ pub async fn client_shell_session(
 }
 
 async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Result<i32> {
+    use crossterm::terminal;
+
     // Channel for stdin input
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
@@ -262,6 +396,22 @@ async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Resu
             }
         }
     });
+
+    // Channel for SIGWINCH resize events (Unix only)
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<()>(1);
+    #[cfg(unix)]
+    {
+        let mut sigwinch =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                .context("failed to register SIGWINCH handler")?;
+        tokio::spawn(async move {
+            while sigwinch.recv().await.is_some() {
+                let _ = resize_tx.send(()).await;
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    drop(resize_tx); // silence unused warning; resize_rx will never yield
 
     let mut stdout = std::io::stdout();
 
@@ -290,6 +440,23 @@ async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Resu
                         return Ok(1);
                     }
                 }
+            }
+            // Terminal resized -> send new window size to host
+            Some(()) = resize_rx.recv() => {
+                let (cols, rows, pixel_width, pixel_height) = match terminal::window_size() {
+                    Ok(size) => (size.columns, size.rows, size.width, size.height),
+                    Err(_) => continue,
+                };
+                let _ = proto::write_message(
+                    send,
+                    &ClientMessage::WindowSize {
+                        cols,
+                        rows,
+                        pixel_width,
+                        pixel_height,
+                    },
+                )
+                .await;
             }
         }
     }
