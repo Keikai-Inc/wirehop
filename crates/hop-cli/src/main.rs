@@ -65,6 +65,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     tracing::info!("Hosting as: {public_key}");
     if let Some(ref url) = relay_url {
         tracing::info!("Relay: {url}");
+        // Persist relay URL so `hop invite` can embed it in tokens
+        let relay_path = config_dir.join("relay_url");
+        if let Err(e) = std::fs::write(&relay_path, url.to_string()) {
+            tracing::warn!("Failed to write relay_url: {e}");
+        }
     }
 
     // Warn about legacy peers with no bound username when running as root
@@ -176,9 +181,10 @@ fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, usernam
         }
     };
 
-    // Derive public key directly from identity — no endpoint needed.
-    // relay_url is None; iroh discovers the host by NodeId automatically.
-    let token = invite::generate_invite(&public_key, config_dir, None, username, host_name)?;
+    // Read relay URL persisted by the daemon (if available) so the client
+    // can connect via relay immediately instead of waiting for discovery.
+    let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
+    let token = invite::generate_invite(&public_key, config_dir, relay_url.as_deref(), username, host_name)?;
 
     println!("Invite token (share with the client):");
     println!();
