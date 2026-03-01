@@ -352,5 +352,20 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
             }
             Ok(())
         }
+        Some(PeersAction::Rename { id, name }) => {
+            if peers.rename_peer(&id, name.clone()) {
+                peers.save(host_config_dir)?;
+                println!("Peer renamed to '{name}'.");
+            } else {
+                let mut hosts = KnownHostsStore::load(user_config_dir)?;
+                if hosts.rename_host(&id, name.clone()) {
+                    hosts.save(user_config_dir)?;
+                    println!("Known host renamed to '{name}'.");
+                } else {
+                    println!("No peer or known host found matching '{id}'.");
+                }
+            }
+            Ok(())
+        }
     }
 }

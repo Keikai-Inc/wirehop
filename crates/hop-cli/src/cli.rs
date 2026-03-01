@@ -61,4 +61,12 @@ pub enum PeersAction {
         /// NodeId of the peer to remove
         id: String,
     },
+
+    /// Rename a peer or known host
+    Rename {
+        /// NodeId prefix or current alias
+        id: String,
+        /// New name
+        name: String,
+    },
 }

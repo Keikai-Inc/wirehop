@@ -255,6 +255,15 @@ impl PeersStore {
         self.peers.len() < before
     }
 
+    pub fn rename_peer(&mut self, id_prefix: &str, new_name: String) -> bool {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.node_id.starts_with(id_prefix)) {
+            peer.name = new_name;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn update_last_seen(&mut self, node_id: &PublicKey) {
         let id_str = node_id.to_string();
         if let Some(peer) = self.peers.iter_mut().find(|p| p.node_id == id_str) {
@@ -332,6 +341,17 @@ impl KnownHostsStore {
         }
 
         candidate
+    }
+
+    pub fn rename_host(&mut self, id_or_name: &str, new_name: String) -> bool {
+        if let Some(host) = self.hosts.iter_mut().find(|h| {
+            h.node_id.starts_with(id_or_name) || h.name == id_or_name
+        }) {
+            host.name = new_name;
+            true
+        } else {
+            false
+        }
     }
 
     /// Resolve an alias (host name) to its node_id. Returns `None` if not found.
