@@ -1,0 +1,17 @@
+[package]
+name = "hop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hop"
+path = "src/main.rs"
+
+[dependencies]
+hop-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
