@@ -55,7 +55,7 @@ impl PendingInvitesStore {
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         let path = config_dir.join("pending_invites.json");
         let data = serde_json::to_string_pretty(self)?;
-        crate::config::write_secret_file(&path, &data)?;
+        crate::config::write_shared_file(&path, &data)?;
         Ok(())
     }
 

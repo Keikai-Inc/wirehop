@@ -6,6 +6,10 @@ use iroh::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// The well-known system-level config directory on macOS.
+#[cfg(target_os = "macos")]
+const SYSTEM_CONFIG_DIR: &str = "/Library/Application Support/hop";
+
 /// Write a file with restricted permissions (0600) for secrets.
 /// On non-Unix platforms, falls back to a regular write.
 pub fn write_secret_file(path: &Path, data: &str) -> Result<()> {
@@ -31,6 +35,32 @@ pub fn write_secret_file(path: &Path, data: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a file with group-accessible permissions (0660).
+/// Used for files shared between the daemon and CLI (peers.json, pending_invites.json).
+/// On non-Unix platforms, falls back to a regular write.
+pub fn write_shared_file(path: &Path, data: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o660)
+            .open(path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(data.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Returns the default config directory (~/.config/hop on Linux/macOS).
 pub fn default_config_dir() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "hop").context("Could not determine config directory")?;
@@ -38,6 +68,8 @@ pub fn default_config_dir() -> Result<PathBuf> {
 }
 
 /// Ensures the config directory exists (with 0700 permissions) and returns its path.
+/// Only sets permissions when the current process owns the directory, so it won't
+/// clobber the system config's 2770 when the daemon calls this.
 pub fn ensure_config_dir(override_path: Option<&Path>) -> Result<PathBuf> {
     let dir = match override_path {
         Some(p) => p.to_path_buf(),
@@ -46,12 +78,19 @@ pub fn ensure_config_dir(override_path: Option<&Path>) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
-    // Restrict directory permissions so only the owner can list/enter it
+    // Restrict directory permissions so only the owner can list/enter it,
+    // but only if we own the directory (avoid clobbering system config permissions).
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
+        let meta = std::fs::metadata(&dir)
+            .with_context(|| format!("Failed to read metadata for {}", dir.display()))?;
+        // SAFETY: geteuid() is always safe to call
+        if meta.uid() == unsafe { libc::geteuid() } {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
+        }
     }
 
     Ok(dir)
@@ -100,6 +139,50 @@ pub fn load_or_generate_identity(config_dir: &Path) -> Result<SecretKey> {
     }
 }
 
+/// Load an existing node identity from `config_dir/identity.json` (read-only).
+/// Returns an error if the file does not exist — never generates a new key.
+/// Used by `hop invite` to read the daemon's identity without creating one.
+pub fn load_identity(config_dir: &Path) -> Result<SecretKey> {
+    let path = config_dir.join("identity.json");
+
+    let data = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {} — is the daemon installed?", path.display()))?;
+    let file: IdentityFile =
+        serde_json::from_str(&data).context("Failed to parse identity.json")?;
+
+    let key_bytes = URL_SAFE_NO_PAD
+        .decode(&file.secret_key)
+        .context("Failed to decode secret key from base64")?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Secret key must be 32 bytes"))?;
+    Ok(SecretKey::from_bytes(&key_array))
+}
+
+/// Resolve the config directory for host-side commands (`invite`, `peers`).
+///
+/// Priority:
+/// 1. `--config` override if provided
+/// 2. System config dir if `identity.json` exists there (daemon installed)
+/// 3. User config dir via `default_config_dir()`
+///
+/// Does NOT create directories or set permissions — just resolves a path.
+pub fn resolve_host_config_dir(override_path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let system_dir = Path::new(SYSTEM_CONFIG_DIR);
+        if system_dir.join("identity.json").exists() {
+            return Ok(system_dir.to_path_buf());
+        }
+    }
+
+    default_config_dir()
+}
+
 /// An authorized peer entry (host side).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
@@ -133,7 +216,7 @@ impl PeersStore {
     pub fn save(&self, config_dir: &Path) -> Result<()> {
         let path = config_dir.join("peers.json");
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, &data)?;
+        write_shared_file(&path, &data)?;
         Ok(())
     }
 

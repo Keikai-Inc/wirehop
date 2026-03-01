@@ -18,9 +18,11 @@ chmod 755 "$BINARY"
 chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
 
-# Create system-level config directory
+# Create system-level config directory accessible to admin users.
+# setgid (2770) ensures new files inherit the admin group.
 mkdir -p "$SYSTEM_CONFIG"
-chmod 700 "$SYSTEM_CONFIG"
+chown root:admin "$SYSTEM_CONFIG"
+chmod 2770 "$SYSTEM_CONFIG"
 
 # Migrate config from the installing user's per-user directory if the
 # system-level directory has no identity yet.
@@ -34,9 +36,23 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" 
         cp -n "$USER_CONFIG/identity.json" "$SYSTEM_CONFIG/identity.json" 2>/dev/null || true
         cp -n "$USER_CONFIG/peers.json" "$SYSTEM_CONFIG/peers.json" 2>/dev/null || true
         cp -n "$USER_CONFIG/pending_invites.json" "$SYSTEM_CONFIG/pending_invites.json" 2>/dev/null || true
-        chmod 600 "$SYSTEM_CONFIG"/*.json 2>/dev/null || true
         echo "Config migrated. User copy left in place."
     fi
+fi
+
+# Set per-file permissions: identity is read-only for admin users,
+# peers and pending_invites are read-write (shared between daemon and CLI).
+if [ -f "$SYSTEM_CONFIG/identity.json" ]; then
+    chown root:admin "$SYSTEM_CONFIG/identity.json"
+    chmod 640 "$SYSTEM_CONFIG/identity.json"
+fi
+if [ -f "$SYSTEM_CONFIG/peers.json" ]; then
+    chown root:admin "$SYSTEM_CONFIG/peers.json"
+    chmod 660 "$SYSTEM_CONFIG/peers.json"
+fi
+if [ -f "$SYSTEM_CONFIG/pending_invites.json" ]; then
+    chown root:admin "$SYSTEM_CONFIG/pending_invites.json"
+    chmod 660 "$SYSTEM_CONFIG/pending_invites.json"
 fi
 
 echo "Starting hop daemon..."

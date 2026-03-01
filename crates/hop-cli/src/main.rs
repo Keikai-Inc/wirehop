@@ -26,16 +26,30 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::new(filter))
         .init();
 
-    let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
-    let secret_key = config::load_or_generate_identity(&config_dir)?;
-    let public_key = secret_key.public();
-
     match cli.command {
-        Command::Host { quiet } => cmd_host(secret_key, &config_dir, quiet).await,
-        Command::Invite { user } => cmd_invite(secret_key, &config_dir, user.as_deref()).await,
-        Command::Connect { target } => cmd_connect(secret_key, &target, &config_dir).await,
-        Command::Peers { action } => cmd_peers(action, &config_dir),
+        Command::Host { quiet } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_host(secret_key, &config_dir, quiet).await
+        }
+        Command::Invite { user } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_identity(&config_dir)?;
+            cmd_invite(secret_key, &config_dir, user.as_deref())
+        }
+        Command::Connect { target } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_connect(secret_key, &target, &config_dir).await
+        }
+        Command::Peers { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_peers(action, &config_dir)
+        }
         Command::Id => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            let public_key = secret_key.public();
             println!("{public_key}");
             Ok(())
         }
@@ -145,33 +159,12 @@ async fn handle_incoming(
     Ok(())
 }
 
-async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>) -> Result<()> {
+fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>) -> Result<()> {
     let public_key = secret_key.public();
 
-    // Create a temporary endpoint to discover our relay URL.
-    // This ensures the invite token includes connectivity info.
-    let endpoint = net::create_host_endpoint(secret_key).await?;
-    let relay_url = net::host_relay_url(&endpoint);
-    let relay_str = relay_url.as_ref().map(|u| u.as_str());
-
-    let token = invite::generate_invite(&public_key, config_dir, relay_str, username)?;
-
-    // Warn if the user won't be able to switch users without root
-    #[cfg(unix)]
-    if let Some(name) = username {
-        if !hop_core::unix_user::is_running_as_root() {
-            let current_user = std::env::var("USER").unwrap_or_default();
-            if name != current_user {
-                eprintln!(
-                    "WARNING: invite bound to user '{name}' but you are not running as root."
-                );
-                eprintln!(
-                    "You will need to start the host with `sudo hop host` for this peer to connect."
-                );
-                eprintln!();
-            }
-        }
-    }
+    // Derive public key directly from identity — no endpoint needed.
+    // relay_url is None; iroh discovers the host by NodeId automatically.
+    let token = invite::generate_invite(&public_key, config_dir, None, username)?;
 
     println!("Invite token (share with the client):");
     println!();
@@ -182,7 +175,6 @@ async fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, u
     println!();
     println!("This invite expires in 15 minutes and is single-use.");
 
-    endpoint.close().await;
     Ok(())
 }
 
