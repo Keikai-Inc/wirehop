@@ -111,11 +111,15 @@ pub async fn host_transfer_session(
     // SendStream sends a QUIC RESET which discards undelivered data.
     let _ = send.finish();
 
-    // Wait for the client to close their side of the stream. This keeps the
-    // connection alive until the client has read our response — otherwise
-    // returning immediately drops the Connection, sending CONNECTION_CLOSE
-    // before the client can read the Done message.
-    let _: Result<TransferMsg> = proto::read_message(&mut recv).await;
+    // Keep the connection alive briefly so the QUIC transport can deliver
+    // the buffered FIN + data before the Connection is dropped (which
+    // sends CONNECTION_CLOSE). We wait for the client to close their side,
+    // but cap it so we don't hang if the client disappears.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        recv.read_to_end(1),
+    )
+    .await;
 
     result
 }

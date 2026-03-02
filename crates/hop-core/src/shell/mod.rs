@@ -333,8 +333,13 @@ pub async fn host_shell_session(
     // causing the client to see a disconnection instead of a clean exit.
     if clean_exit {
         let _ = send.finish();
-        // Give the transport a moment to flush the FIN
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Keep connection alive briefly so QUIC delivers the Exit message
+        // before the Connection is dropped. Cap at 200ms to avoid hanging.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            recv.read_to_end(1),
+        )
+        .await;
     }
 
     Ok(())
