@@ -931,7 +931,7 @@
 <span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/install.sh</span> | <span class="cmd">bash</span>
 
 <span class="comment"># Install specific version</span>
-<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/install.sh</span> | <span class="cmd">bash</span> <span class="flag">-s -- --version 0.2.0</span>
+<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/install.sh</span> | <span class="cmd">bash</span> <span class="flag">-s -- --version 0.2.3</span>
 
 <span class="comment"># Custom install directory</span>
 <span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/install.sh</span> | <span class="cmd">bash</span> <span class="flag">-s -- --dir ~/.local/bin</span>
@@ -1003,10 +1003,10 @@
             </div>
             <div class="code-body">
 <span class="comment"># Download the .pkg installer</span>
-<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSLO</span> <span class="url">https://hop.keik.ai/v0.2.0/hop-0.2.0.pkg</span>
+<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSLO</span> <span class="url">https://hop.keik.ai/v0.2.3/hop-0.2.3.pkg</span>
 
 <span class="comment"># Install the package</span>
-<span class="prompt">$</span> <span class="cmd">sudo installer</span> <span class="flag">-pkg</span> hop-0.2.0.pkg <span class="flag">-target</span> /
+<span class="prompt">$</span> <span class="cmd">sudo installer</span> <span class="flag">-pkg</span> hop-0.2.3.pkg <span class="flag">-target</span> /
 
 <span class="comment"># The daemon starts automatically — create an invite</span>
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
