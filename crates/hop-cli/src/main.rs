@@ -71,12 +71,24 @@ async fn main() -> Result<()> {
             let user_config_dir = config::default_config_dir()?;
             cmd_peers(action, &host_config_dir, &user_config_dir)
         }
+        Command::On { target, name } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
+        }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let public_key = secret_key.public();
             println!("{public_key}");
             Ok(())
+        }
+        Command::External(args) => {
+            // Treat the first arg as a connect target: "hop myhost"
+            let target = args.first().context("no target specified")?;
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_connect(secret_key, target, &config_dir, None).await
         }
     }
 }

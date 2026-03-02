@@ -82,8 +82,21 @@ pub enum Command {
         dest: String,
     },
 
+    /// Connect to a host (shorthand: "hop on <target>")
+    On {
+        /// Host NodeId, invite token, or known host alias
+        target: String,
+        /// Override the name saved for this host in known_hosts
+        #[arg(long)]
+        name: Option<String>,
+    },
+
     /// Print this node's identity (NodeId)
     Id,
+
+    /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
