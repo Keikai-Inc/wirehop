@@ -68,7 +68,7 @@ The .pkg installs the binary to `/usr/local/bin/hop` and a LaunchDaemon (`com.ho
 Creates S3 bucket `hop-releases` (us-east-1), CloudFront distribution with OAC, and bucket policy. Prints the CloudFront domain and distribution ID to export.
 
 **Current infrastructure:**
-- CDN: `https://d17l2ho600thzl.cloudfront.net`
+- CDN: `https://hop.keik.ai` (CloudFront: `d17l2ho600thzl.cloudfront.net`)
 - Distribution ID: `E1SBRBZNSQX4WA`
 
 ### Publishing a release
@@ -109,13 +109,13 @@ s3://hop-releases/
 
 ```bash
 # From CDN (recommended)
-curl -fsSL https://d17l2ho600thzl.cloudfront.net/install.sh | bash
+curl -fsSL https://hop.keik.ai/install.sh | bash
 
 # Specific version
-curl -fsSL https://d17l2ho600thzl.cloudfront.net/install.sh | bash -s -- --version 0.1.0
+curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
 
 # Custom install directory
-curl -fsSL https://d17l2ho600thzl.cloudfront.net/install.sh | bash -s -- --dir ~/.local/bin
+curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
 
 # macOS .pkg
 sudo installer -pkg hop-{VERSION}.pkg -target /
@@ -128,7 +128,7 @@ The installer detects OS/arch, downloads the binary with checksum verification, 
 | Variable | Used by | Purpose |
 |---|---|---|
 | `HOP_CF_DISTRIBUTION_ID` | `scripts/release.sh` | CloudFront distribution ID for cache invalidation |
-| `HOP_CDN_URL` | `install.sh` | Override CDN base URL (default: `https://d17l2ho600thzl.cloudfront.net`) |
+| `HOP_CDN_URL` | `install.sh` | Override CDN base URL (default: `https://hop.keik.ai`) |
 | `AWS_LC_SYS_CMAKE_BUILDER` | `cross` builds | Set to `1` to use cmake instead of cc for aws-lc-sys |
 
 ## Testing

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Installer for hop — https://github.com/jasonthomas/hop
 # Usage:
-#   curl -fsSL https://YOUR_CDN_DOMAIN/install.sh | bash
-#   curl -fsSL https://YOUR_CDN_DOMAIN/install.sh | bash -s -- --version 0.1.0
-#   curl -fsSL https://YOUR_CDN_DOMAIN/install.sh | bash -s -- --dir ~/.local/bin
+#   curl -fsSL https://hop.keik.ai/install.sh | bash
+#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
+#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
 
 set -euo pipefail
 
-BASE_URL="${HOP_CDN_URL:-https://d17l2ho600thzl.cloudfront.net}"
+BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
 
 # --- Colour helpers (disabled when piped) ------------------------------------
 
