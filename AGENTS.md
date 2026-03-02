@@ -74,17 +74,29 @@ Creates S3 bucket `hop-releases` (us-east-1), CloudFront distribution with OAC, 
 ### Publishing a release
 
 ```bash
-export HOP_CF_DISTRIBUTION_ID="E1SBRBZNSQX4WA"
+# Release current version from Cargo.toml
 ./scripts/release.sh
+
+# Bump version, commit, tag, build, and release in one step
+./scripts/release.sh 0.3.0
+
+# Redeploy website only (no builds)
+./scripts/release.sh --site-only
 ```
 
-This script:
-1. Extracts version from `Cargo.toml` (`workspace.package.version`)
-2. Builds all 4 targets (macOS via cargo, Linux via cross)
-3. Strips binaries, generates `.sha256` sidecar files
-4. Uploads to `s3://hop-releases/v{VERSION}/`
-5. Updates `latest` version marker and `install.sh` at bucket root
-6. Invalidates CloudFront cache
+The release script handles the full workflow:
+1. Preflight checks (cargo, cross, aws, docker, rust targets)
+2. Optional version bump (updates Cargo.toml, commits)
+3. Runs tests
+4. Builds all 4 targets (macOS via cargo, Linux via cross)
+5. Strips binaries, generates `.sha256` sidecar files
+6. Builds macOS universal `.pkg` installer
+7. Uploads everything to `s3://hop-releases/v{VERSION}/`
+8. Updates `latest` version marker, `install.sh`, and website
+9. Tags the release in git and pushes (with tags)
+10. Invalidates CloudFront cache
+
+The CloudFront distribution ID defaults to `E1SBRBZNSQX4WA`. Override with `HOP_CF_DISTRIBUTION_ID` env var if needed.
 
 **Prerequisites:** AWS credentials configured, Docker running, `cross` installed, `x86_64-apple-darwin` target added.
 
