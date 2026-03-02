@@ -13,7 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html { overflow-x: clip; }
+    html, body { overflow-x: hidden; }
 
     :root {
       --color-primary: #dc2626;
@@ -139,6 +139,7 @@
       max-width: 72rem;
       margin: 0 auto;
       padding: 0 2rem;
+      overflow: hidden;
     }
 
     /* --- Hero ---------------------------------------------------------------- */
@@ -317,6 +318,8 @@
       gap: 1.5rem;
     }
 
+    .grid > * { min-width: 0; }
+
     .grid-3 { grid-template-columns: repeat(3, 1fr); }
     .grid-2 { grid-template-columns: repeat(2, 1fr); }
 
@@ -391,6 +394,8 @@
       border-bottom: 1px solid var(--color-border);
     }
 
+    .comparison-row > * { min-width: 0; }
+
     .comparison-row:last-child { border-bottom: none; }
 
     .comparison-cell {
@@ -429,6 +434,8 @@
       gap: 2rem;
       counter-reset: step;
     }
+
+    .steps > * { min-width: 0; }
 
     .step {
       position: relative;
@@ -477,6 +484,7 @@
       border: 1px solid var(--color-border);
       border-radius: 0.75rem;
       overflow: hidden;
+      max-width: 100%;
     }
 
     .code-header {
@@ -530,6 +538,8 @@
       gap: 2rem;
       align-items: start;
     }
+
+    .daemon-grid > * { min-width: 0; }
 
     .daemon-info h3 {
       font-family: var(--font-display);
@@ -939,7 +949,7 @@
           <div style="display: flex; flex-direction: column; gap: 0.75rem;">
             <div class="card" style="padding: 1rem 1.25rem;">
               <div style="display: flex; align-items: center; gap: 0.75rem;">
-                <span style="font-size: 1.25rem;">&#63743;</span>
+                <span style="font-size: 1.25rem;">&#128187;</span>
                 <div>
                   <div style="font-weight: 600; font-size: 0.9rem;">macOS</div>
                   <div style="color: var(--color-text-tertiary); font-size: 0.8rem;">Apple Silicon (arm64) &amp; Intel (x86_64)</div>
