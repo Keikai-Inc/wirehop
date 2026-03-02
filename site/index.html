@@ -626,34 +626,37 @@
     footer {
       border-top: 1px solid var(--color-border);
       padding: 3rem 2rem;
-      text-align: center;
     }
 
-    .footer-links {
+    .footer-bottom {
       display: flex;
-      justify-content: center;
-      gap: 2rem;
-      margin-bottom: 1.5rem;
-      list-style: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      max-width: 72rem;
+      margin: 0 auto;
     }
-
-    .footer-links a {
-      color: var(--color-text-tertiary);
-      text-decoration: none;
-      font-size: 0.875rem;
-      transition: color 150ms;
-    }
-
-    .footer-links a:hover { color: var(--color-text-secondary); }
 
     .footer-copy {
       color: var(--color-text-tertiary);
-      font-size: 0.8rem;
+      font-size: 0.75rem;
     }
 
     .footer-copy a {
       color: var(--color-text-secondary);
       text-decoration: none;
+    }
+
+    .footer-copy a:hover { text-decoration: underline; }
+
+    .footer-tagline {
+      color: var(--color-text-tertiary);
+      font-size: 0.75rem;
+      font-style: italic;
+    }
+
+    @media (max-width: 480px) {
+      .footer-bottom { flex-direction: column; text-align: center; }
     }
 
     .footer-copy a:hover { text-decoration: underline; }
@@ -1096,8 +1099,10 @@
 
   <!-- Footer -->
   <footer>
-    <p style="color: var(--color-text-secondary); font-size: 1rem; margin-bottom: 1rem;">The world has changed. Security has to change with it.</p>
-    <p class="footer-copy">&copy; 2026 <a href="https://keik.ai">Keik.ai</a> Cybersecurity. All rights reserved.</p>
+    <div class="footer-bottom">
+      <p class="footer-copy">&copy; 2026 <a href="https://keik.ai">Keik.ai</a> Cybersecurity. All rights reserved.</p>
+      <p class="footer-tagline">"The world has changed. Security has to change with it."</p>
+    </div>
   </footer>
 
   <script>
