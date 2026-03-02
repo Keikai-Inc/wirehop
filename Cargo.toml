@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 
 [workspace.dependencies]
 # Internal
@@ -15,7 +15,7 @@ hop-core = { path = "crates/hop-core" }
 iroh = "0.96"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -28,9 +28,7 @@ bincode = { version = "2", features = ["serde"] }
 # Terminal / PTY
 portable-pty = "0.9"
 crossterm = "0.28"
-
-# Web UI
-axum = "0.8"
+ratatui = "0.29"
 
 # Crypto / Auth
 rand = "0.9"
@@ -48,3 +46,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # System
 libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

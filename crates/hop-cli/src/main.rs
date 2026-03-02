@@ -1,8 +1,13 @@
 mod cli;
+mod reconnect;
+
+use std::io::Read;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command, PeersAction};
+use iroh::{Endpoint, PublicKey, RelayUrl};
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use hop_core::auth::{self, AuthOutcome};
@@ -10,7 +15,7 @@ use hop_core::config::{self, KnownHostsStore, PeersStore};
 use hop_core::invite;
 use hop_core::net;
 use hop_core::proto::{self, ClientMessage};
-use hop_core::shell;
+use hop_core::shell::{self, SessionOutcome};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -198,41 +203,46 @@ fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, usernam
     Ok(())
 }
 
-async fn cmd_connect(
-    secret_key: iroh::SecretKey,
+/// Resolved target info retained for reconnection.
+struct ResolvedHost {
+    host_id: PublicKey,
+    relay_url: Option<RelayUrl>,
+}
+
+/// Perform target resolution, initial connection, auth (if invite), and first
+/// shell request. Returns the resolved host info and the (send, recv) pair
+/// ready for `client_shell_session`.
+async fn resolve_and_initial_connect(
+    endpoint: &Endpoint,
     target: &str,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
-) -> Result<()> {
-    let endpoint = net::create_client_endpoint(secret_key).await?;
-
+) -> Result<(ResolvedHost, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     // 1. Check known_hosts for alias match
     let hosts = KnownHostsStore::load(config_dir)?;
     if let Some(node_id_str) = hosts.resolve_alias(target) {
-        let host_id: iroh::PublicKey = node_id_str
+        let host_id: PublicKey = node_id_str
             .parse()
             .context("Invalid NodeId in known_hosts")?;
 
         println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
 
-        let conn = net::connect_to_host(&endpoint, host_id, None).await?;
+        let conn = net::connect_to_host(endpoint, host_id, None).await?;
         let (mut send, recv) = conn.open_bi().await?;
-
         proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
 
-        let exit_code = shell::client_shell_session(send, recv).await?;
-        std::process::exit(exit_code);
+        return Ok((ResolvedHost { host_id, relay_url: None }, send, recv));
     }
 
     // 2. Check if invite token
     if invite::is_invite_token(target) {
         let token = invite::decode_invite(target)?;
-        let host_id: iroh::PublicKey = token
+        let host_id: PublicKey = token
             .node_id
             .parse()
             .context("Invalid NodeId in invite token")?;
 
-        let relay_url: Option<iroh::RelayUrl> = token
+        let relay_url: Option<RelayUrl> = token
             .relay_url
             .as_deref()
             .map(|u| u.parse())
@@ -241,7 +251,7 @@ async fn cmd_connect(
 
         println!("Connecting to host {}...", host_id.fmt_short());
 
-        let conn = net::connect_to_host(&endpoint, host_id, relay_url.as_ref()).await?;
+        let conn = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
         proto::write_message(
@@ -257,7 +267,6 @@ async fn cmd_connect(
             proto::HostMessage::AuthResult { authorized: true } => {
                 println!("Authorized! Starting shell...");
 
-                // Determine name: --name > token host_name > host-{short_id}
                 let desired_name = cli_name
                     .map(String::from)
                     .or(token.host_name)
@@ -268,10 +277,10 @@ async fn cmd_connect(
                 hosts.save(config_dir)?;
                 println!("Saved as known host: {actual_name}");
 
+                // Send RequestShell on the same stream — the host is waiting for it
                 proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
 
-                let exit_code = shell::client_shell_session(send, recv).await?;
-                std::process::exit(exit_code);
+                return Ok((ResolvedHost { host_id, relay_url }, send, recv));
             }
             proto::HostMessage::AuthResult { authorized: false } => {
                 anyhow::bail!("Invite rejected by host (expired or already used)");
@@ -283,19 +292,86 @@ async fn cmd_connect(
     }
 
     // 3. Parse as NodeId (64-char hex)
-    let host_id: iroh::PublicKey = target
+    let host_id: PublicKey = target
         .parse()
         .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
 
     println!("Connecting to {}...", host_id.fmt_short());
 
-    let conn = net::connect_to_host(&endpoint, host_id, None).await?;
+    let conn = net::connect_to_host(endpoint, host_id, None).await?;
     let (mut send, recv) = conn.open_bi().await?;
-
     proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
 
-    let exit_code = shell::client_shell_session(send, recv).await?;
-    std::process::exit(exit_code);
+    Ok((ResolvedHost { host_id, relay_url: None }, send, recv))
+}
+
+/// Spawn a blocking stdin reader and return the receiver half.
+fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
+    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 1024];
+        let stdin = std::io::stdin();
+        loop {
+            match stdin.lock().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if input_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    input_rx
+}
+
+async fn cmd_connect(
+    secret_key: iroh::SecretKey,
+    target: &str,
+    config_dir: &std::path::Path,
+    cli_name: Option<&str>,
+) -> Result<()> {
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+
+    let (resolved, first_send, first_recv) =
+        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name).await?;
+
+    // Spawn stdin reader once — shared across reconnections
+    let mut stdin_rx = spawn_stdin_reader();
+
+    // Run the first shell session
+    let mut outcome =
+        shell::client_shell_session(first_send, first_recv, &mut stdin_rx).await?;
+
+    // Reconnection loop
+    loop {
+        match outcome {
+            SessionOutcome::Exited(code) => {
+                std::process::exit(code);
+            }
+            SessionOutcome::Disconnected => {
+                match reconnect::show_reconnect_tui(
+                    &endpoint,
+                    resolved.host_id,
+                    resolved.relay_url.as_ref(),
+                    &mut stdin_rx,
+                )
+                .await
+                {
+                    reconnect::ReconnectAction::Reconnected(conn) => {
+                        let (mut send, recv) = conn.open_bi().await?;
+                        proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+                        outcome =
+                            shell::client_shell_session(send, recv, &mut stdin_rx).await?;
+                    }
+                    reconnect::ReconnectAction::Quit => {
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, user_config_dir: &std::path::Path) -> Result<()> {

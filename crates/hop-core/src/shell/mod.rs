@@ -7,7 +7,18 @@ use anyhow::{Context, Result, bail};
 use iroh::endpoint::{RecvStream, SendStream};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+use tokio::sync::mpsc;
+
 use crate::proto::{self, ClientMessage, HostMessage};
+
+/// Outcome of a client shell session.
+#[derive(Debug)]
+pub enum SessionOutcome {
+    /// Host sent an Exit message with a status code — clean exit, don't reconnect.
+    Exited(i32),
+    /// Connection error — the session may be reconnectable.
+    Disconnected,
+}
 
 /// Host side: spawn a PTY and bridge I/O over the wire protocol.
 ///
@@ -318,10 +329,14 @@ pub async fn host_shell_session(
 }
 
 /// Client side: enter raw terminal mode and bridge I/O over the wire protocol.
+///
+/// The caller owns the stdin reader and passes its receiver here so the same
+/// channel can be reused across reconnections.
 pub async fn client_shell_session(
     mut send: SendStream,
     mut recv: RecvStream,
-) -> Result<i32> {
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<SessionOutcome> {
     use crossterm::terminal;
 
     // Send initial window size (with pixel dimensions for sixel/kitty image support)
@@ -366,7 +381,7 @@ pub async fn client_shell_session(
     // Enter raw mode
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
 
-    let result = client_shell_loop(&mut send, &mut recv).await;
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
 
     // Always restore terminal
     let _ = terminal::disable_raw_mode();
@@ -374,31 +389,15 @@ pub async fn client_shell_session(
     result
 }
 
-async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Result<i32> {
+async fn client_shell_loop(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    input_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<SessionOutcome> {
     use crossterm::terminal;
 
-    // Channel for stdin input
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    // Spawn blocking stdin reader
-    tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 1024];
-        let stdin = std::io::stdin();
-        loop {
-            match stdin.lock().read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if input_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
     // Channel for SIGWINCH resize events (Unix only)
-    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (resize_tx, mut resize_rx) = mpsc::channel::<()>(1);
     #[cfg(unix)]
     {
         let mut sigwinch =
@@ -419,7 +418,9 @@ async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Resu
         tokio::select! {
             // Stdin -> send to host
             Some(data) = input_rx.recv() => {
-                proto::write_message(send, &ClientMessage::Input(data)).await?;
+                if proto::write_message(send, &ClientMessage::Input(data)).await.is_err() {
+                    return Ok(SessionOutcome::Disconnected);
+                }
             }
             // Host messages -> write to stdout
             msg = proto::read_message::<HostMessage>(recv) => {
@@ -429,15 +430,14 @@ async fn client_shell_loop(send: &mut SendStream, recv: &mut RecvStream) -> Resu
                         stdout.flush()?;
                     }
                     Ok(HostMessage::Exit(code)) => {
-                        return Ok(code);
+                        return Ok(SessionOutcome::Exited(code));
                     }
                     Ok(HostMessage::WindowSizeAck) => {}
                     Ok(HostMessage::AuthResult { .. }) => {
                         tracing::warn!("Unexpected auth result during shell session");
                     }
                     Err(_) => {
-                        eprintln!("Connection closed by host.");
-                        return Ok(1);
+                        return Ok(SessionOutcome::Disconnected);
                     }
                 }
             }

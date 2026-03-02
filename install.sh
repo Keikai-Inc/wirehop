@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installer for hop — https://github.com/jasonthomas/hop
+# Installer for hop
 # Usage:
 #   curl -fsSL https://hop.keik.ai/install.sh | bash
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
