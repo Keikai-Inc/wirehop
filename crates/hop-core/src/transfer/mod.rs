@@ -106,6 +106,17 @@ pub async fn host_transfer_session(
         let _ = proto::write_message(&mut send, &TransferMsg::Error(format!("{e:#}"))).await;
     }
 
+    // Gracefully close the send stream so the client receives all buffered
+    // data (especially the final Done message). Without this, dropping the
+    // SendStream sends a QUIC RESET which discards undelivered data.
+    let _ = send.finish();
+
+    // Wait for the client to close their side of the stream. This keeps the
+    // connection alive until the client has read our response — otherwise
+    // returning immediately drops the Connection, sending CONNECTION_CLOSE
+    // before the client can read the Done message.
+    let _: Result<TransferMsg> = proto::read_message(&mut recv).await;
+
     result
 }
 

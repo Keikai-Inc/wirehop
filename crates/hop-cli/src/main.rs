@@ -541,6 +541,7 @@ async fn cmd_cp(
 
         let summary =
             transfer::client_push_copy(&mut send, &mut recv, &local_paths, &progress).await?;
+        let _ = send.finish();
         eprintln!("{summary}");
     } else {
         // Pull: remote source -> local dest
@@ -577,6 +578,7 @@ async fn cmd_cp(
 
         let summary =
             transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &progress).await?;
+        let _ = send.finish();
         eprintln!("{summary}");
     }
 
@@ -647,6 +649,7 @@ async fn cmd_sync(
         let summary =
             transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &progress)
                 .await?;
+        let _ = send.finish();
         eprintln!("{summary}");
     } else {
         // Pull sync: remote -> local
@@ -679,6 +682,7 @@ async fn cmd_sync(
         let summary =
             transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &progress)
                 .await?;
+        let _ = send.finish();
         eprintln!("{summary}");
     }
 
