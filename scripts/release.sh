@@ -69,13 +69,17 @@ echo "==> Uploading install.sh"
 aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
   --content-type "text/plain"
 
+echo "==> Uploading site"
+aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
+  --content-type "text/html"
+
 # --- CloudFront invalidation ------------------------------------------------
 
 if [[ -n "${HOP_CF_DISTRIBUTION_ID:-}" ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${HOP_CF_DISTRIBUTION_ID}" \
-    --paths "/latest" "/install.sh" "/v${VERSION}/*"
+    --paths "/" "/index.html" "/latest" "/install.sh" "/v${VERSION}/*"
 else
   echo "==> Skipping CloudFront invalidation (HOP_CF_DISTRIBUTION_ID not set)"
 fi
