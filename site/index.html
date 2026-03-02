@@ -13,6 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { overflow-x: clip; }
 
     :root {
       --color-primary: #dc2626;
@@ -557,6 +558,11 @@
       gap: 0.75rem;
       color: var(--color-text-secondary);
       font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .daemon-features li code {
+      word-break: break-all;
     }
 
     .daemon-features li::before {
@@ -661,6 +667,7 @@
       .install-cmd code { font-size: 0.75rem; }
       .code-body { font-size: 0.7rem; line-height: 1.7; padding: 1rem; white-space: pre; overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .code-block { max-width: 100%; }
+      .daemon-info p code, .daemon-info + div p code { word-break: break-all; }
     }
 
     @media (max-width: 480px) {
@@ -999,7 +1006,7 @@
             </div>
           </div>
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Uninstall cleanly with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">sudo /usr/local/bin/hop-uninstall.sh</code>. Your config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/Library/Application Support/hop/</code> is preserved.
+            Uninstall cleanly with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">sudo /usr/local/bin/hop-uninstall.sh</code>. Your config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">/Library/Application Support/hop/</code> is preserved.
           </p>
         </div>
       </div>
@@ -1039,7 +1046,7 @@
             </div>
           </div>
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Stop and remove with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">sudo systemctl disable --now hop && sudo rm /etc/systemd/system/hop.service</code>
+            Stop and remove with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">sudo systemctl disable --now hop && sudo rm /etc/systemd/system/hop.service</code>
           </p>
         </div>
       </div>
