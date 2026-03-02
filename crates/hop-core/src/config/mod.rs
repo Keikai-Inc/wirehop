@@ -278,6 +278,8 @@ pub struct KnownHost {
     pub node_id: String,
     pub name: String,
     pub added_at: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub relay_url: Option<String>,
 }
 
 /// Known hosts store.
@@ -304,13 +306,14 @@ impl KnownHostsStore {
         Ok(())
     }
 
-    pub fn add_host(&mut self, node_id: &PublicKey, name: String) {
+    pub fn add_host(&mut self, node_id: &PublicKey, name: String, relay_url: Option<String>) {
         let id_str = node_id.to_string();
         if !self.hosts.iter().any(|h| h.node_id == id_str) {
             self.hosts.push(KnownHost {
                 node_id: id_str,
                 name,
                 added_at: chrono_now(),
+                relay_url,
             });
         }
     }
@@ -318,7 +321,7 @@ impl KnownHostsStore {
     /// Add or update a host with deduplication: if the desired name is already
     /// taken by a *different* node_id, auto-suffix with `-2`, `-3`, etc.
     /// Updates the name if the node_id already exists. Returns the actual name used.
-    pub fn add_host_dedup(&mut self, node_id: &PublicKey, desired_name: String) -> String {
+    pub fn add_host_dedup(&mut self, node_id: &PublicKey, desired_name: String, relay_url: Option<String>) -> String {
         let id_str = node_id.to_string();
 
         // Find a unique name (exclude this node_id from collision check)
@@ -332,11 +335,13 @@ impl KnownHostsStore {
         // Update existing or insert new
         if let Some(existing) = self.hosts.iter_mut().find(|h| h.node_id == id_str) {
             existing.name = candidate.clone();
+            existing.relay_url = relay_url;
         } else {
             self.hosts.push(KnownHost {
                 node_id: id_str,
                 name: candidate.clone(),
                 added_at: chrono_now(),
+                relay_url,
             });
         }
 
@@ -351,6 +356,13 @@ impl KnownHostsStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Update the cached relay URL for a known host identified by node_id.
+    pub fn update_relay_url(&mut self, node_id: &str, relay_url: Option<String>) {
+        if let Some(host) = self.hosts.iter_mut().find(|h| h.node_id == node_id) {
+            host.relay_url = relay_url;
         }
     }
 

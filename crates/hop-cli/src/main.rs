@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command, PeersAction};
 use iroh::endpoint::{RecvStream, SendStream};
-use iroh::{Endpoint, PublicKey, RelayUrl};
+use iroh::{Endpoint, PublicKey, RelayUrl, TransportAddr, Watcher};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -111,6 +111,25 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         if let Err(e) = std::fs::write(&relay_path, url.to_string()) {
             tracing::warn!("Failed to write relay_url: {e}");
         }
+    }
+
+    // Watch for relay URL changes and keep the file up to date
+    {
+        let relay_path = config_dir.join("relay_url");
+        let mut watcher = endpoint.watch_addr();
+        tokio::spawn(async move {
+            loop {
+                match watcher.updated().await {
+                    Ok(addr) => {
+                        if let Some(new_relay) = addr.relay_urls().next() {
+                            let _ = std::fs::write(&relay_path, new_relay.to_string());
+                            tracing::debug!("Updated relay_url file: {new_relay}");
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     // Warn about legacy peers with no bound username when running as root
@@ -286,13 +305,23 @@ async fn resolve_and_initial_connect(
             .parse()
             .context("Invalid NodeId in known_hosts")?;
 
+        let relay_url: Option<RelayUrl> = hosts
+            .hosts
+            .iter()
+            .find(|h| h.node_id == node_id_str)
+            .and_then(|h| h.relay_url.as_deref())
+            .map(|u| u.parse())
+            .transpose()
+            .ok()
+            .flatten();
+
         println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
 
-        let conn = net::connect_to_host(endpoint, host_id, None).await?;
+        let conn = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
         let (mut send, recv) = conn.open_bi().await?;
         proto::write_message(&mut send, session_request).await?;
 
-        return Ok((ResolvedHost { host_id, relay_url: None }, conn, send, recv));
+        return Ok((ResolvedHost { host_id, relay_url }, conn, send, recv));
     }
 
     // 2. Check if invite token
@@ -334,7 +363,11 @@ async fn resolve_and_initial_connect(
                     .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
 
                 let mut hosts = KnownHostsStore::load(config_dir)?;
-                let actual_name = hosts.add_host_dedup(&host_id, desired_name);
+                let actual_name = hosts.add_host_dedup(
+                    &host_id,
+                    desired_name,
+                    relay_url.as_ref().map(|u| u.to_string()),
+                );
                 hosts.save(config_dir)?;
                 println!("Saved as known host: {actual_name}");
 
@@ -364,6 +397,29 @@ async fn resolve_and_initial_connect(
     proto::write_message(&mut send, session_request).await?;
 
     Ok((ResolvedHost { host_id, relay_url: None }, conn, send, recv))
+}
+
+/// After a successful connection, query the remote's current relay URL and
+/// update known_hosts so future connections use the freshest relay.
+async fn refresh_known_host_relay(
+    endpoint: &Endpoint,
+    host_id: &PublicKey,
+    config_dir: &std::path::Path,
+) {
+    let Some(remote_info) = endpoint.remote_info(*host_id).await else {
+        return;
+    };
+    let fresh_relay = remote_info
+        .addrs()
+        .filter_map(|a| match a.addr() {
+            TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        })
+        .next();
+    if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
+        hosts.update_relay_url(&host_id.to_string(), fresh_relay);
+        let _ = hosts.save(config_dir);
+    }
 }
 
 /// Spawn a blocking stdin reader and return the receiver half.
@@ -397,6 +453,8 @@ async fn cmd_connect(
 
     let (resolved, _conn, first_send, first_recv) =
         resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
+
+    refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
@@ -444,7 +502,7 @@ async fn cmd_exec(
     let command_str = command.join(" ");
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    let (_resolved, _conn, send, recv) = resolve_and_initial_connect(
+    let (resolved, _conn, send, recv) = resolve_and_initial_connect(
         &endpoint,
         target,
         config_dir,
@@ -452,6 +510,8 @@ async fn cmd_exec(
         &ClientMessage::RequestExec { command: command_str },
     )
     .await?;
+
+    refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
     let mut stdin_rx = spawn_stdin_reader();
     let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
@@ -527,7 +587,7 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
+        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -535,6 +595,8 @@ async fn cmd_cp(
             &ClientMessage::RequestTransfer(request),
         )
         .await?;
+
+        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
         let protocol_version = net::negotiated_protocol_version(&conn);
         let params = if protocol_version >= 1 {
@@ -576,7 +638,7 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
+        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -584,6 +646,8 @@ async fn cmd_cp(
             &ClientMessage::RequestTransfer(request),
         )
         .await?;
+
+        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
         let protocol_version = net::negotiated_protocol_version(&conn);
         let params = if protocol_version >= 1 {
@@ -657,7 +721,7 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
+        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -665,6 +729,8 @@ async fn cmd_sync(
             &ClientMessage::RequestTransfer(request.clone()),
         )
         .await?;
+
+        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
         let protocol_version = net::negotiated_protocol_version(&conn);
         let params = if protocol_version >= 1 {
@@ -702,7 +768,7 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
+        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -710,6 +776,8 @@ async fn cmd_sync(
             &ClientMessage::RequestTransfer(request.clone()),
         )
         .await?;
+
+        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
         let protocol_version = net::negotiated_protocol_version(&conn);
         let params = if protocol_version >= 1 {
