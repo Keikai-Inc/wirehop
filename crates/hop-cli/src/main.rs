@@ -6,6 +6,7 @@ use std::io::Read;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command, PeersAction};
+use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, PublicKey, RelayUrl};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -14,8 +15,9 @@ use hop_core::auth::{self, AuthOutcome};
 use hop_core::config::{self, KnownHostsStore, PeersStore};
 use hop_core::invite;
 use hop_core::net;
-use hop_core::proto::{self, ClientMessage};
+use hop_core::proto::{self, ClientMessage, TransferDirection, TransferMode, TransferRequest};
 use hop_core::shell::{self, SessionOutcome};
+use hop_core::transfer::{self, PathSpec};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,6 +48,22 @@ async fn main() -> Result<()> {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
+        }
+        Command::Cp { recursive, paths } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_cp(secret_key, &config_dir, recursive, &paths).await
+        }
+        Command::Sync {
+            delete,
+            dry_run,
+            verbose,
+            source,
+            dest,
+        } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_sync(secret_key, &config_dir, delete, dry_run, verbose, &source, &dest).await
         }
         Command::Peers { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -145,28 +163,46 @@ async fn handle_incoming(
 
     match outcome {
         AuthOutcome::Authorized { username } => {
-            tracing::info!("Authorized peer {}, starting shell", remote_id.fmt_short());
-            // first_msg should be RequestShell, already consumed
-            shell::host_shell_session(send, recv, username.as_deref()).await?;
+            tracing::info!("Authorized peer {}", remote_id.fmt_short());
+            // first_msg was already consumed during auth — dispatch based on it
+            dispatch_session(_first_msg, send, recv, username.as_deref()).await?;
         }
         AuthOutcome::InviteAccepted { username } => {
-            tracing::info!("Invite accepted for {}, waiting for shell request", remote_id.fmt_short());
-            // Client will send RequestShell next
+            tracing::info!("Invite accepted for {}, waiting for session request", remote_id.fmt_short());
+            // Client will send RequestShell or RequestTransfer next
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
-            match msg {
-                ClientMessage::RequestShell => {
-                    shell::host_shell_session(send, recv, username.as_deref()).await?;
-                }
-                _ => {
-                    tracing::warn!("Expected RequestShell after invite, got: {:?}", msg);
-                }
-            }
+            dispatch_session(Some(msg), send, recv, username.as_deref()).await?;
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
         }
     }
 
+    Ok(())
+}
+
+async fn dispatch_session(
+    msg: Option<ClientMessage>,
+    send: SendStream,
+    recv: RecvStream,
+    username: Option<&str>,
+) -> Result<()> {
+    match msg {
+        Some(ClientMessage::RequestShell) => {
+            tracing::info!("Starting shell session");
+            shell::host_shell_session(send, recv, username).await?;
+        }
+        Some(ClientMessage::RequestTransfer(req)) => {
+            tracing::info!("Starting transfer session: {:?}", req.mode);
+            transfer::host_transfer_session(send, recv, req, username).await?;
+        }
+        Some(other) => {
+            tracing::warn!("Expected RequestShell or RequestTransfer, got: {:?}", other);
+        }
+        None => {
+            tracing::warn!("No session request message received");
+        }
+    }
     Ok(())
 }
 
@@ -209,14 +245,15 @@ struct ResolvedHost {
     relay_url: Option<RelayUrl>,
 }
 
-/// Perform target resolution, initial connection, auth (if invite), and first
-/// shell request. Returns the resolved host info and the (send, recv) pair
-/// ready for `client_shell_session`.
+/// Perform target resolution, initial connection, auth (if invite), and send
+/// the session request. Returns the resolved host info and the (send, recv)
+/// pair ready for the session.
 async fn resolve_and_initial_connect(
     endpoint: &Endpoint,
     target: &str,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
+    session_request: &ClientMessage,
 ) -> Result<(ResolvedHost, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     // 1. Check known_hosts for alias match
     let hosts = KnownHostsStore::load(config_dir)?;
@@ -229,7 +266,7 @@ async fn resolve_and_initial_connect(
 
         let conn = net::connect_to_host(endpoint, host_id, None).await?;
         let (mut send, recv) = conn.open_bi().await?;
-        proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+        proto::write_message(&mut send, session_request).await?;
 
         return Ok((ResolvedHost { host_id, relay_url: None }, send, recv));
     }
@@ -265,7 +302,7 @@ async fn resolve_and_initial_connect(
         let result: proto::HostMessage = proto::read_message(&mut recv).await?;
         match result {
             proto::HostMessage::AuthResult { authorized: true } => {
-                println!("Authorized! Starting shell...");
+                println!("Authorized!");
 
                 let desired_name = cli_name
                     .map(String::from)
@@ -277,8 +314,8 @@ async fn resolve_and_initial_connect(
                 hosts.save(config_dir)?;
                 println!("Saved as known host: {actual_name}");
 
-                // Send RequestShell on the same stream — the host is waiting for it
-                proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+                // Send session request on the same stream — the host is waiting for it
+                proto::write_message(&mut send, session_request).await?;
 
                 return Ok((ResolvedHost { host_id, relay_url }, send, recv));
             }
@@ -300,7 +337,7 @@ async fn resolve_and_initial_connect(
 
     let conn = net::connect_to_host(endpoint, host_id, None).await?;
     let (mut send, recv) = conn.open_bi().await?;
-    proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+    proto::write_message(&mut send, session_request).await?;
 
     Ok((ResolvedHost { host_id, relay_url: None }, send, recv))
 }
@@ -335,7 +372,7 @@ async fn cmd_connect(
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
     let (resolved, first_send, first_recv) =
-        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name).await?;
+        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
 
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
@@ -372,6 +409,280 @@ async fn cmd_connect(
             }
         }
     }
+}
+
+/// CLI progress reporter that prints scp/rsync-style output.
+struct CliProgress {
+    verbose: bool,
+}
+
+impl hop_core::transfer::progress::ProgressReporter for CliProgress {
+    fn file_started(&self, path: &str, size: u64) {
+        if self.verbose {
+            eprint!("  sending {path} ({})...", format_size(size));
+        }
+    }
+
+    fn file_progress(&self, _path: &str, _bytes_transferred: u64, _total: u64) {
+        // For now, no inline progress bar
+    }
+
+    fn file_done(&self, path: &str) {
+        if self.verbose {
+            eprintln!(" done");
+        } else {
+            eprintln!("  sent  {path}");
+        }
+    }
+
+    fn file_skipped(&self, path: &str) {
+        if self.verbose {
+            eprintln!("  skip  {path} (unchanged)");
+        }
+    }
+
+    fn file_deleted(&self, path: &str) {
+        eprintln!("  del   {path}");
+    }
+
+    fn dir_created(&self, _path: &str) {}
+
+    fn file_error(&self, path: &str, error: &str) {
+        eprintln!("  ERROR {path}: {error}");
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+async fn cmd_cp(
+    secret_key: iroh::SecretKey,
+    config_dir: &std::path::Path,
+    recursive: bool,
+    paths: &[String],
+) -> Result<()> {
+    if paths.len() < 2 {
+        anyhow::bail!("cp requires at least a source and destination");
+    }
+
+    let dest_spec = transfer::parse_path_spec(paths.last().unwrap());
+    let source_specs: Vec<PathSpec> = paths[..paths.len() - 1]
+        .iter()
+        .map(|p| transfer::parse_path_spec(p))
+        .collect();
+
+    // Determine direction: exactly one side must be remote
+    let sources_have_remote = source_specs.iter().any(|s| matches!(s, PathSpec::Remote { .. }));
+    let dest_is_remote = matches!(dest_spec, PathSpec::Remote { .. });
+
+    if sources_have_remote && dest_is_remote {
+        anyhow::bail!("remote-to-remote copy is not supported");
+    }
+    if !sources_have_remote && !dest_is_remote {
+        anyhow::bail!("one side must be remote (use host:path notation)");
+    }
+
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+    let progress = CliProgress { verbose: true };
+
+    if dest_is_remote {
+        // Push: local sources -> remote dest
+        let (host, remote_path) = match &dest_spec {
+            PathSpec::Remote { host, path } => (host.as_str(), path.as_str()),
+            _ => unreachable!(),
+        };
+
+        let local_paths: Vec<std::path::PathBuf> = source_specs
+            .iter()
+            .map(|s| match s {
+                PathSpec::Local(p) => Ok(p.clone()),
+                PathSpec::Remote { .. } => anyhow::bail!("mixed local/remote sources not supported"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Validate local paths exist and check recursive requirement
+        for p in &local_paths {
+            if !p.exists() {
+                anyhow::bail!("source path does not exist: {}", p.display());
+            }
+            if p.is_dir() && !recursive {
+                anyhow::bail!("{} is a directory (use -r for recursive copy)", p.display());
+            }
+        }
+
+        let request = TransferRequest {
+            mode: TransferMode::Copy { recursive },
+            direction: TransferDirection::Push,
+            remote_path: remote_path.to_string(),
+            delete_extraneous: false,
+            dry_run: false,
+        };
+
+        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+            &endpoint,
+            host,
+            config_dir,
+            None,
+            &ClientMessage::RequestTransfer(request),
+        )
+        .await?;
+
+        let summary =
+            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &progress).await?;
+        eprintln!("{summary}");
+    } else {
+        // Pull: remote source -> local dest
+        if source_specs.len() != 1 {
+            anyhow::bail!("pull mode supports only one remote source");
+        }
+
+        let (host, remote_path) = match &source_specs[0] {
+            PathSpec::Remote { host, path } => (host.as_str(), path.as_str()),
+            _ => unreachable!(),
+        };
+
+        let local_dest = match &dest_spec {
+            PathSpec::Local(p) => p.clone(),
+            _ => unreachable!(),
+        };
+
+        let request = TransferRequest {
+            mode: TransferMode::Copy { recursive },
+            direction: TransferDirection::Pull,
+            remote_path: remote_path.to_string(),
+            delete_extraneous: false,
+            dry_run: false,
+        };
+
+        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+            &endpoint,
+            host,
+            config_dir,
+            None,
+            &ClientMessage::RequestTransfer(request),
+        )
+        .await?;
+
+        let summary =
+            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &progress).await?;
+        eprintln!("{summary}");
+    }
+
+    Ok(())
+}
+
+async fn cmd_sync(
+    secret_key: iroh::SecretKey,
+    config_dir: &std::path::Path,
+    delete: bool,
+    dry_run: bool,
+    verbose: bool,
+    source: &str,
+    dest: &str,
+) -> Result<()> {
+    let source_spec = transfer::parse_path_spec(source);
+    let dest_spec = transfer::parse_path_spec(dest);
+
+    let source_is_remote = matches!(source_spec, PathSpec::Remote { .. });
+    let dest_is_remote = matches!(dest_spec, PathSpec::Remote { .. });
+
+    if source_is_remote && dest_is_remote {
+        anyhow::bail!("remote-to-remote sync is not supported");
+    }
+    if !source_is_remote && !dest_is_remote {
+        anyhow::bail!("one side must be remote (use host:path notation)");
+    }
+
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+    let progress = CliProgress { verbose };
+
+    if dry_run {
+        eprintln!("DRY RUN — no files will be transferred");
+    }
+
+    if dest_is_remote {
+        // Push sync: local -> remote
+        let local_dir = match &source_spec {
+            PathSpec::Local(p) => p.clone(),
+            _ => unreachable!(),
+        };
+        let (host, remote_path) = match &dest_spec {
+            PathSpec::Remote { host, path } => (host.as_str(), path.as_str()),
+            _ => unreachable!(),
+        };
+
+        if !local_dir.is_dir() {
+            anyhow::bail!("sync source must be a directory: {}", local_dir.display());
+        }
+
+        let request = TransferRequest {
+            mode: TransferMode::Sync,
+            direction: TransferDirection::Push,
+            remote_path: remote_path.to_string(),
+            delete_extraneous: delete,
+            dry_run,
+        };
+
+        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+            &endpoint,
+            host,
+            config_dir,
+            None,
+            &ClientMessage::RequestTransfer(request.clone()),
+        )
+        .await?;
+
+        let summary =
+            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &progress)
+                .await?;
+        eprintln!("{summary}");
+    } else {
+        // Pull sync: remote -> local
+        let (host, remote_path) = match &source_spec {
+            PathSpec::Remote { host, path } => (host.as_str(), path.as_str()),
+            _ => unreachable!(),
+        };
+        let local_dir = match &dest_spec {
+            PathSpec::Local(p) => p.clone(),
+            _ => unreachable!(),
+        };
+
+        let request = TransferRequest {
+            mode: TransferMode::Sync,
+            direction: TransferDirection::Pull,
+            remote_path: remote_path.to_string(),
+            delete_extraneous: delete,
+            dry_run,
+        };
+
+        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+            &endpoint,
+            host,
+            config_dir,
+            None,
+            &ClientMessage::RequestTransfer(request.clone()),
+        )
+        .await?;
+
+        let summary =
+            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &progress)
+                .await?;
+        eprintln!("{summary}");
+    }
+
+    Ok(())
 }
 
 fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, user_config_dir: &std::path::Path) -> Result<()> {

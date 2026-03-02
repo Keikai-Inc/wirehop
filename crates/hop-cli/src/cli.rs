@@ -50,6 +50,38 @@ pub enum Command {
         action: Option<PeersAction>,
     },
 
+    /// Copy files to/from a remote host
+    Cp {
+        /// Copy directories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
+        /// Source and destination paths (use host:path for remote)
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+    },
+
+    /// Sync directories with a remote host
+    Sync {
+        /// Delete extraneous files from destination
+        #[arg(long)]
+        delete: bool,
+
+        /// Show what would be transferred without doing it
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+
+        /// Verbose output (print each file)
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Source path (use host:path for remote)
+        source: String,
+
+        /// Destination path (use host:path for remote)
+        dest: String,
+    },
+
     /// Print this node's identity (NodeId)
     Id,
 }

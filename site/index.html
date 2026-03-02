@@ -655,6 +655,26 @@
       .daemon-grid { grid-template-columns: 1fr; }
       .hero { padding: 7rem 1.5rem 4rem; }
       section { padding: 4rem 0; }
+      .container { padding: 0 1rem; }
+      .install-block { max-width: 100%; }
+      .install-cmd { padding: 0.75rem 1rem; }
+      .install-cmd code { font-size: 0.75rem; }
+      .code-body { font-size: 0.7rem; line-height: 1.7; padding: 1rem; white-space: pre; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .code-block { max-width: 100%; }
+    }
+
+    @media (max-width: 480px) {
+      .hero { padding: 6rem 1rem 3rem; }
+      .hero h1 { font-size: 2rem; }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .hero-actions .btn { justify-content: center; }
+      .install-cmd code { font-size: 0.65rem; }
+      .code-body { font-size: 0.65rem; line-height: 1.6; padding: 0.75rem; }
+      .section-header h2 { font-size: 1.5rem; }
+      .section-header p { font-size: 0.95rem; }
+      .card { padding: 1.5rem; }
+      .step { padding: 1.5rem 1rem; }
     }
   </style>
 </head>
@@ -748,6 +768,22 @@
           <h3>Cross-Platform</h3>
           <p>macOS (Apple Silicon &amp; Intel) and Linux (x86_64 &amp; ARM64). Built with Rust for native performance on every platform.</p>
         </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+          </div>
+          <h3>File Transfer Built In</h3>
+          <p>Copy files with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop cp</code> or sync directories with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop sync</code>. No separate SCP/rsync needed&mdash;transfers use the same encrypted P2P connection.</p>
+        </div>
+
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+          </div>
+          <h3>Smart Sync</h3>
+          <p>Only transfers changed files based on size and timestamp comparison. Supports <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--delete</code> and <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--dry-run</code> for safe, predictable syncs.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -791,6 +827,11 @@
           <div class="comparison-cell hop-col">Automatic (QUIC)</div>
           <div class="comparison-cell comparison-other">Tailscale (WireGuard), SSH (none)</div>
         </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">File transfer</div>
+          <div class="comparison-cell hop-col">Built in (cp &amp; sync)</div>
+          <div class="comparison-cell comparison-other">Separate tool (scp/rsync over SSH)</div>
+        </div>
       </div>
     </div>
   </section>
@@ -800,7 +841,7 @@
     <div class="container">
       <div class="section-header">
         <h2>How it works</h2>
-        <p>Three commands. That's it.</p>
+        <p>Shell access and file transfer in a few commands.</p>
       </div>
 
       <div class="steps">
@@ -835,10 +876,19 @@
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
 <span class="output">Invite token: eyJ0eX...</span>
 
-<span class="comment"># On your laptop (or any machine)</span>
+<span class="comment"># On your laptop — connect for a shell</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Connected to server</span>
 <span class="prompt">server $</span> <span class="cmd">_</span>
+
+<span class="comment"># Copy files to the server</span>
+<span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./project server:~/project
+
+<span class="comment"># Sync a directory (only changed files)</span>
+<span class="prompt">$</span> <span class="cmd">hop sync</span> ./src server:~/project/src
+<span class="output">  sent  main.rs (4.5 KB)</span>
+<span class="output">  sent  lib.rs (1.2 KB)</span>
+<span class="output">transferred 2 file(s), 5.7 KB in 0.1s</span>
           </div>
         </div>
       </div>
