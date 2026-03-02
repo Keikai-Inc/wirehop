@@ -49,6 +49,8 @@ pub enum ClientMessage {
     RequestShell,
     /// Request a file transfer session (after auth).
     RequestTransfer(TransferRequest),
+    /// Request a remote command execution session (after auth).
+    RequestExec { command: String },
     /// Client environment variables (TERM, LANG, LC_*, COLORTERM).
     SetEnv { vars: HashMap<String, String> },
 }

@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
         }
+        Command::Exec { target, command } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_exec(secret_key, &target, &config_dir, &command).await
+        }
         Command::Cp { recursive, paths } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
@@ -211,8 +216,12 @@ async fn dispatch_session(
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
             transfer::host_transfer_session(conn, send, recv, req, username, protocol_version).await?;
         }
+        Some(ClientMessage::RequestExec { command }) => {
+            tracing::info!("Starting exec session: {command}");
+            shell::host_exec_session(send, recv, &command, username).await?;
+        }
         Some(other) => {
-            tracing::warn!("Expected RequestShell or RequestTransfer, got: {:?}", other);
+            tracing::warn!("Expected RequestShell, RequestTransfer, or RequestExec, got: {:?}", other);
         }
         None => {
             tracing::warn!("No session request message received");
@@ -422,6 +431,36 @@ async fn cmd_connect(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn cmd_exec(
+    secret_key: iroh::SecretKey,
+    target: &str,
+    config_dir: &std::path::Path,
+    command: &[String],
+) -> Result<()> {
+    let command_str = command.join(" ");
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+
+    let (_resolved, _conn, send, recv) = resolve_and_initial_connect(
+        &endpoint,
+        target,
+        config_dir,
+        None,
+        &ClientMessage::RequestExec { command: command_str },
+    )
+    .await?;
+
+    let mut stdin_rx = spawn_stdin_reader();
+    let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
+
+    match outcome {
+        SessionOutcome::Exited(code) => std::process::exit(code),
+        SessionOutcome::Disconnected => {
+            eprintln!("Connection lost");
+            std::process::exit(1);
         }
     }
 }

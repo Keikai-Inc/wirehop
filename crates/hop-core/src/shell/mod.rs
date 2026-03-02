@@ -9,6 +9,9 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 use tokio::sync::mpsc;
 
+use std::process::Stdio;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::proto::{self, ClientMessage, HostMessage};
 
 /// Outcome of a client shell session.
@@ -474,6 +477,208 @@ async fn client_shell_loop(
                     },
                 )
                 .await;
+            }
+        }
+    }
+}
+
+/// Host side: execute a command via pipes (no PTY) and stream output over the wire.
+pub async fn host_exec_session(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    command: &str,
+    username: Option<&str>,
+) -> Result<()> {
+    // --- Pre-spawn security checks (same as shell) ---
+    #[cfg(unix)]
+    {
+        use crate::unix_user;
+
+        let is_root = unix_user::is_running_as_root();
+
+        if is_root && username.is_none() {
+            bail!(
+                "hop host is running as root but this peer has no bound username — \
+                 refusing to execute command. Re-invite this peer with \
+                 `hop invite --user <username>` to bind them to a specific account."
+            );
+        }
+
+        if let Some(name) = username {
+            unix_user::validate_username(name)?;
+
+            if !is_root {
+                bail!(
+                    "peer is bound to user '{name}' but hop host is not running as root — \
+                     restart with `sudo hop host` to enable per-user sessions."
+                );
+            }
+        }
+    }
+
+    // Build the command
+    let mut child = if let Some(user) = username {
+        #[cfg(target_os = "macos")]
+        {
+            let mut cmd = tokio::process::Command::new("login");
+            cmd.args(["-fp", user, "/bin/sh", "-c", command]);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn().context("Failed to spawn command")?
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mut cmd = tokio::process::Command::new("su");
+            cmd.args(["-", user, "-c", command]);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn().context("Failed to spawn command")?
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = user;
+            anyhow::bail!("Per-user exec sessions are only supported on Unix");
+        }
+    } else {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", command]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().context("Failed to spawn command")?
+    };
+
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    // Read stdout
+    if let Some(mut stdout) = child_stdout {
+        let tx = output_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Read stderr
+    if let Some(mut stderr) = child_stderr {
+        let tx = output_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Drop the sender so output_rx closes when both stdout/stderr tasks finish
+    drop(output_tx);
+
+    // Proxy client stdin to child stdin
+    if let Some(mut child_in) = child_stdin {
+        tokio::spawn(async move {
+            loop {
+                match proto::read_message::<ClientMessage>(&mut recv).await {
+                    Ok(ClientMessage::Input(data)) => {
+                        if child_in.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        let _ = child_in.flush().await;
+                    }
+                    _ => break,
+                }
+            }
+            // Drop child_in so the child sees EOF
+        });
+    }
+
+    // Main loop: forward output, then wait for exit
+    let mut clean_exit = false;
+    loop {
+        match output_rx.recv().await {
+            Some(data) => {
+                if let Err(e) = proto::write_message(&mut send, &HostMessage::Output(data)).await {
+                    tracing::debug!("Failed to send exec output: {e}");
+                    break;
+                }
+            }
+            None => {
+                // Both stdout and stderr finished — wait for child exit
+                let status = child.wait().await.context("Failed to wait for child")?;
+                let code = status.code().unwrap_or(1);
+                let _ = proto::write_message(&mut send, &HostMessage::Exit(code)).await;
+                clean_exit = true;
+                break;
+            }
+        }
+    }
+
+    if clean_exit {
+        let _ = send.finish();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            send.stopped(),
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Client side: run a remote command, stream I/O, and return the exit code.
+///
+/// Does NOT enter raw terminal mode or send WindowSize/SetEnv.
+pub async fn client_exec_session(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<SessionOutcome> {
+    let mut stdout = std::io::stdout();
+
+    loop {
+        tokio::select! {
+            Some(data) = stdin_rx.recv() => {
+                if proto::write_message(&mut send, &ClientMessage::Input(data)).await.is_err() {
+                    return Ok(SessionOutcome::Disconnected);
+                }
+            }
+            msg = proto::read_message::<HostMessage>(&mut recv) => {
+                match msg {
+                    Ok(HostMessage::Output(data)) => {
+                        stdout.write_all(&data)?;
+                        stdout.flush()?;
+                    }
+                    Ok(HostMessage::Exit(code)) => {
+                        return Ok(SessionOutcome::Exited(code));
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Ok(SessionOutcome::Disconnected);
+                    }
+                }
             }
         }
     }

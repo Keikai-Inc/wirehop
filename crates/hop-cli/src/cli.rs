@@ -82,6 +82,15 @@ pub enum Command {
         dest: String,
     },
 
+    /// Execute a command on a remote host
+    Exec {
+        /// Host NodeId, invite token, or known host alias
+        target: String,
+        /// Command and arguments to execute
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+
     /// Connect to a host (shorthand: "hop on <target>")
     On {
         /// Host NodeId, invite token, or known host alias
