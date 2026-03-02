@@ -1,6 +1,9 @@
 //! File transfer sessions (copy and sync).
 
+pub mod delta;
+pub mod hashing;
 pub mod listing;
+pub mod negotiation;
 pub mod progress;
 pub mod receiver;
 pub mod sender;
@@ -9,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::proto::{
     self, FileEntry, TransferDirection, TransferMode, TransferMsg, TransferRequest,
+    MAX_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL,
 };
+use negotiation::NegotiatedParams;
 use progress::{ProgressReporter, SilentProgress, TransferSummary};
 
 /// Parsed path specification: local path or remote `host:path`.
@@ -73,32 +78,41 @@ pub fn parse_path_spec(input: &str) -> PathSpec {
 /// Dispatches to the appropriate flow based on the transfer request's
 /// mode and direction.
 pub async fn host_transfer_session(
+    conn: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
     request: TransferRequest,
     username: Option<&str>,
+    protocol_version: u8,
 ) -> Result<()> {
     // Resolve the remote path to an absolute path on the host filesystem.
     let base_path = resolve_host_path(&request.remote_path, username)?;
 
     let progress = SilentProgress;
 
+    // Negotiate session parameters
+    let params = if protocol_version >= 1 {
+        negotiate_host(&mut send, &mut recv).await?
+    } else {
+        NegotiatedParams::legacy()
+    };
+
     let result = match (&request.mode, &request.direction) {
         (TransferMode::Copy { .. }, TransferDirection::Push) => {
             // Client pushes files to us — we receive
-            host_receive_files(&mut send, &mut recv, &base_path, &progress).await
+            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await
         }
         (TransferMode::Copy { .. }, TransferDirection::Pull) => {
             // Client pulls files from us — we send
-            host_send_files(&mut send, &mut recv, &base_path, &request, &progress).await
+            host_send_files(&mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
         (TransferMode::Sync, TransferDirection::Push) => {
             // Client sync-pushes to us
-            host_sync_receive(&mut send, &mut recv, &base_path, &request, &progress).await
+            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
         (TransferMode::Sync, TransferDirection::Pull) => {
             // Client sync-pulls from us
-            host_sync_send(&mut send, &mut recv, &base_path, &request, &progress).await
+            host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
     };
 
@@ -126,12 +140,14 @@ pub async fn host_transfer_session(
 
 /// Host receives files pushed by the client (copy push).
 async fn host_receive_files(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     dest: &Path,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<()> {
-    receiver::receive_files(send, recv, dest, progress).await?;
+    receiver::receive_files(send, recv, dest, progress, params).await?;
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
 }
@@ -143,6 +159,7 @@ async fn host_send_files(
     source: &Path,
     request: &TransferRequest,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<()> {
     let recursive = matches!(request.mode, TransferMode::Copy { recursive: true });
 
@@ -167,6 +184,7 @@ async fn host_send_files(
             is_dir: false,
             is_symlink: false,
             symlink_target: None,
+            content_hash: None,
         }]
     } else if source.is_dir() {
         if !recursive {
@@ -183,7 +201,7 @@ async fn host_send_files(
         source
     };
 
-    sender::send_files(send, base_dir, &entries, progress).await?;
+    sender::send_files(send, base_dir, &entries, progress, params).await?;
     // Read acks for non-directory entries
     let ack_count = entries.iter().filter(|e| !e.is_dir || e.is_symlink).count()
         + entries.iter().filter(|e| e.is_dir && !e.is_symlink).count();
@@ -194,11 +212,13 @@ async fn host_send_files(
 
 /// Host receives sync-pushed files from the client.
 async fn host_sync_receive(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     dest: &Path,
     _request: &TransferRequest,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<()> {
     // 1. Walk our (destination) directory and send the listing to the client
     let dest_entries = if dest.is_dir() {
@@ -229,10 +249,42 @@ async fn host_sync_receive(
 
     proto::write_message(send, &TransferMsg::PlanAck { proceed: true }).await?;
 
-    // 3. Receive transferred files and process deletes
-    let _ = files_to_send; // plan info — actual data comes via FileHeader/FileData
+    // 3. Compute delta candidates on host side
+    // Delta candidates: files that exist locally, are in files_to_send, and both
+    // the local and source version are above DELTA_MIN_FILE_SIZE
+    let delta_candidates: std::collections::HashSet<String> = files_to_send
+        .iter()
+        .filter(|f| {
+            !f.is_dir
+                && !f.is_symlink
+                && f.size as usize >= proto::DELTA_MIN_FILE_SIZE
+                && dest.join(&f.path).exists()
+                && dest
+                    .join(&f.path)
+                    .metadata()
+                    .map(|m| m.len() as usize >= proto::DELTA_MIN_FILE_SIZE)
+                    .unwrap_or(false)
+        })
+        .map(|f| f.path.clone())
+        .collect();
+
     let _ = files_to_delete; // deletes come via DeletePath messages
-    receiver::receive_files(send, recv, dest, progress).await?;
+
+    if !delta_candidates.is_empty() {
+        // Delta-aware receiving
+        receiver::receive_files_with_delta(
+            send,
+            recv,
+            dest,
+            &delta_candidates,
+            &files_to_send,
+            progress,
+            params,
+        )
+        .await?;
+    } else {
+        receiver::receive_files(send, recv, dest, progress, params).await?;
+    }
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
 }
@@ -244,6 +296,7 @@ async fn host_sync_send(
     source: &Path,
     request: &TransferRequest,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<()> {
     // 1. Read the client's local file list
     let client_list_msg: TransferMsg = proto::read_message(recv).await?;
@@ -290,9 +343,19 @@ async fn host_sync_send(
         return Ok(());
     }
 
-    // 5. Send the files
+    // 5. Send the files (with delta support if candidates exist)
     let files_to_send: Vec<_> = plan.files_to_send;
-    sender::send_files(send, source, &files_to_send, progress).await?;
+    let delta_set: std::collections::HashSet<String> =
+        plan.delta_candidates.into_iter().collect();
+
+    if !delta_set.is_empty() {
+        sender::send_files_with_delta(
+            send, recv, source, &files_to_send, &delta_set, progress, params,
+        )
+        .await?;
+    } else {
+        sender::send_files(send, source, &files_to_send, progress, params).await?;
+    }
 
     // 6. Send deletes
     sender::send_deletes(send, &plan.files_to_delete, progress).await?;
@@ -318,16 +381,21 @@ async fn host_sync_send(
 // ---------------------------------------------------------------------------
 
 /// Client-side: push files to the remote host (copy push).
+///
+/// Ack reading is pipelined: a background task reads acks from the recv stream
+/// while we continue sending files, so confirmations arrive during sending
+/// rather than in a post-send stall.
 pub async fn client_push_copy(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     local_paths: &[PathBuf],
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
-    let mut total_ack_count = 0usize;
     for local_path in local_paths {
         let (base_dir, entries) = if local_path.is_file() {
             let metadata = std::fs::metadata(local_path)?;
@@ -349,6 +417,7 @@ pub async fn client_push_copy(
                 is_dir: false,
                 is_symlink: false,
                 symlink_target: None,
+                content_hash: None,
             };
             (
                 local_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
@@ -360,28 +429,18 @@ pub async fn client_push_copy(
             bail!("path does not exist: {}", local_path.display());
         };
 
-        let bytes = sender::send_files(send, &base_dir, &entries, progress).await?;
+        let bytes = sender::send_files(send, &base_dir, &entries, progress, params).await?;
         summary.bytes_transferred += bytes;
         summary.files_transferred += entries.iter().filter(|e| !e.is_dir).count() as u64;
         summary.dirs_created += entries.iter().filter(|e| e.is_dir).count() as u64;
-        total_ack_count += entries.len();
     }
 
-    // Send Done immediately after all files — don't block on acks first.
-    // This lets the host process files + Done without waiting for us to
-    // read acks in between, collapsing 2 round-trips into 1.
+    // Send Done immediately after all files
     proto::write_message(send, &TransferMsg::Done).await?;
 
-    // Now read all acks and host's Done in one batch
-    let errors = receiver::read_acks(recv, total_ack_count, Some(progress)).await?;
+    // Read all acks + host's Done in one pass (no count needed)
+    let errors = receiver::read_acks_until_done(recv, Some(progress)).await?;
     summary.errors = errors;
-
-    let msg: TransferMsg = proto::read_message(recv).await?;
-    match msg {
-        TransferMsg::Done => {}
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => tracing::warn!("expected Done from host, got: {other:?}"),
-    }
 
     summary.elapsed = start.elapsed();
     Ok(summary)
@@ -389,15 +448,17 @@ pub async fn client_push_copy(
 
 /// Client-side: pull files from the remote host (copy pull).
 pub async fn client_pull_copy(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     local_dest: &Path,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
-    let bytes = receiver::receive_files(send, recv, local_dest, progress).await?;
+    let bytes = receiver::receive_files(send, recv, local_dest, progress, params).await?;
     summary.bytes_transferred = bytes;
     // Count is approximate — the receive_files function handles acks internally
 
@@ -417,11 +478,13 @@ pub async fn client_pull_copy(
 
 /// Client-side: sync-push local directory to remote host.
 pub async fn client_push_sync(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     local_dir: &Path,
     request: &TransferRequest,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
     let start = Instant::now();
     let mut summary = TransferSummary::default();
@@ -483,10 +546,23 @@ pub async fn client_push_sync(
         return Ok(summary);
     }
 
-    // 5. Send files that need transferring
+    // 5. Send files that need transferring (with delta support)
     let files_only: Vec<_> = plan.files_to_send;
-    let bytes = sender::send_files(send, local_dir, &files_only, progress).await?;
-    summary.bytes_transferred = bytes;
+    let delta_set: std::collections::HashSet<String> =
+        plan.delta_candidates.into_iter().collect();
+
+    if !delta_set.is_empty() {
+        // Delta-aware sync: sender reads BlockSignatures for delta candidates
+        let (bytes, saved) = sender::send_files_with_delta(
+            send, recv, local_dir, &files_only, &delta_set, progress, params,
+        )
+        .await?;
+        summary.bytes_transferred = bytes;
+        summary.bytes_saved = saved;
+    } else {
+        let bytes = sender::send_files(send, local_dir, &files_only, progress, params).await?;
+        summary.bytes_transferred = bytes;
+    }
     summary.files_transferred = files_only.iter().filter(|e| !e.is_dir).count() as u64;
     summary.dirs_created = files_only.iter().filter(|e| e.is_dir).count() as u64;
 
@@ -496,18 +572,9 @@ pub async fn client_push_sync(
 
     proto::write_message(send, &TransferMsg::Done).await?;
 
-    // 7. Read acks
-    let total_acks = files_only.len() + plan.files_to_delete.len();
-    let errors = receiver::read_acks(recv, total_acks, Some(progress)).await?;
+    // 7. Read all acks + host's Done in one pass (pipelined)
+    let errors = receiver::read_acks_until_done(recv, Some(progress)).await?;
     summary.errors = errors;
-
-    // 8. Read host's Done
-    let msg: TransferMsg = proto::read_message(recv).await?;
-    match msg {
-        TransferMsg::Done => {}
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => tracing::warn!("expected Done from host, got: {other:?}"),
-    }
 
     summary.elapsed = start.elapsed();
     Ok(summary)
@@ -515,11 +582,13 @@ pub async fn client_push_sync(
 
 /// Client-side: sync-pull from remote host to local directory.
 pub async fn client_pull_sync(
+    _conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
     local_dir: &Path,
     _request: &TransferRequest,
     progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
     let start = Instant::now();
     let mut summary = TransferSummary::default();
@@ -569,10 +638,35 @@ pub async fn client_pull_sync(
     // 3. Acknowledge the plan
     proto::write_message(send, &TransferMsg::PlanAck { proceed: true }).await?;
 
-    // 4. Receive files and deletes from host
-    let _ = (files_to_send, files_to_delete); // data arrives as messages
-    let bytes = receiver::receive_files(send, recv, local_dir, progress).await?;
-    summary.bytes_transferred = bytes;
+    // 4. Compute delta candidates on client side and receive files
+    let delta_candidates: std::collections::HashSet<String> = files_to_send
+        .iter()
+        .filter(|f| {
+            !f.is_dir
+                && !f.is_symlink
+                && f.size as usize >= proto::DELTA_MIN_FILE_SIZE
+                && local_dir.join(&f.path).exists()
+                && local_dir
+                    .join(&f.path)
+                    .metadata()
+                    .map(|m| m.len() as usize >= proto::DELTA_MIN_FILE_SIZE)
+                    .unwrap_or(false)
+        })
+        .map(|f| f.path.clone())
+        .collect();
+
+    if !delta_candidates.is_empty() {
+        let (bytes, saved) = receiver::receive_files_with_delta(
+            send, recv, local_dir, &delta_candidates, &files_to_send, progress, params,
+        )
+        .await?;
+        summary.bytes_transferred = bytes;
+        summary.bytes_saved = saved;
+    } else {
+        let _ = (files_to_send, files_to_delete); // data arrives as messages
+        let bytes = receiver::receive_files(send, recv, local_dir, progress, params).await?;
+        summary.bytes_transferred = bytes;
+    }
 
     // 5. Read host's Done
     let msg: TransferMsg = proto::read_message(recv).await?;
@@ -586,6 +680,102 @@ pub async fn client_pull_sync(
 
     summary.elapsed = start.elapsed();
     Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// Negotiation helpers
+// ---------------------------------------------------------------------------
+
+/// Host-side: exchange Capabilities → receive client's Capabilities → send Negotiated.
+async fn negotiate_host(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<NegotiatedParams> {
+    // Send our capabilities
+    proto::write_message(
+        send,
+        &TransferMsg::Capabilities {
+            compression: vec!["zstd".to_string()],
+            max_chunk_size: MAX_CHUNK_SIZE as u32,
+            features_version: 1,
+        },
+    )
+    .await?;
+
+    // Read client capabilities
+    let client_caps: TransferMsg = proto::read_message(recv).await?;
+    let (_client_compression, client_max_chunk, _client_version) = match client_caps {
+        TransferMsg::Capabilities {
+            compression,
+            max_chunk_size,
+            features_version,
+        } => (compression, max_chunk_size, features_version),
+        other => bail!("expected Capabilities, got: {other:?}"),
+    };
+
+    // Resolve: pick zstd if both support it
+    let use_compression = Some("zstd".to_string());
+    let chunk_size = client_max_chunk.min(MAX_CHUNK_SIZE as u32);
+    let zstd_level = Some(DEFAULT_ZSTD_LEVEL);
+
+    proto::write_message(
+        send,
+        &TransferMsg::Negotiated {
+            compression: use_compression.clone(),
+            chunk_size,
+            zstd_level,
+        },
+    )
+    .await?;
+
+    Ok(NegotiatedParams::from_negotiated(
+        use_compression.as_deref(),
+        chunk_size,
+        zstd_level,
+    ))
+}
+
+/// Client-side: exchange Capabilities → read host's Capabilities → read Negotiated.
+pub async fn negotiate_client(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<NegotiatedParams> {
+    // Read host capabilities
+    let host_caps: TransferMsg = proto::read_message(recv).await?;
+    let (_host_compression, _host_max_chunk, _host_version) = match host_caps {
+        TransferMsg::Capabilities {
+            compression,
+            max_chunk_size,
+            features_version,
+        } => (compression, max_chunk_size, features_version),
+        other => bail!("expected Capabilities from host, got: {other:?}"),
+    };
+
+    // Send our capabilities
+    proto::write_message(
+        send,
+        &TransferMsg::Capabilities {
+            compression: vec!["zstd".to_string()],
+            max_chunk_size: MAX_CHUNK_SIZE as u32,
+            features_version: 1,
+        },
+    )
+    .await?;
+
+    // Read host's negotiated decision
+    let negotiated: TransferMsg = proto::read_message(recv).await?;
+    match negotiated {
+        TransferMsg::Negotiated {
+            compression,
+            chunk_size,
+            zstd_level,
+        } => Ok(NegotiatedParams::from_negotiated(
+            compression.as_deref(),
+            chunk_size,
+            zstd_level,
+        )),
+        other => bail!("expected Negotiated from host, got: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

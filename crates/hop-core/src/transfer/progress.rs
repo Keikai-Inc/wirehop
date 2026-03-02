@@ -32,6 +32,7 @@ pub struct TransferSummary {
     pub files_deleted: u64,
     pub dirs_created: u64,
     pub bytes_transferred: u64,
+    pub bytes_saved: u64,
     pub errors: Vec<String>,
     pub elapsed: Duration,
 }

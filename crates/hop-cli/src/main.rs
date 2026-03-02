@@ -146,10 +146,10 @@ async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
 ) -> Result<()> {
-    // We only advertise one ALPN, so no need to inspect it
     let conn: iroh::endpoint::Connection = incoming.await?;
     let remote_id = conn.remote_id();
-    tracing::info!("Connection from: {}", remote_id.fmt_short());
+    let protocol_version = net::negotiated_protocol_version(&conn);
+    tracing::info!("Connection from: {} (protocol v{})", remote_id.fmt_short(), protocol_version);
 
     let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -166,13 +166,13 @@ async fn handle_incoming(
         AuthOutcome::Authorized { username } => {
             tracing::info!("Authorized peer {}", remote_id.fmt_short());
             // first_msg was already consumed during auth — dispatch based on it
-            dispatch_session(_first_msg, send, recv, username.as_deref()).await?;
+            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version).await?;
         }
         AuthOutcome::InviteAccepted { username } => {
             tracing::info!("Invite accepted for {}, waiting for session request", remote_id.fmt_short());
             // Client will send RequestShell or RequestTransfer next
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
-            dispatch_session(Some(msg), send, recv, username.as_deref()).await?;
+            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version).await?;
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
@@ -184,9 +184,11 @@ async fn handle_incoming(
 
 async fn dispatch_session(
     msg: Option<ClientMessage>,
+    conn: iroh::endpoint::Connection,
     send: SendStream,
     recv: RecvStream,
     username: Option<&str>,
+    protocol_version: u8,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
@@ -194,8 +196,8 @@ async fn dispatch_session(
             shell::host_shell_session(send, recv, username).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
-            tracing::info!("Starting transfer session: {:?}", req.mode);
-            transfer::host_transfer_session(send, recv, req, username).await?;
+            tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
+            transfer::host_transfer_session(conn, send, recv, req, username, protocol_version).await?;
         }
         Some(other) => {
             tracing::warn!("Expected RequestShell or RequestTransfer, got: {:?}", other);
@@ -247,15 +249,15 @@ struct ResolvedHost {
 }
 
 /// Perform target resolution, initial connection, auth (if invite), and send
-/// the session request. Returns the resolved host info and the (send, recv)
-/// pair ready for the session.
+/// the session request. Returns the resolved host info, the connection, and the
+/// (send, recv) pair ready for the session.
 async fn resolve_and_initial_connect(
     endpoint: &Endpoint,
     target: &str,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
     session_request: &ClientMessage,
-) -> Result<(ResolvedHost, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+) -> Result<(ResolvedHost, iroh::endpoint::Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     // 1. Check known_hosts for alias match
     let hosts = KnownHostsStore::load(config_dir)?;
     if let Some(node_id_str) = hosts.resolve_alias(target) {
@@ -269,7 +271,7 @@ async fn resolve_and_initial_connect(
         let (mut send, recv) = conn.open_bi().await?;
         proto::write_message(&mut send, session_request).await?;
 
-        return Ok((ResolvedHost { host_id, relay_url: None }, send, recv));
+        return Ok((ResolvedHost { host_id, relay_url: None }, conn, send, recv));
     }
 
     // 2. Check if invite token
@@ -318,7 +320,7 @@ async fn resolve_and_initial_connect(
                 // Send session request on the same stream — the host is waiting for it
                 proto::write_message(&mut send, session_request).await?;
 
-                return Ok((ResolvedHost { host_id, relay_url }, send, recv));
+                return Ok((ResolvedHost { host_id, relay_url }, conn, send, recv));
             }
             proto::HostMessage::AuthResult { authorized: false } => {
                 anyhow::bail!("Invite rejected by host (expired or already used)");
@@ -340,7 +342,7 @@ async fn resolve_and_initial_connect(
     let (mut send, recv) = conn.open_bi().await?;
     proto::write_message(&mut send, session_request).await?;
 
-    Ok((ResolvedHost { host_id, relay_url: None }, send, recv))
+    Ok((ResolvedHost { host_id, relay_url: None }, conn, send, recv))
 }
 
 /// Spawn a blocking stdin reader and return the receiver half.
@@ -372,7 +374,7 @@ async fn cmd_connect(
 ) -> Result<()> {
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    let (resolved, first_send, first_recv) =
+    let (resolved, _conn, first_send, first_recv) =
         resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
 
     // Spawn stdin reader once — shared across reconnections
@@ -474,7 +476,7 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -483,11 +485,18 @@ async fn cmd_cp(
         )
         .await?;
 
+        let protocol_version = net::negotiated_protocol_version(&conn);
+        let params = if protocol_version >= 1 {
+            transfer::negotiate_client(&mut send, &mut recv).await?
+        } else {
+            transfer::negotiation::NegotiatedParams::legacy()
+        };
+
         let state = progress_ui::TransferState::new(true);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &state).await?;
+            transfer::client_push_copy(&conn, &mut send, &mut recv, &local_paths, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
         let _ = send.finish();
@@ -516,7 +525,7 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -525,11 +534,18 @@ async fn cmd_cp(
         )
         .await?;
 
+        let protocol_version = net::negotiated_protocol_version(&conn);
+        let params = if protocol_version >= 1 {
+            transfer::negotiate_client(&mut send, &mut recv).await?
+        } else {
+            transfer::negotiation::NegotiatedParams::legacy()
+        };
+
         let state = progress_ui::TransferState::new(false);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &state).await?;
+            transfer::client_pull_copy(&conn, &mut send, &mut recv, &local_dest, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
         let _ = send.finish();
@@ -590,7 +606,7 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -599,11 +615,18 @@ async fn cmd_sync(
         )
         .await?;
 
+        let protocol_version = net::negotiated_protocol_version(&conn);
+        let params = if protocol_version >= 1 {
+            transfer::negotiate_client(&mut send, &mut recv).await?
+        } else {
+            transfer::negotiation::NegotiatedParams::legacy()
+        };
+
         let state = progress_ui::TransferState::new(true);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &state)
+            transfer::client_push_sync(&conn, &mut send, &mut recv, &local_dir, &request, &state, &params)
                 .await?;
         state.mark_finished();
         let _ = render_handle.await;
@@ -628,7 +651,7 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (_resolved, mut send, mut recv) = resolve_and_initial_connect(
+        let (_resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
             &endpoint,
             host,
             config_dir,
@@ -637,11 +660,18 @@ async fn cmd_sync(
         )
         .await?;
 
+        let protocol_version = net::negotiated_protocol_version(&conn);
+        let params = if protocol_version >= 1 {
+            transfer::negotiate_client(&mut send, &mut recv).await?
+        } else {
+            transfer::negotiation::NegotiatedParams::legacy()
+        };
+
         let state = progress_ui::TransferState::new(false);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &state)
+            transfer::client_pull_sync(&conn, &mut send, &mut recv, &local_dir, &request, &state, &params)
                 .await?;
         state.mark_finished();
         let _ = render_handle.await;

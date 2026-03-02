@@ -47,6 +47,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # System
 libc = "0.2"
 
+# Compression & Hashing
+zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Testing
+tempfile = "3"
+
 [profile.release]
 lto = true
 codegen-units = 1

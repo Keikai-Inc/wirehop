@@ -6,10 +6,11 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 
-use crate::proto::FileEntry;
+use crate::proto::{FileEntry, DELTA_MIN_FILE_SIZE};
+use super::hashing;
 
 /// Recursively walk a directory and return a flat list of entries with paths
-/// relative to `root`.
+/// relative to `root`. Computes content hashes for regular files.
 pub fn walk_directory(root: &Path) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     let root = root
@@ -54,6 +55,13 @@ fn walk_recursive(base: &Path, current: &Path, entries: &mut Vec<FileEntry>) -> 
 
         let mode = file_mode(&metadata);
 
+        // Compute content hash for regular files (not dirs/symlinks)
+        let content_hash = if metadata.is_file() && !is_symlink {
+            hashing::hash_file_content(&full_path).ok()
+        } else {
+            None
+        };
+
         entries.push(FileEntry {
             path: rel_path,
             size: if metadata.is_file() {
@@ -66,6 +74,7 @@ fn walk_recursive(base: &Path, current: &Path, entries: &mut Vec<FileEntry>) -> 
             is_dir: metadata.is_dir(),
             is_symlink,
             symlink_target,
+            content_hash,
         });
 
         if metadata.is_dir() && !is_symlink {
@@ -98,11 +107,18 @@ pub struct SyncPlan {
     pub files_to_send: Vec<FileEntry>,
     /// Paths to delete on the destination (only populated when delete_extraneous is true).
     pub files_to_delete: Vec<String>,
+    /// Files existing on both sides that are candidates for delta transfer
+    /// (both sizes >= DELTA_MIN_FILE_SIZE and content differs).
+    pub delta_candidates: Vec<String>,
 }
 
 /// Compare source and destination file listings to determine what needs to be
-/// transferred. A file is "changed" if it exists only on source, or if its
-/// size or mtime differs.
+/// transferred.
+///
+/// Three-tier comparison for files existing on both sides:
+/// 1. Size differs → transfer
+/// 2. Both have content_hash → compare hash (skip if equal even with different mtime)
+/// 3. Fallback → compare mtime
 pub fn compute_sync_plan(
     source: &[FileEntry],
     dest: &[FileEntry],
@@ -113,6 +129,8 @@ pub fn compute_sync_plan(
         source.iter().map(|e| (e.path.as_str(), e)).collect();
 
     let mut files_to_send = Vec::new();
+    let mut delta_candidates = Vec::new();
+
     for src_entry in source {
         if src_entry.is_dir {
             // Directories are always created (cheap to send as CreateDirectory)
@@ -121,9 +139,34 @@ pub fn compute_sync_plan(
         }
         match dest_map.get(src_entry.path.as_str()) {
             Some(dst) => {
-                // File exists on both sides — check if changed
-                if src_entry.size != dst.size || src_entry.mtime != dst.mtime {
+                // File exists on both sides — three-tier comparison
+                if src_entry.size != dst.size {
+                    // Size differs — definitely changed, check delta eligibility
                     files_to_send.push(src_entry.clone());
+                    if src_entry.size as usize >= DELTA_MIN_FILE_SIZE
+                        && dst.size as usize >= DELTA_MIN_FILE_SIZE
+                    {
+                        delta_candidates.push(src_entry.path.clone());
+                    }
+                } else if let (Some(src_hash), Some(dst_hash)) =
+                    (src_entry.content_hash, dst.content_hash)
+                {
+                    // Both have content hash — compare directly
+                    if src_hash != dst_hash {
+                        files_to_send.push(src_entry.clone());
+                        if src_entry.size as usize >= DELTA_MIN_FILE_SIZE {
+                            delta_candidates.push(src_entry.path.clone());
+                        }
+                    }
+                    // If hashes match, skip (even if mtime differs)
+                } else if src_entry.mtime != dst.mtime {
+                    // Fallback: mtime comparison
+                    files_to_send.push(src_entry.clone());
+                    if src_entry.size as usize >= DELTA_MIN_FILE_SIZE
+                        && dst.size as usize >= DELTA_MIN_FILE_SIZE
+                    {
+                        delta_candidates.push(src_entry.path.clone());
+                    }
                 }
             }
             None => {
@@ -147,5 +190,165 @@ pub fn compute_sync_plan(
     SyncPlan {
         files_to_send,
         files_to_delete,
+        delta_candidates,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(path: &str, size: u64, mtime: u64, hash: Option<u64>) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size,
+            mtime,
+            mode: 0o644,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            content_hash: hash,
+        }
+    }
+
+    fn dir_entry(path: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size: 0,
+            mtime: 1000,
+            mode: 0o755,
+            is_dir: true,
+            is_symlink: false,
+            symlink_target: None,
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn empty_source_and_dest() {
+        let plan = compute_sync_plan(&[], &[], false);
+        assert!(plan.files_to_send.is_empty());
+        assert!(plan.files_to_delete.is_empty());
+        assert!(plan.delta_candidates.is_empty());
+    }
+
+    #[test]
+    fn new_file_on_source() {
+        let source = vec![file_entry("a.txt", 100, 1000, Some(111))];
+        let dest = vec![];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+        assert_eq!(plan.files_to_send[0].path, "a.txt");
+    }
+
+    #[test]
+    fn file_only_on_dest_with_delete() {
+        let source = vec![];
+        let dest = vec![file_entry("old.txt", 100, 1000, None)];
+        let plan = compute_sync_plan(&source, &dest, true);
+        assert!(plan.files_to_send.is_empty());
+        assert_eq!(plan.files_to_delete, vec!["old.txt"]);
+    }
+
+    #[test]
+    fn file_only_on_dest_without_delete() {
+        let source = vec![];
+        let dest = vec![file_entry("old.txt", 100, 1000, None)];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert!(plan.files_to_delete.is_empty());
+    }
+
+    #[test]
+    fn identical_files_skipped() {
+        let source = vec![file_entry("a.txt", 100, 1000, Some(111))];
+        let dest = vec![file_entry("a.txt", 100, 1000, Some(111))];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert!(plan.files_to_send.is_empty());
+    }
+
+    #[test]
+    fn size_differs_triggers_transfer() {
+        let source = vec![file_entry("a.txt", 200, 1000, Some(111))];
+        let dest = vec![file_entry("a.txt", 100, 1000, Some(222))];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+    }
+
+    #[test]
+    fn hash_match_skips_even_with_different_mtime() {
+        let source = vec![file_entry("a.txt", 100, 2000, Some(111))];
+        let dest = vec![file_entry("a.txt", 100, 1000, Some(111))];
+        let plan = compute_sync_plan(&source, &dest, false);
+        // Same size, same hash → skip (even though mtime differs)
+        assert!(plan.files_to_send.is_empty());
+    }
+
+    #[test]
+    fn hash_differs_triggers_transfer() {
+        let source = vec![file_entry("a.txt", 100, 1000, Some(111))];
+        let dest = vec![file_entry("a.txt", 100, 1000, Some(222))];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+    }
+
+    #[test]
+    fn no_hash_falls_back_to_mtime() {
+        // Same size, no hashes, different mtime → transfer
+        let source = vec![file_entry("a.txt", 100, 2000, None)];
+        let dest = vec![file_entry("a.txt", 100, 1000, None)];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+    }
+
+    #[test]
+    fn no_hash_same_mtime_skipped() {
+        let source = vec![file_entry("a.txt", 100, 1000, None)];
+        let dest = vec![file_entry("a.txt", 100, 1000, None)];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert!(plan.files_to_send.is_empty());
+    }
+
+    #[test]
+    fn directories_always_sent() {
+        let source = vec![dir_entry("subdir")];
+        let dest = vec![dir_entry("subdir")];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+        assert!(plan.files_to_send[0].is_dir);
+    }
+
+    #[test]
+    fn delta_candidate_large_files_both_sides() {
+        let big = 128 * 1024; // > DELTA_MIN_FILE_SIZE (64 KiB)
+        let source = vec![file_entry("big.bin", big as u64, 2000, Some(111))];
+        let dest = vec![file_entry("big.bin", big as u64, 1000, Some(222))];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+        assert_eq!(plan.delta_candidates, vec!["big.bin"]);
+    }
+
+    #[test]
+    fn delta_candidate_not_for_small_files() {
+        let small = 1024u64; // < DELTA_MIN_FILE_SIZE
+        let source = vec![file_entry("small.txt", small, 2000, None)];
+        let dest = vec![file_entry("small.txt", small, 1000, None)];
+        let plan = compute_sync_plan(&source, &dest, false);
+        assert_eq!(plan.files_to_send.len(), 1);
+        assert!(plan.delta_candidates.is_empty());
+    }
+
+    #[test]
+    fn delete_order_deepest_first() {
+        let source = vec![];
+        let dest = vec![
+            dir_entry("a"),
+            file_entry("a/b/c.txt", 10, 1000, None),
+            dir_entry("a/b"),
+        ];
+        let plan = compute_sync_plan(&source, &dest, true);
+        // Deepest paths first
+        assert_eq!(plan.files_to_delete[0], "a/b/c.txt");
+        assert_eq!(plan.files_to_delete[1], "a/b");
+        assert_eq!(plan.files_to_delete[2], "a");
     }
 }

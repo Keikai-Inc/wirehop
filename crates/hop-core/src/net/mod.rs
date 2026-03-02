@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, TransportAddr};
 
-use crate::proto::ALPN;
+use crate::proto::{ALPN_V0, ALPN_V1};
 
 /// Create an iroh endpoint configured for hosting (accepting connections).
 ///
@@ -13,7 +13,7 @@ use crate::proto::ALPN;
 pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
@@ -46,6 +46,7 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 
 /// Connect to a remote host by their PublicKey, optionally with a relay URL hint.
 ///
+/// Tries `hop/1` first; falls back to `hop/0` if the host doesn't support v1.
 /// If a relay URL is provided, it's included in the endpoint address so iroh
 /// can connect via relay immediately rather than waiting for DNS discovery.
 pub async fn connect_to_host(
@@ -60,12 +61,28 @@ pub async fn connect_to_host(
         None => EndpointAddr::from(remote_id),
     };
 
-    let conn = endpoint
-        .connect(addr, ALPN)
-        .await
-        .context("Failed to connect to host")?;
+    // Try hop/1 first, fall back to hop/0
+    let conn = match endpoint.connect(addr.clone(), ALPN_V1).await {
+        Ok(conn) => conn,
+        Err(_) => {
+            endpoint
+                .connect(addr, ALPN_V0)
+                .await
+                .context("Failed to connect to host")?
+        }
+    };
 
     Ok(conn)
+}
+
+/// Return the protocol version negotiated on a connection.
+/// Returns 1 for `hop/1`, 0 for `hop/0` or anything else.
+pub fn negotiated_protocol_version(conn: &Connection) -> u8 {
+    if conn.alpn() == ALPN_V1 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Get the EndpointId (public key) of an endpoint.

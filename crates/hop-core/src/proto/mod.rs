@@ -4,8 +4,14 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
-/// ALPN protocol identifier for hop connections.
-pub const ALPN: &[u8] = b"hop/0";
+/// ALPN protocol identifier for hop connections (legacy).
+pub const ALPN_V0: &[u8] = b"hop/0";
+
+/// ALPN protocol identifier for hop v1 (compression, hashing, parallel streams, delta).
+pub const ALPN_V1: &[u8] = b"hop/1";
+
+/// Legacy alias — kept so existing callers that reference `ALPN` still compile.
+pub const ALPN: &[u8] = ALPN_V0;
 
 /// Messages sent from the host to the client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +55,24 @@ pub enum ClientMessage {
 
 /// Chunk size for file data transfer (64 KiB).
 pub const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Minimum chunk size for adaptive sizing (64 KiB).
+pub const MIN_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Maximum chunk size for adaptive sizing (1 MiB).
+pub const MAX_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Default zstd compression level.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+/// Default number of parallel data streams.
+pub const DEFAULT_PARALLEL_STREAMS: usize = 4;
+
+/// Block size for delta transfers (same as chunk size).
+pub const DELTA_BLOCK_SIZE: usize = TRANSFER_CHUNK_SIZE;
+
+/// Minimum file size to consider for delta transfer.
+pub const DELTA_MIN_FILE_SIZE: usize = 64 * 1024;
 
 /// Request to initiate a file transfer session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +140,53 @@ pub enum TransferMsg {
     Done,
     /// Fatal error.
     Error(String),
+
+    // -- Negotiation (hop/1) --
+    /// Capabilities advertisement during session setup.
+    Capabilities {
+        compression: Vec<String>,
+        max_chunk_size: u32,
+        features_version: u32,
+    },
+    /// Negotiated parameters after capabilities exchange.
+    Negotiated {
+        compression: Option<String>,
+        chunk_size: u32,
+        zstd_level: Option<i32>,
+    },
+
+    // -- Parallel streams (hop/1) --
+    /// Manifest sent before parallel file transfer.
+    FileManifest {
+        session_id: u64,
+        total_files: u32,
+        total_dirs: u32,
+        total_symlinks: u32,
+        total_deletes: u32,
+    },
+    /// Header on a data stream identifying the session.
+    StreamHeader {
+        session_id: u64,
+    },
+
+    // -- Delta transfers (hop/1) --
+    /// Block signatures for delta sync.
+    BlockSignatures {
+        path: String,
+        block_size: u32,
+        signatures: Vec<BlockSignature>,
+    },
+    /// Header before delta operations.
+    DeltaHeader {
+        path: String,
+        new_size: u64,
+        mode: u32,
+        mtime: u64,
+    },
+    /// A single delta operation.
+    DeltaOp(DeltaOperation),
+    /// End of delta operations for a file.
+    DeltaEnd,
 }
 
 /// Metadata for a file/directory entry used in listings and sync comparison.
@@ -128,6 +199,9 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub symlink_target: Option<String>,
+    /// xxh3-64 content hash (None for dirs/symlinks or when not computed).
+    #[serde(default)]
+    pub content_hash: Option<u64>,
 }
 
 /// Header sent before streaming a file's data.
@@ -145,6 +219,21 @@ pub struct DirEntry {
     pub path: String,
     pub mode: u32,
     pub mtime: u64,
+}
+
+/// A block signature for delta transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockSignature {
+    pub index: u32,
+    pub rolling: u32,
+    pub strong: u64,
+}
+
+/// A delta operation: either copy a block from the old file or insert literal bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeltaOperation {
+    CopyBlock { index: u32 },
+    Literal(Vec<u8>),
 }
 
 /// Write a length-prefixed bincode frame to a QUIC send stream.
