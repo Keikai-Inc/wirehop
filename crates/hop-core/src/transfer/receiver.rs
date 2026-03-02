@@ -144,7 +144,14 @@ async fn receive_file_data(
 }
 
 /// Read FileAck messages, one per expected path. Collect errors.
-pub async fn read_acks(recv: &mut RecvStream, expected_count: usize) -> Result<Vec<String>> {
+///
+/// When `progress` is provided, calls `file_confirmed` for each successful ack
+/// so the UI can distinguish "buffered into QUIC" from "host confirmed receipt".
+pub async fn read_acks(
+    recv: &mut RecvStream,
+    expected_count: usize,
+    progress: Option<&dyn ProgressReporter>,
+) -> Result<Vec<String>> {
     let mut errors = Vec::new();
     for _ in 0..expected_count {
         let msg: TransferMsg = proto::read_message(recv).await?;
@@ -154,7 +161,11 @@ pub async fn read_acks(recv: &mut RecvStream, expected_count: usize) -> Result<V
                 success,
                 error,
             } => {
-                if !success {
+                if success {
+                    if let Some(p) = progress {
+                        p.file_confirmed(&path);
+                    }
+                } else {
                     errors.push(format!(
                         "{}: {}",
                         path,

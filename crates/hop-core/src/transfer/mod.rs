@@ -187,7 +187,7 @@ async fn host_send_files(
     // Read acks for non-directory entries
     let ack_count = entries.iter().filter(|e| !e.is_dir || e.is_symlink).count()
         + entries.iter().filter(|e| e.is_dir && !e.is_symlink).count();
-    let _errors = receiver::read_acks(recv, ack_count).await?;
+    let _errors = receiver::read_acks(recv, ack_count, None).await?;
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
 }
@@ -301,7 +301,7 @@ async fn host_sync_send(
 
     // 7. Read acks from client
     let total_acks = files_to_send.len() + plan.files_to_delete.len();
-    let _errors = receiver::read_acks(recv, total_acks).await?;
+    let _errors = receiver::read_acks(recv, total_acks, None).await?;
 
     // 8. Read client's Done
     let done_msg: TransferMsg = proto::read_message(recv).await?;
@@ -373,7 +373,7 @@ pub async fn client_push_copy(
     proto::write_message(send, &TransferMsg::Done).await?;
 
     // Now read all acks and host's Done in one batch
-    let errors = receiver::read_acks(recv, total_ack_count).await?;
+    let errors = receiver::read_acks(recv, total_ack_count, Some(progress)).await?;
     summary.errors = errors;
 
     let msg: TransferMsg = proto::read_message(recv).await?;
@@ -498,7 +498,7 @@ pub async fn client_push_sync(
 
     // 7. Read acks
     let total_acks = files_only.len() + plan.files_to_delete.len();
-    let errors = receiver::read_acks(recv, total_acks).await?;
+    let errors = receiver::read_acks(recv, total_acks, Some(progress)).await?;
     summary.errors = errors;
 
     // 8. Read host's Done

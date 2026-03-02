@@ -19,6 +19,9 @@ pub trait ProgressReporter: Send + Sync {
     fn dir_created(&self, path: &str);
     /// Called on error for a specific file.
     fn file_error(&self, path: &str, error: &str);
+    /// Called when the remote host confirms receipt of a file (ack received).
+    /// Default no-op — only meaningful for push transfers on the client side.
+    fn file_confirmed(&self, _path: &str) {}
 }
 
 /// Summary of a completed transfer.

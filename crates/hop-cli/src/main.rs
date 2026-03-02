@@ -1,4 +1,5 @@
 mod cli;
+mod progress_ui;
 mod reconnect;
 
 use std::io::Read;
@@ -411,62 +412,6 @@ async fn cmd_connect(
     }
 }
 
-/// CLI progress reporter that prints scp/rsync-style output.
-struct CliProgress {
-    verbose: bool,
-}
-
-impl hop_core::transfer::progress::ProgressReporter for CliProgress {
-    fn file_started(&self, path: &str, size: u64) {
-        if self.verbose {
-            eprint!("  sending {path} ({})...", format_size(size));
-        }
-    }
-
-    fn file_progress(&self, _path: &str, _bytes_transferred: u64, _total: u64) {
-        // For now, no inline progress bar
-    }
-
-    fn file_done(&self, path: &str) {
-        if self.verbose {
-            eprintln!(" done");
-        } else {
-            eprintln!("  sent  {path}");
-        }
-    }
-
-    fn file_skipped(&self, path: &str) {
-        if self.verbose {
-            eprintln!("  skip  {path} (unchanged)");
-        }
-    }
-
-    fn file_deleted(&self, path: &str) {
-        eprintln!("  del   {path}");
-    }
-
-    fn dir_created(&self, _path: &str) {}
-
-    fn file_error(&self, path: &str, error: &str) {
-        eprintln!("  ERROR {path}: {error}");
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 async fn cmd_cp(
     secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
@@ -495,7 +440,6 @@ async fn cmd_cp(
     }
 
     let endpoint = net::create_client_endpoint(secret_key).await?;
-    let progress = CliProgress { verbose: true };
 
     if dest_is_remote {
         // Push: local sources -> remote dest
@@ -539,8 +483,13 @@ async fn cmd_cp(
         )
         .await?;
 
+        let state = progress_ui::TransferState::new(true);
+        let render_handle = progress_ui::spawn_render_loop(state.clone());
+
         let summary =
-            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &progress).await?;
+            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &state).await?;
+        state.mark_finished();
+        let _ = render_handle.await;
         let _ = send.finish();
         eprintln!("{summary}");
     } else {
@@ -576,8 +525,13 @@ async fn cmd_cp(
         )
         .await?;
 
+        let state = progress_ui::TransferState::new(false);
+        let render_handle = progress_ui::spawn_render_loop(state.clone());
+
         let summary =
-            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &progress).await?;
+            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &state).await?;
+        state.mark_finished();
+        let _ = render_handle.await;
         let _ = send.finish();
         eprintln!("{summary}");
     }
@@ -590,7 +544,7 @@ async fn cmd_sync(
     config_dir: &std::path::Path,
     delete: bool,
     dry_run: bool,
-    verbose: bool,
+    _verbose: bool,
     source: &str,
     dest: &str,
 ) -> Result<()> {
@@ -608,10 +562,9 @@ async fn cmd_sync(
     }
 
     let endpoint = net::create_client_endpoint(secret_key).await?;
-    let progress = CliProgress { verbose };
 
     if dry_run {
-        eprintln!("DRY RUN — no files will be transferred");
+        eprintln!("DRY RUN \u{2014} no files will be transferred");
     }
 
     if dest_is_remote {
@@ -646,9 +599,14 @@ async fn cmd_sync(
         )
         .await?;
 
+        let state = progress_ui::TransferState::new(true);
+        let render_handle = progress_ui::spawn_render_loop(state.clone());
+
         let summary =
-            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &progress)
+            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &state)
                 .await?;
+        state.mark_finished();
+        let _ = render_handle.await;
         let _ = send.finish();
         eprintln!("{summary}");
     } else {
@@ -679,9 +637,14 @@ async fn cmd_sync(
         )
         .await?;
 
+        let state = progress_ui::TransferState::new(false);
+        let render_handle = progress_ui::spawn_render_loop(state.clone());
+
         let summary =
-            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &progress)
+            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &state)
                 .await?;
+        state.mark_finished();
+        let _ = render_handle.await;
         let _ = send.finish();
         eprintln!("{summary}");
     }
