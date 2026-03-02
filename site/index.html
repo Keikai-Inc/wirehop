@@ -583,43 +583,6 @@
       margin-top: 0.1rem;
     }
 
-    /* --- Daemon tabs --------------------------------------------------------- */
-
-    .daemon-tabs {
-      display: inline-flex;
-      gap: 2rem;
-      margin-top: 0.75rem;
-    }
-
-    .daemon-tab-btn {
-      background: none;
-      border: none;
-      font-family: var(--font-body);
-      font-size: 1rem;
-      font-weight: 500;
-      color: var(--color-text-tertiary);
-      cursor: pointer;
-      padding: 0.25rem 0;
-      border-bottom: 2px solid transparent;
-      transition: color 150ms, border-color 150ms;
-    }
-
-    .daemon-tab-btn:hover {
-      color: var(--color-text-secondary);
-    }
-
-    .daemon-tab-btn.active {
-      color: var(--color-text);
-      border-bottom-color: var(--color-primary);
-    }
-
-    .daemon-tab-panel {
-      display: none;
-    }
-
-    .daemon-tab-panel.active {
-      display: grid;
-    }
 
     /* --- Footer -------------------------------------------------------------- */
 
@@ -993,36 +956,31 @@
     <div class="container">
       <div class="section-header">
         <h2>Run as a System Daemon</h2>
-        <p>Keep hop running at boot with a native system service.</p>
-        <div class="daemon-tabs">
-          <button class="daemon-tab-btn active" onclick="switchDaemonTab('macos')">macOS</button>
-          <button class="daemon-tab-btn" onclick="switchDaemonTab('linux')">Linux</button>
-        </div>
+        <p>One command to install hop as a persistent system service on macOS or Linux.</p>
       </div>
 
-      <!-- macOS tab -->
-      <div class="daemon-grid daemon-tab-panel active" id="daemon-macos">
+      <div class="daemon-grid">
         <div class="daemon-info">
-          <h3>macOS .pkg Installer</h3>
-          <p>The package installer sets up hop as a system LaunchDaemon that starts automatically at boot. Ideal for always-on machines like home servers, dev boxes, or Mac Minis under your desk.</p>
+          <h3>Always-On Server</h3>
+          <p>The daemon installer detects your platform and sets up hop as a native system service that starts automatically at boot. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
           <ul class="daemon-features">
             <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
-            <li>Registers a LaunchDaemon that runs <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot</li>
-            <li>System-level config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/Library/Application Support/hop/</code></li>
-            <li>Automatic restarts on crash (KeepAlive)</li>
-            <li>Shared config with admin group permissions</li>
+            <li>Registers a native service (LaunchDaemon on macOS, systemd on Linux)</li>
+            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> automatically at boot</li>
+            <li>Automatic restarts on crash</li>
+            <li>Works on macOS (Apple Silicon &amp; Intel) and Linux (x86_64 &amp; ARM64)</li>
           </ul>
         </div>
 
         <div>
-          <div class="install-cmd" onclick="copyCmd('daemon-install', 'copy-daemon-macos')" style="margin-bottom: 1rem;">
+          <div class="install-cmd" onclick="copyCmd('daemon-install', 'copy-daemon')" style="margin-bottom: 1rem;">
             <code><span class="prompt">$</span> curl -fsSL https://hop.keik.ai/install-daemon.sh | bash</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-daemon-macos">
+            <button class="copy-btn" title="Copy to clipboard" id="copy-daemon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             </button>
           </div>
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-bottom: 1.5rem;">
-            Downloads the latest .pkg, installs it (prompts for sudo), and starts the daemon automatically.
+            Detects your platform, installs the binary, sets up the system service, and starts the daemon. Prompts for sudo.
           </p>
           <div class="code-block">
             <div class="code-header">
@@ -1039,54 +997,6 @@
 <span class="prompt">myserver $</span> <span class="cmd">_</span>
             </div>
           </div>
-          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Uninstall cleanly with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">sudo /usr/local/bin/hop-uninstall.sh</code>. Your config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">/Library/Application Support/hop/</code> is preserved.
-          </p>
-        </div>
-      </div>
-
-      <!-- Linux tab -->
-      <div class="daemon-grid daemon-tab-panel" id="daemon-linux">
-        <div class="daemon-info">
-          <h3>systemd Service</h3>
-          <p>Install hop as a systemd service that starts automatically at boot. Ideal for headless servers, VPS instances, or any always-on Linux machine.</p>
-          <ul class="daemon-features">
-            <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
-            <li>Registers a systemd service that runs <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot</li>
-            <li>Config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">~/.config/hop/</code> (XDG default)</li>
-            <li>Automatic restarts on crash (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">Restart=on-failure</code>)</li>
-            <li>Logs via journald (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">journalctl -u hop</code>)</li>
-          </ul>
-        </div>
-
-        <div>
-          <div class="install-cmd" onclick="copyCmd('daemon-install', 'copy-daemon-linux')" style="margin-bottom: 1rem;">
-            <code><span class="prompt">$</span> curl -fsSL https://hop.keik.ai/install-daemon.sh | bash</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-daemon-linux">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            </button>
-          </div>
-          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-bottom: 1.5rem;">
-            Installs the binary, sets up a systemd service, and starts the daemon automatically.
-          </p>
-          <div class="code-block">
-            <div class="code-header">
-              <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
-              <span class="code-title">Terminal</span>
-            </div>
-            <div class="code-body">
-<span class="comment"># The daemon is running — create an invite</span>
-<span class="prompt">$</span> <span class="cmd">hop invite</span>
-<span class="output">Invite token: eyJ0eX...</span>
-
-<span class="comment"># Connect from your laptop</span>
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>
-<span class="prompt">myserver $</span> <span class="cmd">_</span>
-            </div>
-          </div>
-          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Stop and remove with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary); word-break: break-all;">sudo systemctl disable --now hop && sudo rm /etc/systemd/system/hop.service</code>
-          </p>
         </div>
       </div>
     </div>
@@ -1101,13 +1011,6 @@
   </footer>
 
   <script>
-    function switchDaemonTab(tab) {
-      document.querySelectorAll('.daemon-tab-btn').forEach(btn => btn.classList.remove('active'));
-      document.querySelectorAll('.daemon-tab-panel').forEach(panel => panel.classList.remove('active'));
-      document.getElementById('daemon-' + tab).classList.add('active');
-      document.querySelector('[onclick="switchDaemonTab(\'' + tab + '\')"]').classList.add('active');
-    }
-
     var cmds = {
       'install-latest':  'curl -fsSL https://hop.keik.ai/install.sh | bash',
       'install-version': 'curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.2.5',
