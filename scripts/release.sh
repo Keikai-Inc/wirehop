@@ -69,9 +69,33 @@ echo "==> Uploading install.sh"
 aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
   --content-type "text/plain"
 
+# --- macOS .pkg installer ----------------------------------------------------
+
+echo "==> Building macOS universal .pkg"
+"${PROJECT_ROOT}/pkg/build-pkg.sh" --arch universal
+
+echo "==> Uploading .pkg to s3://${BUCKET}/v${VERSION}/"
+aws s3 cp "${PROJECT_ROOT}/hop-${VERSION}.pkg" "s3://${BUCKET}/v${VERSION}/hop-${VERSION}.pkg"
+
+# --- Linux systemd service file ----------------------------------------------
+
+echo "==> Uploading hop.service"
+aws s3 cp "${PROJECT_ROOT}/pkg/hop.service" "s3://${BUCKET}/hop.service" \
+  --content-type "text/plain"
+
 echo "==> Uploading site"
 aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
   --content-type "text/html"
+
+echo "==> Uploading site assets"
+for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
+  if [[ -f "${PROJECT_ROOT}/site/${asset}" ]]; then
+    content_type="image/png"
+    [[ "${asset}" == *.ico ]] && content_type="image/x-icon"
+    aws s3 cp "${PROJECT_ROOT}/site/${asset}" "s3://${BUCKET}/${asset}" \
+      --content-type "${content_type}"
+  fi
+done
 
 # --- CloudFront invalidation ------------------------------------------------
 
@@ -79,7 +103,7 @@ if [[ -n "${HOP_CF_DISTRIBUTION_ID:-}" ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${HOP_CF_DISTRIBUTION_ID}" \
-    --paths "/" "/index.html" "/latest" "/install.sh" "/v${VERSION}/*"
+    --paths "/" "/index.html" "/latest" "/install.sh" "/hop.service" "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*"
 else
   echo "==> Skipping CloudFront invalidation (HOP_CF_DISTRIBUTION_ID not set)"
 fi

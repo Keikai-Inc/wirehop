@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>hop — Secure P2P Remote Access</title>
   <meta name="description" content="SSH-like remote access without port forwarding, VPNs, or third-party routing. Direct encrypted peer-to-peer connections with a single binary.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
@@ -32,7 +35,11 @@
 
     body {
       font-family: var(--font-body);
-      background: var(--color-bg);
+      background-color: var(--color-bg);
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+      background-size: 64px 64px;
       color: var(--color-text);
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
@@ -50,7 +57,7 @@
       align-items: center;
       justify-content: space-between;
       backdrop-filter: blur(16px);
-      background: rgba(9, 9, 11, 0.8);
+      background: rgba(9, 9, 11, 0.85);
       border-bottom: 1px solid var(--color-border);
     }
 
@@ -433,7 +440,7 @@
       font-family: var(--font-display);
       font-size: 3rem;
       font-weight: 900;
-      color: rgba(220, 38, 38, 0.15);
+      color: rgba(220, 38, 38, 0.4);
       line-height: 1;
       margin-bottom: 1rem;
       display: block;
@@ -504,6 +511,7 @@
       font-size: 0.85rem;
       line-height: 1.8;
       overflow-x: auto;
+      white-space: pre;
     }
 
     .code-body .comment { color: var(--color-text-tertiary); }
@@ -557,6 +565,44 @@
       font-weight: 700;
       flex-shrink: 0;
       margin-top: 0.1rem;
+    }
+
+    /* --- Daemon tabs --------------------------------------------------------- */
+
+    .daemon-tabs {
+      display: inline-flex;
+      gap: 2rem;
+      margin-top: 0.75rem;
+    }
+
+    .daemon-tab-btn {
+      background: none;
+      border: none;
+      font-family: var(--font-body);
+      font-size: 1rem;
+      font-weight: 500;
+      color: var(--color-text-tertiary);
+      cursor: pointer;
+      padding: 0.25rem 0;
+      border-bottom: 2px solid transparent;
+      transition: color 150ms, border-color 150ms;
+    }
+
+    .daemon-tab-btn:hover {
+      color: var(--color-text-secondary);
+    }
+
+    .daemon-tab-btn.active {
+      color: var(--color-text);
+      border-bottom-color: var(--color-primary);
+    }
+
+    .daemon-tab-panel {
+      display: none;
+    }
+
+    .daemon-tab-panel.active {
+      display: grid;
     }
 
     /* --- Footer -------------------------------------------------------------- */
@@ -616,7 +662,7 @@
 
   <!-- Nav -->
   <nav>
-    <a href="/" class="nav-brand"><span>&gt;</span> hop</a>
+    <a href="/" class="nav-brand"><img src="hop-icon.png" alt="hop" style="height: 1.5rem; width: auto; filter: brightness(0) invert(1);"> hop</a>
     <ul class="nav-links">
       <li><a href="#features">Features</a></li>
       <li><a href="#install">Install</a></li>
@@ -863,10 +909,15 @@
     <div class="container">
       <div class="section-header">
         <h2>Run as a System Daemon</h2>
-        <p>Keep hop running at boot with the macOS package installer.</p>
+        <p>Keep hop running at boot with a native system service.</p>
+        <div class="daemon-tabs">
+          <button class="daemon-tab-btn active" onclick="switchDaemonTab('macos')">macOS</button>
+          <button class="daemon-tab-btn" onclick="switchDaemonTab('linux')">Linux</button>
+        </div>
       </div>
 
-      <div class="daemon-grid">
+      <!-- macOS tab -->
+      <div class="daemon-grid daemon-tab-panel active" id="daemon-macos">
         <div class="daemon-info">
           <h3>macOS .pkg Installer</h3>
           <p>The package installer sets up hop as a system LaunchDaemon that starts automatically at boot. Ideal for always-on machines like home servers, dev boxes, or Mac Minis under your desk.</p>
@@ -886,22 +937,59 @@
               <span class="code-title">Terminal</span>
             </div>
             <div class="code-body">
-<span class="comment"># Build the .pkg (from source)</span>
-<span class="prompt">$</span> <span class="cmd">./pkg/build-pkg.sh</span> <span class="flag">--arch universal</span>
+<span class="comment"># Download the .pkg installer</span>
+<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSLO</span> <span class="url">https://hop.keik.ai/v0.1.0/hop-0.1.0.pkg</span>
 
 <span class="comment"># Install the package</span>
 <span class="prompt">$</span> <span class="cmd">sudo installer</span> <span class="flag">-pkg</span> hop-0.1.0.pkg <span class="flag">-target</span> /
 
-<span class="comment"># The daemon starts automatically</span>
+<span class="comment"># The daemon starts automatically — create an invite</span>
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
 <span class="output">Invite token: eyJ0eX...</span>
-
-<span class="comment"># Uninstall cleanly</span>
-<span class="prompt">$</span> <span class="cmd">sudo ./pkg/uninstall.sh</span>
             </div>
           </div>
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            The uninstaller preserves your config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/Library/Application Support/hop/</code>.
+            Uninstall cleanly with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">sudo /usr/local/bin/hop-uninstall.sh</code>. Your config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/Library/Application Support/hop/</code> is preserved.
+          </p>
+        </div>
+      </div>
+
+      <!-- Linux tab -->
+      <div class="daemon-grid daemon-tab-panel" id="daemon-linux">
+        <div class="daemon-info">
+          <h3>systemd Service</h3>
+          <p>Install hop as a systemd service that starts automatically at boot. Ideal for headless servers, VPS instances, or any always-on Linux machine.</p>
+          <ul class="daemon-features">
+            <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
+            <li>Registers a systemd service that runs <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot</li>
+            <li>Config at <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">~/.config/hop/</code> (XDG default)</li>
+            <li>Automatic restarts on crash (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">Restart=on-failure</code>)</li>
+            <li>Logs via journald (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">journalctl -u hop</code>)</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+              <span class="code-title">Terminal</span>
+            </div>
+            <div class="code-body">
+<span class="comment"># Install the hop binary</span>
+<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/install.sh</span> | <span class="cmd">bash</span>
+
+<span class="comment"># Install and start the systemd service</span>
+<span class="prompt">$</span> <span class="cmd">sudo curl</span> <span class="flag">-fsSL</span> <span class="url">https://hop.keik.ai/hop.service</span> <span class="flag">-o</span> /etc/systemd/system/hop.service
+<span class="prompt">$</span> <span class="cmd">sudo systemctl</span> daemon-reload
+<span class="prompt">$</span> <span class="cmd">sudo systemctl</span> <span class="flag">enable --now</span> hop
+
+<span class="comment"># Create an invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span>
+<span class="output">Invite token: eyJ0eX...</span>
+            </div>
+          </div>
+          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
+            Stop and remove with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">sudo systemctl disable --now hop && sudo rm /etc/systemd/system/hop.service</code>
           </p>
         </div>
       </div>
@@ -917,6 +1005,13 @@
   </footer>
 
   <script>
+    function switchDaemonTab(tab) {
+      document.querySelectorAll('.daemon-tab-btn').forEach(btn => btn.classList.remove('active'));
+      document.querySelectorAll('.daemon-tab-panel').forEach(panel => panel.classList.remove('active'));
+      document.getElementById('daemon-' + tab).classList.add('active');
+      document.querySelector('[onclick="switchDaemonTab(\'' + tab + '\')"]').classList.add('active');
+    }
+
     function copyInstall() {
       const text = "curl -fsSL https://hop.keik.ai/install.sh | bash";
       navigator.clipboard.writeText(text).then(() => {
