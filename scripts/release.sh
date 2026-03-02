@@ -225,8 +225,8 @@ echo "==> Uploading install.sh"
 aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
   --content-type "text/plain"
 
-echo "==> Uploading install-pkg.sh"
-aws s3 cp "${PROJECT_ROOT}/install-pkg.sh" "s3://${BUCKET}/install-pkg.sh" \
+echo "==> Uploading install-daemon.sh"
+aws s3 cp "${PROJECT_ROOT}/install-daemon.sh" "s3://${BUCKET}/install-daemon.sh" \
   --content-type "text/plain"
 
 echo "==> Uploading hop.service"
@@ -267,7 +267,7 @@ git -C "${PROJECT_ROOT}" push --tags
 echo "==> Invalidating CloudFront cache"
 aws cloudfront create-invalidation \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
-  --paths "/" "/index.html" "/latest" "/install.sh" "/install-pkg.sh" "/hop.service" \
+  --paths "/" "/index.html" "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
     "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" \
     "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*" \
   --output text --query 'Invalidation.Id'

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Daemon installer for hop (macOS + Linux)
+# Usage:
+#   curl -fsSL https://hop.keik.ai/install-daemon.sh | bash
+#
+# macOS:  Downloads the latest .pkg, installs it, starts the LaunchDaemon.
+# Linux:  Installs the binary, creates a systemd service, enables it.
+
+set -euo pipefail
+
+BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
+
+# --- Colour helpers (disabled when piped) ------------------------------------
+
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+  BOLD='\033[1m'; RESET='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BOLD=''; RESET=''
+fi
+
+info()  { printf "${GREEN}info${RESET}  %s\n" "$*"; }
+warn()  { printf "${YELLOW}warn${RESET}  %s\n" "$*"; }
+error() { printf "${RED}error${RESET} %s\n" "$*" >&2; }
+die()   { error "$@"; exit 1; }
+
+# --- Temp dir with cleanup ---------------------------------------------------
+
+TMPDIR_HOP=$(mktemp -d)
+trap 'rm -rf "${TMPDIR_HOP}"' EXIT
+
+# --- HTTP helpers ------------------------------------------------------------
+
+fetch() {
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "${dest}" "${url}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${dest}" "${url}"
+  else
+    die "Neither curl nor wget found."
+  fi
+}
+
+fetch_text() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${url}"
+  else
+    wget -qO- "${url}"
+  fi
+}
+
+# --- Detect platform ---------------------------------------------------------
+
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+case "${ARCH}" in
+  x86_64|amd64)  ARCH="x86_64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *)             die "Unsupported architecture: ${ARCH}" ;;
+esac
+
+# --- Resolve version ---------------------------------------------------------
+
+info "Fetching latest version..."
+VERSION=$(fetch_text "${BASE_URL}/latest")
+[[ -n "${VERSION}" ]] || die "Could not determine version"
+info "Installing hop v${VERSION} daemon"
+
+# --- macOS path --------------------------------------------------------------
+
+if [[ "${OS}" == "Darwin" ]]; then
+  PKG_NAME="hop-${VERSION}.pkg"
+  PKG_URL="${BASE_URL}/v${VERSION}/${PKG_NAME}"
+
+  info "Downloading ${PKG_NAME}..."
+  fetch "${PKG_URL}" "${TMPDIR_HOP}/${PKG_NAME}"
+
+  info "Installing package (sudo required)..."
+  sudo installer -pkg "${TMPDIR_HOP}/${PKG_NAME}" -target /
+
+  printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
+  printf "The daemon is running. Create an invite with: ${BOLD}hop invite${RESET}\n"
+  exit 0
+fi
+
+# --- Linux path --------------------------------------------------------------
+
+if [[ "${OS}" != "Linux" ]]; then
+  die "Unsupported OS: ${OS}. This installer supports macOS and Linux."
+fi
+
+info "Detected platform: linux-${ARCH}"
+
+# Download binary
+BINARY_NAME="hop-linux-${ARCH}"
+BINARY_URL="${BASE_URL}/v${VERSION}/${BINARY_NAME}"
+CHECKSUM_URL="${BINARY_URL}.sha256"
+
+info "Downloading ${BINARY_NAME}..."
+fetch "${BINARY_URL}" "${TMPDIR_HOP}/hop"
+fetch "${CHECKSUM_URL}" "${TMPDIR_HOP}/hop.sha256"
+
+# Verify checksum
+info "Verifying checksum..."
+EXPECTED=$(cat "${TMPDIR_HOP}/hop.sha256" | tr -d '[:space:]')
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "${TMPDIR_HOP}/hop" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "${TMPDIR_HOP}/hop" | awk '{print $1}')
+else
+  warn "No sha256sum or shasum found — skipping checksum verification"
+  ACTUAL="${EXPECTED}"
+fi
+
+[[ "${ACTUAL}" == "${EXPECTED}" ]] || die "Checksum mismatch!\n  expected: ${EXPECTED}\n  got:      ${ACTUAL}"
+
+# Install binary
+chmod +x "${TMPDIR_HOP}/hop"
+info "Installing binary to /usr/local/bin/hop (sudo required)..."
+sudo mv "${TMPDIR_HOP}/hop" /usr/local/bin/hop
+
+# Install systemd service
+info "Installing systemd service..."
+SERVICE_URL="${BASE_URL}/hop.service"
+sudo "${SHELL:-bash}" -c "$(
+cat <<INNEREOF
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL -o /etc/systemd/system/hop.service "${SERVICE_URL}"
+else
+  wget -qO /etc/systemd/system/hop.service "${SERVICE_URL}"
+fi
+INNEREOF
+)"
+
+# Enable and start
+info "Enabling and starting hop daemon..."
+sudo systemctl daemon-reload
+sudo systemctl enable --now hop
+
+printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
+printf "The daemon is running. Create an invite with: ${BOLD}hop invite${RESET}\n"
