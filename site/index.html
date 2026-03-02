@@ -870,7 +870,7 @@
         </div>
         <div class="step">
           <h3>Connect</h3>
-          <p>The other person runs <code>hop connect &lt;token&gt;</code> and gets a secure shell. Future connections use <code>hop connect &lt;name&gt;</code>.</p>
+          <p>The other person runs <code>hop connect &lt;token&gt;</code> and gets a secure shell. Future connections are just <code>hop &lt;name&gt;</code>.</p>
         </div>
       </div>
 
@@ -891,9 +891,12 @@
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
 <span class="output">Invite token: eyJ0eX...</span>
 
-<span class="comment"># On your laptop — connect for a shell</span>
+<span class="comment"># On your laptop — first time, use the invite token</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
-<span class="output">Connected to server</span>
+<span class="output">Saved as known host: server</span>
+
+<span class="comment"># After that, just use the name</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">server</span>
 <span class="prompt">server $</span> <span class="cmd">_</span>
 
 <span class="comment"># Copy files to the server</span>
@@ -996,21 +999,28 @@
         </div>
 
         <div>
+          <div class="install-cmd" onclick="copyPkgInstall()" id="pkgInstallCmd" style="margin-bottom: 1rem;">
+            <code><span class="prompt">$</span> curl -fsSL https://hop.keik.ai/install-pkg.sh | bash</code>
+            <button class="copy-btn" title="Copy to clipboard" id="copyPkgBtn">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-bottom: 1.5rem;">
+            Downloads the latest .pkg, installs it (prompts for sudo), and starts the daemon automatically.
+          </p>
           <div class="code-block">
             <div class="code-header">
               <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
               <span class="code-title">Terminal</span>
             </div>
             <div class="code-body">
-<span class="comment"># Download the .pkg installer</span>
-<span class="prompt">$</span> <span class="cmd">curl</span> <span class="flag">-fsSLO</span> <span class="url">https://hop.keik.ai/v0.2.5/hop-0.2.5.pkg</span>
-
-<span class="comment"># Install the package</span>
-<span class="prompt">$</span> <span class="cmd">sudo installer</span> <span class="flag">-pkg</span> hop-0.2.5.pkg <span class="flag">-target</span> /
-
-<span class="comment"># The daemon starts automatically — create an invite</span>
+<span class="comment"># The daemon is running — create an invite</span>
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
 <span class="output">Invite token: eyJ0eX...</span>
+
+<span class="comment"># Connect from your laptop</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>
+<span class="prompt">myserver $</span> <span class="cmd">_</span>
             </div>
           </div>
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
@@ -1078,9 +1088,16 @@
     }
 
     function copyInstall() {
-      const text = "curl -fsSL https://hop.keik.ai/install.sh | bash";
+      copyToClipboard("curl -fsSL https://hop.keik.ai/install.sh | bash", "copyBtn");
+    }
+
+    function copyPkgInstall() {
+      copyToClipboard("curl -fsSL https://hop.keik.ai/install-pkg.sh | bash", "copyPkgBtn");
+    }
+
+    function copyToClipboard(text, btnId) {
       navigator.clipboard.writeText(text).then(() => {
-        const btn = document.getElementById("copyBtn");
+        const btn = document.getElementById(btnId);
         btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';
         setTimeout(() => {
           btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
