@@ -665,9 +665,7 @@
       .nav-links { display: none; }
       .grid-3, .grid-2 { grid-template-columns: 1fr; }
       .steps { grid-template-columns: 1fr; }
-      .comparison-row { grid-template-columns: 1fr; }
-      .comparison-cell { border-right: none; border-bottom: 1px solid var(--color-border); }
-      .comparison-cell:last-child { border-bottom: none; }
+      #comparison { display: none; }
       .daemon-grid { grid-template-columns: 1fr; }
       .hero { padding: 7rem 1.5rem 4rem; }
       section { padding: 4rem 0; }
@@ -806,7 +804,7 @@
   </section>
 
   <!-- Comparison -->
-  <section style="padding-top: 0;">
+  <section id="comparison" style="padding-top: 0;">
     <div class="container">
       <div class="section-header">
         <h2>How hop compares</h2>
