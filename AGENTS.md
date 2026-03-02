@@ -93,8 +93,8 @@ This script:
 ```
 s3://hop-releases/
   install.sh
-  latest                          # plain text, e.g. "0.1.0"
-  v0.1.0/
+  latest                          # plain text, e.g. "0.2.0"
+  v0.2.0/
     hop-darwin-arm64
     hop-darwin-arm64.sha256
     hop-darwin-x86_64
@@ -112,7 +112,7 @@ s3://hop-releases/
 curl -fsSL https://hop.keik.ai/install.sh | bash
 
 # Specific version
-curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
+curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.2.0
 
 # Custom install directory
 curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
