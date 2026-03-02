@@ -327,6 +327,7 @@ pub async fn client_push_copy(
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
+    let mut total_ack_count = 0usize;
     for local_path in local_paths {
         let (base_dir, entries) = if local_path.is_file() {
             let metadata = std::fs::metadata(local_path)?;
@@ -361,17 +362,20 @@ pub async fn client_push_copy(
 
         let bytes = sender::send_files(send, &base_dir, &entries, progress).await?;
         summary.bytes_transferred += bytes;
-
-        // Read acks
-        let ack_count = entries.len();
-        let errors = receiver::read_acks(recv, ack_count).await?;
         summary.files_transferred += entries.iter().filter(|e| !e.is_dir).count() as u64;
         summary.dirs_created += entries.iter().filter(|e| e.is_dir).count() as u64;
-        summary.errors.extend(errors);
+        total_ack_count += entries.len();
     }
 
+    // Send Done immediately after all files — don't block on acks first.
+    // This lets the host process files + Done without waiting for us to
+    // read acks in between, collapsing 2 round-trips into 1.
     proto::write_message(send, &TransferMsg::Done).await?;
-    // Read host's Done
+
+    // Now read all acks and host's Done in one batch
+    let errors = receiver::read_acks(recv, total_ack_count).await?;
+    summary.errors = errors;
+
     let msg: TransferMsg = proto::read_message(recv).await?;
     match msg {
         TransferMsg::Done => {}
