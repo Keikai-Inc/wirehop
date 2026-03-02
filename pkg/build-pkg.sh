@@ -56,11 +56,11 @@ cd "$PROJECT_ROOT"
 
 build_for_target() {
     local target="$1"
-    echo "Building for $target..."
+    echo "Building for $target..." >&2
     cargo build --release --target "$target" -p hop-cli
     local bin="$PROJECT_ROOT/target/$target/release/hop"
     if [ ! -f "$bin" ]; then
-        echo "Error: Binary not found at $bin"
+        echo "Error: Binary not found at $bin" >&2
         exit 1
     fi
     strip "$bin"
