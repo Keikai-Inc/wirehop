@@ -51,15 +51,18 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 /// can connect via relay immediately rather than waiting for DNS discovery.
 /// If the relay hint fails (stale URL), automatically retries without it so
 /// discovery can find the host via DNS.
+///
+/// Returns `(connection, relay_hint_failed)` — callers should clear a stored
+/// relay URL from known_hosts when `relay_hint_failed` is true.
 pub async fn connect_to_host(
     endpoint: &Endpoint,
     remote_id: PublicKey,
     relay_url: Option<&RelayUrl>,
-) -> Result<Connection> {
+) -> Result<(Connection, bool)> {
     if let Some(url) = relay_url {
         let addr = EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(url.clone())]);
 
-        // Try with relay hint first (10s timeout), then fall back to discovery
+        // Try with relay hint first (3s timeout), then fall back to discovery
         let relay_result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             connect_with_alpn_fallback(endpoint, addr),
@@ -67,7 +70,7 @@ pub async fn connect_to_host(
         .await;
 
         match relay_result {
-            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Ok(conn)) => return Ok((conn, false)),
             Ok(Err(e)) => {
                 tracing::info!("Relay hint failed ({e:#}), falling back to discovery");
             }
@@ -75,13 +78,21 @@ pub async fn connect_to_host(
                 tracing::info!("Relay hint timed out, falling back to discovery");
             }
         }
+
+        // Relay failed — connect via discovery and signal that the hint was bad
+        let addr = EndpointAddr::from(remote_id);
+        let conn = connect_with_alpn_fallback(endpoint, addr)
+            .await
+            .context("Failed to connect to host")?;
+        return Ok((conn, true));
     }
 
-    // No relay hint, or relay hint failed — use discovery
+    // No relay hint — use discovery
     let addr = EndpointAddr::from(remote_id);
-    connect_with_alpn_fallback(endpoint, addr)
+    let conn = connect_with_alpn_fallback(endpoint, addr)
         .await
-        .context("Failed to connect to host")
+        .context("Failed to connect to host")?;
+    Ok((conn, false))
 }
 
 /// Try connecting with hop/1 ALPN, falling back to hop/0.

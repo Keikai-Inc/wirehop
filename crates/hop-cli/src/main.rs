@@ -317,7 +317,8 @@ async fn resolve_and_initial_connect(
 
         println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
 
-        let conn = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
+        let (conn, relay_failed) = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
+        let relay_url = if relay_failed { None } else { relay_url };
         let (mut send, recv) = conn.open_bi().await?;
         proto::write_message(&mut send, session_request).await?;
 
@@ -341,7 +342,7 @@ async fn resolve_and_initial_connect(
 
         println!("Connecting to host {}...", host_id.fmt_short());
 
-        let conn = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
+        let (conn, _relay_failed) = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
         proto::write_message(
@@ -392,7 +393,7 @@ async fn resolve_and_initial_connect(
 
     println!("Connecting to {}...", host_id.fmt_short());
 
-    let conn = net::connect_to_host(endpoint, host_id, None).await?;
+    let (conn, _) = net::connect_to_host(endpoint, host_id, None).await?;
     let (mut send, recv) = conn.open_bi().await?;
     proto::write_message(&mut send, session_request).await?;
 
@@ -463,8 +464,18 @@ async fn cmd_connect(
     let (mut resolved, _conn, first_send, first_recv) =
         resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
 
-    if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
-        resolved.relay_url = Some(fresh);
+    // If relay_url is None, the relay hint failed — clear it from known_hosts.
+    // If relay_url is Some, it worked — refresh it from the live connection.
+    if resolved.relay_url.is_some() {
+        if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
+            resolved.relay_url = Some(fresh);
+        }
+    } else {
+        // Clear stale relay from known_hosts so next connection skips straight to discovery
+        if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
+            hosts.update_relay_url(&resolved.host_id.to_string(), None);
+            let _ = hosts.save(config_dir);
+        }
     }
 
     // Spawn stdin reader once — shared across reconnections

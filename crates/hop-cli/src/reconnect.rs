@@ -79,7 +79,7 @@ pub async fn show_reconnect_tui(
         // Try to connect with a 10-second timeout
         let connect_result = tokio::time::timeout(
             Duration::from_secs(10),
-            net::connect_to_host(endpoint, host_id, relay_url),
+            async { net::connect_to_host(endpoint, host_id, relay_url).await.map(|(conn, _)| conn) },
         )
         .await;
 
