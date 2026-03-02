@@ -269,6 +269,7 @@ pub async fn host_shell_session(
     }
 
     // Main loop: multiplex between PTY output, client input, and child exit
+    let mut clean_exit = false;
     loop {
         tokio::select! {
             // PTY output -> send to client
@@ -320,9 +321,20 @@ pub async fn host_shell_session(
                     let _ = proto::write_message(&mut send, &HostMessage::Output(data)).await;
                 }
                 let _ = proto::write_message(&mut send, &HostMessage::Exit(code)).await;
+                clean_exit = true;
                 break;
             }
         }
+    }
+
+    // Gracefully close the send stream so the client receives all buffered
+    // data (including the Exit message). Without this, dropping the
+    // SendStream sends a QUIC RESET which discards undelivered data —
+    // causing the client to see a disconnection instead of a clean exit.
+    if clean_exit {
+        let _ = send.finish();
+        // Give the transport a moment to flush the FIN
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     Ok(())
