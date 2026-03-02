@@ -49,30 +49,55 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 /// Tries `hop/1` first; falls back to `hop/0` if the host doesn't support v1.
 /// If a relay URL is provided, it's included in the endpoint address so iroh
 /// can connect via relay immediately rather than waiting for DNS discovery.
+/// If the relay hint fails (stale URL), automatically retries without it so
+/// discovery can find the host via DNS.
 pub async fn connect_to_host(
     endpoint: &Endpoint,
     remote_id: PublicKey,
     relay_url: Option<&RelayUrl>,
 ) -> Result<Connection> {
-    let addr = match relay_url {
-        Some(url) => {
-            EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(url.clone())])
-        }
-        None => EndpointAddr::from(remote_id),
-    };
+    if let Some(url) = relay_url {
+        let addr = EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(url.clone())]);
 
-    // Try hop/1 first, fall back to hop/0
-    let conn = match endpoint.connect(addr.clone(), ALPN_V1).await {
-        Ok(conn) => conn,
+        // Try with relay hint first (10s timeout), then fall back to discovery
+        let relay_result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connect_with_alpn_fallback(endpoint, addr),
+        )
+        .await;
+
+        match relay_result {
+            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Err(e)) => {
+                tracing::info!("Relay hint failed ({e:#}), falling back to discovery");
+            }
+            Err(_) => {
+                tracing::info!("Relay hint timed out, falling back to discovery");
+            }
+        }
+    }
+
+    // No relay hint, or relay hint failed — use discovery
+    let addr = EndpointAddr::from(remote_id);
+    connect_with_alpn_fallback(endpoint, addr)
+        .await
+        .context("Failed to connect to host")
+}
+
+/// Try connecting with hop/1 ALPN, falling back to hop/0.
+async fn connect_with_alpn_fallback(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+) -> Result<Connection> {
+    match endpoint.connect(addr.clone(), ALPN_V1).await {
+        Ok(conn) => Ok(conn),
         Err(_) => {
             endpoint
                 .connect(addr, ALPN_V0)
                 .await
-                .context("Failed to connect to host")?
+                .context("Failed to connect")
         }
-    };
-
-    Ok(conn)
+    }
 }
 
 /// Return the protocol version negotiated on a connection.

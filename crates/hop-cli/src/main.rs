@@ -401,15 +401,14 @@ async fn resolve_and_initial_connect(
 
 /// After a successful connection, query the remote's current relay URL and
 /// update known_hosts so future connections use the freshest relay.
+/// Returns the fresh relay URL (if any) so callers can update in-memory state.
 async fn refresh_known_host_relay(
     endpoint: &Endpoint,
     host_id: &PublicKey,
     config_dir: &std::path::Path,
-) {
-    let Some(remote_info) = endpoint.remote_info(*host_id).await else {
-        return;
-    };
-    let fresh_relay = remote_info
+) -> Option<RelayUrl> {
+    let remote_info = endpoint.remote_info(*host_id).await?;
+    let fresh_relay_str = remote_info
         .addrs()
         .filter_map(|a| match a.addr() {
             TransportAddr::Relay(url) => Some(url.to_string()),
@@ -417,9 +416,19 @@ async fn refresh_known_host_relay(
         })
         .next();
     if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
-        hosts.update_relay_url(&host_id.to_string(), fresh_relay);
+        hosts.update_relay_url(&host_id.to_string(), fresh_relay_str.clone());
         let _ = hosts.save(config_dir);
     }
+    let fresh_relay: Option<RelayUrl> = fresh_relay_str
+        .as_deref()
+        .map(|u| u.parse())
+        .transpose()
+        .ok()
+        .flatten();
+    if fresh_relay.is_some() {
+        tracing::debug!("Refreshed relay URL for {}", host_id.fmt_short());
+    }
+    fresh_relay
 }
 
 /// Spawn a blocking stdin reader and return the receiver half.
@@ -451,10 +460,12 @@ async fn cmd_connect(
 ) -> Result<()> {
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    let (resolved, _conn, first_send, first_recv) =
+    let (mut resolved, _conn, first_send, first_recv) =
         resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
 
-    refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
+    if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
+        resolved.relay_url = Some(fresh);
+    }
 
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
