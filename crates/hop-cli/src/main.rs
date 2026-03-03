@@ -3,6 +3,8 @@ mod progress_ui;
 mod reconnect;
 
 use std::io::Read;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,6 +20,7 @@ use hop_core::invite;
 use hop_core::net;
 use hop_core::proto::{self, ClientMessage, TransferDirection, TransferMode, TransferRequest};
 use hop_core::shell::{self, SessionOutcome};
+use hop_core::shell::session_registry::SessionRegistry;
 use hop_core::transfer::{self, PathSpec};
 
 #[tokio::main]
@@ -165,10 +168,28 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         println!();
     }
 
+    // Session registry for persistent PTY sessions (5-minute detach timeout)
+    let registry = Arc::new(tokio::sync::Mutex::new(
+        SessionRegistry::new(Duration::from_secs(5 * 60)),
+    ));
+
+    // Spawn reaper task: every 30s, remove expired/exited sessions
+    {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                registry.lock().await.reap_expired();
+            }
+        });
+    }
+
     while let Some(incoming) = endpoint.accept().await {
         let config_dir = config_dir.to_path_buf();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming(incoming, &config_dir).await {
+            if let Err(e) = handle_incoming(incoming, &config_dir, registry).await {
                 tracing::error!("Connection error: {e:#}");
             }
         });
@@ -181,6 +202,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
+    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
 ) -> Result<()> {
     let conn: iroh::endpoint::Connection = incoming.await?;
     let remote_id = conn.remote_id();
@@ -198,17 +220,17 @@ async fn handle_incoming(
     )
     .await?;
 
+    let peer_id = remote_id.to_string();
+
     match outcome {
         AuthOutcome::Authorized { username } => {
             tracing::info!("Authorized peer {}", remote_id.fmt_short());
-            // first_msg was already consumed during auth — dispatch based on it
-            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version).await?;
+            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version, &peer_id, registry).await?;
         }
         AuthOutcome::InviteAccepted { username } => {
             tracing::info!("Invite accepted for {}, waiting for session request", remote_id.fmt_short());
-            // Client will send RequestShell or RequestTransfer next
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
-            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version).await?;
+            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version, &peer_id, registry).await?;
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
@@ -225,11 +247,17 @@ async fn dispatch_session(
     recv: RecvStream,
     username: Option<&str>,
     protocol_version: u8,
+    peer_id: &str,
+    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
             tracing::info!("Starting shell session");
             shell::host_shell_session(send, recv, username).await?;
+        }
+        Some(ClientMessage::RequestShellV2 { session_id }) => {
+            tracing::info!("Starting persistent shell session (resume: {})", session_id.is_some());
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
@@ -461,17 +489,28 @@ async fn cmd_connect(
 ) -> Result<()> {
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    let (mut resolved, _conn, first_send, first_recv) =
-        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
+    // First connect: use RequestShellV2 with no session_id (new session).
+    // If the host doesn't understand V2 (old host), fall back to RequestShell.
+    let v2_request = ClientMessage::RequestShellV2 { session_id: None };
+    let connect_result =
+        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &v2_request).await;
 
-    // If relay_url is None, the relay hint failed — clear it from known_hosts.
-    // If relay_url is Some, it worked — refresh it from the live connection.
+    let (mut resolved, _conn, first_send, first_recv, use_v2) = match connect_result {
+        Ok((resolved, conn, send, recv)) => (resolved, conn, send, recv, true),
+        Err(_) => {
+            // V2 might have failed because of an old host — fall back to V1
+            let (resolved, conn, send, recv) =
+                resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
+            (resolved, conn, send, recv, false)
+        }
+    };
+
+    // Refresh relay URL
     if resolved.relay_url.is_some() {
         if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
             resolved.relay_url = Some(fresh);
         }
     } else {
-        // Clear stale relay from known_hosts so next connection skips straight to discovery
         if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
             hosts.update_relay_url(&resolved.host_id.to_string(), None);
             let _ = hosts.save(config_dir);
@@ -482,8 +521,14 @@ async fn cmd_connect(
     let mut stdin_rx = spawn_stdin_reader();
 
     // Run the first shell session
-    let mut outcome =
-        shell::client_shell_session(first_send, first_recv, &mut stdin_rx).await?;
+    let (mut session_id, mut outcome) = if use_v2 {
+        let (sid, out) =
+            shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx).await?;
+        (sid, out)
+    } else {
+        let out = shell::client_shell_session(first_send, first_recv, &mut stdin_rx).await?;
+        (None, out)
+    };
 
     // Reconnection loop
     loop {
@@ -502,9 +547,25 @@ async fn cmd_connect(
                 {
                     reconnect::ReconnectAction::Reconnected(conn) => {
                         let (mut send, recv) = conn.open_bi().await?;
-                        proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
-                        outcome =
-                            shell::client_shell_session(send, recv, &mut stdin_rx).await?;
+
+                        if use_v2 {
+                            // Resume with the session ID from the previous session
+                            proto::write_message(
+                                &mut send,
+                                &ClientMessage::RequestShellV2 {
+                                    session_id: session_id.clone(),
+                                },
+                            )
+                            .await?;
+                            let (new_sid, out) =
+                                shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
+                            session_id = new_sid;
+                            outcome = out;
+                        } else {
+                            proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
+                            outcome =
+                                shell::client_shell_session(send, recv, &mut stdin_rx).await?;
+                        }
                     }
                     reconnect::ReconnectAction::Quit => {
                         std::process::exit(1);

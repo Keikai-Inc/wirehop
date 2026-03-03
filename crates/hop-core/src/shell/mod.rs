@@ -1,18 +1,22 @@
 //! PTY and terminal management.
 
+pub mod session_registry;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{RecvStream, SendStream};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::proto::{self, ClientMessage, HostMessage};
+use session_registry::{DetachedSession, SessionKey, SessionRegistry};
 
 /// Outcome of a client shell session.
 #[derive(Debug)]
@@ -348,6 +352,422 @@ pub async fn host_shell_session(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Persistent session support
+// ---------------------------------------------------------------------------
+
+/// Outcome of the attached I/O loop for persistent sessions.
+enum AttachOutcome {
+    /// The shell exited.
+    Exited,
+    /// The client disconnected (network error).
+    Disconnected,
+}
+
+/// Pre-spawn security checks shared by shell and persistent-shell entry points.
+fn check_shell_security(username: Option<&str>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use crate::unix_user;
+
+        let is_root = unix_user::is_running_as_root();
+
+        if is_root && username.is_none() {
+            bail!(
+                "hop host is running as root but this peer has no bound username — \
+                 refusing to grant a root shell. Re-invite this peer with \
+                 `hop invite --user <username>` to bind them to a specific account."
+            );
+        }
+
+        if let Some(name) = username {
+            unix_user::validate_username(name)?;
+
+            if !is_root {
+                bail!(
+                    "peer is bound to user '{name}' but hop host is not running as root — \
+                     restart with `sudo hop host` to enable per-user shell sessions."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read initial WindowSize and SetEnv setup messages from the client (up to 2s timeout each).
+async fn read_setup_messages(
+    recv: &mut RecvStream,
+) -> (PtySize, HashMap<String, String>, Option<ClientMessage>) {
+    let mut initial_size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut env_vars = HashMap::new();
+    let mut leftover_msg: Option<ClientMessage> = None;
+
+    for _ in 0..2 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            proto::read_message::<ClientMessage>(recv),
+        )
+        .await
+        {
+            Ok(Ok(ClientMessage::WindowSize {
+                cols,
+                rows,
+                pixel_width,
+                pixel_height,
+            })) => {
+                initial_size.cols = cols;
+                initial_size.rows = rows;
+                initial_size.pixel_width = pixel_width;
+                initial_size.pixel_height = pixel_height;
+            }
+            Ok(Ok(ClientMessage::SetEnv { vars })) => {
+                env_vars = vars;
+            }
+            Ok(Ok(other)) => {
+                leftover_msg = Some(other);
+                break;
+            }
+            Ok(Err(_)) | Err(_) => {
+                break;
+            }
+        }
+    }
+
+    (initial_size, env_vars, leftover_msg)
+}
+
+/// Spawn a new PTY session with all persistent infrastructure.
+///
+/// The PTY master lives in a background task that handles resize commands
+/// and keeps the PTY alive. Dropping the returned channels causes the
+/// background tasks to exit and the PTY to close (SIGHUP to the shell).
+fn spawn_persistent_pty(
+    username: Option<&str>,
+    size: PtySize,
+    env_vars: &HashMap<String, String>,
+) -> Result<(
+    String,                                          // session_id
+    mpsc::Sender<Vec<u8>>,                           // input_tx
+    watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,    // output_route
+    mpsc::Sender<PtySize>,                           // resize_tx
+    watch::Receiver<Option<i32>>,                     // exit_rx
+)> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(size).context("Failed to open PTY")?;
+
+    let mut cmd = if let Some(user) = username {
+        #[cfg(target_os = "macos")]
+        {
+            let mut c = CommandBuilder::new("login");
+            c.args(["-fp", user]);
+            c
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mut c = CommandBuilder::new("su");
+            c.args(["-", user]);
+            c
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = user;
+            anyhow::bail!("Per-user shell sessions are only supported on Unix");
+        }
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut c = CommandBuilder::new(&shell);
+        c.arg("-l");
+        c
+    };
+
+    const ENV_ALLOWLIST: &[&str] = &[
+        "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
+        "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "COLORTERM",
+    ];
+    for key in ENV_ALLOWLIST {
+        if let Some(val) = env_vars.get(*key) {
+            cmd.env(key, val);
+        }
+    }
+    if !env_vars.contains_key("TERM") {
+        cmd.env("TERM", "xterm-256color");
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("Failed to spawn shell")?;
+    drop(pair.slave);
+
+    let pty_writer = pair.master.take_writer().context("take PTY writer")?;
+    let pty_writer = Arc::new(std::sync::Mutex::new(pty_writer));
+
+    // Output routing via watch channel
+    let (output_route_tx, output_route_rx) =
+        watch::channel::<Option<mpsc::Sender<Vec<u8>>>>(None);
+
+    // Persistent PTY reader — routes output based on the watch channel
+    let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+    let route_rx = output_route_rx.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pty_reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if let Some(tx) = route_rx.borrow().clone() {
+                        let _ = tx.blocking_send(data);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Input writer task
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
+    let writer_clone = pty_writer.clone();
+    tokio::task::spawn_blocking(move || {
+        while let Some(data) = input_rx.blocking_recv() {
+            if let Ok(mut w) = writer_clone.lock() {
+                let _ = w.write_all(&data);
+                let _ = w.flush();
+            }
+        }
+    });
+
+    // Resize task — owns the PTY master, keeping it alive
+    let (resize_tx, mut resize_rx) = mpsc::channel::<PtySize>(4);
+    let master = pair.master;
+    tokio::task::spawn_blocking(move || {
+        // Keep _master alive. Process resize commands until the channel closes.
+        let _master = master;
+        while let Some(size) = resize_rx.blocking_recv() {
+            let _ = _master.resize(size);
+        }
+        // _master is dropped here → PTY closes → shell gets SIGHUP
+    });
+
+    // Child exit watcher
+    let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(status) = child.wait() {
+            let code: i32 = status.exit_code().try_into().unwrap_or(1);
+            let _ = exit_tx.send(Some(code));
+        }
+    });
+
+    let session_id = session_registry::generate_session_id();
+
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx))
+}
+
+/// Run the attached I/O loop: forward PTY output to client, client input to PTY.
+///
+/// Returns `Exited(code)` if the shell exits, or `Disconnected` if the client
+/// disconnects (allowing the session to be preserved for reconnection).
+async fn run_attached_loop(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    input_tx: &mpsc::Sender<Vec<u8>>,
+    output_rx: &mut mpsc::Receiver<Vec<u8>>,
+    resize_tx: &mpsc::Sender<PtySize>,
+    exit_rx: &mut watch::Receiver<Option<i32>>,
+    leftover_msg: Option<ClientMessage>,
+) -> AttachOutcome {
+    // Process any leftover message from setup phase
+    if let Some(msg) = leftover_msg {
+        match msg {
+            ClientMessage::Input(data) => {
+                let _ = input_tx.send(data).await;
+            }
+            ClientMessage::WindowSize {
+                cols, rows, pixel_width, pixel_height,
+            } => {
+                let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height }).await;
+                let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        tokio::select! {
+            Some(data) = output_rx.recv() => {
+                if let Err(e) = proto::write_message(send, &HostMessage::Output(data)).await {
+                    tracing::debug!("Failed to send output: {e}");
+                    return AttachOutcome::Disconnected;
+                }
+            }
+            msg = proto::read_message::<ClientMessage>(recv) => {
+                match msg {
+                    Ok(ClientMessage::Input(data)) => {
+                        let _ = input_tx.send(data).await;
+                    }
+                    Ok(ClientMessage::WindowSize {
+                        cols, rows, pixel_width, pixel_height,
+                    }) => {
+                        let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height }).await;
+                        let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
+                    }
+                    Ok(_) => {
+                        tracing::warn!("Unexpected message during shell session");
+                    }
+                    Err(_) => {
+                        tracing::debug!("Client disconnected");
+                        return AttachOutcome::Disconnected;
+                    }
+                }
+            }
+            Ok(()) = exit_rx.changed() => {
+                let exit_code = { *exit_rx.borrow_and_update() };
+                if let Some(code) = exit_code {
+                    // Drain remaining output
+                    while let Ok(data) = output_rx.try_recv() {
+                        let _ = proto::write_message(send, &HostMessage::Output(data)).await;
+                    }
+                    let _ = proto::write_message(send, &HostMessage::Exit(code)).await;
+                    return AttachOutcome::Exited;
+                }
+            }
+        }
+    }
+}
+
+/// Host side: persistent shell session that survives client disconnects.
+///
+/// Uses the session registry to store/retrieve PTY sessions. On disconnect,
+/// the PTY stays alive. On reconnect with the same session_id, the client
+/// resumes the existing session.
+pub async fn host_shell_session_persistent(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    username: Option<&str>,
+    peer_id: &str,
+    requested_session_id: Option<String>,
+    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+) -> Result<()> {
+    check_shell_security(username)?;
+
+    let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut recv).await;
+
+    let key = SessionKey {
+        peer_id: peer_id.to_string(),
+        username: username.map(String::from),
+    };
+
+    // Channel for receiving routed PTY output during this attachment.
+    let (client_output_tx, mut client_output_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    let (session_id, resumed, input_tx, resize_tx, mut exit_rx) = {
+        let mut reg = registry.lock().await;
+
+        // Try to resume an existing session
+        let can_resume = if let Some(session) = reg.lookup(&key) {
+            if let Some(ref req_id) = requested_session_id {
+                req_id == &session.session_id && !session.has_exited()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if can_resume {
+            let session = reg.lookup_mut(&key).unwrap();
+            session.resize(initial_size);
+            session.attach(client_output_tx);
+
+            let sid = session.session_id.clone();
+            let itx = session.input_tx.clone();
+            let rtx = session.resize_tx.clone();
+            let erx = session.exit_rx.clone();
+            (sid, true, itx, rtx, erx)
+        } else {
+            // Remove any stale session
+            reg.remove(&key);
+
+            let (sid, itx, output_route, rtx, erx) =
+                spawn_persistent_pty(username, initial_size, &env_vars)?;
+
+            // Route output to this client
+            let _ = output_route.send(Some(client_output_tx));
+
+            let session = DetachedSession {
+                session_id: sid.clone(),
+                input_tx: itx.clone(),
+                output_route,
+                resize_tx: rtx.clone(),
+                exit_rx: erx.clone(),
+                detached_at: None,
+                attached: true,
+            };
+
+            reg.insert(key.clone(), session);
+            (sid, false, itx, rtx, erx)
+        }
+    };
+
+    // Send SessionInfo to client
+    proto::write_message(
+        &mut send,
+        &HostMessage::SessionInfo {
+            session_id: session_id.clone(),
+            resumed,
+        },
+    )
+    .await?;
+
+    tracing::info!(
+        "Shell session {} for peer {} (resumed: {})",
+        &session_id[..8],
+        peer_id,
+        resumed
+    );
+
+    // Run the attached I/O loop
+    let outcome = run_attached_loop(
+        &mut send,
+        &mut recv,
+        &input_tx,
+        &mut client_output_rx,
+        &resize_tx,
+        &mut exit_rx,
+        leftover_msg,
+    )
+    .await;
+
+    match outcome {
+        AttachOutcome::Exited => {
+            let mut reg = registry.lock().await;
+            reg.remove(&key);
+            let _ = send.finish();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                recv.read_to_end(1),
+            )
+            .await;
+        }
+        AttachOutcome::Disconnected => {
+            let mut reg = registry.lock().await;
+            reg.detach(&key);
+            tracing::info!(
+                "Session {} detached for peer {}",
+                &session_id[..8],
+                peer_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Client side: enter raw terminal mode and bridge I/O over the wire protocol.
 ///
 /// The caller owns the stdin reader and passes its receiver here so the same
@@ -409,6 +829,83 @@ pub async fn client_shell_session(
     result
 }
 
+/// Client side: V2 shell session that reads SessionInfo during setup.
+///
+/// Same as `client_shell_session` but reads the `SessionInfo` response after
+/// sending setup messages. Returns `(session_id, outcome)` so the caller can
+/// store the session ID for reconnection.
+pub async fn client_shell_session_v2(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<(Option<String>, SessionOutcome)> {
+    use crossterm::terminal;
+
+    // Send initial window size
+    let (cols, rows, pixel_width, pixel_height) = match terminal::window_size() {
+        Ok(size) => (size.columns, size.rows, size.width, size.height),
+        Err(_) => (80, 24, 0, 0),
+    };
+    proto::write_message(
+        &mut send,
+        &ClientMessage::WindowSize {
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        },
+    )
+    .await?;
+
+    // Send environment variables
+    let mut vars = HashMap::new();
+    for key in &[
+        "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
+        "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "COLORTERM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            vars.insert(key.to_string(), val);
+        }
+    }
+    vars.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
+    proto::write_message(&mut send, &ClientMessage::SetEnv { vars }).await?;
+
+    // Read SessionInfo from host
+    let session_id = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        proto::read_message::<HostMessage>(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(HostMessage::SessionInfo { session_id, resumed })) => {
+            tracing::debug!(
+                "Session {} (resumed: {})",
+                &session_id[..8.min(session_id.len())],
+                resumed
+            );
+            Some(session_id)
+        }
+        _ => {
+            // Host didn't send SessionInfo — could be old host or error.
+            // Continue without a session ID.
+            None
+        }
+    };
+
+    // Enter raw mode
+    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
+
+    let _ = terminal::disable_raw_mode();
+
+    match result {
+        Ok(outcome) => Ok((session_id, outcome)),
+        Err(e) => Err(e),
+    }
+}
+
 async fn client_shell_loop(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -455,6 +952,9 @@ async fn client_shell_loop(
                     Ok(HostMessage::WindowSizeAck) => {}
                     Ok(HostMessage::AuthResult { .. }) => {
                         tracing::warn!("Unexpected auth result during shell session");
+                    }
+                    Ok(HostMessage::SessionInfo { .. }) => {
+                        // Late SessionInfo — ignore
                     }
                     Err(_) => {
                         return Ok(SessionOutcome::Disconnected);

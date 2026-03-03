@@ -24,6 +24,11 @@ pub enum HostMessage {
     WindowSizeAck,
     /// Auth result.
     AuthResult { authorized: bool },
+    /// Session info sent in response to `RequestShellV2`.
+    SessionInfo {
+        session_id: String,
+        resumed: bool,
+    },
 }
 
 /// Messages sent from the client to the host.
@@ -47,6 +52,9 @@ pub enum ClientMessage {
     },
     /// Request a shell session (after auth).
     RequestShell,
+    /// Request a shell session with optional session persistence (after auth).
+    /// `session_id: None` = new session, `session_id: Some(id)` = resume existing.
+    RequestShellV2 { session_id: Option<String> },
     /// Request a file transfer session (after auth).
     RequestTransfer(TransferRequest),
     /// Request a remote command execution session (after auth).

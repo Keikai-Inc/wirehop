@@ -82,7 +82,10 @@ pub async fn authenticate_client(
                 Ok((AuthOutcome::Rejected, None))
             }
         }
-        ClientMessage::RequestShell | ClientMessage::RequestTransfer(_) => {
+        ClientMessage::RequestShell
+        | ClientMessage::RequestShellV2 { .. }
+        | ClientMessage::RequestTransfer(_)
+        | ClientMessage::RequestExec { .. } => {
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
                 // Update last seen
