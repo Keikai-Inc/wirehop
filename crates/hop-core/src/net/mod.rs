@@ -6,16 +6,18 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, S
 
 use crate::proto::{ALPN_V0, ALPN_V1};
 
-/// Hop's own relay, with n0's public relays as fallback.
+/// Hop's own relay server.
 const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 
-/// Build a RelayMode with our relay first, then the default n0 relays as fallback.
+/// Build a RelayMode using only our relay.
+///
+/// iroh selects its home relay by lowest latency, so including n0's public
+/// relays causes our relay to be ignored.  Using only our relay guarantees
+/// hop traffic flows through infrastructure we control.  If the relay is
+/// unreachable, iroh still falls back to discovery-based direct connections.
 fn hop_relay_mode() -> RelayMode {
     let hop_relay: RelayUrl = HOP_RELAY_URL.parse().expect("valid relay URL");
-    let default_map = RelayMode::Default.relay_map();
-    let mut urls: Vec<RelayUrl> = vec![hop_relay];
-    urls.extend(default_map.urls::<Vec<RelayUrl>>());
-    RelayMode::custom(urls)
+    RelayMode::custom([hop_relay])
 }
 
 /// Create an iroh endpoint configured for hosting (accepting connections).
