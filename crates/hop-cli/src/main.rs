@@ -489,21 +489,12 @@ async fn cmd_connect(
 ) -> Result<()> {
     let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    // First connect: use RequestShellV2 with no session_id (new session).
-    // If the host doesn't understand V2 (old host), fall back to RequestShell.
-    let v2_request = ClientMessage::RequestShellV2 { session_id: None };
-    let connect_result =
-        resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &v2_request).await;
-
-    let (mut resolved, _conn, first_send, first_recv, use_v2) = match connect_result {
-        Ok((resolved, conn, send, recv)) => (resolved, conn, send, recv, true),
-        Err(_) => {
-            // V2 might have failed because of an old host — fall back to V1
-            let (resolved, conn, send, recv) =
-                resolve_and_initial_connect(&endpoint, target, config_dir, cli_name, &ClientMessage::RequestShell).await?;
-            (resolved, conn, send, recv, false)
-        }
-    };
+    // Always use RequestShellV2 — supports session persistence.
+    let (mut resolved, _conn, first_send, first_recv) =
+        resolve_and_initial_connect(
+            &endpoint, target, config_dir, cli_name,
+            &ClientMessage::RequestShellV2 { session_id: None },
+        ).await?;
 
     // Refresh relay URL
     if resolved.relay_url.is_some() {
@@ -521,14 +512,8 @@ async fn cmd_connect(
     let mut stdin_rx = spawn_stdin_reader();
 
     // Run the first shell session
-    let (mut session_id, mut outcome) = if use_v2 {
-        let (sid, out) =
-            shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx).await?;
-        (sid, out)
-    } else {
-        let out = shell::client_shell_session(first_send, first_recv, &mut stdin_rx).await?;
-        (None, out)
-    };
+    let (mut session_id, mut outcome) =
+        shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx).await?;
 
     // Reconnection loop
     loop {
@@ -547,25 +532,17 @@ async fn cmd_connect(
                 {
                     reconnect::ReconnectAction::Reconnected(conn) => {
                         let (mut send, recv) = conn.open_bi().await?;
-
-                        if use_v2 {
-                            // Resume with the session ID from the previous session
-                            proto::write_message(
-                                &mut send,
-                                &ClientMessage::RequestShellV2 {
-                                    session_id: session_id.clone(),
-                                },
-                            )
-                            .await?;
-                            let (new_sid, out) =
-                                shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
-                            session_id = new_sid;
-                            outcome = out;
-                        } else {
-                            proto::write_message(&mut send, &ClientMessage::RequestShell).await?;
-                            outcome =
-                                shell::client_shell_session(send, recv, &mut stdin_rx).await?;
-                        }
+                        proto::write_message(
+                            &mut send,
+                            &ClientMessage::RequestShellV2 {
+                                session_id: session_id.clone(),
+                            },
+                        )
+                        .await?;
+                        let (new_sid, out) =
+                            shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
+                        session_id = new_sid;
+                        outcome = out;
                     }
                     reconnect::ReconnectAction::Quit => {
                         std::process::exit(1);

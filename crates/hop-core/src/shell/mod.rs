@@ -650,7 +650,7 @@ pub async fn host_shell_session_persistent(
     mut recv: RecvStream,
     username: Option<&str>,
     peer_id: &str,
-    requested_session_id: Option<String>,
+    _requested_session_id: Option<String>,
     registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
 ) -> Result<()> {
     check_shell_security(username)?;
@@ -668,16 +668,14 @@ pub async fn host_shell_session_persistent(
     let (session_id, resumed, input_tx, resize_tx, mut exit_rx) = {
         let mut reg = registry.lock().await;
 
-        // Try to resume an existing session
-        let can_resume = if let Some(session) = reg.lookup(&key) {
-            if let Some(ref req_id) = requested_session_id {
-                req_id == &session.session_id && !session.has_exited()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Try to resume: if a session exists for this key, is alive, and
+        // not currently attached by another connection, take it over.
+        // We match on the key alone (not session_id) because there's only
+        // one session per (peer_id, username) pair.
+        let can_resume = reg
+            .lookup(&key)
+            .map(|s| !s.has_exited() && !s.attached)
+            .unwrap_or(false);
 
         if can_resume {
             let session = reg.lookup_mut(&key).unwrap();
@@ -690,8 +688,14 @@ pub async fn host_shell_session_persistent(
             let erx = session.exit_rx.clone();
             (sid, true, itx, rtx, erx)
         } else {
-            // Remove any stale session
-            reg.remove(&key);
+            // Remove stale/exited session, but don't evict an attached one —
+            // let the other connection's I/O loop detect the disconnect naturally.
+            if reg.lookup(&key).map(|s| s.attached).unwrap_or(false) {
+                tracing::debug!("Session for {:?} still attached, not evicting", key);
+            }
+            if !reg.lookup(&key).map(|s| s.attached).unwrap_or(false) {
+                reg.remove(&key);
+            }
 
             let (sid, itx, output_route, rtx, erx) =
                 spawn_persistent_pty(username, initial_size, &env_vars)?;
@@ -709,7 +713,10 @@ pub async fn host_shell_session_persistent(
                 attached: true,
             };
 
-            reg.insert(key.clone(), session);
+            // Only insert if no attached session exists (avoid eviction)
+            if reg.lookup(&key).is_none() {
+                reg.insert(key.clone(), session);
+            }
             (sid, false, itx, rtx, erx)
         }
     };
