@@ -2,9 +2,21 @@
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
 use crate::proto::{ALPN_V0, ALPN_V1};
+
+/// Hop's own relay, with n0's public relays as fallback.
+const HOP_RELAY_URL: &str = "https://relay.keik.ai";
+
+/// Build a RelayMode with our relay first, then the default n0 relays as fallback.
+fn hop_relay_mode() -> RelayMode {
+    let hop_relay: RelayUrl = HOP_RELAY_URL.parse().expect("valid relay URL");
+    let default_map = RelayMode::Default.relay_map();
+    let mut urls: Vec<RelayUrl> = vec![hop_relay];
+    urls.extend(default_map.urls::<Vec<RelayUrl>>());
+    RelayMode::custom(urls)
+}
 
 /// Create an iroh endpoint configured for hosting (accepting connections).
 ///
@@ -13,6 +25,7 @@ use crate::proto::{ALPN_V0, ALPN_V1};
 pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
+        .relay_mode(hop_relay_mode())
         .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
@@ -30,6 +43,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
+        .relay_mode(hop_relay_mode())
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
