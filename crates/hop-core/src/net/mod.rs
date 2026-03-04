@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2};
 
@@ -70,29 +70,28 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 
 /// Connect to a remote host by their PublicKey, optionally with a relay URL hint.
 ///
-/// Uses a single `endpoint.connect()` with the relay hint. iroh handles
-/// discovery internally — it will use the relay for immediate connectivity
-/// while also discovering direct paths in the background. This avoids
-/// racing two connections to the same host (which causes spurious QUIC
-/// CLOSE frames and "aborted by peer" errors on the host).
+/// Uses iroh's discovery (DNS/pkarr) to find the host's address info,
+/// which includes relay URLs and direct addresses. This is more reliable
+/// than providing an explicit relay hint, as discovery returns the host's
+/// actual published address including any direct paths.
 pub async fn connect_to_host(
     endpoint: &Endpoint,
     remote_id: PublicKey,
-    relay_url: Option<&RelayUrl>,
+    _relay_url: Option<&RelayUrl>,
 ) -> Result<(Connection, bool)> {
-    let relay_url_owned = relay_url
-        .cloned()
-        .unwrap_or_else(|| HOP_RELAY_URL.parse().expect("valid relay URL"));
+    // Let iroh discover the host's address via DNS/pkarr.
+    // The host publishes its relay URL and direct addresses to iroh.link,
+    // so discovery will find the correct path automatically.
+    let addr = EndpointAddr::from(remote_id);
 
-    let addr = EndpointAddr::from_parts(
-        remote_id,
-        [TransportAddr::Relay(relay_url_owned)],
-    );
+    tracing::info!("Connecting to {} via discovery", remote_id.fmt_short());
 
     let conn = endpoint
         .connect(addr, ALPN_V2)
         .await
         .context("Failed to connect to host")?;
+
+    tracing::info!("Connected to {}", remote_id.fmt_short());
 
     Ok((conn, false))
 }

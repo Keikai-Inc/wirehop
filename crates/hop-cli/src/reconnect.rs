@@ -1,36 +1,41 @@
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use iroh::endpoint::Connection;
-use iroh::{Endpoint, PublicKey, RelayUrl};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-use hop_core::net;
+use hop_core::proto::{self, ClientMessage};
+
+use crate::mux::{self, ResolvedHost};
 
 /// Result of the reconnection TUI flow.
 pub enum ReconnectAction {
-    /// Successfully reconnected — contains the new connection.
-    Reconnected(Connection),
+    /// Successfully reconnected via agent — contains IPC stream halves.
+    ReconnectedViaAgent {
+        send: OwnedWriteHalf,
+        recv: OwnedReadHalf,
+        new_session_id: Option<String>,
+    },
     /// User chose to quit.
     Quit,
 }
 
-/// Show a reconnection TUI and attempt to reconnect with exponential backoff.
+/// Show a reconnection TUI that reconnects through the agent process.
 ///
-/// Reads from `stdin_rx` to detect quit keypresses (`q` or Ctrl+C).
-/// On success returns `Reconnected(conn)`, on user quit returns `Quit`.
-pub async fn show_reconnect_tui(
-    endpoint: &Endpoint,
-    host_id: PublicKey,
-    relay_url: Option<&RelayUrl>,
+/// On success returns `ReconnectedViaAgent` with the IPC stream halves and
+/// the new session_id from the host. On user quit returns `Quit`.
+pub async fn show_reconnect_tui_via_agent(
+    config_dir: &Path,
+    resolved: &ResolvedHost,
+    old_session_id: Option<&String>,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> ReconnectAction {
-    // Enter alternate screen so the TUI doesn't mess up the shell scrollback
     let mut stdout = io::stdout();
     let _ = stdout.execute(EnterAlternateScreen);
     let _ = terminal::enable_raw_mode();
@@ -50,22 +55,14 @@ pub async fn show_reconnect_tui(
         loop {
             let elapsed_in_countdown = countdown_start.elapsed().as_secs_f64();
             let remaining = (backoff as f64 - elapsed_in_countdown).max(0.0);
-
             let elapsed_total = start.elapsed().as_secs();
 
-            render_frame(
-                &mut term,
-                attempt,
-                elapsed_total,
-                remaining.ceil() as u64,
-                false,
-            );
+            render_frame(&mut term, attempt, elapsed_total, remaining.ceil() as u64, false);
 
             if remaining <= 0.0 {
                 break;
             }
 
-            // Poll stdin for quit keys (check every 250ms)
             if let Some(action) = poll_quit(stdin_rx) {
                 cleanup(&mut stdout);
                 return action;
@@ -76,24 +73,46 @@ pub async fn show_reconnect_tui(
         let elapsed_total = start.elapsed().as_secs();
         render_frame(&mut term, attempt, elapsed_total, 0, true);
 
-        // Try to connect with a 10-second timeout
-        let connect_result = tokio::time::timeout(
-            Duration::from_secs(10),
-            async { net::connect_to_host(endpoint, host_id, relay_url).await.map(|(conn, _)| conn) },
-        )
+        let session_request = ClientMessage::RequestShellV2 {
+            session_id: old_session_id.cloned(),
+        };
+
+        let connect_result = tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut send, mut recv) = mux::open_agent_stream_pub(
+                config_dir,
+                &resolved.host_id,
+                resolved.relay_url.as_ref().map(|u| u.to_string()),
+            )
+            .await?;
+
+            proto::write_message(&mut send, &session_request).await?;
+
+            // Read the HostMessage to get the new session_id
+            let response: hop_core::proto::HostMessage =
+                proto::read_message(&mut recv).await?;
+            let new_session_id = match response {
+                hop_core::proto::HostMessage::SessionInfo { session_id, .. } => Some(session_id),
+                _ => None,
+            };
+
+            Ok::<_, anyhow::Error>((send, recv, new_session_id))
+        })
         .await;
 
         match connect_result {
-            Ok(Ok(conn)) => {
+            Ok(Ok((send, recv, new_session_id))) => {
                 cleanup(&mut stdout);
-                return ReconnectAction::Reconnected(conn);
+                return ReconnectAction::ReconnectedViaAgent {
+                    send,
+                    recv,
+                    new_session_id,
+                };
             }
             _ => {
                 // Connection failed or timed out — try again
             }
         }
 
-        // Check for quit one more time after failed attempt
         if let Some(action) = poll_quit(stdin_rx) {
             cleanup(&mut stdout);
             return action;

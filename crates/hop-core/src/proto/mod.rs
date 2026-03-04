@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::PeerRole;
 
@@ -427,8 +427,11 @@ pub enum DeltaOperation {
     Literal(Vec<u8>),
 }
 
-/// Write a length-prefixed bincode frame to a QUIC send stream.
-pub async fn write_message<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
+/// Write a length-prefixed bincode frame to a stream.
+pub async fn write_message<T: Serialize>(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    msg: &T,
+) -> Result<()> {
     let payload =
         bincode::serde::encode_to_vec(msg, bincode::config::standard()).context("encode failed")?;
     let len = (payload.len() as u32).to_be_bytes();
@@ -443,8 +446,10 @@ pub async fn write_message<T: Serialize>(stream: &mut SendStream, msg: &T) -> Re
     Ok(())
 }
 
-/// Read a length-prefixed bincode frame from a QUIC recv stream.
-pub async fn read_message<T: for<'de> Deserialize<'de>>(stream: &mut RecvStream) -> Result<T> {
+/// Read a length-prefixed bincode frame from a stream.
+pub async fn read_message<T: for<'de> Deserialize<'de>>(
+    stream: &mut (impl AsyncReadExt + Unpin),
+) -> Result<T> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)

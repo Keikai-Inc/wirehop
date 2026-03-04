@@ -126,9 +126,31 @@ pub enum Command {
     /// Print this node's identity (NodeId)
     Id,
 
+    /// Manage the connection multiplexer agent
+    Agent {
+        #[command(subcommand)]
+        action: Option<AgentAction>,
+
+        /// Start agent in daemon mode (background)
+        #[arg(long)]
+        daemon: bool,
+
+        /// Override config directory
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Stop the running agent
+    Stop,
+    /// Check agent status
+    Status,
 }
 
 #[derive(Subcommand)]

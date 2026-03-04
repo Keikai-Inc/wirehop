@@ -842,8 +842,8 @@ pub async fn client_shell_session(
 /// sending setup messages. Returns `(session_id, outcome)` so the caller can
 /// store the session ID for reconnection.
 pub async fn client_shell_session_v2(
-    mut send: SendStream,
-    mut recv: RecvStream,
+    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(Option<String>, SessionOutcome)> {
     use crossterm::terminal;
@@ -914,8 +914,8 @@ pub async fn client_shell_session_v2(
 }
 
 async fn client_shell_loop(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<SessionOutcome> {
     use crossterm::terminal;
@@ -1162,8 +1162,8 @@ pub async fn host_exec_session(
 ///
 /// Does NOT enter raw terminal mode or send WindowSize/SetEnv.
 pub async fn client_exec_session(
-    mut send: SendStream,
-    mut recv: RecvStream,
+    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<SessionOutcome> {
     let mut stdout = std::io::stdout();

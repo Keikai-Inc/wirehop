@@ -1,4 +1,6 @@
+mod agent;
 mod cli;
+mod mux;
 mod progress_ui;
 mod reconnect;
 
@@ -8,9 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AdminAction, Cli, Command, ConfigAction, FleetAction, PeersAction, RoleAction};
+use cli::{AdminAction, AgentAction, Cli, Command, ConfigAction, FleetAction, PeersAction, RoleAction};
 use iroh::endpoint::{RecvStream, SendStream};
-use iroh::{Endpoint, PublicKey, RelayUrl, TransportAddr, Watcher};
+use iroh::Watcher;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -30,14 +32,18 @@ use hop_core::transfer::{self, PathSpec};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    let filter = match cli.verbose {
-        0 => "hop=info",
-        1 => "hop=debug",
-        _ => "hop=trace",
+    // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(match cli.verbose {
+            0 => "hop=info",
+            1 => "hop=debug",
+            _ => "hop=trace",
+        })
     };
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
+        .with_env_filter(filter)
         .init();
 
     match cli.command {
@@ -111,6 +117,17 @@ async fn main() -> Result<()> {
             let public_key = secret_key.public();
             println!("{public_key}");
             Ok(())
+        }
+        Command::Agent { action, daemon, config: agent_config } => {
+            let config_dir = config::ensure_config_dir(
+                agent_config.as_deref().or(cli.config.as_deref()),
+            )?;
+            match action {
+                Some(AgentAction::Stop) => agent::stop_agent(&config_dir),
+                Some(AgentAction::Status) => agent::agent_status(&config_dir),
+                None if daemon => agent::run_daemon(&config_dir).await,
+                None => agent::run_foreground(&config_dir).await,
+            }
         }
         Command::External(args) => {
             // Treat the first arg as a connect target: "hop myhost"
@@ -281,9 +298,9 @@ async fn handle_incoming(
     let protocol_version = net::negotiated_protocol_version(&conn);
     tracing::info!("Connection from: {} (protocol v{})", remote_id.fmt_short(), protocol_version);
 
+    // First bi-stream: full authentication
     let (mut send, mut recv) = conn.accept_bi().await?;
 
-    // Authenticate the client
     let (outcome, _first_msg) = auth::authenticate_client(
         &mut send,
         &mut recv,
@@ -294,18 +311,71 @@ async fn handle_incoming(
 
     let peer_id = remote_id.to_string();
 
-    match outcome {
+    let (username, role) = match outcome {
         AuthOutcome::Authorized { username, role } => {
             tracing::info!("Authorized peer {} (role: {:?})", remote_id.fmt_short(), role);
-            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version, &peer_id, &role, config_dir, registry).await?;
+            // Spawn first session
+            let conn_c = conn.clone();
+            let reg = registry.clone();
+            let u = username.clone();
+            let r = role.clone();
+            let pid = peer_id.clone();
+            let cd = config_dir.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                    tracing::error!("Session error: {e:#}");
+                }
+            });
+            (username, role)
         }
         AuthOutcome::InviteAccepted { username, role } => {
             tracing::info!("Invite accepted for {} (role: {:?}), waiting for session request", remote_id.fmt_short(), role);
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
-            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version, &peer_id, &role, config_dir, registry).await?;
+            // Spawn first session
+            let conn_c = conn.clone();
+            let reg = registry.clone();
+            let u = username.clone();
+            let r = role.clone();
+            let pid = peer_id.clone();
+            let cd = config_dir.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                    tracing::error!("Session error: {e:#}");
+                }
+            });
+            (username, role)
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
+            return Ok(());
+        }
+    };
+
+    // Additional bi-streams: already authenticated (same QUIC connection = same peer).
+    // This enables connection multiplexing — multiple sessions over one connection.
+    loop {
+        match conn.accept_bi().await {
+            Ok((send, mut recv)) => {
+                let msg: ClientMessage = match proto::read_message(&mut recv).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::debug!("Failed to read message on multiplexed stream: {e:#}");
+                        continue;
+                    }
+                };
+                let conn_c = conn.clone();
+                let reg = registry.clone();
+                let u = username.clone();
+                let r = role.clone();
+                let pid = peer_id.clone();
+                let cd = config_dir.to_path_buf();
+                tokio::spawn(async move {
+                    if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                        tracing::error!("Session error: {e:#}");
+                    }
+                });
+            }
+            Err(_) => break, // Connection closed
         }
     }
 
@@ -405,156 +475,6 @@ fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, usernam
     Ok(())
 }
 
-/// Resolved target info retained for reconnection.
-struct ResolvedHost {
-    host_id: PublicKey,
-    relay_url: Option<RelayUrl>,
-}
-
-/// Perform target resolution, initial connection, auth (if invite), and send
-/// the session request. Returns the resolved host info, the connection, and the
-/// (send, recv) pair ready for the session.
-async fn resolve_and_initial_connect(
-    endpoint: &Endpoint,
-    target: &str,
-    config_dir: &std::path::Path,
-    cli_name: Option<&str>,
-    session_request: &ClientMessage,
-) -> Result<(ResolvedHost, iroh::endpoint::Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
-    // 1. Check known_hosts for alias match
-    let hosts = KnownHostsStore::load(config_dir)?;
-    if let Some(node_id_str) = hosts.resolve_alias(target) {
-        let host_id: PublicKey = node_id_str
-            .parse()
-            .context("Invalid NodeId in known_hosts")?;
-
-        let relay_url: Option<RelayUrl> = hosts
-            .hosts
-            .iter()
-            .find(|h| h.node_id == node_id_str)
-            .and_then(|h| h.relay_url.as_deref())
-            .map(|u| u.parse())
-            .transpose()
-            .ok()
-            .flatten();
-
-        println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
-
-        let (conn, relay_failed) = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
-        let relay_url = if relay_failed { None } else { relay_url };
-        let (mut send, recv) = conn.open_bi().await?;
-        proto::write_message(&mut send, session_request).await?;
-
-        return Ok((ResolvedHost { host_id, relay_url }, conn, send, recv));
-    }
-
-    // 2. Check if invite token
-    if invite::is_invite_token(target) {
-        let token = invite::decode_invite(target)?;
-        let host_id: PublicKey = token
-            .node_id
-            .parse()
-            .context("Invalid NodeId in invite token")?;
-
-        let relay_url: Option<RelayUrl> = token
-            .relay_url
-            .as_deref()
-            .map(|u| u.parse())
-            .transpose()
-            .context("Invalid relay URL in invite token")?;
-
-        println!("Connecting to host {}...", host_id.fmt_short());
-
-        let (conn, _relay_failed) = net::connect_to_host(endpoint, host_id, relay_url.as_ref()).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-
-        proto::write_message(
-            &mut send,
-            &ClientMessage::AuthResponse {
-                secret: token.secret.as_bytes().to_vec(),
-            },
-        )
-        .await?;
-
-        let result: proto::HostMessage = proto::read_message(&mut recv).await?;
-        match result {
-            proto::HostMessage::AuthResult { authorized: true } => {
-                println!("Authorized!");
-
-                let desired_name = cli_name
-                    .map(String::from)
-                    .or(token.host_name)
-                    .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
-
-                let mut hosts = KnownHostsStore::load(config_dir)?;
-                let actual_name = hosts.add_host_dedup(
-                    &host_id,
-                    desired_name,
-                    relay_url.as_ref().map(|u| u.to_string()),
-                );
-                hosts.save(config_dir)?;
-                println!("Saved as known host: {actual_name}");
-
-                // Send session request on the same stream — the host is waiting for it
-                proto::write_message(&mut send, session_request).await?;
-
-                return Ok((ResolvedHost { host_id, relay_url }, conn, send, recv));
-            }
-            proto::HostMessage::AuthResult { authorized: false } => {
-                anyhow::bail!("Invite rejected by host (expired or already used)");
-            }
-            other => {
-                anyhow::bail!("Unexpected response from host: {other:?}");
-            }
-        }
-    }
-
-    // 3. Parse as NodeId (64-char hex)
-    let host_id: PublicKey = target
-        .parse()
-        .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
-
-    println!("Connecting to {}...", host_id.fmt_short());
-
-    let (conn, _) = net::connect_to_host(endpoint, host_id, None).await?;
-    let (mut send, recv) = conn.open_bi().await?;
-    proto::write_message(&mut send, session_request).await?;
-
-    Ok((ResolvedHost { host_id, relay_url: None }, conn, send, recv))
-}
-
-/// After a successful connection, query the remote's current relay URL and
-/// update known_hosts so future connections use the freshest relay.
-/// Returns the fresh relay URL (if any) so callers can update in-memory state.
-async fn refresh_known_host_relay(
-    endpoint: &Endpoint,
-    host_id: &PublicKey,
-    config_dir: &std::path::Path,
-) -> Option<RelayUrl> {
-    let remote_info = endpoint.remote_info(*host_id).await?;
-    let fresh_relay_str = remote_info
-        .addrs()
-        .filter_map(|a| match a.addr() {
-            TransportAddr::Relay(url) => Some(url.to_string()),
-            _ => None,
-        })
-        .next();
-    if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
-        hosts.update_relay_url(&host_id.to_string(), fresh_relay_str.clone());
-        let _ = hosts.save(config_dir);
-    }
-    let fresh_relay: Option<RelayUrl> = fresh_relay_str
-        .as_deref()
-        .map(|u| u.parse())
-        .transpose()
-        .ok()
-        .flatten();
-    if fresh_relay.is_some() {
-        tracing::debug!("Refreshed relay URL for {}", host_id.fmt_short());
-    }
-    fresh_relay
-}
-
 /// Spawn a blocking stdin reader and return the receiver half.
 fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -577,25 +497,17 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
 }
 
 async fn cmd_connect(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     target: &str,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
 ) -> Result<()> {
-    let endpoint = net::create_client_endpoint(secret_key).await?;
-
-    // Always use RequestShellV2 — supports session persistence.
-    let (mut resolved, _conn, first_send, first_recv) =
-        resolve_and_initial_connect(
-            &endpoint, target, config_dir, cli_name,
+    // Connect through the agent (avoids relay conflicts, enables multiplexing)
+    let (resolved, first_send, first_recv) =
+        mux::connect_to_host(
+            config_dir, target, cli_name,
             &ClientMessage::RequestShellV2 { session_id: None },
         ).await?;
-
-    // Always refresh relay URL from the live connection so future connects
-    // get the fast relay-hinted path even if the original invite had no relay.
-    if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
-        resolved.relay_url = Some(fresh);
-    }
 
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
@@ -611,26 +523,22 @@ async fn cmd_connect(
                 std::process::exit(code);
             }
             SessionOutcome::Disconnected => {
-                match reconnect::show_reconnect_tui(
-                    &endpoint,
-                    resolved.host_id,
-                    resolved.relay_url.as_ref(),
+                match reconnect::show_reconnect_tui_via_agent(
+                    config_dir,
+                    &resolved,
+                    session_id.as_ref(),
                     &mut stdin_rx,
                 )
                 .await
                 {
-                    reconnect::ReconnectAction::Reconnected(conn) => {
-                        let (mut send, recv) = conn.open_bi().await?;
-                        proto::write_message(
-                            &mut send,
-                            &ClientMessage::RequestShellV2 {
-                                session_id: session_id.clone(),
-                            },
-                        )
-                        .await?;
+                    reconnect::ReconnectAction::ReconnectedViaAgent {
+                        send,
+                        recv,
+                        new_session_id,
+                    } => {
                         let (new_sid, out) =
                             shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
-                        session_id = new_sid;
+                        session_id = new_sid.or(new_session_id);
                         outcome = out;
                     }
                     reconnect::ReconnectAction::Quit => {
@@ -643,24 +551,20 @@ async fn cmd_connect(
 }
 
 async fn cmd_exec(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     target: &str,
     config_dir: &std::path::Path,
     command: &[String],
 ) -> Result<()> {
     let command_str = command.join(" ");
-    let endpoint = net::create_client_endpoint(secret_key).await?;
 
-    let (resolved, _conn, send, recv) = resolve_and_initial_connect(
-        &endpoint,
-        target,
+    let (_resolved, send, recv) = mux::connect_to_host(
         config_dir,
+        target,
         None,
         &ClientMessage::RequestExec { command: command_str },
     )
     .await?;
-
-    refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
 
     let mut stdin_rx = spawn_stdin_reader();
     let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
@@ -675,7 +579,7 @@ async fn cmd_exec(
 }
 
 async fn cmd_cp(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     recursive: bool,
     paths: &[String],
@@ -701,8 +605,6 @@ async fn cmd_cp(
         anyhow::bail!("one side must be remote (use host:path notation)");
     }
 
-    let endpoint = net::create_client_endpoint(secret_key).await?;
-
     if dest_is_remote {
         // Push: local sources -> remote dest
         let (host, remote_path) = match &dest_spec {
@@ -718,7 +620,6 @@ async fn cmd_cp(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Validate local paths exist and check recursive requirement
         for p in &local_paths {
             if !p.exists() {
                 anyhow::bail!("source path does not exist: {}", p.display());
@@ -736,32 +637,21 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
-            &endpoint,
-            host,
-            config_dir,
-            None,
+        let (_resolved, mut send, mut recv) = mux::connect_to_host(
+            config_dir, host, None,
             &ClientMessage::RequestTransfer(request),
-        )
-        .await?;
+        ).await?;
 
-        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
-
-        let protocol_version = net::negotiated_protocol_version(&conn);
-        let params = if protocol_version >= 1 {
-            transfer::negotiate_client(&mut send, &mut recv).await?
-        } else {
-            transfer::negotiation::NegotiatedParams::legacy()
-        };
+        // Negotiate params (always use v2 through agent)
+        let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
         let state = progress_ui::TransferState::new(true);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_push_copy(&conn, &mut send, &mut recv, &local_paths, &state, &params).await?;
+            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        let _ = send.finish();
         eprintln!("{summary}");
     } else {
         // Pull: remote source -> local dest
@@ -787,32 +677,20 @@ async fn cmd_cp(
             dry_run: false,
         };
 
-        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
-            &endpoint,
-            host,
-            config_dir,
-            None,
+        let (_resolved, mut send, mut recv) = mux::connect_to_host(
+            config_dir, host, None,
             &ClientMessage::RequestTransfer(request),
-        )
-        .await?;
+        ).await?;
 
-        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
-
-        let protocol_version = net::negotiated_protocol_version(&conn);
-        let params = if protocol_version >= 1 {
-            transfer::negotiate_client(&mut send, &mut recv).await?
-        } else {
-            transfer::negotiation::NegotiatedParams::legacy()
-        };
+        let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
         let state = progress_ui::TransferState::new(false);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_pull_copy(&conn, &mut send, &mut recv, &local_dest, &state, &params).await?;
+            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        let _ = send.finish();
         eprintln!("{summary}");
     }
 
@@ -820,7 +698,7 @@ async fn cmd_cp(
 }
 
 async fn cmd_sync(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     delete: bool,
     dry_run: bool,
@@ -840,8 +718,6 @@ async fn cmd_sync(
     if !source_is_remote && !dest_is_remote {
         anyhow::bail!("one side must be remote (use host:path notation)");
     }
-
-    let endpoint = net::create_client_endpoint(secret_key).await?;
 
     if dry_run {
         eprintln!("DRY RUN \u{2014} no files will be transferred");
@@ -870,33 +746,21 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
-            &endpoint,
-            host,
-            config_dir,
-            None,
+        let (_resolved, mut send, mut recv) = mux::connect_to_host(
+            config_dir, host, None,
             &ClientMessage::RequestTransfer(request.clone()),
-        )
-        .await?;
+        ).await?;
 
-        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
-
-        let protocol_version = net::negotiated_protocol_version(&conn);
-        let params = if protocol_version >= 1 {
-            transfer::negotiate_client(&mut send, &mut recv).await?
-        } else {
-            transfer::negotiation::NegotiatedParams::legacy()
-        };
+        let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
         let state = progress_ui::TransferState::new(true);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_push_sync(&conn, &mut send, &mut recv, &local_dir, &request, &state, &params)
+            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &state, &params)
                 .await?;
         state.mark_finished();
         let _ = render_handle.await;
-        let _ = send.finish();
         eprintln!("{summary}");
     } else {
         // Pull sync: remote -> local
@@ -917,33 +781,21 @@ async fn cmd_sync(
             dry_run,
         };
 
-        let (resolved, conn, mut send, mut recv) = resolve_and_initial_connect(
-            &endpoint,
-            host,
-            config_dir,
-            None,
+        let (_resolved, mut send, mut recv) = mux::connect_to_host(
+            config_dir, host, None,
             &ClientMessage::RequestTransfer(request.clone()),
-        )
-        .await?;
+        ).await?;
 
-        refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await;
-
-        let protocol_version = net::negotiated_protocol_version(&conn);
-        let params = if protocol_version >= 1 {
-            transfer::negotiate_client(&mut send, &mut recv).await?
-        } else {
-            transfer::negotiation::NegotiatedParams::legacy()
-        };
+        let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
         let state = progress_ui::TransferState::new(false);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_pull_sync(&conn, &mut send, &mut recv, &local_dir, &request, &state, &params)
+            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &state, &params)
                 .await?;
         state.mark_finished();
         let _ = render_handle.await;
-        let _ = send.finish();
         eprintln!("{summary}");
     }
 
@@ -970,13 +822,11 @@ fn cmd_creator_invite(config_dir: &std::path::Path) -> Result<()> {
 }
 
 async fn cmd_admin(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     target: &str,
     config_dir: &std::path::Path,
     action: AdminAction,
 ) -> Result<()> {
-    let endpoint = net::create_client_endpoint(secret_key).await?;
-
     let request = match &action {
         AdminAction::Invite { user, creator } => AdminRequest::CreateInvite {
             username: user.clone(),
@@ -1061,10 +911,9 @@ async fn cmd_admin(
     };
 
     // Connect and send admin request
-    let (_resolved, _conn, _send, mut recv) = resolve_and_initial_connect(
-        &endpoint,
-        target,
+    let (_resolved, _send, mut recv) = mux::connect_to_host(
         config_dir,
+        target,
         None,
         &ClientMessage::RequestAdmin(request),
     )
@@ -1239,7 +1088,7 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
 }
 
 async fn cmd_fleet(
-    secret_key: iroh::SecretKey,
+    _secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     action: FleetAction,
 ) -> Result<()> {
@@ -1307,27 +1156,19 @@ async fn cmd_fleet(
                 return Ok(());
             }
             let command_str = command.join(" ");
-            let endpoint = net::create_client_endpoint(secret_key).await?;
             for host in &targets {
                 println!("--- {} ({}) ---", host.name, &host.node_id[..10]);
-                let host_id: PublicKey = host.node_id.parse().context("Invalid NodeId")?;
-                let relay_url: Option<RelayUrl> = host
-                    .relay_url
-                    .as_deref()
-                    .map(|u| u.parse())
-                    .transpose()
-                    .ok()
-                    .flatten();
-                match net::connect_to_host(&endpoint, host_id, relay_url.as_ref()).await {
-                    Ok((conn, _)) => {
-                        let (mut send, recv) = conn.open_bi().await?;
-                        proto::write_message(
-                            &mut send,
-                            &ClientMessage::RequestExec {
-                                command: command_str.clone(),
-                            },
-                        )
-                        .await?;
+                match mux::connect_to_host(
+                    config_dir,
+                    &host.name,
+                    None,
+                    &ClientMessage::RequestExec {
+                        command: command_str.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok((_resolved, send, recv)) => {
                         let mut stdin_rx = spawn_stdin_reader();
                         let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
                         match outcome {

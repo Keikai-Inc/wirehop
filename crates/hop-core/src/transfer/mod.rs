@@ -386,9 +386,8 @@ async fn host_sync_send(
 /// while we continue sending files, so confirmations arrive during sending
 /// rather than in a post-send stall.
 pub async fn client_push_copy(
-    _conn: &Connection,
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_paths: &[PathBuf],
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
@@ -448,9 +447,8 @@ pub async fn client_push_copy(
 
 /// Client-side: pull files from the remote host (copy pull).
 pub async fn client_pull_copy(
-    _conn: &Connection,
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dest: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
@@ -478,9 +476,8 @@ pub async fn client_pull_copy(
 
 /// Client-side: sync-push local directory to remote host.
 pub async fn client_push_sync(
-    _conn: &Connection,
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
     request: &TransferRequest,
     progress: &dyn ProgressReporter,
@@ -582,9 +579,8 @@ pub async fn client_push_sync(
 
 /// Client-side: sync-pull from remote host to local directory.
 pub async fn client_pull_sync(
-    _conn: &Connection,
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
     _request: &TransferRequest,
     progress: &dyn ProgressReporter,
@@ -737,8 +733,8 @@ async fn negotiate_host(
 
 /// Client-side: exchange Capabilities → read host's Capabilities → read Negotiated.
 pub async fn negotiate_client(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> Result<NegotiatedParams> {
     // Read host capabilities
     let host_caps: TransferMsg = proto::read_message(recv).await?;

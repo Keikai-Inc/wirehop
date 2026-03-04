@@ -20,8 +20,8 @@ use super::progress::ProgressReporter;
 ///
 /// Returns the total bytes written.
 pub async fn receive_files(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     dest_dir: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
@@ -118,7 +118,7 @@ pub async fn receive_files(
 
 /// Read FileData chunks until FileEnd, writing to `path`.
 async fn receive_file_data(
-    recv: &mut RecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     path: &Path,
     rel_path: &str,
     total_size: u64,
@@ -176,7 +176,7 @@ async fn receive_file_data(
 /// Read acks until a Done message is received, without knowing the count up front.
 /// Returns collected error strings. Used for pipelined ack reading.
 pub async fn read_acks_until_done(
-    recv: &mut RecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<String>> {
     let mut errors = Vec::new();
@@ -440,8 +440,8 @@ pub async fn receive_parallel(
 /// For files in `delta_candidates`, sends `BlockSignatures` before expecting
 /// delta operations instead of full file data.
 pub async fn receive_files_with_delta(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     dest_dir: &Path,
     delta_candidates: &std::collections::HashSet<String>,
     files_to_send: &[crate::proto::FileEntry],
@@ -620,7 +620,7 @@ pub async fn receive_files_with_delta(
 }
 
 async fn send_ack(
-    send: &mut SendStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
     path: &str,
     success: bool,
     error: Option<String>,

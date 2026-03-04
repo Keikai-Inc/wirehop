@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, SendStream};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::proto::{self, DirEntry, FileEntry, FileHeader, TransferMsg, DEFAULT_PARALLEL_STREAMS};
@@ -22,7 +22,7 @@ use super::progress::ProgressReporter;
 ///
 /// The caller is responsible for reading `FileAck` responses (see receiver).
 pub async fn send_files(
-    send: &mut SendStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
     base_dir: &Path,
     files: &[FileEntry],
     progress: &dyn ProgressReporter,
@@ -362,8 +362,8 @@ pub async fn send_files_parallel(
 /// computes delta, and sends `DeltaHeader`/`DeltaOp`/`DeltaEnd` instead of
 /// full file data.
 pub async fn send_files_with_delta(
-    send: &mut SendStream,
-    recv: &mut RecvStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     base_dir: &Path,
     files: &[FileEntry],
     delta_candidates: &std::collections::HashSet<String>,
@@ -483,7 +483,7 @@ pub async fn send_files_with_delta(
 
 /// Send a file's data (FileHeader + FileData chunks + FileEnd).
 async fn send_file_data(
-    send: &mut SendStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
     full_path: &Path,
     entry: &FileEntry,
     progress: &dyn ProgressReporter,
@@ -556,7 +556,7 @@ async fn send_file_data(
 
 /// Send delete commands for the given paths.
 pub async fn send_deletes(
-    send: &mut SendStream,
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
     paths: &[String],
     progress: &dyn ProgressReporter,
 ) -> Result<()> {
