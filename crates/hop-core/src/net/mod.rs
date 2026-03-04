@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
-use crate::proto::{ALPN_V0, ALPN_V1};
+use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2};
 
 /// Hop's own relay server.
 const HOP_RELAY_URL: &str = "https://relay.keik.ai";
@@ -28,7 +28,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
-        .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
+        .alpns(vec![ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
@@ -42,6 +42,9 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 
 /// Create an iroh endpoint configured for connecting (client mode).
 /// Client endpoints don't need to accept connections, so no ALPNs.
+///
+/// Waits up to 5 seconds for the relay to come online. Clients can still
+/// connect via discovery if the relay is slow, so we proceed regardless.
 pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
@@ -50,7 +53,12 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .await
         .context("Failed to bind iroh endpoint")?;
 
-    endpoint.online().await;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Relay did not come online within 5s, proceeding anyway");
+    }
 
     Ok(endpoint)
 }
@@ -103,7 +111,27 @@ pub async fn connect_to_host(
         return Ok((conn, true));
     }
 
-    // No relay hint — use discovery
+    // No relay hint — default to our relay so old invites without a relay
+    // URL still get the fast path.
+    let hop_relay: RelayUrl = HOP_RELAY_URL.parse().expect("valid relay URL");
+    let addr = EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(hop_relay)]);
+
+    let relay_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        connect_with_alpn_fallback(endpoint, addr),
+    )
+    .await;
+
+    match relay_result {
+        Ok(Ok(conn)) => return Ok((conn, false)),
+        Ok(Err(e)) => {
+            tracing::info!("Default relay failed ({e:#}), falling back to discovery");
+        }
+        Err(_) => {
+            tracing::info!("Default relay timed out, falling back to discovery");
+        }
+    }
+
     let addr = EndpointAddr::from(remote_id);
     let conn = connect_with_alpn_fallback(endpoint, addr)
         .await
@@ -111,26 +139,32 @@ pub async fn connect_to_host(
     Ok((conn, false))
 }
 
-/// Try connecting with hop/1 ALPN, falling back to hop/0.
+/// Try connecting with hop/2 ALPN, falling back to hop/1, then hop/0.
 async fn connect_with_alpn_fallback(
     endpoint: &Endpoint,
     addr: EndpointAddr,
 ) -> Result<Connection> {
-    match endpoint.connect(addr.clone(), ALPN_V1).await {
+    match endpoint.connect(addr.clone(), ALPN_V2).await {
         Ok(conn) => Ok(conn),
-        Err(_) => {
-            endpoint
-                .connect(addr, ALPN_V0)
-                .await
-                .context("Failed to connect")
-        }
+        Err(_) => match endpoint.connect(addr.clone(), ALPN_V1).await {
+            Ok(conn) => Ok(conn),
+            Err(_) => {
+                endpoint
+                    .connect(addr, ALPN_V0)
+                    .await
+                    .context("Failed to connect")
+            }
+        },
     }
 }
 
 /// Return the protocol version negotiated on a connection.
-/// Returns 1 for `hop/1`, 0 for `hop/0` or anything else.
+/// Returns 2 for `hop/2`, 1 for `hop/1`, 0 for `hop/0` or anything else.
 pub fn negotiated_protocol_version(conn: &Connection) -> u8 {
-    if conn.alpn() == ALPN_V1 {
+    let alpn = conn.alpn();
+    if alpn == ALPN_V2 {
+        2
+    } else if alpn == ALPN_V1 {
         1
     } else {
         0

@@ -963,6 +963,9 @@ async fn client_shell_loop(
                     Ok(HostMessage::SessionInfo { .. }) => {
                         // Late SessionInfo — ignore
                     }
+                    Ok(HostMessage::AdminResponse(_)) => {
+                        // Unexpected admin response during shell session — ignore
+                    }
                     Err(_) => {
                         return Ok(SessionOutcome::Disconnected);
                     }

@@ -82,7 +82,19 @@ if [[ "${OS}" == "Darwin" ]]; then
   sudo installer -pkg "${TMPDIR_HOP}/${PKG_NAME}" -target /
 
   printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
-  printf "The daemon is running. Create an invite with: ${BOLD}hop invite${RESET}\n"
+  printf "The daemon is running.\n"
+
+  # Wait briefly for daemon to generate creator invite
+  sleep 2
+  CREATOR_INVITE="/Library/Application Support/hop/creator_invite"
+  if [ -f "$CREATOR_INVITE" ]; then
+    printf "\n${BOLD}=== CREATOR INVITE (expires in 1 hour) ===${RESET}\n\n"
+    TOKEN=$(cat "$CREATOR_INVITE")
+    printf "  hop connect %s\n\n" "$TOKEN"
+    printf "This grants full admin access. Re-read with: ${BOLD}hop creator-invite${RESET}\n"
+  else
+    printf "Create an invite with: ${BOLD}hop invite${RESET}\n"
+  fi
   exit 0
 fi
 
@@ -142,4 +154,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now hop
 
 printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
-printf "The daemon is running. Create an invite with: ${BOLD}hop invite${RESET}\n"
+printf "The daemon is running.\n"
+
+# Wait briefly for daemon to generate creator invite
+sleep 2
+CREATOR_INVITE="/etc/hop/creator_invite"
+if [ -f "$CREATOR_INVITE" ]; then
+    printf "\n${BOLD}=== CREATOR INVITE (expires in 1 hour) ===${RESET}\n\n"
+    TOKEN=$(cat "$CREATOR_INVITE")
+    printf "  hop connect %s\n\n" "$TOKEN"
+    printf "This grants full admin access. Re-read with: ${BOLD}hop creator-invite${RESET}\n"
+else
+    printf "Create an invite with: ${BOLD}hop invite${RESET}\n"
+fi

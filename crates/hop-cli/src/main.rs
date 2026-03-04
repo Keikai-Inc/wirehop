@@ -8,17 +8,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command, ConfigAction, PeersAction};
+use cli::{AdminAction, Cli, Command, ConfigAction, FleetAction, PeersAction, RoleAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, PublicKey, RelayUrl, TransportAddr, Watcher};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use hop_core::auth::{self, AuthOutcome};
-use hop_core::config::{self, HostConfig, KnownHostsStore, PeersStore};
+use hop_core::config::{self, HostConfig, KnownHostsStore, PeerRole, PeersStore};
 use hop_core::invite;
 use hop_core::net;
-use hop_core::proto::{self, ClientMessage, TransferDirection, TransferMode, TransferRequest};
+use hop_core::proto::{
+    self, AdminRequest, AdminResponse, ClientMessage, RoleDefinition, RoleUpdates, UserMode,
+    TransferDirection, TransferMode, TransferRequest,
+};
 use hop_core::shell::{self, SessionOutcome};
 use hop_core::shell::session_registry::SessionRegistry;
 use hop_core::transfer::{self, PathSpec};
@@ -87,6 +90,20 @@ async fn main() -> Result<()> {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
+        }
+        Command::Admin { target, action } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_admin(secret_key, &target, &config_dir, action).await
+        }
+        Command::CreatorInvite => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_creator_invite(&config_dir)
+        }
+        Command::Fleet { action } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_fleet(secret_key, &config_dir, action).await
         }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -157,6 +174,46 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 "These peers will be REJECTED until re-invited with `hop invite --user <username>`."
             );
             eprintln!();
+        }
+    }
+
+    // Generate creator invite on first startup (empty peers.json + no creator_invite file)
+    {
+        let peers = PeersStore::load(config_dir)?;
+        let creator_invite_path = config_dir.join("creator_invite");
+        if peers.peers.is_empty() && !creator_invite_path.exists() {
+            let relay_url_str = relay_url.as_ref().map(|u| u.to_string());
+            match invite::generate_invite_with_role(
+                &public_key,
+                config_dir,
+                relay_url_str.as_deref(),
+                None,
+                None,
+                PeerRole::Creator,
+                3600, // 1-hour expiry
+            ) {
+                Ok(token) => {
+                    // Write to file with restricted permissions
+                    if let Err(e) = config::write_shared_file(&creator_invite_path, &token) {
+                        tracing::warn!("Failed to write creator_invite: {e}");
+                    } else {
+                        if !quiet {
+                            println!();
+                            println!("=== CREATOR INVITE (expires in 1 hour) ===");
+                            println!();
+                            println!("  hop connect {token}");
+                            println!();
+                            println!("This grants full admin access. Use it to set up the first administrator.");
+                            println!("Re-read with: hop creator-invite");
+                            println!();
+                        }
+                        tracing::info!("Creator invite generated and saved to {}", creator_invite_path.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to generate creator invite: {e}");
+                }
+            }
         }
     }
 
@@ -238,14 +295,14 @@ async fn handle_incoming(
     let peer_id = remote_id.to_string();
 
     match outcome {
-        AuthOutcome::Authorized { username } => {
-            tracing::info!("Authorized peer {}", remote_id.fmt_short());
-            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version, &peer_id, registry).await?;
+        AuthOutcome::Authorized { username, role } => {
+            tracing::info!("Authorized peer {} (role: {:?})", remote_id.fmt_short(), role);
+            dispatch_session(_first_msg, conn, send, recv, username.as_deref(), protocol_version, &peer_id, &role, config_dir, registry).await?;
         }
-        AuthOutcome::InviteAccepted { username } => {
-            tracing::info!("Invite accepted for {}, waiting for session request", remote_id.fmt_short());
+        AuthOutcome::InviteAccepted { username, role } => {
+            tracing::info!("Invite accepted for {} (role: {:?}), waiting for session request", remote_id.fmt_short(), role);
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
-            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version, &peer_id, registry).await?;
+            dispatch_session(Some(msg), conn, send, recv, username.as_deref(), protocol_version, &peer_id, &role, config_dir, registry).await?;
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
@@ -258,11 +315,13 @@ async fn handle_incoming(
 async fn dispatch_session(
     msg: Option<ClientMessage>,
     conn: iroh::endpoint::Connection,
-    send: SendStream,
+    mut send: SendStream,
     recv: RecvStream,
     username: Option<&str>,
     protocol_version: u8,
     peer_id: &str,
+    role: &config::PeerRole,
+    config_dir: &std::path::Path,
     registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
 ) -> Result<()> {
     match msg {
@@ -281,6 +340,27 @@ async fn dispatch_session(
         Some(ClientMessage::RequestExec { command }) => {
             tracing::info!("Starting exec session: {command}");
             shell::host_exec_session(send, recv, &command, username).await?;
+        }
+        Some(ClientMessage::RequestAdmin(request)) => {
+            if *role != config::PeerRole::Creator {
+                tracing::warn!("Non-creator peer {} attempted admin request", peer_id);
+                let resp = AdminResponse::Error {
+                    message: "permission denied: creator role required".to_string(),
+                };
+                proto::write_message(&mut send, &proto::HostMessage::AdminResponse(resp)).await?;
+                return Ok(());
+            }
+            tracing::info!("Admin request from creator {}: {:?}", peer_id, request);
+            let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
+            let secret_key = config::load_identity(config_dir)?;
+            let host_public_key = secret_key.public();
+            let response = hop_core::admin::handle_admin_request(
+                request,
+                config_dir,
+                relay_url.as_deref(),
+                &host_public_key,
+            );
+            proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
         Some(other) => {
             tracing::warn!("Expected RequestShell, RequestTransfer, or RequestExec, got: {:?}", other);
@@ -511,16 +591,10 @@ async fn cmd_connect(
             &ClientMessage::RequestShellV2 { session_id: None },
         ).await?;
 
-    // Refresh relay URL
-    if resolved.relay_url.is_some() {
-        if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
-            resolved.relay_url = Some(fresh);
-        }
-    } else {
-        if let Ok(mut hosts) = KnownHostsStore::load(config_dir) {
-            hosts.update_relay_url(&resolved.host_id.to_string(), None);
-            let _ = hosts.save(config_dir);
-        }
+    // Always refresh relay URL from the live connection so future connects
+    // get the fast relay-hinted path even if the original invite had no relay.
+    if let Some(fresh) = refresh_known_host_relay(&endpoint, &resolved.host_id, config_dir).await {
+        resolved.relay_url = Some(fresh);
     }
 
     // Spawn stdin reader once — shared across reconnections
@@ -876,6 +950,408 @@ async fn cmd_sync(
     Ok(())
 }
 
+fn cmd_creator_invite(config_dir: &std::path::Path) -> Result<()> {
+    let path = config_dir.join("creator_invite");
+    if path.exists() {
+        let token = std::fs::read_to_string(&path)
+            .context("Failed to read creator_invite file")?;
+        let token = token.trim();
+        println!("Creator invite:");
+        println!();
+        println!("  hop connect {token}");
+        println!();
+        println!("This invite grants full admin (creator) access.");
+    } else {
+        println!("No creator invite found.");
+        println!("A creator invite is generated on first daemon startup when no peers exist.");
+        println!("If you already have a creator peer, no new invite is needed.");
+    }
+    Ok(())
+}
+
+async fn cmd_admin(
+    secret_key: iroh::SecretKey,
+    target: &str,
+    config_dir: &std::path::Path,
+    action: AdminAction,
+) -> Result<()> {
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+
+    let request = match &action {
+        AdminAction::Invite { user, creator } => AdminRequest::CreateInvite {
+            username: user.clone(),
+            role: if *creator { PeerRole::Creator } else { PeerRole::Peer },
+        },
+        AdminAction::Peers => AdminRequest::ListPeers,
+        AdminAction::RemovePeer { id } => AdminRequest::RemovePeer {
+            node_id_prefix: id.clone(),
+        },
+        AdminAction::CreateUser {
+            username,
+            sudo,
+            admin,
+            groups,
+            shell,
+            invite,
+        } => AdminRequest::CreateUser {
+            username: username.clone(),
+            sudo: *sudo,
+            admin: *admin,
+            groups: groups.clone(),
+            shell: shell.clone(),
+            invite: *invite,
+        },
+        AdminAction::Status => AdminRequest::Status,
+        AdminAction::FleetInvite { tags, max_uses, expiry } => AdminRequest::CreateFleetInvite {
+            tags: tags.clone(),
+            max_uses: *max_uses,
+            expiry_secs: *expiry,
+        },
+        AdminAction::FleetList { tag } => AdminRequest::ListFleet {
+            tag_filter: tag.clone(),
+        },
+        AdminAction::FleetRemove { id } => AdminRequest::RemoveFleetMember {
+            node_id_prefix: id.clone(),
+        },
+        AdminAction::FleetTag { id, add, remove: _ } => {
+            AdminRequest::UpdateFleetTags {
+                node_id_prefix: id.clone(),
+                tags: add.clone(),
+            }
+        }
+        AdminAction::Role(role_action) => match role_action {
+            RoleAction::Create {
+                name,
+                tags,
+                shared,
+                sudo,
+                admin,
+                groups,
+                shell,
+            } => AdminRequest::CreateRole {
+                definition: RoleDefinition {
+                    name: name.clone(),
+                    host_tags: tags.clone(),
+                    user_mode: if *shared { UserMode::Shared } else { UserMode::Individual },
+                    sudo: *sudo,
+                    admin: *admin,
+                    groups: groups.clone(),
+                    shell: shell.clone(),
+                },
+            },
+            RoleAction::List => AdminRequest::ListRoles,
+            RoleAction::Update {
+                name,
+                add_tags,
+                remove_tags,
+                sudo,
+                admin,
+            } => AdminRequest::UpdateRole {
+                name: name.clone(),
+                updates: RoleUpdates {
+                    add_tags: add_tags.clone(),
+                    remove_tags: remove_tags.clone(),
+                    sudo: *sudo,
+                    admin: *admin,
+                    ..Default::default()
+                },
+            },
+            RoleAction::Delete { name } => AdminRequest::DeleteRole { name: name.clone() },
+        },
+    };
+
+    // Connect and send admin request
+    let (_resolved, _conn, _send, mut recv) = resolve_and_initial_connect(
+        &endpoint,
+        target,
+        config_dir,
+        None,
+        &ClientMessage::RequestAdmin(request),
+    )
+    .await?;
+
+    // Read admin response
+    let response: proto::HostMessage = proto::read_message(&mut recv).await?;
+    match response {
+        proto::HostMessage::AdminResponse(resp) => {
+            display_admin_response(&action, resp);
+        }
+        other => {
+            eprintln!("Unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
+fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
+    match resp {
+        AdminResponse::InviteCreated { token } => {
+            println!("Invite created:");
+            println!();
+            println!("  hop connect {token}");
+            println!();
+        }
+        AdminResponse::PeerList { peers } => {
+            if peers.is_empty() {
+                println!("No authorized peers.");
+            } else {
+                println!("Authorized peers:");
+                for p in &peers {
+                    let role = match p.role {
+                        PeerRole::Creator => " [creator]",
+                        PeerRole::Peer => "",
+                    };
+                    let user = p
+                        .username
+                        .as_deref()
+                        .map(|u| format!(", user: {u}"))
+                        .unwrap_or_default();
+                    let seen = p
+                        .last_seen
+                        .as_deref()
+                        .unwrap_or("never");
+                    println!(
+                        "  {} ({}){} - last seen: {}{user}",
+                        &p.node_id[..10],
+                        p.name,
+                        role,
+                        seen,
+                    );
+                }
+            }
+        }
+        AdminResponse::PeerRemoved { success } => {
+            if success {
+                println!("Peer removed.");
+            } else {
+                println!("No peer found with that ID prefix.");
+            }
+        }
+        AdminResponse::UserCreated {
+            username,
+            invite_token,
+        } => {
+            println!("User '{username}' created.");
+            if let Some(token) = invite_token {
+                println!();
+                println!("Invite for {username}:");
+                println!("  hop connect {token}");
+            }
+        }
+        AdminResponse::HostStatus {
+            version,
+            peer_count,
+            active_sessions,
+        } => {
+            println!("Host status:");
+            println!("  Version: {version}");
+            println!("  Peers: {peer_count}");
+            println!("  Active sessions: {active_sessions}");
+        }
+        AdminResponse::FleetInviteCreated { token } => {
+            println!("Fleet invite created:");
+            println!("  {token}");
+        }
+        AdminResponse::FleetList { members } => {
+            if members.is_empty() {
+                println!("No fleet members.");
+            } else {
+                println!("Fleet members:");
+                for m in &members {
+                    let status = if m.online { "online" } else { "offline" };
+                    let tags = m.tags.join(", ");
+                    println!(
+                        "  {} ({}) [{}] - tags: {tags}",
+                        &m.node_id[..10],
+                        m.hostname,
+                        status,
+                    );
+                }
+            }
+        }
+        AdminResponse::FleetMemberRemoved { success } => {
+            if success {
+                println!("Fleet member removed.");
+            } else {
+                println!("No fleet member found with that ID prefix.");
+            }
+        }
+        AdminResponse::FleetTagsUpdated { success } => {
+            if success {
+                println!("Fleet member tags updated.");
+            } else {
+                println!("No fleet member found with that ID prefix.");
+            }
+        }
+        AdminResponse::RoleCreated { name } => {
+            println!("Role '{name}' created.");
+        }
+        AdminResponse::RoleList { roles } => {
+            if roles.is_empty() {
+                println!("No roles defined.");
+            } else {
+                println!("Roles:");
+                for r in &roles {
+                    let mode = match r.user_mode {
+                        UserMode::Individual => "individual",
+                        UserMode::Shared => "shared",
+                    };
+                    let tags = r.host_tags.join(", ");
+                    let mut flags = Vec::new();
+                    if r.sudo {
+                        flags.push("sudo");
+                    }
+                    if r.admin {
+                        flags.push("admin");
+                    }
+                    let flags_str = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", flags.join(", "))
+                    };
+                    println!("  {} ({mode}) - tags: {tags}{flags_str}", r.name);
+                }
+            }
+        }
+        AdminResponse::RoleUpdated { name } => {
+            println!("Role '{name}' updated.");
+        }
+        AdminResponse::RoleDeleted { name } => {
+            println!("Role '{name}' deleted.");
+        }
+        AdminResponse::AggregateInviteCreated { token } => {
+            println!("Aggregate invite created:");
+            println!();
+            println!("  hop connect {token}");
+            println!();
+        }
+        AdminResponse::AggregateInviteRedeemed { hosts } => {
+            println!("Redeemed aggregate invite. {} host(s) available:", hosts.len());
+            for h in &hosts {
+                println!("  {} ({})", h.hostname, &h.node_id[..10]);
+            }
+        }
+        AdminResponse::Error { message } => {
+            eprintln!("Error: {message}");
+        }
+    }
+}
+
+async fn cmd_fleet(
+    secret_key: iroh::SecretKey,
+    config_dir: &std::path::Path,
+    action: FleetAction,
+) -> Result<()> {
+    match action {
+        FleetAction::Status { fleet } => {
+            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            let store = hop_core::fleet::FleetRegistrationsStore::load(&host_config_dir)?;
+            if store.registrations.is_empty() {
+                println!("Not registered with any fleet.");
+                return Ok(());
+            }
+            let reg = if let Some(name) = fleet {
+                store
+                    .registrations
+                    .iter()
+                    .find(|r| r.name == name)
+                    .context(format!("No fleet registration named '{name}'"))?
+            } else {
+                &store.registrations[0]
+            };
+            println!("Fleet: {}", reg.name);
+            println!("  Orchestrator: {}", &reg.orchestrator_node_id[..10]);
+            println!("  Tags: {}", reg.tags.join(", "));
+            println!("  Registered: {}", reg.registered_at);
+            if let Some(ref url) = reg.orchestrator_relay_url {
+                println!("  Orchestrator relay: {url}");
+            }
+            Ok(())
+        }
+        FleetAction::List { group } => {
+            let hosts = KnownHostsStore::load(config_dir)?;
+            let filtered: Vec<_> = hosts
+                .hosts
+                .iter()
+                .filter(|h| {
+                    group
+                        .as_ref()
+                        .map(|g| h.groups.contains(g))
+                        .unwrap_or(true)
+                })
+                .collect();
+            if filtered.is_empty() {
+                println!("No hosts found.");
+            } else {
+                for h in &filtered {
+                    let groups = if h.groups.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", h.groups.join(", "))
+                    };
+                    println!("  {} ({}){groups}", &h.node_id[..10], h.name);
+                }
+            }
+            Ok(())
+        }
+        FleetAction::Exec { group, command } => {
+            let hosts = KnownHostsStore::load(config_dir)?;
+            let targets: Vec<_> = hosts
+                .hosts
+                .iter()
+                .filter(|h| h.groups.contains(&group))
+                .collect();
+            if targets.is_empty() {
+                println!("No hosts in group '{group}'.");
+                return Ok(());
+            }
+            let command_str = command.join(" ");
+            let endpoint = net::create_client_endpoint(secret_key).await?;
+            for host in &targets {
+                println!("--- {} ({}) ---", host.name, &host.node_id[..10]);
+                let host_id: PublicKey = host.node_id.parse().context("Invalid NodeId")?;
+                let relay_url: Option<RelayUrl> = host
+                    .relay_url
+                    .as_deref()
+                    .map(|u| u.parse())
+                    .transpose()
+                    .ok()
+                    .flatten();
+                match net::connect_to_host(&endpoint, host_id, relay_url.as_ref()).await {
+                    Ok((conn, _)) => {
+                        let (mut send, recv) = conn.open_bi().await?;
+                        proto::write_message(
+                            &mut send,
+                            &ClientMessage::RequestExec {
+                                command: command_str.clone(),
+                            },
+                        )
+                        .await?;
+                        let mut stdin_rx = spawn_stdin_reader();
+                        let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
+                        match outcome {
+                            SessionOutcome::Exited(code) => {
+                                if code != 0 {
+                                    eprintln!("Exit code: {code}");
+                                }
+                            }
+                            SessionOutcome::Disconnected => {
+                                eprintln!("Connection lost");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to connect: {e:#}");
+                    }
+                }
+                println!();
+            }
+            Ok(())
+        }
+    }
+}
+
 fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Result<()> {
     let mut cfg = HostConfig::load(config_dir)?;
 
@@ -954,8 +1430,12 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
                         .as_deref()
                         .map(|u| format!(", user: {u}"))
                         .unwrap_or_default();
+                    let role_info = match peer.role {
+                        PeerRole::Creator => " [creator]",
+                        PeerRole::Peer => "",
+                    };
                     println!(
-                        "  {} ({}) - authorized: {}, last seen: {}{user_info}",
+                        "  {} ({}){role_info} - authorized: {}, last seen: {}{user_info}",
                         &peer.node_id[..10],
                         peer.name,
                         peer.authorized_at,

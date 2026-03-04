@@ -5,7 +5,7 @@ use iroh::PublicKey;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
-use crate::config::PeersStore;
+use crate::config::{PeerRole, PeersStore};
 use crate::invite::PendingInvitesStore;
 use crate::proto::{self, ClientMessage, HostMessage};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -21,11 +21,15 @@ pub enum AuthOutcome {
     Authorized {
         /// Unix username this peer is bound to (None = host's own user).
         username: Option<String>,
+        /// Role of this peer.
+        role: PeerRole,
     },
     /// Client was authorized via invite (newly added).
     InviteAccepted {
         /// Unix username from the invite (None = host's own user).
         username: Option<String>,
+        /// Role assigned via the invite.
+        role: PeerRole,
     },
     /// Client was rejected.
     Rejected,
@@ -64,17 +68,22 @@ pub async fn authenticate_client(
                 result
             };
 
-            if let Some(username) = consumed {
+            if let Some(consumed) = consumed {
                 // Add to authorized peers
                 let mut peers = peers;
-                peers.add_peer(remote_id, format!("peer-{}", remote_id.fmt_short()), username.clone());
+                peers.add_peer(
+                    remote_id,
+                    format!("peer-{}", remote_id.fmt_short()),
+                    consumed.username.clone(),
+                    consumed.role.clone(),
+                );
                 peers.save(config_dir)?;
 
                 // Tell client they're authorized
                 proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
 
-                tracing::info!("Invite accepted for peer {}", remote_id.fmt_short());
-                Ok((AuthOutcome::InviteAccepted { username }, None))
+                tracing::info!("Invite accepted for peer {} (role: {:?})", remote_id.fmt_short(), consumed.role);
+                Ok((AuthOutcome::InviteAccepted { username: consumed.username, role: consumed.role }, None))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;
@@ -85,14 +94,16 @@ pub async fn authenticate_client(
         ClientMessage::RequestShell
         | ClientMessage::RequestShellV2 { .. }
         | ClientMessage::RequestTransfer(_)
-        | ClientMessage::RequestExec { .. } => {
+        | ClientMessage::RequestExec { .. }
+        | ClientMessage::RequestAdmin(_) => {
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
+                let role = peers.peer_role(remote_id);
                 // Update last seen
                 let mut peers = peers;
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;
-                Ok((AuthOutcome::Authorized { username }, Some(msg)))
+                Ok((AuthOutcome::Authorized { username, role }, Some(msg)))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;

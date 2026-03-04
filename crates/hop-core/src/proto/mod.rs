@@ -4,11 +4,16 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
+use crate::config::PeerRole;
+
 /// ALPN protocol identifier for hop connections (legacy).
 pub const ALPN_V0: &[u8] = b"hop/0";
 
 /// ALPN protocol identifier for hop v1 (compression, hashing, parallel streams, delta).
 pub const ALPN_V1: &[u8] = b"hop/1";
+
+/// ALPN protocol identifier for hop v2 (admin, fleet, roles).
+pub const ALPN_V2: &[u8] = b"hop/2";
 
 /// Legacy alias — kept so existing callers that reference `ALPN` still compile.
 pub const ALPN: &[u8] = ALPN_V0;
@@ -29,6 +34,8 @@ pub enum HostMessage {
         session_id: String,
         resumed: bool,
     },
+    /// Response to an admin request (hop/2+).
+    AdminResponse(AdminResponse),
 }
 
 /// Messages sent from the client to the host.
@@ -61,6 +68,180 @@ pub enum ClientMessage {
     RequestExec { command: String },
     /// Client environment variables (TERM, LANG, LC_*, COLORTERM).
     SetEnv { vars: HashMap<String, String> },
+    /// Admin request (hop/2+). Requires creator role.
+    RequestAdmin(AdminRequest),
+}
+
+// --- Admin protocol (hop/2+) ---
+
+/// Admin requests sent by creator peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminRequest {
+    /// Create an invite on this host.
+    CreateInvite {
+        username: Option<String>,
+        role: PeerRole,
+    },
+    /// List authorized peers.
+    ListPeers,
+    /// Remove a peer by node_id prefix.
+    RemovePeer { node_id_prefix: String },
+    /// Create a Unix user on this host.
+    CreateUser {
+        username: String,
+        sudo: bool,
+        admin: bool,
+        groups: Vec<String>,
+        shell: Option<String>,
+        /// Also generate an invite for this user.
+        invite: bool,
+    },
+    /// Get host status.
+    Status,
+    // --- Fleet admin (Phase 2) ---
+    /// Create a fleet invite token.
+    CreateFleetInvite {
+        tags: Vec<String>,
+        max_uses: u32,
+        expiry_secs: u64,
+    },
+    /// List fleet members.
+    ListFleet { tag_filter: Option<String> },
+    /// Remove a fleet member.
+    RemoveFleetMember { node_id_prefix: String },
+    /// Update tags on a fleet member.
+    UpdateFleetTags {
+        node_id_prefix: String,
+        tags: Vec<String>,
+    },
+    // --- Role management (Phase 2) ---
+    /// Create a role definition.
+    CreateRole { definition: RoleDefinition },
+    /// List all role definitions.
+    ListRoles,
+    /// Update a role definition.
+    UpdateRole { name: String, updates: RoleUpdates },
+    /// Delete a role definition.
+    DeleteRole { name: String },
+    // --- Aggregate invite (Phase 3) ---
+    /// Create an aggregate invite for a role.
+    CreateAggregateInvite {
+        role: String,
+        peer_name: String,
+    },
+    /// Redeem an aggregate invite.
+    RedeemAggregateInvite { secret: String },
+}
+
+/// Admin responses sent by the host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminResponse {
+    /// An invite was created.
+    InviteCreated { token: String },
+    /// List of authorized peers.
+    PeerList { peers: Vec<PeerInfo> },
+    /// A peer was removed.
+    PeerRemoved { success: bool },
+    /// A Unix user was created.
+    UserCreated {
+        username: String,
+        invite_token: Option<String>,
+    },
+    /// Host status info.
+    HostStatus {
+        version: String,
+        peer_count: usize,
+        active_sessions: usize,
+    },
+    /// Fleet invite created.
+    FleetInviteCreated { token: String },
+    /// Fleet member list.
+    FleetList { members: Vec<FleetMemberInfo> },
+    /// Fleet member removed.
+    FleetMemberRemoved { success: bool },
+    /// Fleet member tags updated.
+    FleetTagsUpdated { success: bool },
+    /// Role created.
+    RoleCreated { name: String },
+    /// Role list.
+    RoleList { roles: Vec<RoleDefinition> },
+    /// Role updated.
+    RoleUpdated { name: String },
+    /// Role deleted.
+    RoleDeleted { name: String },
+    /// Aggregate invite created.
+    AggregateInviteCreated { token: String },
+    /// Aggregate invite redeemed — list of per-host connections.
+    AggregateInviteRedeemed { hosts: Vec<RedeemHostEntry> },
+    /// Error response.
+    Error { message: String },
+}
+
+/// Summary info about an authorized peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub node_id: String,
+    pub name: String,
+    pub role: PeerRole,
+    pub username: Option<String>,
+    pub last_seen: Option<String>,
+}
+
+/// Summary info about a fleet member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetMemberInfo {
+    pub node_id: String,
+    pub hostname: String,
+    pub tags: Vec<String>,
+    pub online: bool,
+    pub last_heartbeat: Option<String>,
+}
+
+/// A role definition stored on the orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleDefinition {
+    pub name: String,
+    pub host_tags: Vec<String>,
+    #[serde(default)]
+    pub user_mode: UserMode,
+    #[serde(default)]
+    pub sudo: bool,
+    #[serde(default)]
+    pub admin: bool,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
+}
+
+/// Whether users for a role get individual or shared Unix accounts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMode {
+    #[default]
+    Individual,
+    Shared,
+}
+
+/// Partial updates for a role definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleUpdates {
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<String>,
+    pub sudo: Option<bool>,
+    pub admin: Option<bool>,
+    pub groups: Option<Vec<String>>,
+    pub shell: Option<Option<String>>,
+    pub user_mode: Option<UserMode>,
+}
+
+/// Entry returned when redeeming an aggregate invite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedeemHostEntry {
+    pub hostname: String,
+    pub node_id: String,
+    pub relay_url: Option<String>,
+    pub invite_token: String,
 }
 
 /// Chunk size for file data transfer (64 KiB).

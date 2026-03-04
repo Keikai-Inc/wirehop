@@ -65,4 +65,21 @@ else
     launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
 fi
 
+# Wait briefly for daemon to start and generate creator invite
+sleep 2
+
+# Display creator invite if available
+CREATOR_INVITE="$SYSTEM_CONFIG/creator_invite"
+if [ -f "$CREATOR_INVITE" ]; then
+    echo ""
+    echo "=== CREATOR INVITE (expires in 1 hour) ==="
+    echo ""
+    TOKEN=$(cat "$CREATOR_INVITE")
+    echo "  hop connect $TOKEN"
+    echo ""
+    echo "This grants full admin access. Use it to set up the first administrator."
+    echo "Re-read with: hop creator-invite"
+    echo ""
+fi
+
 exit 0

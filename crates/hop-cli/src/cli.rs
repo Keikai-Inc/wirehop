@@ -106,6 +106,23 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// Remote administration (requires creator role)
+    Admin {
+        /// Target host (alias, NodeId, or invite token)
+        target: String,
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+
+    /// Print the creator invite for this host (useful for headless/Docker)
+    CreatorInvite,
+
+    /// Fleet management (host-side)
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
+
     /// Print this node's identity (NodeId)
     Id,
 
@@ -122,6 +139,159 @@ pub enum ConfigAction {
         key: String,
         /// New value
         value: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AdminAction {
+    /// Create an invite on the remote host
+    Invite {
+        /// Unix username for the invited peer
+        #[arg(long)]
+        user: Option<String>,
+        /// Create a creator invite (admin access)
+        #[arg(long)]
+        creator: bool,
+    },
+    /// List authorized peers on the remote host
+    Peers,
+    /// Remove a peer from the remote host
+    RemovePeer {
+        /// NodeId prefix of the peer to remove
+        id: String,
+    },
+    /// Create a Unix user on the remote host
+    CreateUser {
+        /// Username to create
+        username: String,
+        /// Grant sudo access
+        #[arg(long)]
+        sudo: bool,
+        /// macOS admin group membership
+        #[arg(long)]
+        admin: bool,
+        /// Extra Unix groups (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Override default shell
+        #[arg(long)]
+        shell: Option<String>,
+        /// Also generate an invite for this user
+        #[arg(long)]
+        invite: bool,
+    },
+    /// Get status of the remote host
+    Status,
+    /// Create a fleet invite token (orchestrator)
+    FleetInvite {
+        /// Tags for fleet members using this invite
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Maximum number of uses (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_uses: u32,
+        /// Expiry in seconds (default: 24h)
+        #[arg(long, default_value = "86400")]
+        expiry: u64,
+    },
+    /// List fleet members (orchestrator)
+    FleetList {
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Remove a fleet member (orchestrator)
+    FleetRemove {
+        /// NodeId prefix of the member to remove
+        id: String,
+    },
+    /// Update tags on a fleet member (orchestrator)
+    FleetTag {
+        /// NodeId prefix of the member
+        id: String,
+        /// Tags to add
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        /// Tags to remove
+        #[arg(long, value_delimiter = ',')]
+        remove: Vec<String>,
+    },
+    /// Create a role definition (orchestrator)
+    #[command(subcommand)]
+    Role(RoleAction),
+}
+
+#[derive(Subcommand)]
+pub enum RoleAction {
+    /// Create a new role
+    Create {
+        /// Role name
+        name: String,
+        /// Host tags this role can access (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Use shared Unix accounts (default: individual)
+        #[arg(long)]
+        shared: bool,
+        /// Grant sudo access
+        #[arg(long)]
+        sudo: bool,
+        /// macOS admin group membership
+        #[arg(long)]
+        admin: bool,
+        /// Extra Unix groups (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Override default shell
+        #[arg(long)]
+        shell: Option<String>,
+    },
+    /// List all roles
+    List,
+    /// Update an existing role
+    Update {
+        /// Role name to update
+        name: String,
+        /// Tags to add
+        #[arg(long, value_delimiter = ',')]
+        add_tags: Vec<String>,
+        /// Tags to remove
+        #[arg(long, value_delimiter = ',')]
+        remove_tags: Vec<String>,
+        /// Set sudo access
+        #[arg(long)]
+        sudo: Option<bool>,
+        /// Set macOS admin
+        #[arg(long)]
+        admin: Option<bool>,
+    },
+    /// Delete a role
+    Delete {
+        /// Role name to delete
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FleetAction {
+    /// Show fleet registration status
+    Status {
+        /// Fleet name (required only if registered with multiple fleets)
+        #[arg(long)]
+        fleet: Option<String>,
+    },
+    /// List hosts in a fleet group
+    List {
+        /// Group/role to filter by
+        group: Option<String>,
+    },
+    /// Execute a command on all hosts in a group
+    Exec {
+        /// Group/role name
+        group: String,
+        /// Command and arguments
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
     },
 }
 

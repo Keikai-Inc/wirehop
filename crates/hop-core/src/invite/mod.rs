@@ -9,6 +9,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::config::PeerRole;
+
 /// The invite token payload, encoded as base64url JSON.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InviteToken {
@@ -25,6 +27,13 @@ pub struct InviteToken {
     /// Human-readable name for the host (e.g. system hostname).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub host_name: Option<String>,
+    /// Role assigned to the invited peer (default: Peer).
+    #[serde(default, skip_serializing_if = "is_default_peer_role")]
+    pub role: PeerRole,
+}
+
+fn is_default_peer_role(role: &PeerRole) -> bool {
+    *role == PeerRole::Peer
 }
 
 /// A pending invite stored on the host side.
@@ -37,6 +46,9 @@ pub struct PendingInvite {
     /// Unix username the invited peer will log in as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Role assigned to the invited peer (default: Peer).
+    #[serde(default)]
+    pub role: PeerRole,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -69,14 +81,8 @@ impl PendingInvitesStore {
             .retain(|inv| now.saturating_sub(inv.created_at) < max_age_secs);
     }
 
-    /// Try to consume an invite by verifying the client's secret against stored hashes.
-    /// Returns `Some(username)` if the invite was valid and has been consumed (removed),
-    /// where the inner `Option<String>` is the bound Unix username (if any).
-    /// Returns `None` if no matching invite was found.
-    ///
-    /// The client sends the raw hex-encoded secret. We hash it with Argon2 and
-    /// compare against the stored hash (the plaintext secret is never persisted).
-    pub fn try_consume(&mut self, client_secret: &[u8]) -> Option<Option<String>> {
+    /// Result of consuming an invite: username binding and role.
+    pub fn try_consume(&mut self, client_secret: &[u8]) -> Option<ConsumedInvite> {
         let client_secret_str = match std::str::from_utf8(client_secret) {
             Ok(s) => s,
             Err(_) => return None,
@@ -94,11 +100,20 @@ impl PendingInvitesStore {
 
         if let Some(idx) = idx {
             let invite = self.invites.remove(idx);
-            Some(invite.username)
+            Some(ConsumedInvite {
+                username: invite.username,
+                role: invite.role,
+            })
         } else {
             None
         }
     }
+}
+
+/// Result of consuming an invite.
+pub struct ConsumedInvite {
+    pub username: Option<String>,
+    pub role: PeerRole,
 }
 
 /// Get the system hostname via libc.
@@ -126,10 +141,36 @@ pub fn generate_invite(
     username: Option<&str>,
     host_name: Option<&str>,
 ) -> Result<String> {
-    // Validate the username early so bad values never reach storage
+    generate_invite_with_role(
+        host_public_key,
+        config_dir,
+        relay_url,
+        username,
+        host_name,
+        PeerRole::Peer,
+        15 * 60,
+    )
+}
+
+/// Generate a new invite with a specific role and configurable expiry.
+///
+/// Creator invites typically use a 1-hour expiry; regular invites use 15 minutes.
+pub fn generate_invite_with_role(
+    host_public_key: &PublicKey,
+    config_dir: &Path,
+    relay_url: Option<&str>,
+    username: Option<&str>,
+    host_name: Option<&str>,
+    role: PeerRole,
+    expiry_secs: u64,
+) -> Result<String> {
+    // Validate the username early so bad values never reach storage.
+    // Skip validation for Creator role (maps to root).
     #[cfg(unix)]
-    if let Some(name) = username {
-        crate::unix_user::validate_username(name)?;
+    if role != PeerRole::Creator {
+        if let Some(name) = username {
+            crate::unix_user::validate_username(name)?;
+        }
     }
 
     // Generate 32 bytes of random secret
@@ -138,7 +179,6 @@ pub fn generate_invite(
     let secret_hex = hex::encode(secret_bytes);
 
     // Hash the secret with Argon2 for storage
-    // Generate salt manually to avoid rand_core version mismatch with argon2
     let mut salt_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut salt_bytes);
     let salt_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(salt_bytes);
@@ -152,11 +192,12 @@ pub fn generate_invite(
 
     // Store the pending invite
     let mut store = PendingInvitesStore::load(config_dir)?;
-    store.prune_expired(15 * 60); // 15 minute expiry
+    store.prune_expired(expiry_secs);
     store.invites.push(PendingInvite {
         secret_hash,
         created_at: unix_now(),
         username: username.map(String::from),
+        role: role.clone(),
     });
     store.save(config_dir)?;
 
@@ -170,6 +211,7 @@ pub fn generate_invite(
         relay_url: relay_url.map(String::from),
         username: username.map(String::from),
         host_name: resolved_host_name,
+        role,
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -203,4 +245,176 @@ fn unix_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_token_backward_compat_without_role() {
+        // Old invite tokens have no "role" field — should default to Peer
+        let json = r#"{"node_id":"abc123","secret":"deadbeef","relay_url":null,"username":"alice"}"#;
+        let token: InviteToken = serde_json::from_str(json).unwrap();
+        assert_eq!(token.role, PeerRole::Peer);
+        assert_eq!(token.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn invite_token_with_creator_role() {
+        let json = r#"{"node_id":"abc123","secret":"deadbeef","role":"creator"}"#;
+        let token: InviteToken = serde_json::from_str(json).unwrap();
+        assert_eq!(token.role, PeerRole::Creator);
+    }
+
+    #[test]
+    fn invite_token_role_not_serialized_when_peer() {
+        let token = InviteToken {
+            node_id: "abc".into(),
+            secret: "def".into(),
+            relay_url: None,
+            username: None,
+            host_name: None,
+            role: PeerRole::Peer,
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(!json.contains("role"), "Peer role should not be serialized: {json}");
+    }
+
+    #[test]
+    fn invite_token_role_serialized_when_creator() {
+        let token = InviteToken {
+            node_id: "abc".into(),
+            secret: "def".into(),
+            relay_url: None,
+            username: None,
+            host_name: None,
+            role: PeerRole::Creator,
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(json.contains(r#""role":"creator""#), "Creator role should be serialized: {json}");
+    }
+
+    #[test]
+    fn pending_invite_backward_compat_without_role() {
+        let json = r#"{"secret_hash":"$argon2id$...","created_at":1700000000}"#;
+        let invite: PendingInvite = serde_json::from_str(json).unwrap();
+        assert_eq!(invite.role, PeerRole::Peer);
+    }
+
+    #[test]
+    fn generate_invite_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[5u8; 32]);
+        let public = key.public();
+
+        let token_str = generate_invite_with_role(
+            &public,
+            dir.path(),
+            Some("https://relay.example.com"),
+            None,
+            Some("test-host"),
+            PeerRole::Creator,
+            3600,
+        )
+        .unwrap();
+
+        let decoded = decode_invite(&token_str).unwrap();
+        assert_eq!(decoded.node_id, public.to_string());
+        assert_eq!(decoded.role, PeerRole::Creator);
+        assert_eq!(decoded.host_name.as_deref(), Some("test-host"));
+        assert_eq!(decoded.relay_url.as_deref(), Some("https://relay.example.com"));
+        assert!(is_invite_token(&token_str));
+    }
+
+    #[test]
+    fn generate_invite_default_is_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[6u8; 32]);
+        let public = key.public();
+
+        let token_str = generate_invite(&public, dir.path(), None, None, None).unwrap();
+        let decoded = decode_invite(&token_str).unwrap();
+        assert_eq!(decoded.role, PeerRole::Peer);
+    }
+
+    #[test]
+    fn try_consume_returns_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]);
+        let public = key.public();
+
+        let token_str = generate_invite_with_role(
+            &public,
+            dir.path(),
+            None,
+            None,
+            None,
+            PeerRole::Creator,
+            3600,
+        )
+        .unwrap();
+
+        let decoded = decode_invite(&token_str).unwrap();
+        let mut store = PendingInvitesStore::load(dir.path()).unwrap();
+        let consumed = store.try_consume(decoded.secret.as_bytes()).unwrap();
+        assert_eq!(consumed.role, PeerRole::Creator);
+        assert_eq!(consumed.username, None);
+    }
+
+    #[test]
+    fn try_consume_invalid_secret_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[8u8; 32]);
+        let public = key.public();
+
+        let _token = generate_invite(&public, dir.path(), None, None, None).unwrap();
+
+        let mut store = PendingInvitesStore::load(dir.path()).unwrap();
+        assert!(store.try_consume(b"wrong_secret").is_none());
+    }
+
+    #[test]
+    fn try_consume_removes_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[9u8; 32]);
+        let public = key.public();
+
+        let token_str = generate_invite(&public, dir.path(), None, None, None).unwrap();
+        let decoded = decode_invite(&token_str).unwrap();
+
+        let mut store = PendingInvitesStore::load(dir.path()).unwrap();
+        assert_eq!(store.invites.len(), 1);
+
+        let consumed = store.try_consume(decoded.secret.as_bytes());
+        assert!(consumed.is_some());
+        assert_eq!(store.invites.len(), 0);
+
+        // Second consume should fail
+        let mut store2 = store;
+        assert!(store2.try_consume(decoded.secret.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn prune_expired_removes_old_invites() {
+        let mut store = PendingInvitesStore {
+            invites: vec![
+                PendingInvite {
+                    secret_hash: "old".into(),
+                    created_at: 1000,
+                    username: None,
+                    role: PeerRole::Peer,
+                },
+                PendingInvite {
+                    secret_hash: "new".into(),
+                    created_at: unix_now(),
+                    username: None,
+                    role: PeerRole::Creator,
+                },
+            ],
+        };
+        store.prune_expired(60); // 60-second expiry
+        assert_eq!(store.invites.len(), 1);
+        assert_eq!(store.invites[0].role, PeerRole::Creator);
+    }
 }

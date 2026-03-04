@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 const SYSTEM_CONFIG_DIR: &str = "/Library/Application Support/hop";
 
+/// The well-known system-level config directory on Linux.
+#[cfg(target_os = "linux")]
+const SYSTEM_CONFIG_DIR: &str = "/etc/hop";
+
 /// Write a file with restricted permissions (0600) for secrets.
 /// On non-Unix platforms, falls back to a regular write.
 pub fn write_secret_file(path: &Path, data: &str) -> Result<()> {
@@ -173,7 +177,7 @@ pub fn resolve_host_config_dir(override_path: Option<&Path>) -> Result<PathBuf> 
         return Ok(p.to_path_buf());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let system_dir = Path::new(SYSTEM_CONFIG_DIR);
         if system_dir.join("identity.json").exists() {
@@ -182,6 +186,15 @@ pub fn resolve_host_config_dir(override_path: Option<&Path>) -> Result<PathBuf> 
     }
 
     default_config_dir()
+}
+
+/// Role assigned to an authorized peer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRole {
+    #[default]
+    Peer,
+    Creator,
 }
 
 /// An authorized peer entry (host side).
@@ -195,6 +208,9 @@ pub struct Peer {
     /// Unix username this peer logs in as (None = host's own user).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Role of this peer (default: Peer). Creator peers get admin access.
+    #[serde(default)]
+    pub role: PeerRole,
 }
 
 /// Authorized peers store.
@@ -226,7 +242,7 @@ impl PeersStore {
         self.peers.iter().any(|p| p.node_id == id_str)
     }
 
-    pub fn add_peer(&mut self, node_id: &PublicKey, name: String, username: Option<String>) {
+    pub fn add_peer(&mut self, node_id: &PublicKey, name: String, username: Option<String>, role: PeerRole) {
         let id_str = node_id.to_string();
         if !self.peers.iter().any(|p| p.node_id == id_str) {
             self.peers.push(Peer {
@@ -235,8 +251,19 @@ impl PeersStore {
                 authorized_at: chrono_now(),
                 last_seen: None,
                 username,
+                role,
             });
         }
+    }
+
+    /// Look up the role of a peer by NodeId.
+    pub fn peer_role(&self, node_id: &PublicKey) -> PeerRole {
+        let id_str = node_id.to_string();
+        self.peers
+            .iter()
+            .find(|p| p.node_id == id_str)
+            .map(|p| p.role.clone())
+            .unwrap_or_default()
     }
 
     /// Look up the Unix username bound to a peer (if any).
@@ -280,6 +307,9 @@ pub struct KnownHost {
     pub added_at: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub relay_url: Option<String>,
+    /// Fleet groups this host belongs to (e.g., role names from aggregate invites).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 /// Known hosts store.
@@ -314,6 +344,7 @@ impl KnownHostsStore {
                 name,
                 added_at: chrono_now(),
                 relay_url,
+                groups: Vec::new(),
             });
         }
     }
@@ -342,6 +373,7 @@ impl KnownHostsStore {
                 name: candidate.clone(),
                 added_at: chrono_now(),
                 relay_url,
+                groups: Vec::new(),
             });
         }
 
@@ -441,4 +473,164 @@ fn chrono_now() -> String {
     // Format as seconds since epoch — good enough for ordering
     // In a real app you'd use chrono, but we avoid the extra dep
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_role_defaults_to_peer() {
+        assert_eq!(PeerRole::default(), PeerRole::Peer);
+    }
+
+    #[test]
+    fn peer_role_serialization_roundtrip() {
+        let creator = PeerRole::Creator;
+        let json = serde_json::to_string(&creator).unwrap();
+        assert_eq!(json, r#""creator""#);
+
+        let peer = PeerRole::Peer;
+        let json = serde_json::to_string(&peer).unwrap();
+        assert_eq!(json, r#""peer""#);
+
+        let parsed: PeerRole = serde_json::from_str(r#""creator""#).unwrap();
+        assert_eq!(parsed, PeerRole::Creator);
+    }
+
+    #[test]
+    fn peers_json_backward_compat_without_role() {
+        // Old peers.json entries have no "role" field — should default to Peer
+        let json = r#"{
+            "peers": [
+                {
+                    "node_id": "abc123",
+                    "name": "old-peer",
+                    "authorized_at": "1700000000"
+                }
+            ]
+        }"#;
+        let store: PeersStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.peers.len(), 1);
+        assert_eq!(store.peers[0].role, PeerRole::Peer);
+        assert_eq!(store.peers[0].username, None);
+    }
+
+    #[test]
+    fn peers_json_with_creator_role() {
+        let json = r#"{
+            "peers": [
+                {
+                    "node_id": "abc123",
+                    "name": "admin",
+                    "authorized_at": "1700000000",
+                    "role": "creator"
+                }
+            ]
+        }"#;
+        let store: PeersStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.peers[0].role, PeerRole::Creator);
+    }
+
+    #[test]
+    fn add_peer_with_role() {
+        let mut store = PeersStore::default();
+        let key_bytes = [1u8; 32];
+        let key = iroh::SecretKey::from_bytes(&key_bytes);
+        let public = key.public();
+
+        store.add_peer(&public, "admin".into(), None, PeerRole::Creator);
+        assert_eq!(store.peers.len(), 1);
+        assert_eq!(store.peers[0].role, PeerRole::Creator);
+        assert_eq!(store.peer_role(&public), PeerRole::Creator);
+
+        // Duplicate add is ignored
+        store.add_peer(&public, "admin2".into(), None, PeerRole::Peer);
+        assert_eq!(store.peers.len(), 1);
+        assert_eq!(store.peers[0].name, "admin");
+    }
+
+    #[test]
+    fn peer_role_lookup_default_for_unknown() {
+        let store = PeersStore::default();
+        let key_bytes = [2u8; 32];
+        let key = iroh::SecretKey::from_bytes(&key_bytes);
+        let public = key.public();
+        assert_eq!(store.peer_role(&public), PeerRole::Peer);
+    }
+
+    #[test]
+    fn known_hosts_backward_compat_without_groups() {
+        let json = r#"{
+            "hosts": [
+                {
+                    "node_id": "abc123",
+                    "name": "myhost",
+                    "added_at": "1700000000"
+                }
+            ]
+        }"#;
+        let store: KnownHostsStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.hosts.len(), 1);
+        assert!(store.hosts[0].groups.is_empty());
+    }
+
+    #[test]
+    fn known_hosts_with_groups() {
+        let json = r#"{
+            "hosts": [
+                {
+                    "node_id": "abc123",
+                    "name": "myhost",
+                    "added_at": "1700000000",
+                    "groups": ["developer", "staging"]
+                }
+            ]
+        }"#;
+        let store: KnownHostsStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.hosts[0].groups, vec!["developer", "staging"]);
+    }
+
+    #[test]
+    fn known_hosts_groups_not_serialized_when_empty() {
+        let host = KnownHost {
+            node_id: "abc".into(),
+            name: "test".into(),
+            added_at: "0".into(),
+            relay_url: None,
+            groups: Vec::new(),
+        };
+        let json = serde_json::to_string(&host).unwrap();
+        assert!(!json.contains("groups"));
+    }
+
+    #[test]
+    fn peers_store_load_save_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PeersStore::default();
+        let key = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let public = key.public();
+        store.add_peer(&public, "test-peer".into(), Some("alice".into()), PeerRole::Creator);
+        store.save(dir.path()).unwrap();
+
+        let loaded = PeersStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].role, PeerRole::Creator);
+        assert_eq!(loaded.peers[0].username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn known_hosts_store_load_save_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = KnownHostsStore::default();
+        let key = iroh::SecretKey::from_bytes(&[4u8; 32]);
+        let public = key.public();
+        store.add_host(&public, "myhost".into(), Some("https://relay.example.com".into()));
+        store.save(dir.path()).unwrap();
+
+        let loaded = KnownHostsStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.hosts.len(), 1);
+        assert_eq!(loaded.hosts[0].name, "myhost");
+        assert!(loaded.hosts[0].groups.is_empty());
+    }
 }
