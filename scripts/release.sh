@@ -123,6 +123,8 @@ if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Uploading site"
   aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
     --content-type "text/html"
+  aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
+    --content-type "text/html"
 
   for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
     if [[ -f "${PROJECT_ROOT}/site/${asset}" ]]; then
@@ -136,7 +138,7 @@ if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
-    --paths "/" "/index.html" "/favicon.ico" "/favicon-32x32.png" \
+    --paths "/" "/index.html" "/fleet.html" "/favicon.ico" "/favicon-32x32.png" \
       "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" \
     --output text --query 'Invalidation.Id'
 
@@ -238,6 +240,8 @@ aws s3 cp "${PROJECT_ROOT}/pkg/hop.service" "s3://${BUCKET}/hop.service" \
 echo "==> Uploading site"
 aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
   --content-type "text/html"
+aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
+  --content-type "text/html"
 
 echo "==> Uploading site assets"
 for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
@@ -267,7 +271,7 @@ git -C "${PROJECT_ROOT}" push --tags
 echo "==> Invalidating CloudFront cache"
 aws cloudfront create-invalidation \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
-  --paths "/" "/index.html" "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
+  --paths "/" "/index.html" "/fleet.html" "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
     "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" \
     "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*" \
   --output text --query 'Invalidation.Id'
