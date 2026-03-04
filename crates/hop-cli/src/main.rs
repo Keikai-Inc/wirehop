@@ -130,11 +130,20 @@ async fn main() -> Result<()> {
             }
         }
         Command::External(args) => {
-            // Treat the first arg as a connect target: "hop myhost"
             let target = args.first().context("no target specified")?;
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_connect(secret_key, target, &config_dir, None).await
+
+            // "hop myhost -- cmd args" → exec shorthand
+            if let Some(sep) = args.iter().position(|a| a == "--") {
+                let command = args[sep + 1..].to_vec();
+                if command.is_empty() {
+                    anyhow::bail!("no command specified after --");
+                }
+                cmd_exec(secret_key, target, &config_dir, &command).await
+            } else {
+                cmd_connect(secret_key, target, &config_dir, None).await
+            }
         }
     }
 }

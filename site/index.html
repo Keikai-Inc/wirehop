@@ -624,11 +624,30 @@
 
     .footer-copy a:hover { text-decoration: underline; }
 
+    /* --- Hamburger nav -------------------------------------------------------- */
+
+    .nav-toggle {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--color-text);
+      cursor: pointer;
+      padding: 0.25rem;
+    }
+
     /* --- Responsive ---------------------------------------------------------- */
 
     @media (max-width: 768px) {
-      nav { padding: 0.75rem 1rem; }
-      .nav-links { display: none; }
+      nav { padding: 0.75rem 1rem; flex-wrap: wrap; }
+      .nav-toggle { display: block; }
+      .nav-links {
+        display: none;
+        flex-basis: 100%;
+        flex-direction: column;
+        gap: 1rem;
+        padding: 1rem 0 0.5rem;
+      }
+      .nav-links.open { display: flex; }
       .grid-3, .grid-2 { grid-template-columns: 1fr; }
       .steps { grid-template-columns: 1fr; }
       #comparison { display: none; }
@@ -651,7 +670,7 @@
       .hero-actions { flex-direction: column; align-items: stretch; }
       .hero-actions .btn { justify-content: center; }
       .install-cmd code { font-size: 0.65rem; }
-      .code-body { font-size: 0.65rem; line-height: 1.6; padding: 0.75rem; }
+      .code-body { font-size: 0.7rem; line-height: 1.6; padding: 0.75rem; }
       .section-header h2 { font-size: 1.5rem; }
       .section-header p { font-size: 0.95rem; }
       .card { padding: 1.5rem; }
@@ -664,6 +683,9 @@
   <!-- Nav -->
   <nav>
     <a href="/" class="nav-brand"><img src="hop-icon.png" alt="hop" style="height: 1.5rem; width: auto; filter: brightness(0) invert(1);"> hop</a>
+    <button class="nav-toggle" aria-label="Toggle navigation" onclick="document.querySelector('.nav-links').classList.toggle('open')">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
     <ul class="nav-links">
       <li><a href="#features">Features</a></li>
       <li><a href="#install">Install</a></li>
@@ -737,10 +759,10 @@
 
         <div class="card card-red">
           <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           </div>
-          <h3>Direct P2P</h3>
-          <p>Connections go directly between peers whenever possible. No bandwidth limits, no metered relay, no man-in-the-middle.</p>
+          <h3>Remote Execution</h3>
+          <p>Run commands without opening a shell. <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop server -- cmd</code> executes remotely and returns the output &mdash; perfect for scripts and automation.</p>
         </div>
 
         <div class="card card-teal">
@@ -761,10 +783,10 @@
 
         <div class="card card-green">
           <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
           </div>
-          <h3>Smart Sync</h3>
-          <p>Only transfers changed files based on size and timestamp comparison. Supports <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--delete</code> and <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--dry-run</code> for safe, predictable syncs.</p>
+          <h3>Persistent Sessions</h3>
+          <p>Your shell survives disconnects. If your connection drops, hop reconnects and resumes where you left off &mdash; no tmux needed.</p>
         </div>
 
         <div class="card card-red">
@@ -822,6 +844,11 @@
           <div class="comparison-cell hop-col">Built in (cp &amp; sync)</div>
           <div class="comparison-cell comparison-other">Separate tool (scp/rsync over SSH)</div>
         </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Session persistence</div>
+          <div class="comparison-cell hop-col">Built-in (auto-reconnect)</div>
+          <div class="comparison-cell comparison-other">Requires tmux/screen</div>
+        </div>
       </div>
     </div>
   </section>
@@ -873,6 +900,11 @@
 <span class="comment"># After that, just use the name</span>
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">server</span>
 <span class="prompt">server $</span> <span class="cmd">_</span>
+
+<span class="comment"># Run a command without opening a shell</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">server</span> -- ps aux
+<span class="output">USER       PID %CPU  COMMAND</span>
+<span class="output">root         1  0.0  /sbin/init</span>
 
 <span class="comment"># Copy files to the server</span>
 <span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./project server:~/project
