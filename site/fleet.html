@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hop — Fleet Management</title>
+  <meta name="description" content="Manage fleets of machines with hop. Role-based access, host tagging, and aggregate invites — from a 5-person team to thousands of hosts.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { overflow-x: hidden; }
+
+    :root {
+      --color-primary: #dc2626;
+      --color-primary-hover: #b91c1c;
+      --color-bg: #09090b;
+      --color-surface: #18181b;
+      --color-surface-elevated: #1e1e23;
+      --color-text: #f4f4f5;
+      --color-text-secondary: #c4c4cc;
+      --color-text-tertiary: #9a9aa3;
+      --color-border: rgba(255, 255, 255, 0.05);
+      --color-border-hover: rgba(255, 255, 255, 0.12);
+      --color-accent-teal: #2ec4b6;
+      --color-accent-amber: #f59e0b;
+      --color-accent-green: #10b981;
+      --font-display: "Manrope", sans-serif;
+      --font-body: "Inter", "Manrope", sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Segoe UI Mono", monospace;
+    }
+
+    body {
+      font-family: var(--font-body);
+      background-color: var(--color-bg);
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+      background-size: 64px 64px;
+      color: var(--color-text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* --- Nav ---------------------------------------------------------------- */
+
+    nav {
+      position: fixed;
+      top: 0;
+      width: 100%;
+      z-index: 50;
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      backdrop-filter: blur(16px);
+      background: rgba(9, 9, 11, 0.85);
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .nav-brand {
+      font-family: var(--font-display);
+      font-weight: 800;
+      font-size: 1.5rem;
+      color: var(--color-text);
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .nav-brand span { color: var(--color-primary); }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: var(--color-text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 150ms;
+    }
+
+    .nav-links a:hover { color: var(--color-text); }
+    .nav-links a.active { color: var(--color-text); }
+
+    /* --- Buttons ------------------------------------------------------------- */
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.5rem;
+      border-radius: 0.5rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      font-family: var(--font-body);
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 150ms;
+      border: none;
+    }
+
+    .btn-primary {
+      background: var(--color-primary);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: var(--color-primary-hover);
+      box-shadow: 0 0 24px rgba(220, 38, 38, 0.3);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--color-text-secondary);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+
+    .btn-ghost:hover {
+      color: var(--color-text);
+      border-color: rgba(255, 255, 255, 0.25);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    /* --- Container ----------------------------------------------------------- */
+
+    .container {
+      max-width: 72rem;
+      margin: 0 auto;
+      padding: 0 2rem;
+      overflow: hidden;
+    }
+
+    /* --- Hero ---------------------------------------------------------------- */
+
+    .hero {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 10rem 2rem 6rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      top: -20%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 60rem;
+      height: 60rem;
+      background: radial-gradient(ellipse, rgba(220, 38, 38, 0.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.375rem 1rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 2rem;
+      border: 1px solid rgba(220, 38, 38, 0.3);
+      background: rgba(220, 38, 38, 0.08);
+      color: #f87171;
+    }
+
+    .badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--color-primary);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.5rem, 6vw, 4rem);
+      font-weight: 900;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.5rem;
+      max-width: 48rem;
+    }
+
+    .hero h1 .gradient {
+      background: linear-gradient(90deg, var(--color-primary), #f87171);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--color-text-secondary);
+      max-width: 36rem;
+      margin-bottom: 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    /* --- Section ------------------------------------------------------------- */
+
+    section {
+      padding: 6rem 0;
+    }
+
+    .section-header {
+      text-align: center;
+      margin-bottom: 4rem;
+    }
+
+    .section-header h2 {
+      font-family: var(--font-display);
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .section-header p {
+      color: var(--color-text-secondary);
+      font-size: 1.125rem;
+      max-width: 36rem;
+      margin: 0 auto;
+    }
+
+    /* --- Cards --------------------------------------------------------------- */
+
+    .grid {
+      display: grid;
+      gap: 1.5rem;
+    }
+
+    .grid > * { min-width: 0; }
+
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid-2 { grid-template-columns: repeat(2, 1fr); }
+
+    .card {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 1rem;
+      padding: 2rem;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 150ms;
+    }
+
+    .card:hover { border-color: var(--color-border-hover); }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 1.5rem;
+      right: 1.5rem;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--card-accent, rgba(255,255,255,0.1)), transparent);
+    }
+
+    .card-red    { --card-accent: var(--color-primary); }
+    .card-teal   { --card-accent: var(--color-accent-teal); }
+    .card-amber  { --card-accent: var(--color-accent-amber); }
+    .card-green  { --card-accent: var(--color-accent-green); }
+
+    .card-icon {
+      width: 2.5rem;
+      height: 2.5rem;
+      border-radius: 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 1.25rem;
+      font-size: 1.25rem;
+    }
+
+    .card-icon-red   { background: rgba(220, 38, 38, 0.1); color: #f87171; }
+    .card-icon-teal  { background: rgba(46, 196, 182, 0.1); color: var(--color-accent-teal); }
+    .card-icon-amber { background: rgba(245, 158, 11, 0.1); color: var(--color-accent-amber); }
+    .card-icon-green { background: rgba(16, 185, 129, 0.1); color: var(--color-accent-green); }
+
+    .card h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.125rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .card p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+    }
+
+    /* --- Steps --------------------------------------------------------------- */
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2rem;
+      counter-reset: step;
+    }
+
+    .steps > * { min-width: 0; }
+
+    .step {
+      position: relative;
+      padding: 2rem;
+      counter-increment: step;
+    }
+
+    .step::before {
+      content: counter(step);
+      font-family: var(--font-display);
+      font-size: 3rem;
+      font-weight: 900;
+      color: rgba(220, 38, 38, 0.4);
+      line-height: 1;
+      margin-bottom: 1rem;
+      display: block;
+    }
+
+    .step h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.125rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .step p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+    }
+
+    .step code {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      padding: 0.125rem 0.5rem;
+      border-radius: 0.25rem;
+      color: var(--color-accent-teal);
+    }
+
+    /* --- Code block ---------------------------------------------------------- */
+
+    .code-block {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      overflow: hidden;
+      max-width: 100%;
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid var(--color-border);
+      background: var(--color-surface-elevated);
+    }
+
+    .code-dot {
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      background: var(--color-text-tertiary);
+    }
+
+    .code-dot:nth-child(1) { background: #ef4444; }
+    .code-dot:nth-child(2) { background: #f59e0b; }
+    .code-dot:nth-child(3) { background: #22c55e; }
+
+    .code-title {
+      margin-left: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--color-text-tertiary);
+      font-family: var(--font-mono);
+    }
+
+    .code-body {
+      padding: 1.25rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      line-height: 1.8;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .code-body .comment { color: var(--color-text-tertiary); }
+    .code-body .cmd { color: var(--color-accent-teal); }
+    .code-body .flag { color: var(--color-accent-amber); }
+    .code-body .url { color: #f87171; }
+    .code-body .output { color: var(--color-text-secondary); }
+    .code-body .prompt { color: var(--color-accent-green); }
+
+    /* --- Concept diagram ----------------------------------------------------- */
+
+    .concept-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+
+    .concept-grid > * { min-width: 0; }
+
+    .concept-info h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .concept-info p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+      margin-bottom: 1.5rem;
+    }
+
+    .concept-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .concept-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .concept-list li::before {
+      content: "\2713";
+      color: var(--color-accent-green);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 0.1rem;
+    }
+
+    /* --- Roles table --------------------------------------------------------- */
+
+    .roles-table {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 1rem;
+      overflow: hidden;
+      width: 100%;
+    }
+
+    .roles-row {
+      display: grid;
+      grid-template-columns: 1fr 2fr 1fr 1fr;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .roles-row > * { min-width: 0; }
+
+    .roles-row:last-child { border-bottom: none; }
+
+    .roles-cell {
+      padding: 1rem 1.5rem;
+      font-size: 0.875rem;
+      border-right: 1px solid var(--color-border);
+    }
+
+    .roles-cell:last-child { border-right: none; }
+
+    .roles-header {
+      font-weight: 600;
+      font-family: var(--font-display);
+      color: var(--color-text);
+      background: var(--color-surface-elevated);
+    }
+
+    .roles-cell.role-name {
+      color: var(--color-accent-teal);
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+
+    .roles-cell.role-detail {
+      color: var(--color-text-secondary);
+    }
+
+    /* --- Footer -------------------------------------------------------------- */
+
+    footer {
+      border-top: 1px solid var(--color-border);
+      padding: 3rem 2rem;
+    }
+
+    .footer-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      max-width: 72rem;
+      margin: 0 auto;
+    }
+
+    .footer-copy {
+      color: var(--color-text-tertiary);
+      font-size: 0.75rem;
+    }
+
+    .footer-copy a {
+      color: var(--color-text-secondary);
+      text-decoration: none;
+    }
+
+    .footer-copy a:hover { text-decoration: underline; }
+
+    .footer-tagline {
+      color: var(--color-text-tertiary);
+      font-size: 0.75rem;
+      font-style: italic;
+    }
+
+    /* --- Responsive ---------------------------------------------------------- */
+
+    @media (max-width: 768px) {
+      nav { padding: 0.75rem 1rem; }
+      .nav-links { display: none; }
+      .grid-3, .grid-2 { grid-template-columns: 1fr; }
+      .steps { grid-template-columns: 1fr; }
+      .concept-grid { grid-template-columns: 1fr; }
+      .roles-row { grid-template-columns: 1fr 1fr; }
+      .hero { padding: 7rem 1.5rem 4rem; }
+      section { padding: 4rem 0; }
+      .container { padding: 0 1rem; }
+      .code-body { font-size: 0.7rem; line-height: 1.7; padding: 1rem; white-space: pre; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .code-block { max-width: 100%; }
+    }
+
+    @media (max-width: 480px) {
+      .hero { padding: 6rem 1rem 3rem; }
+      .hero h1 { font-size: 2rem; }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .hero-actions .btn { justify-content: center; }
+      .code-body { font-size: 0.65rem; line-height: 1.6; padding: 0.75rem; }
+      .section-header h2 { font-size: 1.5rem; }
+      .section-header p { font-size: 0.95rem; }
+      .card { padding: 1.5rem; }
+      .step { padding: 1.5rem 1rem; }
+      .footer-bottom { flex-direction: column; text-align: center; }
+      .roles-row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav>
+    <a href="/" class="nav-brand"><img src="hop-icon.png" alt="hop" style="height: 1.5rem; width: auto; filter: brightness(0) invert(1);"> hop</a>
+    <ul class="nav-links">
+      <li><a href="index.html#features">Features</a></li>
+      <li><a href="index.html#install">Install</a></li>
+      <li><a href="index.html#how-it-works">How It Works</a></li>
+      <li><a href="index.html#daemon">Daemon</a></li>
+      <li><a href="fleet.html" class="active">Fleet</a></li>
+    </ul>
+  </nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Fleet Management</div>
+    <h1>One tool,<br><span class="gradient">every machine</span></h1>
+    <p>Manage access to your entire infrastructure with roles, tags, and one-command invites. Same hop simplicity, from 5 machines to 5,000.</p>
+    <div class="hero-actions">
+      <a href="#how-fleet-works" class="btn btn-primary">How It Works</a>
+      <a href="index.html" class="btn btn-ghost">&larr; Back to hop</a>
+    </div>
+  </div>
+
+  <!-- Key concepts -->
+  <section id="concepts">
+    <div class="container">
+      <div class="section-header">
+        <h2>Three concepts, that's it</h2>
+        <p>Fleet management in hop comes down to orchestrators, tags, and roles.</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card card-red">
+          <div class="card-icon card-icon-red">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
+          </div>
+          <h3>Orchestrator</h3>
+          <p>Any hop host can be an orchestrator. It keeps track of your fleet members, role definitions, and distributes access.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+          </div>
+          <h3>Tags</h3>
+          <p>Label your hosts with tags like <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">developer</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">production</code>, or <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">web</code>. Tags describe what a machine is.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </div>
+          <h3>Roles</h3>
+          <p>Define what access people get. A role maps to host tags &mdash; "developers access developer + staging hosts." Each person gets their own account.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How fleet works -->
+  <section id="how-fleet-works">
+    <div class="container">
+      <div class="section-header">
+        <h2>How it works</h2>
+        <p>Set up fleet management in four steps.</p>
+      </div>
+
+      <div class="steps" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="step">
+          <h3>Install the orchestrator</h3>
+          <p>Install hop as a daemon on any machine. On first startup it prints a <strong>creator invite</strong> &mdash; this gives you admin access.</p>
+        </div>
+        <div class="step">
+          <h3>Define roles</h3>
+          <p>Create roles that map to host tags. <code>hop admin myorch role create developer --tags developer,staging</code></p>
+        </div>
+        <div class="step">
+          <h3>Register hosts</h3>
+          <p>Create a fleet invite and use it when installing hop on each machine. Tags are assigned at registration time.</p>
+        </div>
+        <div class="step">
+          <h3>Invite your team</h3>
+          <p>Invite people by role. They automatically get access to every matching host &mdash; with their own user account on each.</p>
+        </div>
+      </div>
+
+      <div style="margin-top: 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — Setting up a fleet</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># 1. Install hop daemon (orchestrator)</span>
+<span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keik.ai/install-daemon.sh <span class="cmd">| bash</span>
+<span class="output">Creator invite: eyJ0eX...   (valid for 1 hour)</span>
+
+<span class="comment"># 2. Redeem creator invite from your laptop</span>
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
+<span class="output">Saved as known host: myorch</span>
+
+<span class="comment"># 3. Define roles</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> role create <span class="flag">developer</span> --tags developer,staging
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> role create <span class="flag">ops</span> --tags '*' --sudo
+
+<span class="comment"># 4. Create a fleet invite for registering hosts</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> fleet-invite --tags developer,web
+<span class="output">Fleet invite: abCdEf...   (100 uses, 24h expiry)</span>
+
+<span class="comment"># 5. Register a host (on the host machine)</span>
+<span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keik.ai/install-daemon.sh <span class="cmd">| bash</span> -s -- --register <span class="flag">abCdEf...</span>
+
+<span class="comment"># 6. Invite a developer</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> invite --role developer --name alice
+<span class="output">Invite: xYz123...   (covers all developer+staging hosts)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Roles -->
+  <section id="roles">
+    <div class="container">
+      <div class="section-header">
+        <h2>Role-based access</h2>
+        <p>Define who can access what. Each role maps to host tags and access settings.</p>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-info">
+          <h3>Sensible defaults, full control</h3>
+          <p>Roles default to individual accounts with no sudo. Override as needed &mdash; give ops sudo, create shared service accounts for CI, or add users to specific Unix groups.</p>
+          <ul class="concept-list">
+            <li><strong>Individual accounts</strong> &mdash; each person gets their own Unix user</li>
+            <li><strong>No sudo by default</strong> &mdash; principle of least privilege</li>
+            <li><strong>No passwords</strong> &mdash; access only via hop's key-based auth</li>
+            <li><strong>Auto-created</strong> &mdash; user accounts created on first connection</li>
+            <li><strong>Git-committable</strong> &mdash; roles live in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code>, version-control your access policy</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="roles-table">
+            <div class="roles-row">
+              <div class="roles-cell roles-header">Role</div>
+              <div class="roles-cell roles-header">Host Tags</div>
+              <div class="roles-cell roles-header">Sudo</div>
+              <div class="roles-cell roles-header">User Mode</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name">developer</div>
+              <div class="roles-cell role-detail">developer, staging</div>
+              <div class="roles-cell role-detail">No</div>
+              <div class="roles-cell role-detail">Individual</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name">ops</div>
+              <div class="roles-cell role-detail">* (all hosts)</div>
+              <div class="roles-cell role-detail">Yes</div>
+              <div class="roles-cell role-detail">Individual</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name">security</div>
+              <div class="roles-cell role-detail">production, staging</div>
+              <div class="roles-cell role-detail">No</div>
+              <div class="roles-cell role-detail">Individual</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name">ci</div>
+              <div class="roles-cell role-detail">build</div>
+              <div class="roles-cell role-detail">No</div>
+              <div class="roles-cell role-detail">Shared</div>
+            </div>
+          </div>
+
+          <div class="code-block" style="margin-top: 1.5rem;">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">roles.json</span>
+            </div>
+            <div class="code-body" style="font-size: 0.8rem;">
+<span class="output">{</span>
+  <span class="cmd">"roles"</span>: [
+    {
+      <span class="cmd">"name"</span>: <span class="flag">"developer"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"developer"</span>, <span class="flag">"staging"</span>],
+      <span class="cmd">"user_mode"</span>: <span class="flag">"individual"</span>,
+      <span class="cmd">"sudo"</span>: <span class="url">false</span>
+    },
+    {
+      <span class="cmd">"name"</span>: <span class="flag">"ops"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"*"</span>],
+      <span class="cmd">"user_mode"</span>: <span class="flag">"individual"</span>,
+      <span class="cmd">"sudo"</span>: <span class="url">true</span>,
+      <span class="cmd">"groups"</span>: [<span class="flag">"docker"</span>]
+    }
+  ]
+<span class="output">}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Using the fleet -->
+  <section id="using-fleet">
+    <div class="container">
+      <div class="section-header">
+        <h2>Using the fleet</h2>
+        <p>Once set up, your team interacts with the fleet using familiar commands.</p>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — Connecting</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Alice redeems her invite</span>
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">xYz123...</span>
+<span class="output">Added 12 hosts (role: developer)</span>
+
+<span class="comment"># List available hosts</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet list</span> <span class="flag">developer</span>
+<span class="output">  web-1       online   developer,web</span>
+<span class="output">  web-2       online   developer,web</span>
+<span class="output">  staging-1   online   staging</span>
+
+<span class="comment"># Connect to a specific host</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1</span>
+<span class="prompt">web-1 $</span> <span class="cmd">_</span>
+          </div>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — Fleet operations</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Run a command across all developer hosts</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet exec</span> <span class="flag">developer</span> -- uname -a
+<span class="output">[web-1]     Linux 6.1 x86_64</span>
+<span class="output">[web-2]     Linux 6.1 x86_64</span>
+<span class="output">[staging-1] Linux 6.1 x86_64</span>
+
+<span class="comment"># Check fleet status</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet status</span>
+<span class="output">Fleet: myorch</span>
+<span class="output">  3 hosts registered</span>
+<span class="output">  3 online, 0 offline</span>
+
+<span class="comment"># Admin: see all peers</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> peers
+<span class="output">  alice   developer   online</span>
+<span class="output">  bob     ops         online</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scaling -->
+  <section id="scaling" style="padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Scales with you</h2>
+        <p>No infrastructure to manage. The same tool works at every size.</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </div>
+          <h3>Small Team (5-50)</h3>
+          <p>Single orchestrator, JSON config files, zero infrastructure beyond hop itself. Set up in minutes.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </div>
+          <h3>Growing (50-500)</h3>
+          <p>Same architecture. Role definitions keep access organized. Heartbeats keep fleet status current.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="9" height="9" rx="1"/><rect x="13" y="2" width="9" height="9" rx="1"/><rect x="2" y="13" width="9" height="9" rx="1"/><rect x="13" y="13" width="9" height="9" rx="1"/></svg>
+          </div>
+          <h3>Large (500+)</h3>
+          <p>Shard orchestrators by region or team. The P2P foundation means no central bottleneck for data transfer.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to get started?</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop. Install the daemon, redeem the creator invite, and you're managing infrastructure.</p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="index.html#install" class="btn btn-primary">Install hop</a>
+          <a href="https://github.com/thedracle/hop" class="btn btn-ghost">GitHub</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="footer-bottom">
+      <p class="footer-copy">&copy; 2026 <a href="https://keik.ai">Keik.ai</a> Cybersecurity. All rights reserved.</p>
+      <p class="footer-tagline">"The world has changed. Security has to change with it."</p>
+    </div>
+  </footer>
+
+</body>
+</html>
