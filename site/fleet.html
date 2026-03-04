@@ -657,12 +657,12 @@
 
       <div class="steps" style="grid-template-columns: repeat(2, 1fr);">
         <div class="step">
-          <h3>Install the orchestrator</h3>
-          <p>Install hop as a daemon on any machine. On first startup it prints a <strong>creator invite</strong> &mdash; this gives you admin access.</p>
+          <h3>Install &amp; connect to the orchestrator</h3>
+          <p>Install hop as a daemon on any machine. It prints a <strong>creator invite</strong> on first startup. Redeem it from your laptop with <code>hop connect</code> &mdash; this saves the orchestrator as a known host (e.g. <code>orch-1</code>).</p>
         </div>
         <div class="step">
           <h3>Define roles</h3>
-          <p>Create roles that map to host tags. <code>hop admin orch-1 role create developer --tags developer,staging</code></p>
+          <p>Create roles that map to host tags. Use <code>hop admin &lt;host&gt;</code> to manage the orchestrator remotely, e.g. <code>hop admin orch-1 role create developer</code></p>
         </div>
         <div class="step">
           <h3>Register hosts</h3>
@@ -688,10 +688,11 @@
 <span class="output">Creator invite: eyJ0eX...   (valid for 1 hour)</span>
 
 <span class="comment"># 2. Redeem creator invite from your laptop</span>
+<span class="comment">#    This saves the orchestrator as a known host — here it's "orch-1"</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Saved as known host: orch-1</span>
 
-<span class="comment"># 3. Define roles (orch-1 is the saved host name from step 2)</span>
+<span class="comment"># 3. Now use "hop admin orch-1" to manage it remotely</span>
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">developer</span> --tags developer,staging
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">ops</span> --tags '*' --sudo
 
