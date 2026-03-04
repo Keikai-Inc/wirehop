@@ -70,7 +70,11 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 
 /// Connect to a remote host by their PublicKey, optionally with a relay URL hint.
 ///
-/// Tries `hop/1` first; falls back to `hop/0` if the host doesn't support v1.
+/// Uses a single ALPN (hop/2) per connection attempt. The server registers
+/// [hop/2, hop/1, hop/0] and TLS ALPN negotiation selects the best match.
+/// No client-side ALPN fallback — retrying with different ALPNs on network
+/// errors causes spurious "aborted by peer" errors and confused connection state.
+///
 /// If a relay URL is provided, it's included in the endpoint address so iroh
 /// can connect via relay immediately rather than waiting for DNS discovery.
 /// If the relay hint fails (stale URL), automatically retries without it so
@@ -86,10 +90,10 @@ pub async fn connect_to_host(
     if let Some(url) = relay_url {
         let addr = EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(url.clone())]);
 
-        // Try with relay hint first (3s timeout), then fall back to discovery
+        // Try with relay hint first (5s timeout), then fall back to discovery
         let relay_result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            connect_with_alpn_fallback(endpoint, addr),
+            std::time::Duration::from_secs(5),
+            endpoint.connect(addr, ALPN_V2),
         )
         .await;
 
@@ -105,7 +109,8 @@ pub async fn connect_to_host(
 
         // Relay failed — connect via discovery and signal that the hint was bad
         let addr = EndpointAddr::from(remote_id);
-        let conn = connect_with_alpn_fallback(endpoint, addr)
+        let conn = endpoint
+            .connect(addr, ALPN_V2)
             .await
             .context("Failed to connect to host")?;
         return Ok((conn, true));
@@ -117,8 +122,8 @@ pub async fn connect_to_host(
     let addr = EndpointAddr::from_parts(remote_id, [TransportAddr::Relay(hop_relay)]);
 
     let relay_result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        connect_with_alpn_fallback(endpoint, addr),
+        std::time::Duration::from_secs(5),
+        endpoint.connect(addr, ALPN_V2),
     )
     .await;
 
@@ -133,29 +138,11 @@ pub async fn connect_to_host(
     }
 
     let addr = EndpointAddr::from(remote_id);
-    let conn = connect_with_alpn_fallback(endpoint, addr)
+    let conn = endpoint
+        .connect(addr, ALPN_V2)
         .await
         .context("Failed to connect to host")?;
     Ok((conn, false))
-}
-
-/// Try connecting with hop/2 ALPN, falling back to hop/1, then hop/0.
-async fn connect_with_alpn_fallback(
-    endpoint: &Endpoint,
-    addr: EndpointAddr,
-) -> Result<Connection> {
-    match endpoint.connect(addr.clone(), ALPN_V2).await {
-        Ok(conn) => Ok(conn),
-        Err(_) => match endpoint.connect(addr.clone(), ALPN_V1).await {
-            Ok(conn) => Ok(conn),
-            Err(_) => {
-                endpoint
-                    .connect(addr, ALPN_V0)
-                    .await
-                    .context("Failed to connect")
-            }
-        },
-    }
 }
 
 /// Return the protocol version negotiated on a connection.
