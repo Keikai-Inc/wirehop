@@ -189,7 +189,7 @@ impl Agent {
 
         // 6. Transparent bidirectional proxy
         let (ipc_read, ipc_write) = ipc.into_split();
-        let result = proxy_streams(ipc_read, ipc_write, quic_recv, quic_send).await;
+        let result = proxy_quic(ipc_read, ipc_write, quic_send, quic_recv).await;
 
         // 7. Session done
         self.active_sessions
@@ -203,7 +203,32 @@ impl Agent {
     }
 }
 
-/// Bidirectional byte proxy between two async stream pairs.
+/// Bidirectional proxy between IPC socket and QUIC bi-stream.
+///
+/// Calls `quic_send.finish()` when the IPC→QUIC direction ends so the remote
+/// host sees a clean EOF (FIN) rather than a stream reset (RST).
+async fn proxy_quic(
+    mut ipc_read: tokio::net::unix::OwnedReadHalf,
+    mut ipc_write: tokio::net::unix::OwnedWriteHalf,
+    mut quic_send: iroh::endpoint::SendStream,
+    mut quic_recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    tokio::select! {
+        r = tokio::io::copy(&mut ipc_read, &mut quic_send) => {
+            let _ = quic_send.finish();
+            r.context("IPC->QUIC copy")?;
+        }
+        r = tokio::io::copy(&mut quic_recv, &mut ipc_write) => {
+            r.context("QUIC->IPC copy")?;
+        }
+    }
+    Ok(())
+}
+
+/// Generic bidirectional byte proxy between two async stream pairs.
+///
+/// Used for testing with mock streams (tokio::io::duplex).
+#[cfg(test)]
 async fn proxy_streams(
     mut side_a_read: impl tokio::io::AsyncRead + Unpin,
     mut side_a_write: impl tokio::io::AsyncWrite + Unpin,
