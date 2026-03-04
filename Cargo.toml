@@ -3,7 +3,7 @@ members = ["crates/hop-cli", "crates/hop-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 license = "LicenseRef-Proprietary"
 
@@ -12,7 +12,7 @@ license = "LicenseRef-Proprietary"
 hop-core = { path = "crates/hop-core" }
 
 # Networking
-iroh = "0.96"
+iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }

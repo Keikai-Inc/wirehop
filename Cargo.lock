@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1760,8 +1760,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.96.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5236da4d5681f317ec393c8fe2b7e3d360d31c6bb40383991d0b7429ca5ad117"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix#747dbf840a6b3dbbd42791bcab33db941093d2ec"
 dependencies = [
  "backon",
  "bytes",
@@ -1813,8 +1812,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.96.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c99d836a1c99e037e98d1bf3ef209c3a4df97555a00ce9510eb78eccdf5567"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix#747dbf840a6b3dbbd42791bcab33db941093d2ec"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1920,8 +1918,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.96.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd2b63e654b9dec799a73372cdc79b529ca6c7248c0c8de7da78a02e3a46f03c"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix#747dbf840a6b3dbbd42791bcab33db941093d2ec"
 dependencies = [
  "blake3",
  "bytes",
