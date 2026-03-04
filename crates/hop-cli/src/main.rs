@@ -243,6 +243,27 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         }
     }
 
+    // Seed default roles on first startup
+    {
+        let roles_path = config_dir.join("roles.json");
+        if !roles_path.exists() {
+            match hop_core::fleet::RolesStore::seed_defaults(config_dir) {
+                Ok(store) => {
+                    if !quiet {
+                        println!(
+                            "Created default roles ({}):",
+                            store.roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                        println!("  Edit with: hop admin <host> role list/update/delete");
+                        println!("  Or edit roles.json directly.");
+                        println!();
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to seed default roles: {e}"),
+            }
+        }
+    }
+
     if !quiet {
         println!("Hosting as: {public_key}");
         if let Some(ref url) = relay_url {

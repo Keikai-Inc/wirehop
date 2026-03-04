@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::config::{write_shared_file, PeerRole};
 use crate::invite;
 use crate::proto::{
-    AdminResponse, FleetMemberInfo, RoleDefinition, RoleUpdates,
+    AdminResponse, FleetMemberInfo, RoleDefinition, RoleUpdates, UserMode,
 };
 
 // --- Fleet store ---
@@ -84,6 +84,62 @@ impl RolesStore {
 
     pub fn find_role(&self, name: &str) -> Option<&RoleDefinition> {
         self.roles.iter().find(|r| r.name == name)
+    }
+
+    /// Seed opinionated default roles on first orchestrator startup.
+    /// Only call this when roles.json does not yet exist.
+    pub fn seed_defaults(config_dir: &Path) -> Result<Self> {
+        let store = Self {
+            roles: vec![
+                RoleDefinition {
+                    name: "admin".into(),
+                    host_tags: vec!["*".into()],
+                    sudo: true,
+                    admin: true,
+                    user_mode: UserMode::Individual,
+                    groups: vec!["docker".into()],
+                    shell: None,
+                },
+                RoleDefinition {
+                    name: "ops".into(),
+                    host_tags: vec!["*".into()],
+                    sudo: true,
+                    admin: false,
+                    user_mode: UserMode::Individual,
+                    groups: vec!["docker".into()],
+                    shell: None,
+                },
+                RoleDefinition {
+                    name: "developer".into(),
+                    host_tags: vec!["developer".into(), "staging".into()],
+                    sudo: false,
+                    admin: false,
+                    user_mode: UserMode::Individual,
+                    groups: vec![],
+                    shell: None,
+                },
+                RoleDefinition {
+                    name: "security".into(),
+                    host_tags: vec!["production".into(), "staging".into()],
+                    sudo: false,
+                    admin: false,
+                    user_mode: UserMode::Individual,
+                    groups: vec![],
+                    shell: None,
+                },
+                RoleDefinition {
+                    name: "ci".into(),
+                    host_tags: vec!["build".into()],
+                    sudo: false,
+                    admin: false,
+                    user_mode: UserMode::Shared,
+                    groups: vec![],
+                    shell: None,
+                },
+            ],
+        };
+        store.save(config_dir)?;
+        Ok(store)
     }
 }
 
@@ -931,6 +987,61 @@ mod tests {
             AdminResponse::Error { message } => assert!(message.contains("not found")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // --- seed_defaults tests ---
+
+    #[test]
+    fn seed_defaults_creates_five_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RolesStore::seed_defaults(dir.path()).unwrap();
+        assert_eq!(store.roles.len(), 5);
+
+        // Verify file was written
+        assert!(dir.path().join("roles.json").exists());
+
+        // admin role
+        let admin = store.find_role("admin").unwrap();
+        assert_eq!(admin.host_tags, vec!["*"]);
+        assert!(admin.sudo);
+        assert!(admin.admin);
+        assert_eq!(admin.user_mode, UserMode::Individual);
+        assert_eq!(admin.groups, vec!["docker"]);
+
+        // ops role
+        let ops = store.find_role("ops").unwrap();
+        assert_eq!(ops.host_tags, vec!["*"]);
+        assert!(ops.sudo);
+        assert!(!ops.admin);
+        assert_eq!(ops.groups, vec!["docker"]);
+
+        // developer role
+        let dev = store.find_role("developer").unwrap();
+        assert_eq!(dev.host_tags, vec!["developer", "staging"]);
+        assert!(!dev.sudo);
+        assert_eq!(dev.user_mode, UserMode::Individual);
+
+        // security role
+        let sec = store.find_role("security").unwrap();
+        assert_eq!(sec.host_tags, vec!["production", "staging"]);
+        assert!(!sec.sudo);
+
+        // ci role
+        let ci = store.find_role("ci").unwrap();
+        assert_eq!(ci.host_tags, vec!["build"]);
+        assert!(!ci.sudo);
+        assert_eq!(ci.user_mode, UserMode::Shared);
+    }
+
+    #[test]
+    fn seed_defaults_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        RolesStore::seed_defaults(dir.path()).unwrap();
+
+        let loaded = RolesStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.roles.len(), 5);
+        assert_eq!(loaded.roles[0].name, "admin");
+        assert_eq!(loaded.roles[4].name, "ci");
     }
 
     // --- Fleet admin handler tests ---
