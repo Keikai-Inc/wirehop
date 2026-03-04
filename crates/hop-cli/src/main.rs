@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command, PeersAction};
+use cli::{Cli, Command, ConfigAction, PeersAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, PublicKey, RelayUrl, TransportAddr, Watcher};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use hop_core::auth::{self, AuthOutcome};
-use hop_core::config::{self, KnownHostsStore, PeersStore};
+use hop_core::config::{self, HostConfig, KnownHostsStore, PeersStore};
 use hop_core::invite;
 use hop_core::net;
 use hop_core::proto::{self, ClientMessage, TransferDirection, TransferMode, TransferRequest};
@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_sync(secret_key, &config_dir, delete, dry_run, verbose, &source, &dest).await
+        }
+        Command::Config { action } => {
+            let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_config(action, &host_config_dir)
         }
         Command::Peers { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -168,9 +172,20 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         println!();
     }
 
-    // Session registry for persistent PTY sessions (5-minute detach timeout)
+    // Load host configuration
+    let host_config = HostConfig::load(config_dir)?;
+    tracing::info!(
+        "Session config: timeout={}s, max_sessions={}",
+        host_config.session_timeout_secs,
+        host_config.max_sessions
+    );
+
+    // Session registry for persistent PTY sessions
     let registry = Arc::new(tokio::sync::Mutex::new(
-        SessionRegistry::new(Duration::from_secs(5 * 60)),
+        SessionRegistry::new(
+            Duration::from_secs(host_config.session_timeout_secs),
+            host_config.max_sessions,
+        ),
     ));
 
     // Spawn reaper task: every 30s, remove expired/exited sessions
@@ -859,6 +874,66 @@ async fn cmd_sync(
     }
 
     Ok(())
+}
+
+fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Result<()> {
+    let mut cfg = HostConfig::load(config_dir)?;
+
+    match action {
+        None => {
+            // Display current config
+            let timeout = cfg.session_timeout_secs;
+            let human = if timeout >= 86400 {
+                format!("{}d", timeout / 86400)
+            } else if timeout >= 3600 {
+                format!("{}h", timeout / 3600)
+            } else if timeout >= 60 {
+                format!("{}m", timeout / 60)
+            } else {
+                format!("{timeout}s")
+            };
+            println!("session_timeout  {timeout} ({human})");
+            println!("max_sessions     {}", cfg.max_sessions);
+        }
+        Some(ConfigAction::Set { key, value }) => {
+            match key.as_str() {
+                "session_timeout" => {
+                    let secs: u64 = parse_duration_value(&value)?;
+                    cfg.session_timeout_secs = secs;
+                    cfg.save(config_dir)?;
+                    println!("session_timeout set to {secs}s");
+                }
+                "max_sessions" => {
+                    let n: usize = value.parse().context("max_sessions must be a positive integer")?;
+                    cfg.max_sessions = n;
+                    cfg.save(config_dir)?;
+                    println!("max_sessions set to {n}");
+                }
+                _ => {
+                    anyhow::bail!("Unknown config key '{key}'. Valid keys: session_timeout, max_sessions");
+                }
+            }
+            println!("Note: restart the host/daemon for changes to take effect.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a duration value that can be plain seconds or suffixed (s, m, h, d).
+fn parse_duration_value(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('d') {
+        Ok(n.parse::<u64>().context("invalid number")? * 86400)
+    } else if let Some(n) = s.strip_suffix('h') {
+        Ok(n.parse::<u64>().context("invalid number")? * 3600)
+    } else if let Some(n) = s.strip_suffix('m') {
+        Ok(n.parse::<u64>().context("invalid number")? * 60)
+    } else if let Some(n) = s.strip_suffix('s') {
+        Ok(n.parse::<u64>().context("invalid number")?)
+    } else {
+        Ok(s.parse::<u64>().context("invalid number — use a suffix like 1h, 30m, 1d, or plain seconds")?)
+    }
 }
 
 fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, user_config_dir: &std::path::Path) -> Result<()> {

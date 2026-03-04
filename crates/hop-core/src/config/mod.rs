@@ -375,6 +375,62 @@ impl KnownHostsStore {
     }
 }
 
+/// Host-side configuration (persisted as `host_config.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostConfig {
+    /// How long (in seconds) to keep a detached PTY session alive.
+    /// Default: 86400 (24 hours).
+    #[serde(default = "default_session_timeout")]
+    pub session_timeout_secs: u64,
+
+    /// Maximum number of detached PTY sessions to keep alive.
+    /// When the limit is reached, the oldest detached session is evicted.
+    /// Default: 10.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+}
+
+fn default_session_timeout() -> u64 {
+    86400
+}
+
+fn default_max_sessions() -> usize {
+    10
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            session_timeout_secs: default_session_timeout(),
+            max_sessions: default_max_sessions(),
+        }
+    }
+}
+
+impl HostConfig {
+    /// Load config from `host_config.json` in the given directory.
+    /// Returns defaults if the file doesn't exist.
+    pub fn load(config_dir: &Path) -> Result<Self> {
+        let path = config_dir.join("host_config.json");
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok(serde_json::from_str(&data)
+                .with_context(|| format!("Failed to parse {}", path.display()))?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Save config to `host_config.json`.
+    pub fn save(&self, config_dir: &Path) -> Result<()> {
+        let path = config_dir.join("host_config.json");
+        let data = serde_json::to_string_pretty(self)?;
+        write_shared_file(&path, &data)?;
+        Ok(())
+    }
+}
+
 fn chrono_now() -> String {
     // Simple ISO 8601 timestamp without pulling in the chrono crate
     use std::time::SystemTime;

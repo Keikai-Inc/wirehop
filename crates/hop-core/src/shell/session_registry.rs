@@ -66,14 +66,16 @@ impl DetachedSession {
 pub struct SessionRegistry {
     sessions: HashMap<SessionKey, DetachedSession>,
     timeout: Duration,
+    max_sessions: usize,
 }
 
 impl SessionRegistry {
-    /// Create a new registry with the given detach timeout.
-    pub fn new(timeout: Duration) -> Self {
+    /// Create a new registry with the given detach timeout and session cap.
+    pub fn new(timeout: Duration, max_sessions: usize) -> Self {
         Self {
             sessions: HashMap::new(),
             timeout,
+            max_sessions,
         }
     }
 
@@ -87,8 +89,12 @@ impl SessionRegistry {
         self.sessions.get_mut(key)
     }
 
-    /// Insert a new session.
+    /// Insert a new session, evicting the oldest detached session if at capacity.
     pub fn insert(&mut self, key: SessionKey, session: DetachedSession) {
+        // If we're at the limit, evict the oldest detached (non-attached) session.
+        if self.max_sessions > 0 && self.sessions.len() >= self.max_sessions {
+            self.evict_oldest_detached();
+        }
         self.sessions.insert(key, session);
     }
 
@@ -102,6 +108,11 @@ impl SessionRegistry {
     /// Remove a session and return it (dropping it will close the PTY).
     pub fn remove(&mut self, key: &SessionKey) -> Option<DetachedSession> {
         self.sessions.remove(key)
+    }
+
+    /// Number of sessions currently in the registry.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Remove sessions that have expired (detached longer than timeout)
@@ -120,6 +131,22 @@ impl SessionRegistry {
             }
             true
         });
+    }
+
+    /// Evict the detached session with the oldest `detached_at` time.
+    /// If no detached sessions exist, does nothing (insertion will exceed cap).
+    fn evict_oldest_detached(&mut self) {
+        let oldest = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| !s.attached && s.detached_at.is_some())
+            .min_by_key(|(_, s)| s.detached_at.unwrap())
+            .map(|(k, _)| k.clone());
+
+        if let Some(key) = oldest {
+            tracing::info!("Evicting oldest detached session for {:?} (at capacity)", key);
+            self.sessions.remove(&key);
+        }
     }
 }
 

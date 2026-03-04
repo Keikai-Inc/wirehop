@@ -44,6 +44,12 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// View or update host configuration
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+
     /// List authorized peers or known hosts
     Peers {
         #[command(subcommand)]
@@ -106,6 +112,17 @@ pub enum Command {
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Set a configuration value
+    Set {
+        /// Configuration key (session_timeout, max_sessions)
+        key: String,
+        /// New value
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]

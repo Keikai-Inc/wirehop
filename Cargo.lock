@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "argon2",
