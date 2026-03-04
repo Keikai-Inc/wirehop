@@ -70,12 +70,11 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 
 /// Connect to a remote host by their PublicKey, optionally with a relay URL hint.
 ///
-/// Races relay and discovery paths concurrently — the first successful
-/// connection wins. This avoids the multi-second penalty when the host's
-/// relay session is dead (common with NAT timeouts).
-///
-/// Returns `(connection, relay_hint_failed)` — callers should clear a stored
-/// relay URL from known_hosts when `relay_hint_failed` is true.
+/// Uses a single `endpoint.connect()` with the relay hint. iroh handles
+/// discovery internally — it will use the relay for immediate connectivity
+/// while also discovering direct paths in the background. This avoids
+/// racing two connections to the same host (which causes spurious QUIC
+/// CLOSE frames and "aborted by peer" errors on the host).
 pub async fn connect_to_host(
     endpoint: &Endpoint,
     remote_id: PublicKey,
@@ -85,54 +84,17 @@ pub async fn connect_to_host(
         .cloned()
         .unwrap_or_else(|| HOP_RELAY_URL.parse().expect("valid relay URL"));
 
-    let relay_addr = EndpointAddr::from_parts(
+    let addr = EndpointAddr::from_parts(
         remote_id,
         [TransportAddr::Relay(relay_url_owned)],
     );
-    let discovery_addr = EndpointAddr::from(remote_id);
 
-    // Race relay and discovery concurrently — first to connect wins.
-    // When the host's relay session is dead, discovery finds it directly
-    // without waiting for a relay timeout.
-    tokio::select! {
-        result = endpoint.connect(relay_addr, ALPN_V2) => {
-            match result {
-                Ok(conn) => Ok((conn, false)),
-                Err(e) => {
-                    // Relay errored before discovery completed — try discovery
-                    tracing::info!("Relay path failed ({e:#}), falling back to discovery");
-                    let addr = EndpointAddr::from(remote_id);
-                    let conn = endpoint
-                        .connect(addr, ALPN_V2)
-                        .await
-                        .context("Failed to connect to host")?;
-                    Ok((conn, true))
-                }
-            }
-        }
-        result = endpoint.connect(discovery_addr, ALPN_V2) => {
-            match result {
-                Ok(conn) => {
-                    tracing::info!("Connected via discovery (relay was slower)");
-                    Ok((conn, false))
-                }
-                Err(e) => {
-                    // Discovery errored before relay — unusual, retry with relay
-                    tracing::warn!("Discovery path failed ({e:#}), retrying via relay");
-                    let url: RelayUrl = HOP_RELAY_URL.parse().expect("valid relay URL");
-                    let addr = EndpointAddr::from_parts(
-                        remote_id,
-                        [TransportAddr::Relay(url)],
-                    );
-                    let conn = endpoint
-                        .connect(addr, ALPN_V2)
-                        .await
-                        .context("Failed to connect to host")?;
-                    Ok((conn, false))
-                }
-            }
-        }
-    }
+    let conn = endpoint
+        .connect(addr, ALPN_V2)
+        .await
+        .context("Failed to connect to host")?;
+
+    Ok((conn, false))
 }
 
 /// Return the protocol version negotiated on a connection.
