@@ -662,7 +662,7 @@
         </div>
         <div class="step">
           <h3>Define roles</h3>
-          <p>Create roles that map to host tags. <code>hop admin myorch role create developer --tags developer,staging</code></p>
+          <p>Create roles that map to host tags. <code>hop admin orch-1 role create developer --tags developer,staging</code></p>
         </div>
         <div class="step">
           <h3>Register hosts</h3>
@@ -689,21 +689,21 @@
 
 <span class="comment"># 2. Redeem creator invite from your laptop</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
-<span class="output">Saved as known host: myorch</span>
+<span class="output">Saved as known host: orch-1</span>
 
-<span class="comment"># 3. Define roles</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> role create <span class="flag">developer</span> --tags developer,staging
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> role create <span class="flag">ops</span> --tags '*' --sudo
+<span class="comment"># 3. Define roles (orch-1 is the saved host name from step 2)</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">developer</span> --tags developer,staging
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">ops</span> --tags '*' --sudo
 
 <span class="comment"># 4. Create a fleet invite for registering hosts</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> fleet-invite --tags developer,web
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> fleet-invite --tags developer,web
 <span class="output">Fleet invite: abCdEf...   (100 uses, 24h expiry)</span>
 
 <span class="comment"># 5. Register a host (on the host machine)</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keik.ai/install-daemon.sh <span class="cmd">| bash</span> -s -- --register <span class="flag">abCdEf...</span>
 
 <span class="comment"># 6. Invite a developer</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> invite --role developer --name alice
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> invite --role developer --name alice
 <span class="output">Invite: xYz123...   (covers all developer+staging hosts)</span>
           </div>
         </div>
@@ -847,12 +847,12 @@
 
 <span class="comment"># Check fleet status</span>
 <span class="prompt">$</span> <span class="cmd">hop fleet status</span>
-<span class="output">Fleet: myorch</span>
+<span class="output">Fleet: orch-1</span>
 <span class="output">  3 hosts registered</span>
 <span class="output">  3 online, 0 offline</span>
 
 <span class="comment"># Admin: see all peers</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">myorch</span> peers
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> peers
 <span class="output">  alice   developer   online</span>
 <span class="output">  bob     ops         online</span>
           </div>
