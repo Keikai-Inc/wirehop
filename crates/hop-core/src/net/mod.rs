@@ -70,21 +70,22 @@ pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
 
 /// Connect to a remote host by their PublicKey, optionally with a relay URL hint.
 ///
-/// Uses iroh's discovery (DNS/pkarr) to find the host's address info,
-/// which includes relay URLs and direct addresses. This is more reliable
-/// than providing an explicit relay hint, as discovery returns the host's
-/// actual published address including any direct paths.
+/// When a relay URL is provided (from known_hosts or invite tokens), it's
+/// included as a hint so iroh can immediately relay traffic while also
+/// attempting direct paths via discovery. Without the hint, iroh must
+/// discover the relay URL via DNS/pkarr first, which can delay or fail.
 pub async fn connect_to_host(
     endpoint: &Endpoint,
     remote_id: PublicKey,
-    _relay_url: Option<&RelayUrl>,
+    relay_url: Option<&RelayUrl>,
 ) -> Result<(Connection, bool)> {
-    // Let iroh discover the host's address via DNS/pkarr.
-    // The host publishes its relay URL and direct addresses to iroh.link,
-    // so discovery will find the correct path automatically.
-    let addr = EndpointAddr::from(remote_id);
+    let addr = if let Some(relay) = relay_url {
+        EndpointAddr::from(remote_id).with_relay_url(relay.clone())
+    } else {
+        EndpointAddr::from(remote_id)
+    };
 
-    tracing::info!("Connecting to {} via discovery", remote_id.fmt_short());
+    tracing::info!("Connecting to {} (relay hint: {})", remote_id.fmt_short(), relay_url.is_some());
 
     let conn = endpoint
         .connect(addr, ALPN_V2)
