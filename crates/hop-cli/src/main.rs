@@ -22,7 +22,7 @@ use hop_core::invite;
 use hop_core::net;
 use hop_core::proto::{
     self, AdminRequest, AdminResponse, ClientMessage, RoleDefinition, RoleUpdates, UserMode,
-    TransferDirection, TransferMode, TransferRequest,
+    TransferDirection, TransferMode, TransferMsg, TransferRequest,
 };
 use hop_core::shell::{self, SessionOutcome};
 use hop_core::shell::session_registry::SessionRegistry;
@@ -825,6 +825,23 @@ async fn cmd_sync(
             _ => unreachable!(),
         };
 
+        // rsync convention: no trailing slash → sync the directory itself,
+        // trailing slash → sync the contents into dest.
+        let effective_dir = if !remote_path.ends_with('/') && local_dir.is_dir() {
+            let dir_name = std::path::Path::new(remote_path)
+                .file_name()
+                .unwrap_or_default();
+            if !dir_name.is_empty() {
+                let nested = local_dir.join(dir_name);
+                std::fs::create_dir_all(&nested)?;
+                nested
+            } else {
+                local_dir.clone()
+            }
+        } else {
+            local_dir.clone()
+        };
+
         let request = TransferRequest {
             mode: TransferMode::Sync,
             direction: TransferDirection::Pull,
@@ -840,15 +857,35 @@ async fn cmd_sync(
 
         let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
-        let state = progress_ui::TransferState::new(false);
-        let render_handle = progress_ui::spawn_render_loop(state.clone());
+        // Phase 1: plan exchange (before progress UI so no "0/0 files" flash)
+        let plan =
+            transfer::client_pull_sync_negotiate(&mut send, &mut recv, &effective_dir).await?;
 
-        let summary =
-            transfer::client_pull_sync(&mut send, &mut recv, &local_dir, &request, &state, &params)
-                .await?;
-        state.mark_finished();
-        let _ = render_handle.await;
-        eprintln!("{summary}");
+        if plan.files_to_send.is_empty() && plan.files_to_delete.is_empty() && !plan.dry_run {
+            // Nothing to transfer — still need to complete the protocol:
+            // send PlanAck, host sends Done (0 files), we read it, send Done back.
+            proto::write_message(&mut send, &TransferMsg::PlanAck { proceed: true }).await?;
+            // Host sends 0 files then Done — read it
+            let msg: TransferMsg = proto::read_message(&mut recv).await?;
+            match msg {
+                TransferMsg::Done => {}
+                other => tracing::warn!("expected Done, got: {other:?}"),
+            }
+            let _ = proto::write_message(&mut send, &TransferMsg::Done).await;
+            eprintln!("Already up to date.");
+        } else {
+            // Phase 2: transfer files (with progress UI)
+            let state = progress_ui::TransferState::new(false);
+            let render_handle = progress_ui::spawn_render_loop(state.clone());
+
+            let summary = transfer::client_pull_sync_transfer(
+                &mut send, &mut recv, &effective_dir, plan, &state, &params,
+            )
+            .await?;
+            state.mark_finished();
+            let _ = render_handle.await;
+            eprintln!("{summary}");
+        }
     }
 
     Ok(())

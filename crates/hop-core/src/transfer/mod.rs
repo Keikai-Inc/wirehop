@@ -599,18 +599,22 @@ pub async fn client_push_sync(
     Ok(summary)
 }
 
-/// Client-side: sync-pull from remote host to local directory.
-pub async fn client_pull_sync(
+/// Result of sync plan negotiation (phase 1).
+pub struct SyncPlanResult {
+    pub files_to_send: Vec<proto::FileEntry>,
+    pub files_to_delete: Vec<String>,
+    pub dry_run: bool,
+}
+
+/// Client-side sync-pull phase 1: exchange file list and negotiate plan.
+///
+/// Call this BEFORE starting the progress UI so the user doesn't see an
+/// empty "0/0 files" display during the multi-second plan exchange.
+pub async fn client_pull_sync_negotiate(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
-    _request: &TransferRequest,
-    progress: &dyn ProgressReporter,
-    params: &NegotiatedParams,
-) -> Result<TransferSummary> {
-    let start = Instant::now();
-    let mut summary = TransferSummary::default();
-
+) -> Result<SyncPlanResult> {
     // 1. Walk local directory and send listing to host
     let local_entries = if local_dir.is_dir() {
         listing::walk_directory(local_dir)?
@@ -623,7 +627,7 @@ pub async fn client_pull_sync(
     // 2. Read the host's TransferPlan
     tracing::debug!("sync: waiting for TransferPlan from host...");
     let plan_msg: TransferMsg = proto::read_message(recv).await?;
-    let (files_to_send, files_to_delete, dry_run) = match plan_msg {
+    match plan_msg {
         TransferMsg::TransferPlan {
             files_to_send,
             files_to_delete,
@@ -635,15 +639,34 @@ pub async fn client_pull_sync(
                 files_to_delete.len(),
                 dry_run
             );
-            (files_to_send, files_to_delete, dry_run)
+            Ok(SyncPlanResult {
+                files_to_send,
+                files_to_delete,
+                dry_run,
+            })
         }
         TransferMsg::Error(e) => bail!("host error: {e}"),
         other => bail!("expected TransferPlan from host, got: {other:?}"),
-    };
+    }
+}
 
-    if dry_run {
+/// Client-side sync-pull phase 2: transfer files according to the plan.
+///
+/// Call this AFTER starting the progress UI.
+pub async fn client_pull_sync_transfer(
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    local_dir: &Path,
+    plan: SyncPlanResult,
+    progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
+) -> Result<TransferSummary> {
+    let start = Instant::now();
+    let mut summary = TransferSummary::default();
+
+    if plan.dry_run {
         proto::write_message(send, &TransferMsg::PlanAck { proceed: true }).await?;
-        for entry in &files_to_send {
+        for entry in &plan.files_to_send {
             if entry.is_dir {
                 summary.dirs_created += 1;
             } else {
@@ -651,7 +674,7 @@ pub async fn client_pull_sync(
                 summary.bytes_transferred += entry.size;
             }
         }
-        summary.files_deleted = files_to_delete.len() as u64;
+        summary.files_deleted = plan.files_to_delete.len() as u64;
         // Read host's Done
         let msg: TransferMsg = proto::read_message(recv).await?;
         match msg {
@@ -663,12 +686,13 @@ pub async fn client_pull_sync(
         return Ok(summary);
     }
 
-    // 3. Acknowledge the plan
+    // Acknowledge the plan
     tracing::debug!("sync: sending PlanAck");
     proto::write_message(send, &TransferMsg::PlanAck { proceed: true }).await?;
 
-    // 4. Compute delta candidates on client side and receive files
-    let delta_candidates: std::collections::HashSet<String> = files_to_send
+    // Compute delta candidates on client side and receive files
+    let delta_candidates: std::collections::HashSet<String> = plan
+        .files_to_send
         .iter()
         .filter(|f| {
             !f.is_dir
@@ -687,13 +711,18 @@ pub async fn client_pull_sync(
     tracing::debug!("sync: {} delta candidates, receiving files...", delta_candidates.len());
     if !delta_candidates.is_empty() {
         let (bytes, saved) = receiver::receive_files_with_delta(
-            send, recv, local_dir, &delta_candidates, &files_to_send, progress, params,
+            send,
+            recv,
+            local_dir,
+            &delta_candidates,
+            &plan.files_to_send,
+            progress,
+            params,
         )
         .await?;
         summary.bytes_transferred = bytes;
         summary.bytes_saved = saved;
     } else {
-        let _ = (files_to_send, files_to_delete); // data arrives as messages
         let bytes = receiver::receive_files(send, recv, local_dir, progress, params).await?;
         summary.bytes_transferred = bytes;
     }
