@@ -184,27 +184,14 @@ pub async fn host_shell_session(
     let pty_writer_clone = pty_writer.clone();
     let pty_to_client = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut buf = [0u8; 4096];
-        let mut output_buf = Vec::new();
-        loop {
-            match pty_reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output_buf.extend_from_slice(&buf[..n]);
-                    // Flush accumulated output
-                    let data = std::mem::take(&mut output_buf);
-                    // We'll collect chunks and send them via a channel
-                    // For simplicity, return the data and handle in async context
-                    // Actually we need a channel approach here
-                    output_buf = data; // put it back, we need a different approach
-                    break; // exit to restructure
-                }
-                Err(e) => {
-                    // PTY closed
-                    tracing::debug!("PTY read error: {e}");
-                    break;
-                }
+        let output_buf = match pty_reader.read(&mut buf) {
+            Ok(0) => Vec::new(),
+            Ok(n) => buf[..n].to_vec(),
+            Err(e) => {
+                tracing::debug!("PTY read error: {e}");
+                Vec::new()
             }
-        }
+        };
         Ok(output_buf)
     });
 

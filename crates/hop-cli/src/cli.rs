@@ -77,9 +77,29 @@ pub enum Command {
         #[arg(short = 'n', long)]
         dry_run: bool,
 
-        /// Print each file being transferred
-        #[arg(long)]
+        /// Show itemized list of changes per file
+        #[arg(short = 'i', long = "itemize-changes", alias = "itemize")]
         itemize: bool,
+
+        /// Show detailed transfer statistics
+        #[arg(long)]
+        stats: bool,
+
+        /// Suppress per-file progress (show only filenames)
+        #[arg(long)]
+        no_progress: bool,
+
+        // Compat no-ops (hidden from --help)
+        #[arg(short = 'a', long, hide = true)]
+        archive: bool,
+        #[arg(short = 'z', long, hide = true)]
+        compress: bool,
+        #[arg(short = 'P', hide = true)]
+        partial_progress: bool,
+        #[arg(long, hide = true)]
+        progress: bool,
+        #[arg(short = 'H', long = "human-readable", hide = true)]
+        human_readable: bool,
 
         /// Source path (use host:path for remote)
         source: String,

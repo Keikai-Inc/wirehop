@@ -496,18 +496,23 @@ pub async fn client_pull_copy(
     Ok(summary)
 }
 
-/// Client-side: sync-push local directory to remote host.
-pub async fn client_push_sync(
+/// Result of push-sync plan negotiation (phase 1).
+pub struct PushSyncNegotiation {
+    pub local_entries: Vec<proto::FileEntry>,
+    pub remote_entries: Vec<proto::FileEntry>,
+    pub plan: listing::SyncPlan,
+}
+
+/// Client-side push-sync phase 1: exchange file lists and negotiate plan.
+///
+/// Call this BEFORE starting the progress UI so the user can compute
+/// itemize maps from the local/remote entries.
+pub async fn client_push_sync_negotiate(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
     request: &TransferRequest,
-    progress: &dyn ProgressReporter,
-    params: &NegotiatedParams,
-) -> Result<TransferSummary> {
-    let start = Instant::now();
-    let mut summary = TransferSummary::default();
-
+) -> Result<PushSyncNegotiation> {
     // 1. Read the host's destination file listing
     let remote_list_msg: TransferMsg = proto::read_message(recv).await?;
     let remote_entries = match remote_list_msg {
@@ -537,12 +542,34 @@ pub async fn client_push_sync(
     match ack_msg {
         TransferMsg::PlanAck { proceed: true } => {}
         TransferMsg::PlanAck { proceed: false } => {
-            summary.elapsed = start.elapsed();
-            return Ok(summary);
+            bail!("host declined the sync plan");
         }
         TransferMsg::Error(e) => bail!("host error: {e}"),
         other => bail!("expected PlanAck, got: {other:?}"),
     }
+
+    Ok(PushSyncNegotiation {
+        local_entries,
+        remote_entries,
+        plan,
+    })
+}
+
+/// Client-side push-sync phase 2: transfer files according to the plan.
+///
+/// Call this AFTER starting the progress UI.
+pub async fn client_push_sync_transfer(
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    local_dir: &Path,
+    request: &TransferRequest,
+    negotiation: PushSyncNegotiation,
+    progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
+) -> Result<TransferSummary> {
+    let start = Instant::now();
+    let mut summary = TransferSummary::default();
+    let plan = negotiation.plan;
 
     if request.dry_run {
         // In dry run, report what would happen
@@ -597,6 +624,21 @@ pub async fn client_push_sync(
 
     summary.elapsed = start.elapsed();
     Ok(summary)
+}
+
+/// Client-side: sync-push local directory to remote host.
+///
+/// Convenience wrapper that calls negotiate + transfer in one shot.
+pub async fn client_push_sync(
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    local_dir: &Path,
+    request: &TransferRequest,
+    progress: &dyn ProgressReporter,
+    params: &NegotiatedParams,
+) -> Result<TransferSummary> {
+    let negotiation = client_push_sync_negotiate(send, recv, local_dir, request).await?;
+    client_push_sync_transfer(send, recv, local_dir, request, negotiation, progress, params).await
 }
 
 /// Result of sync plan negotiation (phase 1).

@@ -1,9 +1,11 @@
 mod agent;
 mod cli;
+mod itemize;
 mod mux;
 mod progress_ui;
 mod reconnect;
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,12 +78,20 @@ async fn main() -> Result<()> {
             delete,
             dry_run,
             itemize,
+            stats,
+            no_progress,
             source,
             dest,
+            // no-op compat flags
+            archive: _,
+            compress: _,
+            partial_progress: _,
+            progress: _,
+            human_readable: _,
         } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_sync(secret_key, &config_dir, delete, dry_run, itemize, &source, &dest).await
+            cmd_sync(secret_key, &config_dir, delete, dry_run, itemize, stats, no_progress, &source, &dest).await
         }
         Command::Config { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -749,12 +759,15 @@ async fn cmd_cp(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_sync(
     _secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     delete: bool,
     dry_run: bool,
-    _verbose: bool,
+    itemize: bool,
+    stats: bool,
+    no_progress: bool,
     source: &str,
     dest: &str,
 ) -> Result<()> {
@@ -805,15 +818,87 @@ async fn cmd_sync(
 
         let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
-        let state = progress_ui::TransferState::new(true);
+        // Print rsync-style header
+        eprintln!(
+            "sending file list to {}:{}",
+            host, remote_path,
+        );
+
+        // Phase 1: negotiate (get plan + local/remote entries for itemize)
+        let negotiation =
+            transfer::client_push_sync_negotiate(&mut send, &mut recv, &local_dir, &request).await?;
+
+        // Check if nothing to do
+        if negotiation.plan.files_to_send.is_empty()
+            && negotiation.plan.files_to_delete.is_empty()
+            && !dry_run
+        {
+            // Read host's Done
+            let msg: TransferMsg = proto::read_message(&mut recv).await?;
+            match msg {
+                TransferMsg::Done => {}
+                other => tracing::warn!("expected Done from host, got: {other:?}"),
+            }
+            eprintln!("Already up to date.");
+            return Ok(());
+        }
+
+        // Compute itemize map if requested
+        let itemize_map = if itemize {
+            itemize::compute_itemize_map(
+                &negotiation.plan.files_to_send,
+                &negotiation.remote_entries,
+                true, // is_push
+            )
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Dry run with -i: print itemize strings and exit
+        if dry_run && itemize {
+            for entry in &negotiation.plan.files_to_send {
+                if let Some(change_str) = itemize_map.get(&entry.path) {
+                    if entry.is_dir {
+                        eprintln!("{} {}/", change_str, entry.path);
+                    } else {
+                        eprintln!("{} {}", change_str, entry.path);
+                    }
+                }
+            }
+            for path in &negotiation.plan.files_to_delete {
+                eprintln!("*deleting   {}", path);
+            }
+        }
+
+        let total_file_count = negotiation.plan.files_to_send
+            .iter()
+            .filter(|e| !e.is_dir && !e.is_symlink)
+            .count();
+        let existing_dirs: HashSet<String> = negotiation.remote_entries
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.path.clone())
+            .collect();
+
+        let state = progress_ui::TransferState::with_mode(
+            true,
+            progress_ui::DisplayMode::Rsync,
+            total_file_count,
+            existing_dirs,
+        );
+        state.set_itemize_map(itemize_map);
+        state.set_no_progress(no_progress);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
-        let summary =
-            transfer::client_push_sync(&mut send, &mut recv, &local_dir, &request, &state, &params)
-                .await?;
+        let summary = transfer::client_push_sync_transfer(
+            &mut send, &mut recv, &local_dir, &request, negotiation, &state, &params,
+        ).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        eprintln!("{summary}");
+        eprintln!("{}", summary.format_rsync());
+        if stats {
+            eprintln!("\n{}", summary.format_stats());
+        }
     } else {
         // Pull sync: remote -> local
         let (host, remote_path) = match &source_spec {
@@ -874,8 +959,69 @@ async fn cmd_sync(
             let _ = proto::write_message(&mut send, &TransferMsg::Done).await;
             eprintln!("Already up to date.");
         } else {
+            // Compute itemize map if requested: walk local dir for comparison
+            let itemize_map = if itemize {
+                let local_entries = if effective_dir.is_dir() {
+                    hop_core::transfer::listing::walk_directory(&effective_dir)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                itemize::compute_itemize_map(
+                    &plan.files_to_send,
+                    &local_entries,
+                    false, // is_pull
+                )
+            } else {
+                std::collections::HashMap::new()
+            };
+
+            // Dry run with -i: print itemize strings and exit early from display
+            if dry_run && itemize {
+                for entry in &plan.files_to_send {
+                    if let Some(change_str) = itemize_map.get(&entry.path) {
+                        if entry.is_dir {
+                            eprintln!("{} {}/", change_str, entry.path);
+                        } else {
+                            eprintln!("{} {}", change_str, entry.path);
+                        }
+                    }
+                }
+                for path in &plan.files_to_delete {
+                    eprintln!("*deleting   {}", path);
+                }
+            }
+
+            // Compute existing dirs from plan (suppress from rsync output)
+            let existing_dirs: HashSet<String> = plan
+                .files_to_send
+                .iter()
+                .filter(|e| e.is_dir && effective_dir.join(&e.path).is_dir())
+                .map(|e| e.path.clone())
+                .collect();
+            let total_file_count = plan
+                .files_to_send
+                .iter()
+                .filter(|e| !e.is_dir && !e.is_symlink)
+                .count();
+
+            // Print rsync-style header
+            eprintln!(
+                "receiving file list from {}:{} \u{2192} {}",
+                host,
+                remote_path,
+                effective_dir.display(),
+            );
+
             // Phase 2: transfer files (with progress UI)
-            let state = progress_ui::TransferState::new(false);
+            let state = progress_ui::TransferState::with_mode(
+                false,
+                progress_ui::DisplayMode::Rsync,
+                total_file_count,
+                existing_dirs,
+            );
+            state.set_itemize_map(itemize_map);
+            state.set_no_progress(no_progress);
             let render_handle = progress_ui::spawn_render_loop(state.clone());
 
             let summary = transfer::client_pull_sync_transfer(
@@ -884,7 +1030,10 @@ async fn cmd_sync(
             .await?;
             state.mark_finished();
             let _ = render_handle.await;
-            eprintln!("{summary}");
+            eprintln!("{}", summary.format_rsync());
+            if stats {
+                eprintln!("\n{}", summary.format_stats());
+            }
         }
     }
 

@@ -74,6 +74,79 @@ impl fmt::Display for TransferSummary {
     }
 }
 
+impl TransferSummary {
+    /// Format the summary in rsync-compatible style.
+    pub fn format_rsync(&self) -> String {
+        let has_work = self.files_transferred > 0
+            || self.dirs_created > 0
+            || self.bytes_transferred > 0
+            || self.files_deleted > 0;
+        if has_work {
+            format!(
+                "\ntotal size is {}  {} file(s) in {:.1}s",
+                format_bytes_comma(self.bytes_transferred),
+                self.files_transferred,
+                self.elapsed.as_secs_f64(),
+            )
+        } else {
+            "\nAlready up to date.".to_string()
+        }
+    }
+
+    /// Format detailed transfer statistics (for --stats flag).
+    pub fn format_stats(&self) -> String {
+        let elapsed_secs = self.elapsed.as_secs_f64();
+        let speed = if elapsed_secs > 0.0 {
+            self.bytes_transferred as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Number of regular files transferred: {}",
+            self.files_transferred
+        ));
+        lines.push(format!(
+            "Number of files deleted: {}",
+            self.files_deleted
+        ));
+        lines.push(format!(
+            "Number of directories created: {}",
+            self.dirs_created
+        ));
+        lines.push(format!(
+            "Total bytes transferred: {}",
+            format_bytes_comma(self.bytes_transferred)
+        ));
+        if self.bytes_saved > 0 {
+            lines.push(format!(
+                "Bytes saved by delta: {}",
+                format_bytes_comma(self.bytes_saved)
+            ));
+        }
+        lines.push(format!(
+            "Transfer speed: {}/s",
+            format_bytes_comma(speed as u64)
+        ));
+
+        lines.join("\n")
+    }
+}
+
+/// Format a byte count with comma separators (e.g. `3,085`).
+pub fn format_bytes_comma(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
