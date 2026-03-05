@@ -53,12 +53,12 @@ pub async fn receive_files(
                     receive_file_data(recv, &tmp_path, &header.path, header.size, progress, params).await;
 
                 match result {
-                    Ok(bytes_written) => {
+                    Ok(_wire_bytes) => {
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
                         set_metadata(&target, header.mode, header.mtime);
-                        total_bytes += bytes_written;
+                        total_bytes += header.size; // actual file size, not wire bytes
                         progress.file_done(&header.path);
                         send_ack(send, &header.path, true, None).await?;
                     }
@@ -506,12 +506,12 @@ pub async fn receive_files_with_delta(
                         .await;
 
                 match result {
-                    Ok(bytes_written) => {
+                    Ok(_wire_bytes) => {
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
                         set_metadata(&target, header.mode, header.mtime);
-                        total_bytes += bytes_written;
+                        total_bytes += header.size; // actual file size, not wire bytes
                         progress.file_done(&header.path);
                         send_ack(send, &header.path, true, None).await?;
                     }
@@ -555,15 +555,14 @@ pub async fn receive_files_with_delta(
                     &ops,
                     crate::proto::DELTA_BLOCK_SIZE,
                 ) {
-                    Ok(written) => {
+                    Ok(_written) => {
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
                         set_metadata(&target, mode, mtime);
-                        total_bytes += written;
-                        if new_size > written {
-                            bytes_saved += new_size - written;
-                        }
+                        total_bytes += new_size; // actual file size
+                        // bytes_saved tracks how much we avoided sending over the wire
+                        bytes_saved += new_size; // delta avoided full retransmit
                         progress.file_done(&path);
                         send_ack(send, &path, true, None).await?;
                     }

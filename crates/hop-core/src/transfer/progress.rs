@@ -39,11 +39,19 @@ pub struct TransferSummary {
 
 impl fmt::Display for TransferSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.files_transferred > 0 || self.bytes_transferred > 0 {
+        let has_work = self.files_transferred > 0
+            || self.dirs_created > 0
+            || self.bytes_transferred > 0
+            || self.files_deleted > 0;
+        if has_work {
+            // Build a compact summary: "transferred 2 file(s), 1 dir(s), 3.0 KB in 0.1s"
+            write!(f, "transferred {} file(s)", self.files_transferred)?;
+            if self.dirs_created > 0 {
+                write!(f, ", {} dir(s)", self.dirs_created)?;
+            }
             write!(
                 f,
-                "transferred {} file(s), {} in {:.1}s",
-                self.files_transferred,
+                ", {} in {:.1}s",
                 format_bytes(self.bytes_transferred),
                 self.elapsed.as_secs_f64(),
             )?;
@@ -53,7 +61,10 @@ impl fmt::Display for TransferSummary {
         if self.files_skipped > 0 {
             write!(f, ", {} skipped", self.files_skipped)?;
         }
-        if self.files_deleted > 0 {
+        if self.files_deleted > 0 && self.files_transferred == 0 && self.dirs_created == 0 {
+            // Only show "deleted" standalone when nothing was transferred
+            write!(f, "deleted {} file(s)", self.files_deleted)?;
+        } else if self.files_deleted > 0 {
             write!(f, ", {} deleted", self.files_deleted)?;
         }
         if !self.errors.is_empty() {

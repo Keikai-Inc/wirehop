@@ -201,7 +201,20 @@ impl ProgressReporter for TransferState {
         }
     }
 
-    fn dir_created(&self, _path: &str) {}
+    fn dir_created(&self, path: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let display_path = format!("{path}/");
+        let idx = inner.files.len();
+        inner.files.push(FileState {
+            path: display_path.clone(),
+            size: 0,
+            status: FileStatus::Done,
+        });
+        inner.file_index.insert(display_path, idx);
+        if !inner.is_tty {
+            eprintln!("  {path}/");
+        }
+    }
 
     fn file_error(&self, path: &str, error: &str) {
         let mut inner = self.inner.lock().unwrap();
