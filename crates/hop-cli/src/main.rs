@@ -75,13 +75,13 @@ async fn main() -> Result<()> {
         Command::Sync {
             delete,
             dry_run,
-            verbose,
+            itemize,
             source,
             dest,
         } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_sync(secret_key, &config_dir, delete, dry_run, verbose, &source, &dest).await
+            cmd_sync(secret_key, &config_dir, delete, dry_run, itemize, &source, &dest).await
         }
         Command::Config { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;

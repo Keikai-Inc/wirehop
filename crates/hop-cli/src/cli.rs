@@ -77,9 +77,9 @@ pub enum Command {
         #[arg(short = 'n', long)]
         dry_run: bool,
 
-        /// Verbose output (print each file)
+        /// Print each file being transferred
         #[arg(long)]
-        verbose: bool,
+        itemize: bool,
 
         /// Source path (use host:path for remote)
         source: String,
