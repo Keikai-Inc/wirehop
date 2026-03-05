@@ -708,6 +708,16 @@ pub async fn client_pull_sync_transfer(
         .map(|f| f.path.clone())
         .collect();
 
+    // Count files/dirs from the plan before receiving
+    for entry in &plan.files_to_send {
+        if entry.is_dir {
+            summary.dirs_created += 1;
+        } else {
+            summary.files_transferred += 1;
+        }
+    }
+    summary.files_deleted = plan.files_to_delete.len() as u64;
+
     tracing::debug!("sync: {} delta candidates, receiving files...", delta_candidates.len());
     if !delta_candidates.is_empty() {
         let (bytes, saved) = receiver::receive_files_with_delta(
