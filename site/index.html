@@ -661,6 +661,9 @@
       .code-body { font-size: 0.7rem; line-height: 1.7; padding: 1rem; white-space: pre; overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .code-block { max-width: 100%; }
       .daemon-info p code, .daemon-info + div p code { word-break: break-all; }
+      .daemon-features li { flex-wrap: wrap; }
+      .daemon-features li code { font-size: 0.75rem !important; word-break: break-all; }
+      #ai .section-header p code { font-size: 0.8rem !important; }
     }
 
     @media (max-width: 480px) {
@@ -675,6 +678,9 @@
       .section-header p { font-size: 0.95rem; }
       .card { padding: 1.5rem; }
       .step { padding: 1.5rem 1rem; }
+      .daemon-features li { font-size: 0.825rem; line-height: 1.55; }
+      .daemon-features li code { font-size: 0.7rem !important; }
+      .daemon-info h3 { font-size: 1.1rem; }
     }
   </style>
 </head>
@@ -691,6 +697,7 @@
       <li><a href="#install">Install</a></li>
       <li><a href="#how-it-works">How It Works</a></li>
       <li><a href="#daemon">Daemon</a></li>
+      <li><a href="#ai">AI</a></li>
       <li><a href="fleet.html">Fleet</a></li>
     </ul>
   </nav>
@@ -767,10 +774,10 @@
 
         <div class="card card-teal">
           <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/><circle cx="12" cy="15" r="2"/></svg>
           </div>
-          <h3>Cross-Platform</h3>
-          <p>macOS (Apple Silicon &amp; Intel) and Linux (x86_64 &amp; ARM64). Built with Rust for native performance on every platform.</p>
+          <h3>AI Orchestration</h3>
+          <p>Let AI agents manage your fleet. <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop mcp</code> exposes a sandboxed JavaScript runtime and skill library to tools like Claude Code&mdash;run commands, transfer files, and manage roles through natural language.</p>
         </div>
 
         <div class="card card-amber">
@@ -849,6 +856,11 @@
           <div class="comparison-cell hop-col">Built-in (auto-reconnect)</div>
           <div class="comparison-cell comparison-other">Requires tmux/screen</div>
         </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">AI integration</div>
+          <div class="comparison-cell hop-col">Built-in MCP server</div>
+          <div class="comparison-cell comparison-other">None (external tools only)</div>
+        </div>
       </div>
     </div>
   </section>
@@ -909,11 +921,14 @@
 <span class="comment"># Copy files to the server</span>
 <span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./project server:~/project
 
-<span class="comment"># Sync a directory (only changed files)</span>
-<span class="prompt">$</span> <span class="cmd">hop sync</span> ./src server:~/project/src
-<span class="output">  sent  main.rs (4.5 KB)</span>
-<span class="output">  sent  lib.rs (1.2 KB)</span>
-<span class="output">transferred 2 file(s), 5.7 KB in 0.1s</span>
+<span class="comment"># Sync a directory (rsync-compatible)</span>
+<span class="prompt">$</span> <span class="cmd">hop sync</span> <span class="flag">-i</span> server:~/project/src ./src
+<span class="output">&gt;f+++++++++ main.rs</span>
+<span class="output">          4,512 100%    0.00kB/s    0:00:00 (xfr#1, to-chk=1/2)</span>
+<span class="output">&gt;f.st...... lib.rs</span>
+<span class="output">          1,203 100%   11.75kB/s    0:00:00 (xfr#2, to-chk=0/2)</span>
+<span class="output"></span>
+<span class="output">total size is 5,715  2 file(s) in 0.1s</span>
           </div>
         </div>
       </div>
@@ -1036,6 +1051,54 @@
 <span class="comment"># Connect from your laptop</span>
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>
 <span class="prompt">myserver $</span> <span class="cmd">_</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AI Orchestration -->
+  <section id="ai">
+    <div class="container">
+      <div class="section-header">
+        <h2>AI-Powered Fleet Management</h2>
+        <p><code style="font-family: var(--font-mono); font-size: 0.95rem; color: var(--color-accent-teal);">hop mcp</code> turns hop into an MCP server that AI coding tools can use to manage your infrastructure.</p>
+      </div>
+
+      <div class="daemon-grid">
+        <div class="daemon-info">
+          <h3>Model Context Protocol</h3>
+          <p>Expose fleet management to AI agents through the standard MCP protocol. Claude Code, Cursor, and other compatible tools can orchestrate your infrastructure through natural language.</p>
+          <ul class="daemon-features">
+            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_exec</code> runs JavaScript with fleet bindings (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fleet.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fs.push()</code>)</li>
+            <li><strong style="color: var(--color-text);">Built-in Skills Library</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_skills</code> provides 80+ searchable skills across 12 categories (fleet, security, monitoring, and more)</li>
+            <li><strong style="color: var(--color-text);">Works with Claude Code, Cursor, etc.</strong> &mdash; Standard MCP protocol, plug into any compatible AI tool</li>
+            <li><strong style="color: var(--color-text);">Safe by Design</strong> &mdash; Memory limits, timeouts, no shell escape&mdash;agents operate within defined boundaries</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+              <span class="code-title">Terminal</span>
+            </div>
+            <div class="code-body">
+<span class="comment"># Add hop as an MCP server in Claude Code</span>
+<span class="prompt">$</span> <span class="cmd">hop mcp</span>
+
+<span class="comment"># AI agent queries available skills</span>
+<span class="output">&rarr; hop_skills(query: "deploy to production hosts")</span>
+
+<span class="comment"># AI agent executes fleet operations</span>
+<span class="output">&rarr; hop_exec(`</span>
+<span class="output">  const hosts = await hop.fleet.list("production");</span>
+<span class="output">  for (const h of hosts) {</span>
+<span class="output">    await hop.exec("systemctl restart myapp",</span>
+<span class="output">      { host: h.name });</span>
+<span class="output">  }</span>
+<span class="output">`)</span>
             </div>
           </div>
         </div>
