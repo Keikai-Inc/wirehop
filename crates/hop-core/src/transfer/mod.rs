@@ -306,11 +306,34 @@ async fn host_sync_send(
         other => bail!("expected FileList, got: {other:?}"),
     };
 
-    // 2. Walk our (source) directory and compute the plan
-    let source_entries = if source.is_dir() {
-        listing::walk_directory(source)?
+    // 2. Walk our source and compute the plan
+    let (source_entries, base_dir) = if source.is_dir() {
+        (listing::walk_directory(source)?, source.to_path_buf())
+    } else if source.is_file() {
+        let metadata = std::fs::metadata(source)?;
+        let file_name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let entry = FileEntry {
+            path: file_name,
+            size: metadata.len(),
+            mtime: metadata
+                .modified()
+                .unwrap_or(std::time::UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            mode: listing::file_mode_from_metadata(&metadata),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            content_hash: None,
+        };
+        (vec![entry], source.parent().unwrap_or(source).to_path_buf())
     } else {
-        bail!("sync source must be a directory: {}", source.display());
+        bail!("source path does not exist: {}", source.display());
     };
 
     let plan =
@@ -350,11 +373,11 @@ async fn host_sync_send(
 
     if !delta_set.is_empty() {
         sender::send_files_with_delta(
-            send, recv, source, &files_to_send, &delta_set, progress, params,
+            send, recv, &base_dir, &files_to_send, &delta_set, progress, params,
         )
         .await?;
     } else {
-        sender::send_files(send, source, &files_to_send, progress, params).await?;
+        sender::send_files(send, &base_dir, &files_to_send, progress, params).await?;
     }
 
     // 6. Send deletes
@@ -659,14 +682,7 @@ pub async fn client_pull_sync(
         summary.bytes_transferred = bytes;
     }
 
-    // 5. Read host's Done
-    let msg: TransferMsg = proto::read_message(recv).await?;
-    match msg {
-        TransferMsg::Done => {}
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => tracing::warn!("expected Done from host, got: {other:?}"),
-    }
-
+    // receive_files/receive_files_with_delta already consumed the host's Done.
     // Best-effort Done — host may have already closed the connection.
     let _ = proto::write_message(send, &TransferMsg::Done).await;
 
