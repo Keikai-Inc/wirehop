@@ -123,6 +123,9 @@ pub enum Command {
         action: FleetAction,
     },
 
+    /// Start MCP server (Model Context Protocol) for AI agent integration
+    Mcp,
+
     /// Print this node's identity (NodeId)
     Id,
 

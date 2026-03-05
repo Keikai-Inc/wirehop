@@ -111,6 +111,11 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_fleet(secret_key, &config_dir, action).await
         }
+        Command::Mcp => {
+            // MCP server: all output goes to stdout (JSON-RPC), logs to stderr only
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            hop_mcp::run_stdio_server(&config_dir).await
+        }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;

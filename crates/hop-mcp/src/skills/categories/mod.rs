@@ -1,0 +1,12 @@
+pub mod getting_started;
+pub mod fleet;
+pub mod roles;
+pub mod admin;
+pub mod discover;
+pub mod install;
+pub mod services;
+pub mod monitor;
+pub mod security;
+pub mod files;
+pub mod troubleshoot;
+pub mod recipes;
