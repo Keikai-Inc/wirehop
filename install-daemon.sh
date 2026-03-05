@@ -78,6 +78,13 @@ if [[ "${OS}" == "Darwin" ]]; then
   info "Downloading ${PKG_NAME}..."
   fetch "${PKG_URL}" "${TMPDIR_HOP}/${PKG_NAME}"
 
+  # Stop the client-side multiplexer agent so it restarts with the new binary.
+  if command -v hop >/dev/null 2>&1; then
+    if hop agent stop 2>/dev/null; then
+      info "Restarted connection agent (will auto-launch on next use)"
+    fi
+  fi
+
   info "Installing package (sudo required)..."
   sudo installer -pkg "${TMPDIR_HOP}/${PKG_NAME}" -target /
 
@@ -148,10 +155,22 @@ fi
 INNEREOF
 )"
 
-# Enable and start
+# Stop the client-side multiplexer agent so it restarts with the new binary.
+if command -v hop >/dev/null 2>&1; then
+  if hop agent stop 2>/dev/null; then
+    info "Restarted connection agent (will auto-launch on next use)"
+  fi
+fi
+
+# Enable and start (or restart if already running)
 info "Enabling and starting hop daemon..."
 sudo systemctl daemon-reload
-sudo systemctl enable --now hop
+if systemctl is-active --quiet hop 2>/dev/null; then
+  sudo systemctl restart hop
+  info "Hop daemon restarted."
+else
+  sudo systemctl enable --now hop
+fi
 
 printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
 printf "The daemon is running.\n"

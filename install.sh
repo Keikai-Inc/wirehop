@@ -134,6 +134,33 @@ fi
 
 info "Installed hop to ${INSTALL_DIR}/hop"
 
+# --- Restart running services ------------------------------------------------
+
+# Stop the client-side multiplexer agent so it restarts with the new binary.
+if command -v hop >/dev/null 2>&1; then
+  if hop agent stop 2>/dev/null; then
+    info "Restarted connection agent (will auto-launch on next use)"
+  fi
+fi
+
+# Restart the host daemon if one is running.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  DAEMON_LABEL="com.hop.daemon"
+  if launchctl print "system/${DAEMON_LABEL}" &>/dev/null 2>&1; then
+    info "Restarting hop daemon..."
+    sudo launchctl kickstart -k "system/${DAEMON_LABEL}" 2>/dev/null && \
+      info "Hop daemon restarted." || \
+      warn "Could not restart daemon (try: sudo launchctl kickstart -k system/${DAEMON_LABEL})"
+  fi
+else
+  if systemctl is-active --quiet hop 2>/dev/null; then
+    info "Restarting hop daemon..."
+    sudo systemctl restart hop && \
+      info "Hop daemon restarted." || \
+      warn "Could not restart daemon (try: sudo systemctl restart hop)"
+  fi
+fi
+
 # --- PATH check --------------------------------------------------------------
 
 if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
