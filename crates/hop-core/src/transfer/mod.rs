@@ -456,18 +456,11 @@ pub async fn client_pull_copy(
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
+    // receive_files reads messages until Done (inclusive), sends acks for each file.
     let bytes = receiver::receive_files(send, recv, local_dest, progress, params).await?;
     summary.bytes_transferred = bytes;
-    // Count is approximate — the receive_files function handles acks internally
 
-    // Read host's Done
-    let msg: TransferMsg = proto::read_message(recv).await?;
-    match msg {
-        TransferMsg::Done => {}
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => tracing::warn!("expected Done from host, got: {other:?}"),
-    }
-
+    // Signal to the host that we're done.
     proto::write_message(send, &TransferMsg::Done).await?;
 
     summary.elapsed = start.elapsed();

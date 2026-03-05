@@ -205,23 +205,46 @@ impl Agent {
 
 /// Bidirectional proxy between IPC socket and QUIC bi-stream.
 ///
-/// Calls `quic_send.finish()` when the IPC→QUIC direction ends so the remote
-/// host sees a clean EOF (FIN) rather than a stream reset (RST).
+/// Both directions run as independent tasks. When one completes, it drops its
+/// owned resources, which propagates EOF to the other side, causing it to
+/// complete naturally. This avoids the old `select!` approach which would
+/// immediately cancel the reverse direction, potentially dropping unread data.
 async fn proxy_quic(
     mut ipc_read: tokio::net::unix::OwnedReadHalf,
     mut ipc_write: tokio::net::unix::OwnedWriteHalf,
     mut quic_send: iroh::endpoint::SendStream,
     mut quic_recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
-    tokio::select! {
-        r = tokio::io::copy(&mut ipc_read, &mut quic_send) => {
-            let _ = quic_send.finish();
-            r.context("IPC->QUIC copy")?;
+    // Host→Client: copy QUIC data to IPC.
+    // When this finishes, dropping ipc_write signals EOF to the client.
+    let h2c = tokio::spawn(async move {
+        let r = tokio::io::copy(&mut quic_recv, &mut ipc_write).await;
+        if let Err(ref e) = r {
+            tracing::debug!("QUIC→IPC ended: {e:#}");
         }
-        r = tokio::io::copy(&mut quic_recv, &mut ipc_write) => {
-            r.context("QUIC->IPC copy")?;
+    });
+
+    // Client→Host: copy IPC data to QUIC.
+    // When this finishes, quic_send.finish() signals FIN to the host.
+    let c2h = tokio::spawn(async move {
+        let r = tokio::io::copy(&mut ipc_read, &mut quic_send).await;
+        let _ = quic_send.finish();
+        if let Err(ref e) = r {
+            tracing::debug!("IPC→QUIC ended: {e:#}");
         }
-    }
+    });
+
+    // Both tasks complete naturally via EOF propagation:
+    //   Pull: host finishes → h2c drops ipc_write → client sees EOF → client
+    //         drops socket → c2h's ipc_read sees EOF → c2h finishes
+    //   Push: client finishes → c2h calls finish() → host sees FIN → host
+    //         sends response + finishes → h2c's quic_recv sees EOF → h2c finishes
+    // Cap total wait to 30s to avoid hanging on misbehaving peers.
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+        let _ = tokio::join!(h2c, c2h);
+    })
+    .await;
+
     Ok(())
 }
 
