@@ -78,7 +78,7 @@ pub enum Command {
         dry_run: bool,
 
         /// Verbose output (print each file)
-        #[arg(short, long)]
+        #[arg(long)]
         verbose: bool,
 
         /// Source path (use host:path for remote)
