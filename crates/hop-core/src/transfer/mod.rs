@@ -299,9 +299,13 @@ async fn host_sync_send(
     params: &NegotiatedParams,
 ) -> Result<()> {
     // 1. Read the client's local file list
+    tracing::debug!("host_sync_send: waiting for FileList from client...");
     let client_list_msg: TransferMsg = proto::read_message(recv).await?;
     let client_entries = match client_list_msg {
-        TransferMsg::FileList(entries) => entries,
+        TransferMsg::FileList(entries) => {
+            tracing::debug!("host_sync_send: got FileList with {} entries", entries.len());
+            entries
+        }
         TransferMsg::Error(e) => bail!("client error: {e}"),
         other => bail!("expected FileList, got: {other:?}"),
     };
@@ -613,16 +617,26 @@ pub async fn client_pull_sync(
     } else {
         Vec::new()
     };
+    tracing::debug!("sync: sending FileList ({} entries)", local_entries.len());
     proto::write_message(send, &TransferMsg::FileList(local_entries)).await?;
 
     // 2. Read the host's TransferPlan
+    tracing::debug!("sync: waiting for TransferPlan from host...");
     let plan_msg: TransferMsg = proto::read_message(recv).await?;
     let (files_to_send, files_to_delete, dry_run) = match plan_msg {
         TransferMsg::TransferPlan {
             files_to_send,
             files_to_delete,
             dry_run,
-        } => (files_to_send, files_to_delete, dry_run),
+        } => {
+            tracing::debug!(
+                "sync: got TransferPlan: {} to send, {} to delete, dry_run={}",
+                files_to_send.len(),
+                files_to_delete.len(),
+                dry_run
+            );
+            (files_to_send, files_to_delete, dry_run)
+        }
         TransferMsg::Error(e) => bail!("host error: {e}"),
         other => bail!("expected TransferPlan from host, got: {other:?}"),
     };
@@ -650,6 +664,7 @@ pub async fn client_pull_sync(
     }
 
     // 3. Acknowledge the plan
+    tracing::debug!("sync: sending PlanAck");
     proto::write_message(send, &TransferMsg::PlanAck { proceed: true }).await?;
 
     // 4. Compute delta candidates on client side and receive files
@@ -669,6 +684,7 @@ pub async fn client_pull_sync(
         .map(|f| f.path.clone())
         .collect();
 
+    tracing::debug!("sync: {} delta candidates, receiving files...", delta_candidates.len());
     if !delta_candidates.is_empty() {
         let (bytes, saved) = receiver::receive_files_with_delta(
             send, recv, local_dir, &delta_candidates, &files_to_send, progress, params,
@@ -681,6 +697,7 @@ pub async fn client_pull_sync(
         let bytes = receiver::receive_files(send, recv, local_dir, progress, params).await?;
         summary.bytes_transferred = bytes;
     }
+    tracing::debug!("sync: receive complete, sending client Done");
 
     // receive_files/receive_files_with_delta already consumed the host's Done.
     // Best-effort Done — host may have already closed the connection.

@@ -719,11 +719,28 @@ async fn cmd_cp(
 
         let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
+        // When pulling a remote directory into an existing local directory,
+        // nest under the source directory name (like scp -r / cp -r).
+        let effective_dest = if recursive && local_dest.is_dir() {
+            let dir_name = std::path::Path::new(remote_path)
+                .file_name()
+                .unwrap_or_default();
+            if !dir_name.is_empty() {
+                let nested = local_dest.join(dir_name);
+                std::fs::create_dir_all(&nested)?;
+                nested
+            } else {
+                local_dest.clone()
+            }
+        } else {
+            local_dest.clone()
+        };
+
         let state = progress_ui::TransferState::new(false);
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_pull_copy(&mut send, &mut recv, &local_dest, &state, &params).await?;
+            transfer::client_pull_copy(&mut send, &mut recv, &effective_dest, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
         eprintln!("{summary}");
