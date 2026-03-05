@@ -460,8 +460,10 @@ pub async fn client_pull_copy(
     let bytes = receiver::receive_files(send, recv, local_dest, progress, params).await?;
     summary.bytes_transferred = bytes;
 
-    // Signal to the host that we're done.
-    proto::write_message(send, &TransferMsg::Done).await?;
+    // Signal to the host that we're done. This may fail if the host has
+    // already closed the connection — the acks were already delivered, so
+    // the Done is best-effort.
+    let _ = proto::write_message(send, &TransferMsg::Done).await;
 
     summary.elapsed = start.elapsed();
     Ok(summary)
@@ -665,7 +667,8 @@ pub async fn client_pull_sync(
         other => tracing::warn!("expected Done from host, got: {other:?}"),
     }
 
-    proto::write_message(send, &TransferMsg::Done).await?;
+    // Best-effort Done — host may have already closed the connection.
+    let _ = proto::write_message(send, &TransferMsg::Done).await;
 
     summary.elapsed = start.elapsed();
     Ok(summary)
