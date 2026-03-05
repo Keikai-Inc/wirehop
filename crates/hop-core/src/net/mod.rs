@@ -1,13 +1,26 @@
 //! iroh endpoint lifecycle and connection management.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, QuicTransportConfig};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2};
 
 /// Hop's own relay server.
 const HOP_RELAY_URL: &str = "https://relay.keik.ai";
+
+/// QUIC transport configuration tuned for responsive disconnect detection.
+///
+/// - 10s idle timeout (2 missed keepalives = dead), down from iroh's 30s default
+/// - 3s keepalive interval so both sides actively probe liveness
+fn hop_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("valid idle timeout")))
+        .keep_alive_interval(Duration::from_secs(3))
+        .build()
+}
 
 /// Build a RelayMode using only our relay.
 ///
@@ -28,6 +41,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
+        .transport_config(hop_transport_config())
         .alpns(vec![ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
@@ -49,6 +63,7 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
+        .transport_config(hop_transport_config())
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;

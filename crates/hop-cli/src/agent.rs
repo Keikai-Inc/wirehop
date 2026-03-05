@@ -297,6 +297,19 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
 
     let agent = Agent::new(config_dir).await?;
 
+    // Background task: flush stale connections on sleep/wake
+    let wake_conns = agent.connections.clone();
+    tokio::spawn(async move {
+        loop {
+            let before = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if before.elapsed() > Duration::from_secs(7) {
+                tracing::info!("Agent detected sleep/wake, flushing connection pool");
+                wake_conns.lock().await.clear();
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {

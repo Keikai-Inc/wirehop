@@ -900,6 +900,20 @@ pub async fn client_shell_session_v2(
     }
 }
 
+/// Detect sleep/wake by observing wall-clock time jumps.
+///
+/// Sleeps for 3s in a loop; if the elapsed time exceeds 7s, the machine
+/// was almost certainly asleep. Returns immediately on wake detection.
+async fn detect_sleep_wake() {
+    loop {
+        let before = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if before.elapsed() > std::time::Duration::from_secs(7) {
+            return;
+        }
+    }
+}
+
 async fn client_shell_loop(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -924,6 +938,9 @@ async fn client_shell_loop(
     drop(resize_tx); // silence unused warning; resize_rx will never yield
 
     let mut stdout = std::io::stdout();
+
+    let wake_detect = detect_sleep_wake();
+    tokio::pin!(wake_detect);
 
     loop {
         tokio::select! {
@@ -974,6 +991,11 @@ async fn client_shell_loop(
                     },
                 )
                 .await;
+            }
+            // Sleep/wake detection — instant disconnect on wake
+            () = &mut wake_detect => {
+                tracing::info!("Sleep/wake detected, treating as disconnected");
+                return Ok(SessionOutcome::Disconnected);
             }
         }
     }

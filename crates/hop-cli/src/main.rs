@@ -561,6 +561,10 @@ async fn cmd_connect(
     let (mut session_id, mut outcome) =
         shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx).await?;
 
+    // Anti-flapping state: track recent reconnections to detect rapid cycling
+    let mut last_reconnect_time: Option<std::time::Instant> = None;
+    let mut flap_attempt_offset: u32 = 0;
+
     // Reconnection loop
     loop {
         match outcome {
@@ -568,19 +572,59 @@ async fn cmd_connect(
                 std::process::exit(code);
             }
             SessionOutcome::Disconnected => {
-                match reconnect::show_reconnect_tui_via_agent(
-                    config_dir,
-                    &resolved,
-                    session_id.as_ref(),
-                    &mut stdin_rx,
-                )
-                .await
-                {
+                // Detect flapping: disconnect within 10s of last reconnect
+                if let Some(last) = last_reconnect_time {
+                    if last.elapsed() < Duration::from_secs(10) {
+                        flap_attempt_offset = (flap_attempt_offset + 2).min(5);
+                        tracing::warn!(
+                            "Flapping detected (disconnected {}s after reconnect), offset={}",
+                            last.elapsed().as_secs(),
+                            flap_attempt_offset,
+                        );
+                    } else {
+                        flap_attempt_offset = 0;
+                    }
+                }
+
+                // Tier 1: Quick inline reconnect (non-disruptive, 5s window)
+                // Skip if flapping — go straight to full TUI with backoff
+                let quick_result = if flap_attempt_offset == 0 {
+                    reconnect::try_quick_reconnect(
+                        config_dir,
+                        &resolved,
+                        session_id.as_ref(),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                } else {
+                    None
+                };
+
+                let reconnect_result = if let Some(action) = quick_result {
+                    action
+                } else {
+                    // Tier 2: Full alternate-screen TUI with backoff
+                    reconnect::show_reconnect_tui_via_agent(
+                        config_dir,
+                        &resolved,
+                        session_id.as_ref(),
+                        &mut stdin_rx,
+                        flap_attempt_offset,
+                    )
+                    .await
+                };
+
+                match reconnect_result {
                     reconnect::ReconnectAction::ReconnectedViaAgent {
                         send,
                         recv,
                         new_session_id,
                     } => {
+                        // Brief stabilization delay to let the connection settle
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+
+                        last_reconnect_time = Some(std::time::Instant::now());
+
                         let (new_sid, out) =
                             shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
                         session_id = new_sid.or(new_session_id);
