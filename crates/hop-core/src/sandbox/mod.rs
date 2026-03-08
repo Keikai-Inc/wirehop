@@ -60,6 +60,22 @@ fn build_exec_command(
         return build_unsandboxed_exec(cmd, username);
     }
 
+    // On macOS, broker-safe commands (ps, netstat, etc.) are setuid binaries
+    // that sandbox-exec categorically blocks. Run them unsandboxed as the
+    // session user — they're read-only monitoring tools already validated
+    // by the policy layer above.
+    #[cfg(target_os = "macos")]
+    {
+        let first_word = cmd.split_whitespace().next().unwrap_or("");
+        let cmd_name = std::path::Path::new(first_word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first_word);
+        if broker::is_broker_safe(cmd_name) {
+            return build_unsandboxed_exec(cmd, username);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         if let Some(user) = username {

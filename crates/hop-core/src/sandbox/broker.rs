@@ -31,8 +31,6 @@ use serde::{Deserialize, Serialize};
 /// are setuid binaries (on macOS), not because they are dangerous.
 const BROKER_SAFE_COMMANDS: &[&str] = &[
     "ps",
-    "top",
-    "htop",
     "w",
     "who",
     "last",
@@ -47,7 +45,6 @@ const BROKER_SAFE_COMMANDS: &[&str] = &[
     "system_profiler",
     "diskutil",
     "ifconfig",
-    "nettop",
     "finger",
 ];
 
@@ -228,9 +225,13 @@ pub fn setup_zdotdir(config_dir: &Path, session_id: &str, username: Option<&str>
     )?;
 
     // .zshrc — sourced for interactive shells.
+    // Unset HISTFILE so zsh doesn't try to write history in the read-only sandbox.
     std::fs::write(
         zdir.join(".zshrc"),
-        "[ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"\n",
+        concat!(
+            "[ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"\n",
+            "unset HISTFILE\n",
+        ),
     )?;
 
     // .zlogin — sourced last for login shells.
@@ -671,7 +672,8 @@ mod tests {
     fn broker_safe_list_contains_ps() {
         assert!(is_broker_safe("ps"));
         assert!(is_broker_safe("PS"));
-        assert!(is_broker_safe("top"));
+        assert!(is_broker_safe("netstat"));
+        assert!(!is_broker_safe("top")); // interactive/ncurses — not brokered
         assert!(!is_broker_safe("rm"));
         assert!(!is_broker_safe("bash"));
     }
