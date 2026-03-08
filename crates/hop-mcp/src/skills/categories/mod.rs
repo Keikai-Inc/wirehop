@@ -10,3 +10,4 @@ pub mod security;
 pub mod files;
 pub mod troubleshoot;
 pub mod recipes;
+pub mod datastore;

@@ -143,7 +143,9 @@ async fn main() -> Result<()> {
         Command::Mcp => {
             // MCP server: all output goes to stdout (JSON-RPC), logs to stderr only
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            hop_mcp::run_stdio_server(&config_dir).await
+            let ds_path = config_dir.join("datastore.redb");
+            let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
+            hop_mcp::run_stdio_server_with_datastore(&config_dir, Some(datastore)).await
         }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;

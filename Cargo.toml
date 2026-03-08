@@ -52,6 +52,10 @@ libc = "0.2"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# Datastore
+redb = "2"
+cron = "0.13"
+
 # Testing
 tempfile = "3"
 

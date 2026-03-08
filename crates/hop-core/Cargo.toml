@@ -22,6 +22,8 @@ tracing.workspace = true
 libc = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
+redb = { workspace = true }
+cron = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

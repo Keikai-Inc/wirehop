@@ -6,6 +6,7 @@ pub mod types;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use hop_core::datastore::Datastore;
 use rquickjs::{Context as JsContext, Runtime as QjsRuntime};
 
 use crate::backend::BoxedBackend;
@@ -30,6 +31,7 @@ impl Default for SandboxLimits {
 /// JS runtime wrapper with sandbox enforcement.
 pub struct JsRuntime {
     limits: SandboxLimits,
+    datastore: Option<Datastore>,
 }
 
 impl Default for JsRuntime {
@@ -42,11 +44,20 @@ impl JsRuntime {
     pub fn new() -> Self {
         Self {
             limits: SandboxLimits::default(),
+            datastore: None,
         }
     }
 
     pub fn with_limits(limits: SandboxLimits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            datastore: None,
+        }
+    }
+
+    /// Set the datastore for hop.kv.* and hop.ts.* bindings.
+    pub fn set_datastore(&mut self, ds: Datastore) {
+        self.datastore = Some(ds);
     }
 
     /// Execute JS code in a fresh sandbox with hop.* bindings.
@@ -63,12 +74,13 @@ impl JsRuntime {
         let code = code.to_string();
         let memory_limit = self.limits.memory_limit;
         let max_stack_size = self.limits.max_stack_size;
+        let datastore = self.datastore.clone();
 
         // Use a oneshot channel to bridge the OS thread back to async
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         std::thread::spawn(move || {
-            let result = execute_js_sync(&code, memory_limit, max_stack_size, timeout);
+            let result = execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref());
             let _ = tx.send(result);
         });
 
@@ -82,6 +94,7 @@ fn execute_js_sync(
     memory_limit: usize,
     max_stack_size: usize,
     timeout: Duration,
+    datastore: Option<&Datastore>,
 ) -> Result<String> {
     let rt = QjsRuntime::new().context("Failed to create QuickJS runtime")?;
     rt.set_memory_limit(memory_limit);
@@ -99,7 +112,7 @@ fn execute_js_sync(
     // called inside ctx.with() — ctx.with() holds the runtime Mutex and
     // runtime methods also need it, causing a deadlock.
     let result = ctx.with(|ctx| -> Result<String> {
-        bindings::install_hop_bindings(&ctx)?;
+        bindings::install_hop_bindings(&ctx, datastore)?;
 
         let wrapped = format!("(function() {{\n{code}\n}})()");
 
@@ -193,43 +206,43 @@ mod tests {
 
     #[test]
     fn execute_js_sync_math() {
-        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert_eq!(result, "4");
     }
 
     #[test]
     fn execute_js_sync_string() {
-        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn execute_js_sync_object() {
-        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert!(result.contains("\"a\": 1"));
     }
 
     #[test]
     fn execute_js_sync_log() {
-        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert_eq!(result, "ok");
     }
 
     #[test]
     fn execute_js_sync_error() {
-        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5));
+        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None);
         assert!(result.is_err());
     }
 
     #[test]
     fn execute_js_sync_no_return() {
-        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert_eq!(result, "undefined");
     }
 
     #[test]
     fn execute_js_sync_array() {
-        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5)).unwrap();
+        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
         assert!(result.contains("["));
         assert!(result.contains("1"));
     }
@@ -254,5 +267,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn execute_kv_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let mut runtime = JsRuntime::new();
+        runtime.set_datastore(ds);
+        let backend = test_backend();
+
+        let code = r#"
+            try {
+                hop.kv.set("test", "greeting", "hello");
+                const result = hop.kv.get("test", "greeting");
+                return result.value;
+            } catch(e) {
+                return "ERROR: " + e.message + " | " + e.stack;
+            }
+        "#;
+
+        let result = runtime
+            .execute(code, &backend, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn execute_ts_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let mut runtime = JsRuntime::new();
+        runtime.set_datastore(ds);
+        let backend = test_backend();
+
+        let code = r#"
+            hop.ts.insert("cpu.usage", 42.5, {host: "web-1"});
+            const latest = hop.ts.latest("cpu.usage");
+            return latest.value;
+        "#;
+
+        let result = runtime
+            .execute(code, &backend, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(result, "42.5");
     }
 }

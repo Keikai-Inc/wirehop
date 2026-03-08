@@ -593,6 +593,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "cron"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eee8b2b4516038bc0f1d3c9934bcb4a13dd316e04abbc63c96757a6d75978532"
+dependencies = [
+ "chrono",
+ "nom",
+ "once_cell",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1473,6 +1484,7 @@ dependencies = [
  "argon2",
  "base64",
  "bincode",
+ "cron",
  "crossterm",
  "directories",
  "hex",
@@ -1480,6 +1492,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "rand",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",
@@ -1497,6 +1510,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
+ "cron",
  "hop-core",
  "iroh",
  "rquickjs",
@@ -3109,6 +3123,15 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

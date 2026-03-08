@@ -32,5 +32,6 @@ pub fn all_skills() -> Vec<Skill> {
     skills.extend(super::categories::files::skills());
     skills.extend(super::categories::troubleshoot::skills());
     skills.extend(super::categories::recipes::skills());
+    skills.extend(super::categories::datastore::skills());
     skills
 }

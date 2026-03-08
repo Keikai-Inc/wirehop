@@ -17,6 +17,7 @@ tracing.workspace = true
 rquickjs = { version = "0.8", features = ["bindgen", "classes", "properties", "parallel", "rust-alloc"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+cron = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
