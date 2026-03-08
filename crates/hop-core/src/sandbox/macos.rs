@@ -119,26 +119,31 @@ pub fn sandboxed_shell_command(
 
     // We wrap the shell invocation through sandbox-exec.
     // For per-user shells, the caller handles login/su wrapping separately.
-    let bin = "/usr/bin/sandbox-exec".to_string();
-    let args = if let Some(user) = username {
-        // On macOS: login -fp <user> launches a login shell for that user.
-        // We wrap: sandbox-exec -p <profile> login -fp <user>
-        vec![
-            "-p".into(),
-            profile,
-            "login".into(),
+    if let Some(user) = username {
+        // login is setuid — sandbox-exec cannot exec it.
+        // Run login first to switch users, then sandbox-exec the shell:
+        // login -fp <user> /usr/bin/sandbox-exec -p <profile> <shell> -l
+        let bin = "login".to_string();
+        let args = vec![
             "-fp".into(),
             user.into(),
-        ]
-    } else {
-        vec![
+            "/usr/bin/sandbox-exec".into(),
             "-p".into(),
             profile,
             shell.into(),
             "-l".into(),
-        ]
-    };
-    (bin, args)
+        ];
+        (bin, args)
+    } else {
+        let bin = "/usr/bin/sandbox-exec".to_string();
+        let args = vec![
+            "-p".into(),
+            profile,
+            shell.into(),
+            "-l".into(),
+        ];
+        (bin, args)
+    }
 }
 
 /// Resolve allowed_paths, adding macOS-specific essential paths.
@@ -215,9 +220,12 @@ mod tests {
             ..Default::default()
         };
         let (bin, args) = sandboxed_shell_command(&policy, "/bin/bash", Some("alice"));
-        assert_eq!(bin, "/usr/bin/sandbox-exec");
-        assert!(args.contains(&"login".to_string()));
+        // login runs first (setuid), then sandbox-exec wraps the shell
+        assert_eq!(bin, "login");
+        assert!(args.contains(&"-fp".to_string()));
         assert!(args.contains(&"alice".to_string()));
+        assert!(args.contains(&"/usr/bin/sandbox-exec".to_string()));
+        assert!(args.contains(&"/bin/bash".to_string()));
     }
 
     #[test]
@@ -346,14 +354,8 @@ mod tests {
             read_only: true,
             ..Default::default()
         };
+        // Without a username, bin is sandbox-exec directly
         let (bin, args) = sandboxed_shell_command(&policy, "/bin/sh", None);
-        // Build the command the same way the PTY code would
-        let cmd = std::process::Command::new(&bin);
-        // Replace the shell args: instead of an interactive "-l" shell,
-        // run a write-attempt command to test enforcement.
-        // args = ["-p", "<profile>", "/bin/sh", "-l"]
-        // We keep the sandbox-exec + profile, but swap the shell invocation
-        // for a one-shot write test.
         assert_eq!(bin, "/usr/bin/sandbox-exec");
         assert!(args.len() >= 2, "expected at least -p and profile");
         let output = std::process::Command::new(&bin)
@@ -369,7 +371,6 @@ mod tests {
             stdout.contains("WRITE_DENIED"),
             "sandboxed_shell_command must deny writes in read-only mode via the PTY path, got: {stdout}"
         );
-        let _ = cmd; // suppress unused warning
     }
 
     #[test]

@@ -62,14 +62,15 @@ fn build_exec_command(
     #[cfg(target_os = "macos")]
     {
         if let Some(user) = username {
-            // sandbox-exec -p <profile> login -fp <user> /bin/sh -c <cmd>
+            // login is setuid — sandbox-exec cannot exec it.
+            // Run login first to switch users, then sandbox-exec inside:
+            // login -fp <user> /usr/bin/sandbox-exec -p <profile> /bin/sh -c <cmd>
             let profile = macos::generate_sbpl_profile(policy);
-            let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
+            let mut command = tokio::process::Command::new("login");
             command
-                .arg("-p")
+                .args(["-fp", user, "/usr/bin/sandbox-exec", "-p"])
                 .arg(&profile)
-                .arg("login")
-                .args(["-fp", user, "/bin/sh", "-c", cmd])
+                .args(["/bin/sh", "-c", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
