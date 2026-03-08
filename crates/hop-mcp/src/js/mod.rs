@@ -86,6 +86,27 @@ impl JsRuntime {
 
         rx.await.context("JS thread panicked")?
     }
+
+    /// Execute JS code without requiring a fleet backend.
+    ///
+    /// Used by the cron scheduler which only needs JS + datastore bindings.
+    pub async fn execute_script(&self, code: &str, timeout: Option<Duration>) -> Result<String> {
+        let timeout = timeout.unwrap_or(self.limits.timeout);
+        let code = code.to_string();
+        let memory_limit = self.limits.memory_limit;
+        let max_stack_size = self.limits.max_stack_size;
+        let datastore = self.datastore.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        std::thread::spawn(move || {
+            let result =
+                execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref());
+            let _ = tx.send(result);
+        });
+
+        rx.await.context("JS thread panicked")?
+    }
 }
 
 /// Synchronous JS execution (runs on a dedicated thread).

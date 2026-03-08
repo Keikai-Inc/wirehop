@@ -340,6 +340,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         });
     }
 
+    // Spawn cron scheduler: every 15s, check for due jobs and execute them
+    {
+        let ds_path = config_dir.join("datastore.redb");
+        let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
+        hop_mcp::cron::spawn_cron_scheduler(datastore, Duration::from_secs(15));
+    }
+
     while let Some(incoming) = endpoint.accept().await {
         let config_dir = config_dir.to_path_buf();
         let registry = registry.clone();

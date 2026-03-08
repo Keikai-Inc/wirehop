@@ -316,6 +316,31 @@ test_mcp_cron_delete() {
     assert_contains "$text" '"deleted":true'
 }
 
+# ── Cron Execution Test ──
+
+test_cron_execution() {
+    # Create a cron job that fires every second (so it's always due within 15s poll)
+    local create_req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"create","name":"e2e-cron-exec","schedule":"* * * * * *","script":"hop.kv.set(\"cron_e2e\", \"proof\", \"executed\")"}}}'
+    local response
+    response=$(mcp_call "$create_req")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "job_id"
+
+    # Wait for hop host's scheduler to pick it up (15s poll interval + execution time)
+    sleep 20
+
+    # Read KV to verify the cron job executed
+    local kv_req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"kv_get","namespace":"cron_e2e","key":"proof"}}}'
+    local kv_response
+    kv_response=$(mcp_call "$kv_req")
+
+    local kv_text
+    kv_text=$(mcp_result_text "$kv_response")
+    assert_contains "$kv_text" "executed"
+}
+
 # ── File Transfer Tests ──
 
 test_cp_push() {

@@ -253,16 +253,7 @@ fn now_ms() -> u64 {
 }
 
 fn next_occurrence_ms(schedule: &cron::Schedule, after_ms: u64) -> u64 {
-    use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_millis_opt(after_ms as i64).single();
-    match dt {
-        Some(dt) => schedule
-            .after(&dt)
-            .next()
-            .map(|next| next.timestamp_millis() as u64)
-            .unwrap_or(after_ms + 60_000),
-        None => after_ms + 60_000,
-    }
+    crate::cron::next_occurrence_ms(schedule, after_ms)
 }
 
 fn generate_id() -> String {

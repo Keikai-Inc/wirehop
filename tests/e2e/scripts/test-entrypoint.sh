@@ -75,6 +75,11 @@ run_test test_mcp_cron_create
 run_test test_mcp_cron_list
 run_test test_mcp_cron_delete
 
+# ── Cron Execution ──
+echo ""
+echo "--- Cron Execution ---"
+run_test test_cron_execution
+
 # ── File Transfer ──
 echo ""
 echo "--- File Transfer ---"
