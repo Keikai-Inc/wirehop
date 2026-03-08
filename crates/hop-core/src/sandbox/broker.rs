@@ -444,8 +444,8 @@ fn build_broker_command(
 
 /// Entry point for broker client mode (called when hop is invoked via symlink).
 ///
-/// This is a synchronous function that builds a small tokio runtime, connects
-/// to the broker socket, sends the command, and streams output to stdout.
+/// Fully synchronous — uses `std::os::unix::net::UnixStream` so it works even
+/// when called from inside an existing tokio runtime (e.g. the hop daemon).
 /// Returns the exit code.
 pub fn broker_client_main(command: &str, args: &[String]) -> i32 {
     let sock = match std::env::var("HOP_BROKER_SOCK") {
@@ -456,47 +456,32 @@ pub fn broker_client_main(command: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Build a small tokio runtime for the client
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
+    match broker_client_sync(command, args, &sock) {
+        Ok(code) => code,
         Err(e) => {
-            eprintln!("hop broker: failed to start runtime: {e}");
-            return 127;
+            eprintln!("hop broker: {e}");
+            127
         }
-    };
-
-    rt.block_on(async {
-        match broker_client_async(command, args, &sock).await {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("hop broker: {e}");
-                127
-            }
-        }
-    })
+    }
 }
 
-/// Async broker client logic.
-async fn broker_client_async(command: &str, args: &[String], sock_path: &str) -> anyhow::Result<i32> {
-    use tokio::net::UnixStream;
+/// Synchronous broker client logic using std Unix sockets.
+fn broker_client_sync(command: &str, args: &[String], sock_path: &str) -> anyhow::Result<i32> {
+    use std::os::unix::net::UnixStream;
 
-    let stream = UnixStream::connect(sock_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let mut stream = UnixStream::connect(sock_path)?;
 
     // Send the exec request
     let request = BrokerRequest::Exec {
         command: command.to_string(),
         args: args.to_vec(),
     };
-    write_broker_message(&mut writer, &request).await?;
+    write_broker_message_sync(&mut stream, &request)?;
 
     // Read responses and write output to stdout
     let mut stdout = std::io::stdout();
     loop {
-        let response: BrokerResponse = read_broker_message(&mut reader).await?;
+        let response: BrokerResponse = read_broker_message_sync(&mut stream)?;
         match response {
             BrokerResponse::Output(data) => {
                 use std::io::Write;
@@ -557,6 +542,46 @@ async fn read_broker_message<T: for<'de> Deserialize<'de>>(
         .read_exact(&mut payload)
         .await
         .context("broker read payload")?;
+
+    let (msg, _) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+        .context("broker decode failed")?;
+    Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous wire format helpers (for broker client — no tokio dependency)
+// ---------------------------------------------------------------------------
+
+fn write_broker_message_sync<T: Serialize>(
+    stream: &mut impl std::io::Write,
+    msg: &T,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .context("broker encode failed")?;
+    let len = (payload.len() as u32).to_be_bytes();
+    stream.write_all(&len).context("broker write length")?;
+    stream.write_all(&payload).context("broker write payload")?;
+    stream.flush().context("broker flush")?;
+    Ok(())
+}
+
+fn read_broker_message_sync<T: for<'de> Deserialize<'de>>(
+    stream: &mut impl std::io::Read,
+) -> anyhow::Result<T> {
+    use anyhow::Context;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).context("broker read length")?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > 16 * 1024 * 1024 {
+        anyhow::bail!("broker frame too large: {len} bytes");
+    }
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).context("broker read payload")?;
 
     let (msg, _) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
         .context("broker decode failed")?;
