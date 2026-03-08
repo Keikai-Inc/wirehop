@@ -31,6 +31,27 @@ pub fn user_exists(username: &str) -> bool {
     !pw.is_null()
 }
 
+/// Returns the login shell for `username` from the passwd database.
+///
+/// Falls back to `$SHELL` or `/bin/sh` if the lookup fails.
+pub fn user_login_shell(username: &str) -> String {
+    let Ok(c_name) = CString::new(username) else {
+        return std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    };
+    // SAFETY: getpwnam is safe with a valid C string; we only read the return pointer.
+    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if pw.is_null() {
+        return std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    }
+    let shell = unsafe { std::ffi::CStr::from_ptr((*pw).pw_shell) };
+    shell
+        .to_str()
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
+}
+
 /// Validate a username for use with per-user shell sessions.
 ///
 /// Checks:

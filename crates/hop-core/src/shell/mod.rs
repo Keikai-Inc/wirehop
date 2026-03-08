@@ -118,6 +118,13 @@ pub async fn host_shell_session(
         .openpty(initial_size)
         .context("Failed to open PTY")?;
 
+    // Use the target user's login shell, not the daemon's $SHELL.
+    #[cfg(unix)]
+    let shell = match username {
+        Some(user) => crate::unix_user::user_login_shell(user),
+        None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+    };
+    #[cfg(not(unix))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
     let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
@@ -434,6 +441,15 @@ fn spawn_persistent_pty(
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).context("Failed to open PTY")?;
 
+    // Use the target user's login shell, not the daemon's $SHELL.
+    // When the daemon runs as root, $SHELL is /bin/sh, but the user's
+    // shell is typically /bin/zsh on macOS.
+    #[cfg(unix)]
+    let shell = match username {
+        Some(user) => crate::unix_user::user_login_shell(user),
+        None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+    };
+    #[cfg(not(unix))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
     let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
