@@ -173,9 +173,8 @@ pub fn sandboxed_shell(
 
     #[cfg(target_os = "linux")]
     {
-        // On Linux, the sandbox is applied via pre_exec hooks on the
-        // CommandBuilder, not by wrapping the binary. Return the plain
-        // shell command — the caller applies the sandbox.
+        // On Linux, the sandbox is applied via a self-exec wrapper:
+        // hop __sandbox-shell --policy <json> -- <shell> <args>
         return linux::sandboxed_shell_command(policy, shell, username);
     }
 
@@ -186,7 +185,7 @@ pub fn sandboxed_shell(
     }
 }
 
-/// Plain shell command without sandboxing (existing behavior).
+/// Plain shell command without sandboxing (visible for tests).
 fn plain_shell(shell: &str, username: Option<&str>) -> (String, Vec<String>) {
     if let Some(user) = username {
         #[cfg(target_os = "macos")]
@@ -204,5 +203,37 @@ fn plain_shell(shell: &str, username: Option<&str>) -> (String, Vec<String>) {
         }
     } else {
         (shell.to_string(), vec!["-l".into()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unrestricted policy should return the plain shell directly,
+    /// not a sandbox wrapper binary.
+    #[test]
+    fn sandboxed_shell_unrestricted_returns_plain_shell() {
+        let policy = SandboxPolicy::unrestricted();
+        let (bin, args) = sandboxed_shell(&policy, "/bin/bash", None);
+        // Should be the shell itself, not sandbox-exec or hop wrapper
+        assert_eq!(bin, "/bin/bash");
+        assert_eq!(args, vec!["-l"]);
+    }
+
+    /// A restricted policy should return a wrapper binary (sandbox-exec
+    /// on macOS, the hop binary on Linux) — never the bare shell.
+    #[test]
+    fn sandboxed_shell_restricted_wraps() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let (bin, _args) = sandboxed_shell(&policy, "/bin/bash", None);
+        // On macOS: sandbox-exec; on Linux: hop __sandbox-shell wrapper
+        #[cfg(target_os = "macos")]
+        assert_eq!(bin, "/usr/bin/sandbox-exec", "macOS must use sandbox-exec");
+        #[cfg(target_os = "linux")]
+        assert_ne!(bin, "/bin/bash", "Linux must not return the bare shell");
     }
 }

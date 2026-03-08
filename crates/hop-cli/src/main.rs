@@ -148,20 +148,23 @@ async fn main() -> Result<()> {
                 None => agent::run_foreground(&config_dir).await,
             }
         }
+        Command::SandboxShell { policy, shell_args } => {
+            cmd_sandbox_shell(&policy, &shell_args)
+        }
         Command::External(args) => {
-            let target = args.first().context("no target specified")?;
+            let ext = parse_external_args(&args)?;
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
 
-            // "hop myhost -- cmd args" → exec shorthand
-            if let Some(sep) = args.iter().position(|a| a == "--") {
-                let command = args[sep + 1..].to_vec();
-                if command.is_empty() {
-                    anyhow::bail!("no command specified after --");
-                }
-                cmd_exec(secret_key, target, &config_dir, &command, hop_core::sandbox::SandboxPolicy::default()).await
+            let sandbox = build_sandbox_policy(
+                ext.preset.as_deref(), ext.read_only, ext.no_network,
+                &ext.scopes, &ext.allow_commands,
+            )?;
+
+            if let Some(command) = ext.exec_command {
+                cmd_exec(secret_key, &ext.target, &config_dir, &command, sandbox).await
             } else {
-                cmd_connect(secret_key, target, &config_dir, None, hop_core::sandbox::SandboxPolicy::default()).await
+                cmd_connect(secret_key, &ext.target, &config_dir, ext.name.as_deref(), sandbox).await
             }
         }
     }
@@ -567,6 +570,66 @@ fn cmd_invite(
 }
 
 /// Build a SandboxPolicy from CLI flags.
+/// Parsed arguments from the `External` (catch-all) subcommand handler.
+///
+/// `hop <target> [--read-only] [--no-network] [--preset X] [--name X]
+///  [--scope P]... [--allow-command C]... [-- cmd args...]`
+#[derive(Debug, PartialEq)]
+struct ExternalArgs {
+    target: String,
+    read_only: bool,
+    no_network: bool,
+    preset: Option<String>,
+    name: Option<String>,
+    scopes: Vec<std::path::PathBuf>,
+    allow_commands: Vec<String>,
+    exec_command: Option<Vec<String>>,
+}
+
+/// Parse sandbox/connection flags from the External (catch-all) subcommand args.
+///
+/// Extracted from the inline handler so we can unit-test it without needing
+/// config/key loading. Fails if `args` is empty (no target).
+fn parse_external_args(args: &[String]) -> Result<ExternalArgs> {
+    let target = args.first().context("no target specified")?.clone();
+
+    let read_only = args.iter().any(|a| a == "--read-only");
+    let no_network = args.iter().any(|a| a == "--no-network");
+    let preset = args.iter().position(|a| a == "--preset")
+        .and_then(|i| args.get(i + 1)).cloned();
+    let name = args.iter().position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1)).cloned();
+    let scopes: Vec<std::path::PathBuf> = args.windows(2)
+        .filter(|w| w[0] == "--scope")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+        .collect();
+    let allow_commands: Vec<String> = args.windows(2)
+        .filter(|w| w[0] == "--allow-command")
+        .map(|w| w[1].clone())
+        .collect();
+
+    let exec_command = if let Some(sep) = args.iter().position(|a| a == "--") {
+        let command = args[sep + 1..].to_vec();
+        if command.is_empty() {
+            anyhow::bail!("no command specified after --");
+        }
+        Some(command)
+    } else {
+        None
+    };
+
+    Ok(ExternalArgs {
+        target,
+        read_only,
+        no_network,
+        preset,
+        name,
+        scopes,
+        allow_commands,
+        exec_command,
+    })
+}
+
 fn build_sandbox_policy(
     preset: Option<&str>,
     read_only: bool,
@@ -588,6 +651,43 @@ fn build_sandbox_policy(
     let nn = if no_network { Some(true) } else { None };
 
     Ok(base.with_overrides(ro, nn, scopes, allow_commands))
+}
+
+/// Internal subcommand: apply sandbox and exec a shell.
+///
+/// Used by the Linux PTY sandbox wrapper. The hop binary re-execs itself with
+/// `__sandbox-shell --policy <json> -- <shell> <args...>`, applies Landlock +
+/// no_new_privs in-process, then execs the real shell.
+fn cmd_sandbox_shell(policy_json: &str, shell_args: &[String]) -> Result<()> {
+    let policy: hop_core::sandbox::SandboxPolicy = serde_json::from_str(policy_json)
+        .context("invalid sandbox policy JSON")?;
+
+    // Apply sandbox restrictions to this process
+    #[cfg(target_os = "linux")]
+    hop_core::sandbox::linux::apply_sandbox(&policy);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &policy;
+    }
+
+    // Exec the real shell (replaces this process)
+    let shell = shell_args.first().context("no shell specified")?;
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args(&shell_args[1..]);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("exec failed: {err}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().context("failed to run shell")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Spawn a blocking stdin reader and return the receiver half.
@@ -1796,6 +1896,151 @@ mod tests {
                     original
                 ),
             }
+        }
+    }
+
+    // --- parse_external_args tests (Bug 1 regression) ---
+
+    fn s(val: &str) -> String { val.to_string() }
+
+    #[test]
+    fn external_args_read_only() {
+        let args = vec![s("myhost"), s("--read-only")];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.target, "myhost");
+        assert!(ext.read_only);
+        assert!(!ext.no_network);
+    }
+
+    #[test]
+    fn external_args_no_network() {
+        let args = vec![s("myhost"), s("--no-network")];
+        let ext = parse_external_args(&args).unwrap();
+        assert!(ext.no_network);
+        assert!(!ext.read_only);
+    }
+
+    #[test]
+    fn external_args_preset() {
+        let args = vec![s("myhost"), s("--preset"), s("monitor")];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.preset, Some(s("monitor")));
+    }
+
+    #[test]
+    fn external_args_name() {
+        let args = vec![s("myhost"), s("--name"), s("mybox")];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.name, Some(s("mybox")));
+    }
+
+    #[test]
+    fn external_args_scope_multiple() {
+        let args = vec![
+            s("myhost"), s("--scope"), s("/var/log"), s("--scope"), s("/etc"),
+        ];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.scopes.len(), 2);
+        assert_eq!(ext.scopes[0], std::path::PathBuf::from("/var/log"));
+        assert_eq!(ext.scopes[1], std::path::PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn external_args_allow_command_multiple() {
+        let args = vec![
+            s("myhost"), s("--allow-command"), s("ps"), s("--allow-command"), s("ls"),
+        ];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.allow_commands, vec!["ps", "ls"]);
+    }
+
+    #[test]
+    fn external_args_exec_separator() {
+        let args = vec![
+            s("myhost"), s("--read-only"), s("--"), s("ls"), s("-la"),
+        ];
+        let ext = parse_external_args(&args).unwrap();
+        assert!(ext.read_only);
+        assert_eq!(ext.exec_command, Some(vec![s("ls"), s("-la")]));
+    }
+
+    #[test]
+    fn external_args_no_flags() {
+        let args = vec![s("myhost")];
+        let ext = parse_external_args(&args).unwrap();
+        assert_eq!(ext.target, "myhost");
+        assert!(!ext.read_only);
+        assert!(!ext.no_network);
+        assert!(ext.preset.is_none());
+        assert!(ext.name.is_none());
+        assert!(ext.scopes.is_empty());
+        assert!(ext.allow_commands.is_empty());
+        assert!(ext.exec_command.is_none());
+    }
+
+    #[test]
+    fn external_args_combined_flags() {
+        let args = vec![
+            s("myhost"), s("--read-only"), s("--no-network"), s("--preset"), s("audit"),
+        ];
+        let ext = parse_external_args(&args).unwrap();
+        assert!(ext.read_only);
+        assert!(ext.no_network);
+        assert_eq!(ext.preset, Some(s("audit")));
+    }
+
+    #[test]
+    fn external_args_empty_fails() {
+        let args: Vec<String> = vec![];
+        assert!(parse_external_args(&args).is_err());
+    }
+
+    // --- build_sandbox_policy tests ---
+
+    #[test]
+    fn build_policy_read_only_flag() {
+        let policy = build_sandbox_policy(None, true, false, &[], &[]).unwrap();
+        assert!(policy.read_only);
+        assert!(!policy.no_network);
+    }
+
+    #[test]
+    fn build_policy_preset_monitor() {
+        let policy = build_sandbox_policy(Some("monitor"), false, false, &[], &[]).unwrap();
+        assert_eq!(policy, SandboxPolicy::preset_monitor());
+    }
+
+    #[test]
+    fn build_policy_unknown_preset_errors() {
+        let result = build_sandbox_policy(Some("bogus"), false, false, &[], &[]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("bogus"), "error should mention the bad preset name");
+    }
+
+    #[test]
+    fn build_policy_preset_with_overrides() {
+        // "deploy" preset has read_only=false; passing read_only=true should override
+        let policy = build_sandbox_policy(Some("deploy"), true, false, &[], &[]).unwrap();
+        assert!(policy.read_only, "read_only override must apply on top of preset");
+    }
+
+    // --- __sandbox-shell clap parsing test (Bug 2 regression) ---
+
+    #[test]
+    fn sandbox_shell_clap_parses() {
+        use cli::{Cli, Command};
+        let policy = SandboxPolicy::preset_monitor();
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed = Cli::try_parse_from([
+            "hop", "__sandbox-shell", "--policy", &json, "--", "/bin/bash", "-l",
+        ]).expect("__sandbox-shell should parse via clap");
+        match parsed.command {
+            Command::SandboxShell { policy: p, shell_args } => {
+                assert_eq!(p, json);
+                assert_eq!(shell_args, vec!["/bin/bash", "-l"]);
+            }
+            _ => panic!("expected SandboxShell variant"),
         }
     }
 }

@@ -223,6 +223,17 @@ pub enum Command {
         config: Option<PathBuf>,
     },
 
+    /// Internal: apply sandbox and exec a shell (used by Linux PTY sandboxing)
+    #[command(name = "__sandbox-shell", hide = true)]
+    SandboxShell {
+        /// JSON-serialized SandboxPolicy
+        #[arg(long)]
+        policy: String,
+        /// Shell binary and args to exec
+        #[arg(required = true, last = true)]
+        shell_args: Vec<String>,
+    },
+
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
     #[command(external_subcommand)]
     External(Vec<String>),

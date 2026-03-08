@@ -337,6 +337,41 @@ mod tests {
         );
     }
 
+    /// Regression test: verify the PTY/shell path (sandboxed_shell_command)
+    /// also enforces sandboxing, not just the exec path (sandboxed_command).
+    /// This catches Bug 2 where PTY sessions could bypass the sandbox.
+    #[test]
+    fn sandbox_shell_path_denies_writes() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let (bin, args) = sandboxed_shell_command(&policy, "/bin/sh", None);
+        // Build the command the same way the PTY code would
+        let cmd = std::process::Command::new(&bin);
+        // Replace the shell args: instead of an interactive "-l" shell,
+        // run a write-attempt command to test enforcement.
+        // args = ["-p", "<profile>", "/bin/sh", "-l"]
+        // We keep the sandbox-exec + profile, but swap the shell invocation
+        // for a one-shot write test.
+        assert_eq!(bin, "/usr/bin/sandbox-exec");
+        assert!(args.len() >= 2, "expected at least -p and profile");
+        let output = std::process::Command::new(&bin)
+            .arg(&args[0]) // -p
+            .arg(&args[1]) // profile
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("echo test > /var/tmp/hop-shell-sandbox-test 2>&1 && echo WRITE_OK || echo WRITE_DENIED")
+            .output()
+            .expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("WRITE_DENIED"),
+            "sandboxed_shell_command must deny writes in read-only mode via the PTY path, got: {stdout}"
+        );
+        let _ = cmd; // suppress unused warning
+    }
+
     #[test]
     fn sandbox_exec_unrestricted_allows_writes() {
         let policy = SandboxPolicy::default();

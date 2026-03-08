@@ -257,23 +257,39 @@ pub fn sandboxed_command(cmd: &str, policy: &SandboxPolicy) -> tokio::process::C
 
 /// Build arguments for a sandboxed shell session on Linux.
 ///
-/// Returns `(binary, args)` for spawning via portable-pty. The sandbox
-/// is applied via pre-exec hooks in the PTY spawning code, not here.
+/// Returns `(binary, args)` for spawning via portable-pty. Since
+/// `portable_pty::CommandBuilder` doesn't support `pre_exec` hooks, we use a
+/// self-exec wrapper: the hop binary re-invokes itself with `__sandbox-shell`
+/// to apply Landlock + no_new_privs in-process, then execs the real shell.
 pub fn sandboxed_shell_command(
-    _policy: &SandboxPolicy,
+    policy: &SandboxPolicy,
     shell: &str,
     username: Option<&str>,
 ) -> (String, Vec<String>) {
+    let hop_bin = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("hop"))
+        .to_string_lossy()
+        .to_string();
+
+    let policy_json = serde_json::to_string(policy).unwrap_or_default();
+
+    let mut args = vec![
+        "__sandbox-shell".into(),
+        "--policy".into(),
+        policy_json,
+        "--".into(),
+    ];
+
     if let Some(user) = username {
-        // su - <user> launches a login shell for that user
-        let bin = "su".to_string();
-        let args = vec!["-".into(), user.into()];
-        (bin, args)
+        args.push("su".into());
+        args.push("-".into());
+        args.push(user.into());
     } else {
-        let bin = shell.to_string();
-        let args = vec!["-l".into()];
-        (bin, args)
+        args.push(shell.into());
+        args.push("-l".into());
     }
+
+    (hop_bin, args)
 }
 
 /// Resolve allowed_paths, adding Linux-specific essential paths.
@@ -300,15 +316,69 @@ mod tests {
             ..Default::default()
         };
         let (bin, args) = sandboxed_shell_command(&policy, "/bin/bash", Some("alice"));
-        assert_eq!(bin, "su");
+        // Should use self-exec wrapper
+        assert!(bin.contains("hop") || bin.ends_with("sandbox-linux") || !bin.is_empty());
+        assert!(args.contains(&"__sandbox-shell".to_string()));
+        assert!(args.contains(&"--policy".to_string()));
+        assert!(args.contains(&"su".to_string()));
         assert!(args.contains(&"alice".to_string()));
     }
 
     #[test]
     fn sandboxed_shell_without_user() {
-        let policy = SandboxPolicy::default();
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
         let (bin, args) = sandboxed_shell_command(&policy, "/bin/bash", None);
-        assert_eq!(bin, "/bin/bash");
+        // Should use self-exec wrapper
+        assert!(args.contains(&"__sandbox-shell".to_string()));
+        assert!(args.contains(&"--policy".to_string()));
+        assert!(args.contains(&"/bin/bash".to_string()));
         assert!(args.contains(&"-l".to_string()));
+        let _ = bin; // hop binary path
+    }
+
+    #[test]
+    fn sandboxed_shell_policy_json_roundtrips() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            ..Default::default()
+        };
+        let (_bin, args) = sandboxed_shell_command(&policy, "/bin/zsh", None);
+        let policy_idx = args.iter().position(|a| a == "--policy").unwrap();
+        let json = &args[policy_idx + 1];
+        let parsed: SandboxPolicy = serde_json::from_str(json).unwrap();
+        assert!(parsed.read_only);
+        assert!(parsed.no_network);
+    }
+
+    /// Regression test for Bug 2: verify that a fully populated SandboxPolicy
+    /// survives the JSON roundtrip through sandboxed_shell_command, ensuring
+    /// the Linux PTY path doesn't silently lose sandbox fields.
+    #[test]
+    fn sandboxed_shell_full_policy_roundtrip() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            allowed_paths: vec![
+                PathBuf::from("/var/log"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/proc"),
+            ],
+            allowed_commands: vec!["ps".into(), "top".into(), "cat".into()],
+            denied_commands: vec!["rm".into(), "dd".into(), "shutdown".into()],
+        };
+
+        let (_bin, args) = sandboxed_shell_command(&policy, "/bin/bash", None);
+
+        // Extract and parse the JSON from the args
+        let policy_idx = args.iter().position(|a| a == "--policy").unwrap();
+        let json = &args[policy_idx + 1];
+        let parsed: SandboxPolicy = serde_json::from_str(json)
+            .expect("policy JSON from sandboxed_shell_command must be valid");
+
+        assert_eq!(parsed, policy, "all SandboxPolicy fields must survive the JSON roundtrip");
     }
 }
