@@ -17,6 +17,10 @@ struct CronArgs {
     script: Option<String>,
     tags: Option<Vec<String>>,
     tag_filter: Option<String>,
+    /// Fleet target tag. When set, matching hosts are injected as `hop.targets`.
+    targets: Option<String>,
+    /// Catalog identifier for dedup. Used by `ensure` to prevent duplicate jobs.
+    catalog_id: Option<String>,
 }
 
 pub fn tool_definition() -> ToolDefinition {
@@ -28,8 +32,8 @@ pub fn tool_definition() -> ToolDefinition {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "delete", "list", "get", "enable", "disable"],
-                    "description": "The cron management operation"
+                    "enum": ["create", "ensure", "delete", "list", "get", "enable", "disable"],
+                    "description": "The cron management operation. 'ensure' creates a job only if no job with the same catalog_id exists (idempotent)."
                 },
                 "job_id": {
                     "type": "string",
@@ -55,6 +59,14 @@ pub fn tool_definition() -> ToolDefinition {
                 "tag_filter": {
                     "type": "string",
                     "description": "Filter jobs by tag (optional, for list)"
+                },
+                "targets": {
+                    "type": "string",
+                    "description": "Fleet target tag (optional, for create/ensure). When set, matching hosts are resolved and injected as hop.targets array before script execution."
+                },
+                "catalog_id": {
+                    "type": "string",
+                    "description": "Catalog identifier for dedup (required for ensure, optional for create). When using 'ensure', if a job with this catalog_id already exists, the existing job is returned instead of creating a duplicate."
                 }
             },
             "required": ["action"]
@@ -70,6 +82,7 @@ pub fn call(datastore: &Datastore, args: Value) -> ToolCallResult {
 
     match args.action.as_str() {
         "create" => cron_create(datastore, &args),
+        "ensure" => cron_ensure(datastore, &args),
         "delete" => cron_delete(datastore, &args),
         "list" => cron_list(datastore, &args),
         "get" => cron_get(datastore, &args),
@@ -117,12 +130,98 @@ fn cron_create(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         next_run,
         created_at: now,
         tags: args.tags.clone().unwrap_or_default(),
+        targets: args.targets.clone(),
+        catalog_id: args.catalog_id.clone(),
     };
 
     match ds.cron_add(&job) {
         Ok(()) => ToolCallResult::text(
             json!({
                 "job_id": job_id,
+                "name": name,
+                "schedule": schedule,
+                "enabled": true,
+                "next_run": next_run,
+            })
+            .to_string(),
+        ),
+        Err(e) => ToolCallResult::error(format!("Failed to create cron job: {e}")),
+    }
+}
+
+fn cron_ensure(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
+    let catalog_id = match args.catalog_id.as_deref() {
+        Some(id) => id,
+        None => return ToolCallResult::error("catalog_id is required for ensure"),
+    };
+
+    // Check if a job with this catalog_id already exists
+    match ds.cron_find_by_catalog_id(catalog_id) {
+        Ok(Some(existing)) => {
+            // Already exists — return it without creating a duplicate
+            return ToolCallResult::text(
+                json!({
+                    "status": "exists",
+                    "job_id": existing.id,
+                    "catalog_id": catalog_id,
+                    "name": existing.name,
+                    "schedule": existing.schedule,
+                    "enabled": existing.enabled,
+                })
+                .to_string(),
+            );
+        }
+        Ok(None) => {} // proceed to create
+        Err(e) => return ToolCallResult::error(format!("Failed to check catalog: {e}")),
+    }
+
+    // Create the job (same validation as cron_create)
+    let name = match args.name.as_deref() {
+        Some(n) => n,
+        None => return ToolCallResult::error("name is required for ensure"),
+    };
+    let schedule = match args.schedule.as_deref() {
+        Some(s) => s,
+        None => return ToolCallResult::error("schedule is required for ensure"),
+    };
+    let script = match args.script.as_deref() {
+        Some(s) => s,
+        None => return ToolCallResult::error("script is required for ensure"),
+    };
+
+    let parsed = match schedule.parse::<cron::Schedule>() {
+        Ok(s) => s,
+        Err(e) => {
+            return ToolCallResult::error(format!(
+                "Invalid cron expression '{schedule}': {e}. Use 6-field format: sec min hour day month weekday"
+            ))
+        }
+    };
+
+    let now = now_ms();
+    let next_run = next_occurrence_ms(&parsed, now);
+    let job_id = generate_id();
+
+    let job = CronJob {
+        id: job_id.clone(),
+        name: name.to_string(),
+        schedule: schedule.to_string(),
+        script: script.to_string(),
+        enabled: true,
+        last_run: None,
+        next_run,
+        created_at: now,
+        tags: args.tags.clone().unwrap_or_default(),
+        targets: args.targets.clone(),
+        catalog_id: Some(catalog_id.to_string()),
+    };
+
+    match ds.cron_add(&job) {
+        Ok(()) => ToolCallResult::text(
+            json!({
+                "status": "created",
+                "job_id": job_id,
+                "catalog_id": catalog_id,
                 "name": name,
                 "schedule": schedule,
                 "enabled": true,
@@ -169,6 +268,7 @@ fn cron_list(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
                         "last_run": j.last_run,
                         "next_run": j.next_run,
                         "tags": j.tags,
+                        "catalog_id": j.catalog_id,
                     })
                 })
                 .collect();
@@ -196,6 +296,7 @@ fn cron_get(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
                 "next_run": job.next_run,
                 "created_at": job.created_at,
                 "tags": job.tags,
+                "catalog_id": job.catalog_id,
             })
             .to_string(),
         ),

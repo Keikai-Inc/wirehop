@@ -364,7 +364,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     {
         let ds_path = config_dir.join("datastore.redb");
         let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
-        hop_mcp::cron::spawn_cron_scheduler(datastore, Duration::from_secs(15));
+        hop_mcp::cron::spawn_cron_scheduler(datastore, Duration::from_secs(15), None);
     }
 
     while let Some(incoming) = endpoint.accept().await {
@@ -1762,6 +1762,9 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
             for h in &hosts {
                 println!("  {} ({})", h.hostname, &h.node_id[..10]);
             }
+        }
+        AdminResponse::MetricsReceived { count } => {
+            println!("Received {count} metric point(s)");
         }
         AdminResponse::Error { message } => {
             eprintln!("Error: {message}");

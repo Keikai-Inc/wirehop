@@ -15,6 +15,7 @@ pub mod skills;
 pub mod tools;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use hop_core::datastore::Datastore;
@@ -36,7 +37,7 @@ pub async fn run_stdio_server_with_datastore(
     config_dir: &Path,
     datastore: Option<Datastore>,
 ) -> Result<()> {
-    let backend: BoxedBackend = Box::new(LocalBackend::new(config_dir.to_path_buf()));
+    let backend: BoxedBackend = Arc::new(LocalBackend::new(config_dir.to_path_buf()));
     let mut registry = ToolRegistry::new(backend);
     if let Some(ds) = datastore {
         registry = registry.with_datastore(ds);

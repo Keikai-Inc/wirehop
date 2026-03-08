@@ -4,11 +4,16 @@
 //! The JS runtime runs on a dedicated OS thread; async backend calls
 //! will be bridged via a channel back to the tokio runtime (Phase 2+).
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use anyhow::Result;
 use hop_core::datastore::types::{KvEntry, MetricPoint, TimeSeriesQuery};
 use hop_core::datastore::Datastore;
 use rquickjs::{Ctx, Function, Object, Value};
-use std::collections::BTreeMap;
+use tokio::runtime::Handle;
+
+use crate::backend::OrchestratorBackend;
 
 /// Create a rquickjs error with an owned message.
 fn js_err(msg: String) -> rquickjs::Error {
@@ -16,7 +21,15 @@ fn js_err(msg: String) -> rquickjs::Error {
 }
 
 /// Install the `hop` global object with all bindings.
-pub fn install_hop_bindings(ctx: &Ctx<'_>, datastore: Option<&Datastore>) -> Result<()> {
+///
+/// When `backend` is `Some`, hop.exec/fleet/admin/roles/fs are wired to the
+/// real OrchestratorBackend via `handle.block_on()`. When `None` (cron jobs),
+/// they remain as stubs that throw errors.
+pub fn install_hop_bindings(
+    ctx: &Ctx<'_>,
+    datastore: Option<&Datastore>,
+    backend: Option<(Arc<dyn OrchestratorBackend>, Handle)>,
+) -> Result<()> {
     let globals = ctx.globals();
 
     let hop = Object::new(ctx.clone())
@@ -54,6 +67,275 @@ pub fn install_hop_bindings(ctx: &Ctx<'_>, datastore: Option<&Datastore>) -> Res
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if let Some((ref _b, ref _h)) = backend {
+        // Set hop.id with the real backend before globals assignment
+        let b = Arc::clone(_b);
+        hop.set(
+            "id",
+            Function::new(ctx.clone(), move || -> rquickjs::Result<String> {
+                b.whoami()
+                    .map(|u| u.node_id)
+                    .map_err(|e| js_err(format!("hop.id() failed: {e}")))
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        install_stub_bindings(ctx, &hop)?;
+    }
+
+    // Set hop on globals BEFORE installing JS wrappers (they reference the hop global)
+    globals
+        .set("hop", hop)
+        .map_err(|e| anyhow::anyhow!("Failed to set hop global: {e}"))?;
+
+    if let Some((backend, handle)) = backend {
+        install_live_raw_bindings(ctx, backend, handle)?;
+        install_backend_js_wrappers(ctx)?;
+    }
+
+    // Install datastore bindings via JS wrapper
+    if let Some(ds) = datastore {
+        install_datastore_raw(ctx, ds)?;
+        install_datastore_js_wrappers(ctx)?;
+    } else {
+        install_datastore_stubs(ctx)?;
+    }
+
+    remove_dangerous_globals(ctx)?;
+
+    Ok(())
+}
+
+/// Install raw __hop_* functions backed by a real OrchestratorBackend.
+///
+/// Each binding calls `handle.block_on(backend.method())` to bridge the
+/// async backend into the synchronous QuickJS thread. This is safe because
+/// the JS thread is a plain OS thread, not a tokio worker thread.
+///
+/// Must be called AFTER `hop` is set on globals (the JS wrappers reference it).
+fn install_live_raw_bindings(
+    ctx: &Ctx<'_>,
+    backend: Arc<dyn OrchestratorBackend>,
+    handle: Handle,
+) -> Result<()> {
+    // __hop_exec(host, command) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_exec",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, command: String| -> rquickjs::Result<String> {
+                match h.block_on(b.exec(&host, &command)) {
+                    Ok(result) => serde_json::to_string(&result)
+                        .map_err(|e| js_err(format!("serialize exec result: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.exec({host}, ...) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_fleet_list(tag?) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_fleet_list",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, tag: rquickjs::function::Opt<String>| -> rquickjs::Result<String> {
+                match h.block_on(b.list_hosts(tag.0.as_deref())) {
+                    Ok(hosts) => serde_json::to_string(&hosts)
+                        .map_err(|e| js_err(format!("serialize fleet list: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.fleet.list() failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_fleet_exec(group, command) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_fleet_exec",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, group: String, command: String| -> rquickjs::Result<String> {
+                match h.block_on(b.fleet_exec(&group, &command)) {
+                    Ok(results) => serde_json::to_string(&results)
+                        .map_err(|e| js_err(format!("serialize fleet exec: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.fleet.exec({group}, ...) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_admin_status(host) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_admin_status",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
+                match h.block_on(b.admin_status(&host)) {
+                    Ok(status) => serde_json::to_string(&status)
+                        .map_err(|e| js_err(format!("serialize admin status: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.admin.status({host}) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_admin_peers(host) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_admin_peers",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
+                match h.block_on(b.admin_peers(&host)) {
+                    Ok(peers) => serde_json::to_string(&peers)
+                        .map_err(|e| js_err(format!("serialize admin peers: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.admin.peers({host}) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_admin_invite(host, username?, role?) → string (token)
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_admin_invite",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, username: rquickjs::function::Opt<String>, role: rquickjs::function::Opt<String>| -> rquickjs::Result<String> {
+                match h.block_on(b.admin_invite(&host, username.0.as_deref(), role.0.as_deref())) {
+                    Ok(token) => Ok(token),
+                    Err(e) => Err(js_err(format!("hop.admin.invite({host}) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_admin_remove_peer(host, nodeIdPrefix) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_admin_remove_peer",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, prefix: String| -> rquickjs::Result<String> {
+                match h.block_on(b.admin_remove_peer(&host, &prefix)) {
+                    Ok(success) => Ok(serde_json::json!({"success": success}).to_string()),
+                    Err(e) => Err(js_err(format!("hop.admin.removePeer({host}) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_roles_list(host) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_roles_list",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
+                match h.block_on(b.list_roles(&host)) {
+                    Ok(roles) => serde_json::to_string(&roles)
+                        .map_err(|e| js_err(format!("serialize roles: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.roles.list({host}) failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_roles_delete(host, name) → void
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_roles_delete",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, name: String| -> rquickjs::Result<()> {
+                h.block_on(b.delete_role(&host, &name))
+                    .map_err(|e| js_err(format!("hop.roles.delete({host}, {name}) failed: {e}")))
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_metrics_push(pointsJson) → JSON string
+    {
+        let b = Arc::clone(&backend);
+        let h = handle.clone();
+        ctx.globals().set("__hop_metrics_push",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, points_json: String| -> rquickjs::Result<String> {
+                let points: Vec<hop_core::proto::PushMetricPoint> = serde_json::from_str(&points_json)
+                    .map_err(|e| js_err(format!("invalid points JSON: {e}")))?;
+                match h.block_on(b.push_metrics(points)) {
+                    Ok(count) => Ok(serde_json::json!({"count": count}).to_string()),
+                    Err(e) => Err(js_err(format!("hop.metrics.push() failed: {e}"))),
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Install JS wrappers over the raw __hop_* functions.
+fn install_backend_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
+    let js_code = r#"
+        hop.exec = function(host, command) {
+            return JSON.parse(__hop_exec(host, command));
+        };
+        hop.fleet = {
+            list: function(tag) {
+                if (tag !== undefined) {
+                    return JSON.parse(__hop_fleet_list(tag));
+                }
+                return JSON.parse(__hop_fleet_list());
+            },
+            exec: function(group, command) {
+                return JSON.parse(__hop_fleet_exec(group, command));
+            }
+        };
+        hop.admin = {
+            status: function(host) {
+                return JSON.parse(__hop_admin_status(host));
+            },
+            peers: function(host) {
+                return JSON.parse(__hop_admin_peers(host));
+            },
+            invite: function(host, username, role) {
+                return __hop_admin_invite(host, username, role);
+            },
+            removePeer: function(host, prefix) {
+                return JSON.parse(__hop_admin_remove_peer(host, prefix));
+            }
+        };
+        hop.roles = {
+            list: function(host) {
+                return JSON.parse(__hop_roles_list(host));
+            },
+            delete: function(host, name) {
+                __hop_roles_delete(host, name);
+            }
+        };
+        hop.fs = {
+            push: function() { throw new Error("hop.fs.push not yet implemented in MCP mode"); },
+            pull: function() { throw new Error("hop.fs.pull not yet implemented in MCP mode"); }
+        };
+        hop.metrics = {
+            push: function(points) {
+                return JSON.parse(__hop_metrics_push(JSON.stringify(points)));
+            }
+        };
+    "#;
+
+    ctx.eval::<(), _>(js_code)
+        .map_err(|e| anyhow::anyhow!("Failed to install backend JS wrappers: {e}"))?;
+
+    Ok(())
+}
+
+/// Install stub bindings (no backend available, e.g. cron jobs).
+fn install_stub_bindings<'js>(ctx: &Ctx<'js>, hop: &Object<'js>) -> Result<()> {
     // hop.id()
     hop.set(
         "id",
@@ -132,20 +414,6 @@ pub fn install_hop_bindings(ctx: &Ctx<'_>, datastore: Option<&Datastore>) -> Res
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     hop.set("fs", fs).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    globals
-        .set("hop", hop)
-        .map_err(|e| anyhow::anyhow!("Failed to set hop global: {e}"))?;
-
-    // Install datastore bindings via JS wrapper
-    if let Some(ds) = datastore {
-        install_datastore_raw(ctx, ds)?;
-        install_datastore_js_wrappers(ctx)?;
-    } else {
-        install_datastore_stubs(ctx)?;
-    }
-
-    remove_dangerous_globals(ctx)?;
 
     Ok(())
 }

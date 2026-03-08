@@ -5,13 +5,15 @@
 
 pub mod local;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::js::types::*;
 use hop_core::proto::RoleDefinition;
 
-pub type BoxedBackend = Box<dyn OrchestratorBackend>;
+pub type BoxedBackend = Arc<dyn OrchestratorBackend>;
 
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
@@ -66,6 +68,9 @@ pub trait OrchestratorBackend: Send + Sync {
 
     /// Pull a file from a host.
     async fn fs_pull(&self, host: &str, remote_path: &str, local_path: &str) -> Result<TransferResult>;
+
+    /// Push metric points to the orchestrator's datastore via admin channel.
+    async fn push_metrics(&self, points: Vec<hop_core::proto::PushMetricPoint>) -> Result<usize>;
 
     /// Get our own NodeId.
     fn whoami(&self) -> Result<UserInfo>;

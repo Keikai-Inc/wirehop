@@ -1,11 +1,13 @@
 //! Cron scheduler: polls for due jobs and executes their JS scripts.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use hop_core::datastore::Datastore;
 use tokio::task::JoinHandle;
 
+use crate::backend::OrchestratorBackend;
 use crate::js::JsRuntime;
 
 /// Compute the next occurrence (in epoch milliseconds) of a cron schedule
@@ -24,12 +26,19 @@ pub fn next_occurrence_ms(schedule: &cron::Schedule, after_ms: u64) -> u64 {
 }
 
 /// Spawn the cron scheduler loop. Polls for due jobs at `poll_interval`.
-pub fn spawn_cron_scheduler(datastore: Datastore, poll_interval: Duration) -> JoinHandle<()> {
+///
+/// When `backend` is provided, cron jobs can use `hop.exec()` / `hop.fleet.exec()`
+/// and jobs with `targets` will have `hop.targets` injected.
+pub fn spawn_cron_scheduler(
+    datastore: Datastore,
+    poll_interval: Duration,
+    backend: Option<Arc<dyn OrchestratorBackend>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         loop {
             interval.tick().await;
-            if let Err(e) = run_due_jobs(&datastore).await {
+            if let Err(e) = run_due_jobs(&datastore, backend.as_ref()).await {
                 tracing::error!("Cron scheduler error: {e:#}");
             }
         }
@@ -37,7 +46,10 @@ pub fn spawn_cron_scheduler(datastore: Datastore, poll_interval: Duration) -> Jo
 }
 
 /// Query for due jobs and spawn a task for each one.
-async fn run_due_jobs(datastore: &Datastore) -> Result<()> {
+async fn run_due_jobs(
+    datastore: &Datastore,
+    backend: Option<&Arc<dyn OrchestratorBackend>>,
+) -> Result<()> {
     let now = now_ms();
     let due_jobs = datastore.cron_get_due(now)?;
 
@@ -47,8 +59,9 @@ async fn run_due_jobs(datastore: &Datastore) -> Result<()> {
 
     for job in due_jobs {
         let ds = datastore.clone();
+        let be = backend.cloned();
         tokio::spawn(async move {
-            if let Err(e) = execute_cron_job(&ds, &job).await {
+            if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
                 tracing::error!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
             }
         });
@@ -61,6 +74,7 @@ async fn run_due_jobs(datastore: &Datastore) -> Result<()> {
 async fn execute_cron_job(
     datastore: &Datastore,
     job: &hop_core::datastore::types::CronJob,
+    backend: Option<&Arc<dyn OrchestratorBackend>>,
 ) -> Result<()> {
     let now = now_ms();
 
@@ -69,9 +83,24 @@ async fn execute_cron_job(
     let mut runtime = JsRuntime::new();
     runtime.set_datastore(datastore.clone());
 
-    let result = runtime
-        .execute_script(&job.script, Some(Duration::from_secs(30)))
-        .await;
+    // Build the script, optionally prepending hop.targets injection
+    let script = if let (Some(tag), Some(be)) = (&job.targets, backend) {
+        let hosts = be.list_hosts(Some(tag)).await.unwrap_or_default();
+        let hosts_json = serde_json::to_string(&hosts).unwrap_or_else(|_| "[]".to_string());
+        format!("hop.targets = {};\n{}", hosts_json, job.script)
+    } else {
+        job.script.clone()
+    };
+
+    let result = if let Some(be) = backend {
+        runtime
+            .execute(&script, be, Some(Duration::from_secs(30)))
+            .await
+    } else {
+        runtime
+            .execute_script(&script, Some(Duration::from_secs(30)))
+            .await
+    };
 
     match &result {
         Ok(output) => tracing::info!(
@@ -125,6 +154,8 @@ mod tests {
             next_run,
             created_at: 1000,
             tags: vec![],
+            targets: None,
+            catalog_id: None,
         }
     }
 
@@ -151,7 +182,7 @@ mod tests {
         );
         ds.cron_add(&job).unwrap();
 
-        run_due_jobs(&ds).await.unwrap();
+        run_due_jobs(&ds, None).await.unwrap();
 
         // Give the spawned task a moment to complete
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -172,7 +203,7 @@ mod tests {
         ds.cron_add(&job).unwrap();
 
         // Should not panic
-        run_due_jobs(&ds).await.unwrap();
+        run_due_jobs(&ds, None).await.unwrap();
 
         // Give the spawned task time to complete
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -200,7 +231,7 @@ mod tests {
         );
         ds.cron_add(&job).unwrap();
 
-        run_due_jobs(&ds).await.unwrap();
+        run_due_jobs(&ds, None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let entry = ds.kv_get("cron_test", "disabled").unwrap();
@@ -222,7 +253,7 @@ mod tests {
         ds.cron_add(&job).unwrap();
 
         // Spawn scheduler with a short interval
-        let handle = spawn_cron_scheduler(ds.clone(), Duration::from_millis(100));
+        let handle = spawn_cron_scheduler(ds.clone(), Duration::from_millis(100), None);
 
         // Wait for at least one tick
         tokio::time::sleep(Duration::from_millis(800)).await;

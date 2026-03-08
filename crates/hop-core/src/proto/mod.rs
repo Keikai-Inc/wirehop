@@ -142,6 +142,18 @@ pub enum AdminRequest {
     },
     /// Redeem an aggregate invite.
     RedeemAggregateInvite { secret: String },
+    /// Push metric points from a remote host to the orchestrator's datastore.
+    PushMetrics { points: Vec<PushMetricPoint> },
+}
+
+/// A single metric point pushed from a remote host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushMetricPoint {
+    pub metric: String,
+    pub value: f64,
+    pub tags: std::collections::BTreeMap<String, String>,
+    /// Optional timestamp in epoch milliseconds. If None, uses server time.
+    pub timestamp: Option<u64>,
 }
 
 /// Admin responses sent by the host.
@@ -184,6 +196,8 @@ pub enum AdminResponse {
     AggregateInviteCreated { token: String },
     /// Aggregate invite redeemed — list of per-host connections.
     AggregateInviteRedeemed { hosts: Vec<RedeemHostEntry> },
+    /// Metrics were received and stored.
+    MetricsReceived { count: usize },
     /// Error response.
     Error { message: String },
 }

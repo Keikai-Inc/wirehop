@@ -3,11 +3,13 @@
 pub mod bindings;
 pub mod types;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hop_core::datastore::Datastore;
 use rquickjs::{Context as JsContext, Runtime as QjsRuntime};
+use tokio::runtime::Handle;
 
 use crate::backend::BoxedBackend;
 
@@ -63,11 +65,13 @@ impl JsRuntime {
     /// Execute JS code in a fresh sandbox with hop.* bindings.
     ///
     /// Runs QuickJS on a dedicated OS thread to avoid tokio runtime
-    /// interaction issues with rquickjs internal locking.
+    /// interaction issues with rquickjs internal locking. The tokio
+    /// Handle is captured so synchronous JS bindings can call async
+    /// backend methods via `handle.block_on()`.
     pub async fn execute(
         &self,
         code: &str,
-        _backend: &BoxedBackend,
+        backend: &BoxedBackend,
         timeout: Option<Duration>,
     ) -> Result<String> {
         let timeout = timeout.unwrap_or(self.limits.timeout);
@@ -75,12 +79,21 @@ impl JsRuntime {
         let memory_limit = self.limits.memory_limit;
         let max_stack_size = self.limits.max_stack_size;
         let datastore = self.datastore.clone();
+        let backend = Arc::clone(backend);
+        let handle = Handle::current();
 
         // Use a oneshot channel to bridge the OS thread back to async
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         std::thread::spawn(move || {
-            let result = execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref());
+            let result = execute_js_sync(
+                &code,
+                memory_limit,
+                max_stack_size,
+                timeout,
+                datastore.as_ref(),
+                Some((backend, handle)),
+            );
             let _ = tx.send(result);
         });
 
@@ -101,7 +114,7 @@ impl JsRuntime {
 
         std::thread::spawn(move || {
             let result =
-                execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref());
+                execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref(), None);
             let _ = tx.send(result);
         });
 
@@ -116,6 +129,7 @@ fn execute_js_sync(
     max_stack_size: usize,
     timeout: Duration,
     datastore: Option<&Datastore>,
+    backend: Option<(Arc<dyn crate::backend::OrchestratorBackend>, Handle)>,
 ) -> Result<String> {
     let rt = QjsRuntime::new().context("Failed to create QuickJS runtime")?;
     rt.set_memory_limit(memory_limit);
@@ -133,7 +147,7 @@ fn execute_js_sync(
     // called inside ctx.with() — ctx.with() holds the runtime Mutex and
     // runtime methods also need it, causing a deadlock.
     let result = ctx.with(|ctx| -> Result<String> {
-        bindings::install_hop_bindings(&ctx, datastore)?;
+        bindings::install_hop_bindings(&ctx, datastore, backend)?;
 
         let wrapped = format!("(function() {{\n{code}\n}})()");
 
@@ -211,7 +225,7 @@ mod tests {
     use crate::backend::BoxedBackend;
 
     fn test_backend() -> BoxedBackend {
-        Box::new(LocalBackend::new(std::path::PathBuf::from("/tmp/hop-mcp-test")))
+        Arc::new(LocalBackend::new(std::path::PathBuf::from("/tmp/hop-mcp-test")))
     }
 
     #[test]
@@ -227,43 +241,43 @@ mod tests {
 
     #[test]
     fn execute_js_sync_math() {
-        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert_eq!(result, "4");
     }
 
     #[test]
     fn execute_js_sync_string() {
-        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn execute_js_sync_object() {
-        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert!(result.contains("\"a\": 1"));
     }
 
     #[test]
     fn execute_js_sync_log() {
-        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert_eq!(result, "ok");
     }
 
     #[test]
     fn execute_js_sync_error() {
-        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None);
+        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn execute_js_sync_no_return() {
-        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert_eq!(result, "undefined");
     }
 
     #[test]
     fn execute_js_sync_array() {
-        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None).unwrap();
+        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None).unwrap();
         assert!(result.contains("["));
         assert!(result.contains("1"));
     }

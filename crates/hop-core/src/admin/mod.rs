@@ -80,7 +80,42 @@ pub fn handle_admin_request(
         AdminRequest::RedeemAggregateInvite { secret } => {
             crate::fleet::handle_redeem_aggregate_invite(config_dir, relay_url, host_public_key, &secret)
         }
+        AdminRequest::PushMetrics { points } => {
+            handle_push_metrics(config_dir, points)
+        }
     }
+}
+
+fn handle_push_metrics(config_dir: &Path, points: Vec<crate::proto::PushMetricPoint>) -> AdminResponse {
+    let ds_path = config_dir.join("datastore.redb");
+    let ds = match crate::datastore::Datastore::open(&ds_path) {
+        Ok(ds) => ds,
+        Err(e) => {
+            return AdminResponse::Error {
+                message: format!("failed to open datastore: {e}"),
+            }
+        }
+    };
+
+    let mut count = 0;
+    for point in &points {
+        let metric_point = crate::datastore::types::MetricPoint {
+            value: point.value,
+            tags: point.tags.clone(),
+        };
+        if let Some(ts) = point.timestamp {
+            if let Err(e) = ds.ts_insert_at(&point.metric, ts, &metric_point) {
+                tracing::warn!("Failed to insert metric {}: {e}", point.metric);
+                continue;
+            }
+        } else if let Err(e) = ds.ts_insert(&point.metric, &metric_point) {
+            tracing::warn!("Failed to insert metric {}: {e}", point.metric);
+            continue;
+        }
+        count += 1;
+    }
+
+    AdminResponse::MetricsReceived { count }
 }
 
 fn handle_create_invite(

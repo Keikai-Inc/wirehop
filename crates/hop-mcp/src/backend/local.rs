@@ -442,6 +442,28 @@ impl OrchestratorBackend for LocalBackend {
         anyhow::bail!("File pull not yet implemented in MCP mode")
     }
 
+    async fn push_metrics(&self, points: Vec<hop_core::proto::PushMetricPoint>) -> Result<usize> {
+        // For local backend, push metrics to "self" (the orchestrator host).
+        // Uses the first known host or errors if no hosts are configured.
+        let hosts = self.list_hosts(None).await?;
+        let host = hosts
+            .first()
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| "localhost".to_string());
+
+        match self
+            .send_admin_request(
+                &host,
+                AdminRequest::PushMetrics { points },
+            )
+            .await?
+        {
+            AdminResponse::MetricsReceived { count } => Ok(count),
+            AdminResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("Unexpected response"),
+        }
+    }
+
     fn whoami(&self) -> Result<UserInfo> {
         let secret_key = config::load_identity(&self.config_dir)?;
         let public_key = secret_key.public();

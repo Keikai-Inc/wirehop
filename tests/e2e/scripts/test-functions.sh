@@ -370,3 +370,116 @@ test_cp_pull() {
     content=$(cat /tmp/e2e-push.txt)
     assert_contains "$content" "e2e-push-test-content"
 }
+
+# ── JS Bindings Tests (hop.exec / hop.fleet) ──
+
+test_js_exec_on_host() {
+    # Verify hop.exec() in JS runtime reaches a real host and returns stdout
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"var r = hop.exec(\"host-a\", \"echo hi-from-js\"); return r.stdout.trim();"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "hi-from-js"
+}
+
+test_js_fleet_list() {
+    # Verify hop.fleet.list() returns a valid JSON array with at least one host
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"var hosts = hop.fleet.list(); return JSON.stringify(hosts);"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    # Should be a JSON array
+    assert_contains "$text" "["
+    # Should contain a host name
+    assert_contains "$text" "name"
+}
+
+test_js_fleet_exec() {
+    # Verify hop.fleet.exec() returns results from multiple hosts
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"var results = hop.fleet.exec(\"*\", \"echo fleet-ok\"); return JSON.stringify(results);"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "fleet-ok"
+    assert_contains "$text" "host"
+}
+
+# ── Monitoring Pipeline Tests ──
+
+test_monitor_collect_and_query() {
+    # Verify the full pipeline: exec → ts_insert → ts_latest
+    local request
+    request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"var r = hop.exec(\"host-a\", \"echo 42.5\"); var val = parseFloat(r.stdout.trim()); hop.ts.insert(\"e2e.test.metric\", val, {host: \"host-a\"}); var latest = hop.ts.latest(\"e2e.test.metric\"); return String(latest.value);"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "42.5"
+}
+
+# ── Cron Catalog / Dedup Tests ──
+
+test_cron_ensure_creates() {
+    # First ensure should create the job
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"ensure","catalog_id":"e2e-catalog-test","name":"E2E Catalog Test","schedule":"0 0 * * * *","script":"return 1"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"status":"created"'
+    assert_contains "$text" '"catalog_id":"e2e-catalog-test"'
+}
+
+test_cron_ensure_dedup() {
+    # Second ensure with same catalog_id should return "exists"
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"ensure","catalog_id":"e2e-catalog-test","name":"E2E Catalog Test","schedule":"0 0 * * * *","script":"return 1"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"status":"exists"'
+    assert_contains "$text" '"catalog_id":"e2e-catalog-test"'
+}
+
+test_cron_catalog_in_list() {
+    # Verify catalog_id appears in list output
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"list"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "e2e-catalog-test"
+}
+
+test_monitor_cron_with_exec() {
+    # Create a cron job that uses hop.exec + ts_insert, verify after 20s
+    local create_req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"create","name":"e2e-monitor-cron","schedule":"* * * * * *","script":"var r = hop.exec(\"host-a\", \"echo 99.1\"); hop.ts.insert(\"e2e.cron.metric\", parseFloat(r.stdout.trim()), {host: \"host-a\"});"}}}'
+    local response
+    response=$(mcp_call "$create_req")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "job_id"
+
+    # Wait for scheduler to pick it up
+    sleep 20
+
+    # Read ts_latest to verify the cron job stored the metric
+    local ts_req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"ts_latest","metric":"e2e.cron.metric"}}}'
+    local ts_response
+    ts_response=$(mcp_call "$ts_req")
+
+    local ts_text
+    ts_text=$(mcp_result_text "$ts_response")
+    assert_contains "$ts_text" "99.1"
+}

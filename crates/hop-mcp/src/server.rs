@@ -174,7 +174,7 @@ mod tests {
     use crate::backend::BoxedBackend;
 
     fn test_registry() -> ToolRegistry {
-        let backend: BoxedBackend = Box::new(LocalBackend::new(
+        let backend: BoxedBackend = std::sync::Arc::new(LocalBackend::new(
             std::path::PathBuf::from("/tmp/hop-mcp-test"),
         ));
         ToolRegistry::new(backend)

@@ -75,6 +75,13 @@ run_test test_mcp_cron_create
 run_test test_mcp_cron_list
 run_test test_mcp_cron_delete
 
+# ── Cron Catalog / Dedup ──
+echo ""
+echo "--- Cron Catalog / Dedup ---"
+run_test test_cron_ensure_creates
+run_test test_cron_ensure_dedup
+run_test test_cron_catalog_in_list
+
 # ── Cron Execution ──
 echo ""
 echo "--- Cron Execution ---"
@@ -85,6 +92,19 @@ echo ""
 echo "--- File Transfer ---"
 run_test test_cp_push
 run_test test_cp_pull
+
+# ── JS Bindings (hop.exec / hop.fleet) ──
+echo ""
+echo "--- JS Bindings ---"
+run_test test_js_exec_on_host
+run_test test_js_fleet_list
+run_test test_js_fleet_exec
+
+# ── Monitoring Pipeline ──
+echo ""
+echo "--- Monitoring Pipeline ---"
+run_test test_monitor_collect_and_query
+run_test test_monitor_cron_with_exec
 
 # ── Results ──
 echo ""

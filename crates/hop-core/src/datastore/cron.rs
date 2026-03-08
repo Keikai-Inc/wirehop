@@ -76,6 +76,14 @@ impl Datastore {
         }
     }
 
+    /// Find a cron job by its catalog ID. Returns the first match.
+    pub fn cron_find_by_catalog_id(&self, catalog_id: &str) -> Result<Option<CronJob>> {
+        let jobs = self.cron_list()?;
+        Ok(jobs
+            .into_iter()
+            .find(|j| j.catalog_id.as_deref() == Some(catalog_id)))
+    }
+
     /// Get all enabled cron jobs that are due for execution.
     pub fn cron_get_due(&self, now: u64) -> Result<Vec<CronJob>> {
         let jobs = self.cron_list()?;
@@ -124,6 +132,8 @@ mod tests {
             next_run,
             created_at: 1000,
             tags: vec![],
+            targets: None,
+            catalog_id: None,
         }
     }
 
@@ -175,6 +185,25 @@ mod tests {
         let job = ds.cron_get("j1").unwrap().unwrap();
         assert_eq!(job.last_run, Some(2000));
         assert_eq!(job.next_run, 3000);
+    }
+
+    #[test]
+    fn cron_find_by_catalog_id_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+
+        let mut job = make_job("j1", "0 * * * * *", true, 5000);
+        job.catalog_id = Some("fleet-metrics".to_string());
+        ds.cron_add(&job).unwrap();
+
+        ds.cron_add(&make_job("j2", "0 * * * * *", true, 5000)).unwrap();
+
+        let found = ds.cron_find_by_catalog_id("fleet-metrics").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, "j1");
+
+        let not_found = ds.cron_find_by_catalog_id("nonexistent").unwrap();
+        assert!(not_found.is_none());
     }
 
     #[test]

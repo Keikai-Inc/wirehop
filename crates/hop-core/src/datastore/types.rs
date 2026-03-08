@@ -42,6 +42,14 @@ pub struct CronJob {
     /// Tags for fleet targeting: ["fleet:web", "role:monitor"].
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional fleet target tag. When set, the scheduler resolves matching
+    /// hosts and injects them as `hop.targets` before executing the script.
+    #[serde(default)]
+    pub targets: Option<String>,
+    /// Optional catalog identifier for dedup. When set, `ensure` will skip
+    /// creation if a job with the same catalog_id already exists.
+    #[serde(default)]
+    pub catalog_id: Option<String>,
 }
 
 /// Query parameters for time-series range queries.
