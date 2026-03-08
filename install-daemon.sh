@@ -142,6 +142,25 @@ chmod +x "${TMPDIR_HOP}/hop"
 info "Installing binary to /usr/local/bin/hop (sudo required)..."
 sudo mv "${TMPDIR_HOP}/hop" /usr/local/bin/hop
 
+# Create hop group and set up config directory permissions
+if ! getent group hop >/dev/null 2>&1; then
+  info "Creating system group 'hop'..."
+  sudo groupadd --system hop
+fi
+CURRENT_USER=$(whoami)
+if [ "$CURRENT_USER" != "root" ]; then
+  sudo usermod -aG hop "$CURRENT_USER"
+fi
+sudo mkdir -p /etc/hop
+sudo chown root:hop /etc/hop
+sudo chmod 2770 /etc/hop
+for f in peers.json pending_invites.json datastore.redb; do
+  if [ -f "/etc/hop/$f" ]; then
+    sudo chown root:hop "/etc/hop/$f"
+    sudo chmod 660 "/etc/hop/$f"
+  fi
+done
+
 # Install systemd service
 info "Installing systemd service..."
 SERVICE_URL="${BASE_URL}/hop.service"

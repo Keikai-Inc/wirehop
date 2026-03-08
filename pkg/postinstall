@@ -54,6 +54,10 @@ if [ -f "$SYSTEM_CONFIG/pending_invites.json" ]; then
     chown root:admin "$SYSTEM_CONFIG/pending_invites.json"
     chmod 660 "$SYSTEM_CONFIG/pending_invites.json"
 fi
+if [ -f "$SYSTEM_CONFIG/datastore.redb" ]; then
+    chown root:admin "$SYSTEM_CONFIG/datastore.redb"
+    chmod 660 "$SYSTEM_CONFIG/datastore.redb"
+fi
 
 echo "Starting hop daemon..."
 

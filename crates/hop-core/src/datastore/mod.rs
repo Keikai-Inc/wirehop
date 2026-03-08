@@ -25,6 +25,29 @@ impl Datastore {
     pub fn open(path: &Path) -> Result<Self> {
         let db = redb::Database::create(path)
             .with_context(|| format!("Failed to open datastore at {}", path.display()))?;
+
+        // If the parent directory has the setgid bit, make the file group-writable
+        // so unprivileged users in the same group can open it. Ignore errors —
+        // non-owners can't chmod, but a prior daemon run will have fixed it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = path.parent()
+                && let Ok(dir_meta) = std::fs::metadata(parent)
+                && dir_meta.mode() & 0o2000 != 0
+                && let Ok(file_meta) = std::fs::metadata(path)
+            {
+                let current = file_meta.mode() & 0o777;
+                if current != 0o660 {
+                    let _ = std::fs::set_permissions(
+                        path,
+                        std::fs::Permissions::from_mode(0o660),
+                    );
+                }
+            }
+        }
+
         Ok(Self { db: Arc::new(db) })
     }
 }
