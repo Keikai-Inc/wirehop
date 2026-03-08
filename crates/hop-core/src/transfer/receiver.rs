@@ -399,18 +399,13 @@ pub async fn receive_parallel(
 
     let acceptor = tokio::spawn(async move {
         let mut handles = Vec::new();
-        loop {
-            match conn_clone.accept_bi().await {
-                Ok((_send, recv)) => {
-                    let dest = dest_dir_for_tasks.clone();
-                    let tx = ack_tx.clone();
-                    let p = params_clone.clone();
-                    handles.push(tokio::spawn(async move {
-                        receive_files_from_data_stream(recv, &dest, tx, &p).await
-                    }));
-                }
-                Err(_) => break, // No more streams
-            }
+        while let Ok((_send, recv)) = conn_clone.accept_bi().await {
+            let dest = dest_dir_for_tasks.clone();
+            let tx = ack_tx.clone();
+            let p = params_clone.clone();
+            handles.push(tokio::spawn(async move {
+                receive_files_from_data_stream(recv, &dest, tx, &p).await
+            }));
         }
         // Wait for all data stream tasks
         let mut bytes = 0u64;
@@ -650,12 +645,12 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
         joined.canonicalize()?
     } else {
         // Ensure the parent exists and is within base
-        if let Some(parent) = joined.parent() {
-            if parent.exists() {
-                let canonical_parent = parent.canonicalize()?;
-                if !canonical_parent.starts_with(base) {
-                    bail!("path traversal rejected: {relative}");
-                }
+        if let Some(parent) = joined.parent()
+            && parent.exists()
+        {
+            let canonical_parent = parent.canonicalize()?;
+            if !canonical_parent.starts_with(base) {
+                bail!("path traversal rejected: {relative}");
             }
         }
         joined

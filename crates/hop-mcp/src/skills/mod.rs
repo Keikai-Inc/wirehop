@@ -53,6 +53,12 @@ pub struct SkillStore {
     skills: Vec<Skill>,
 }
 
+impl Default for SkillStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkillStore {
     /// Create a new skill store with all embedded skills.
     pub fn new() -> Self {

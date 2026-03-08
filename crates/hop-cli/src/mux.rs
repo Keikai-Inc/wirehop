@@ -282,7 +282,7 @@ async fn open_agent_stream(
     let mut ipc = ensure_agent(config_dir).await?;
 
     let req = MuxConnect {
-        host_id: host_id.as_bytes().clone(),
+        host_id: *host_id.as_bytes(),
         relay_url,
     };
     write_ipc_message(&mut ipc, &req).await?;

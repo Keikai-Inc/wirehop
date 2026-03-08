@@ -32,6 +32,12 @@ pub struct JsRuntime {
     limits: SandboxLimits,
 }
 
+impl Default for JsRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsRuntime {
     pub fn new() -> Self {
         Self {

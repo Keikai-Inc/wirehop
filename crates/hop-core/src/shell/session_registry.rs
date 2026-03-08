@@ -136,6 +136,11 @@ impl SessionRegistry {
         self.sessions.len()
     }
 
+    /// Returns `true` if the registry contains no sessions.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
     /// Remove sessions that have expired (detached longer than timeout)
     /// or whose child process has exited.
     pub fn reap_expired(&mut self) {
@@ -144,11 +149,11 @@ impl SessionRegistry {
                 tracing::debug!("Reaping exited session for {:?}", key);
                 return false;
             }
-            if let Some(detached_at) = session.detached_at {
-                if !session.attached && detached_at.elapsed() > self.timeout {
-                    tracing::debug!("Reaping expired session for {:?}", key);
-                    return false;
-                }
+            if let Some(detached_at) = session.detached_at
+                && !session.attached && detached_at.elapsed() > self.timeout
+            {
+                tracing::debug!("Reaping expired session for {:?}", key);
+                return false;
             }
             true
         });

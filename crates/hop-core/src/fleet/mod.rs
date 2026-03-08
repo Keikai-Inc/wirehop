@@ -295,12 +295,12 @@ pub fn handle_remove_fleet_member(config_dir: &Path, node_id_prefix: &str) -> Ad
             let before = store.members.len();
             store.members.retain(|m| !m.node_id.starts_with(node_id_prefix));
             let removed = store.members.len() < before;
-            if removed {
-                if let Err(e) = store.save(config_dir) {
-                    return AdminResponse::Error {
-                        message: format!("removed but failed to save: {e}"),
-                    };
-                }
+            if removed
+                && let Err(e) = store.save(config_dir)
+            {
+                return AdminResponse::Error {
+                    message: format!("removed but failed to save: {e}"),
+                };
             }
             AdminResponse::FleetMemberRemoved { success: removed }
         }

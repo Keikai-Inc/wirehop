@@ -37,10 +37,10 @@ pub fn spawn_sandboxed_command(
     username: Option<&str>,
 ) -> std::io::Result<tokio::process::Child> {
     // Layer 1: Application-level validation
-    if policy.is_restricted() {
-        if let Err(e) = validate_command(cmd, policy) {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()));
-        }
+    if policy.is_restricted()
+        && let Err(e) = validate_command(cmd, policy)
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()));
     }
 
     // Layer 2: OS-native sandbox
@@ -190,7 +190,7 @@ pub fn sandboxed_shell(
 
     #[cfg(target_os = "macos")]
     {
-        return macos::sandboxed_shell_command_with_broker(policy, shell, username, broker_config_dir);
+        macos::sandboxed_shell_command_with_broker(policy, shell, username, broker_config_dir)
     }
 
     #[cfg(target_os = "linux")]

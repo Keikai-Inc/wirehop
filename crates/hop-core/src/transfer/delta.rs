@@ -23,6 +23,12 @@ pub struct RollingChecksum {
     count: usize,
 }
 
+impl Default for RollingChecksum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RollingChecksum {
     pub fn new() -> Self {
         Self {

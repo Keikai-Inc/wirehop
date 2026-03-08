@@ -169,6 +169,7 @@ pub fn generate_invite(
 /// Generate a new invite with a specific role and configurable expiry.
 ///
 /// Creator invites typically use a 1-hour expiry; regular invites use 15 minutes.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_invite_with_role(
     host_public_key: &PublicKey,
     config_dir: &Path,
@@ -182,10 +183,10 @@ pub fn generate_invite_with_role(
     // Validate the username early so bad values never reach storage.
     // Skip validation for Creator role (maps to root).
     #[cfg(unix)]
-    if role != PeerRole::Creator {
-        if let Some(name) = username {
-            crate::unix_user::validate_username(name)?;
-        }
+    if role != PeerRole::Creator
+        && let Some(name) = username
+    {
+        crate::unix_user::validate_username(name)?;
     }
 
     // Generate 32 bytes of random secret

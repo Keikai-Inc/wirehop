@@ -46,6 +46,7 @@ const BROKER_SAFE_COMMANDS: &[&str] = &[
     "diskutil",
     "ifconfig",
     "finger",
+    "top",
 ];
 
 /// Check if a command name is on the broker-safe list.
@@ -60,7 +61,9 @@ pub fn is_broker_safe(name: &str) -> bool {
 /// Request from broker client (shim) to broker server (daemon).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BrokerRequest {
-    Exec { command: String, args: Vec<String> },
+    Exec { command: String, args: Vec<String>, rows: u16, cols: u16 },
+    Input(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
 }
 
 /// Response from broker server (daemon) to broker client (shim).
@@ -244,10 +247,8 @@ pub fn setup_zdotdir(config_dir: &Path, session_id: &str, username: Option<&str>
     #[cfg(unix)]
     if let Some(user) = username {
         chown_to_user(&zdir, user);
-        for entry in std::fs::read_dir(&zdir).into_iter().flatten() {
-            if let Ok(e) = entry {
-                chown_to_user(&e.path(), user);
-            }
+        for e in std::fs::read_dir(&zdir).into_iter().flatten().flatten() {
+            chown_to_user(&e.path(), user);
         }
     }
 
@@ -330,140 +331,218 @@ pub async fn start_broker(
     Ok(handle)
 }
 
-/// Handle a single broker client connection.
+/// Commands sent to the PTY control thread.
+enum PtyCmd {
+    Write(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Shutdown,
+}
+
+/// Handle a single broker client connection using a real PTY.
 async fn handle_broker_connection(
     stream: tokio::net::UnixStream,
     policy: &super::SandboxPolicy,
     username: Option<&str>,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncReadExt;
+    use portable_pty::{native_pty_system, PtySize};
+    use std::io::Read as _;
 
     let (mut reader, mut writer) = stream.into_split();
 
-    // Read the request (length-prefixed bincode, same as proto::read_message)
+    // Read the initial Exec request
     let request: BrokerRequest = read_broker_message(&mut reader).await?;
 
-    match request {
-        BrokerRequest::Exec { command, args } => {
-            // Validate: must be on broker-safe list
-            if !is_broker_safe(&command) {
-                let resp = BrokerResponse::Denied(format!(
-                    "command '{}' is not on the broker-safe list",
-                    command
-                ));
-                write_broker_message(&mut writer, &resp).await?;
-                return Ok(());
-            }
+    let (command, args, rows, cols) = match request {
+        BrokerRequest::Exec { command, args, rows, cols } => (command, args, rows, cols),
+        _ => {
+            anyhow::bail!("expected Exec as first message");
+        }
+    };
 
-            // Validate against sandbox policy (denied_commands, allowed_commands)
-            let full_cmd = if args.is_empty() {
-                command.clone()
-            } else {
-                format!("{} {}", command, args.join(" "))
-            };
-            if let Err(e) = super::validate_command(&full_cmd, policy) {
-                let resp = BrokerResponse::Denied(format!("policy denied: {e}"));
-                write_broker_message(&mut writer, &resp).await?;
-                return Ok(());
-            }
+    // Validate: must be on broker-safe list
+    if !is_broker_safe(&command) {
+        let resp = BrokerResponse::Denied(format!(
+            "command '{}' is not on the broker-safe list",
+            command
+        ));
+        write_broker_message(&mut writer, &resp).await?;
+        return Ok(());
+    }
 
-            // Resolve the real binary
-            let real_bin = match resolve_real_binary(&command) {
-                Some(p) => p,
-                None => {
-                    let resp =
-                        BrokerResponse::Denied(format!("command '{}' not found", command));
-                    write_broker_message(&mut writer, &resp).await?;
-                    return Ok(());
-                }
-            };
+    // Validate against sandbox policy (denied_commands, allowed_commands)
+    let full_cmd = if args.is_empty() {
+        command.clone()
+    } else {
+        format!("{} {}", command, args.join(" "))
+    };
+    if let Err(e) = super::validate_command(&full_cmd, policy) {
+        let resp = BrokerResponse::Denied(format!("policy denied: {e}"));
+        write_broker_message(&mut writer, &resp).await?;
+        return Ok(());
+    }
 
-            // Spawn the command unsandboxed as the session user
-            let mut cmd = build_broker_command(&real_bin, &args, username);
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    let resp = BrokerResponse::Denied(format!("spawn failed: {e}"));
-                    write_broker_message(&mut writer, &resp).await?;
-                    return Ok(());
-                }
-            };
+    // Resolve the real binary
+    let real_bin = match resolve_real_binary(&command) {
+        Some(p) => p,
+        None => {
+            let resp = BrokerResponse::Denied(format!("command '{}' not found", command));
+            write_broker_message(&mut writer, &resp).await?;
+            return Ok(());
+        }
+    };
 
-            // Stream stdout + stderr to the client
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // Open PTY with client's terminal size
+    let pty_system = native_pty_system();
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    let pair = pty_system.openpty(size).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            if let Some(mut stdout) = child.stdout.take() {
-                let tx = output_tx.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stdout.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if tx.send(buf[..n].to_vec()).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+    // Build command
+    let cmd = build_broker_pty_command(&real_bin, &args, username);
+
+    // Spawn on PTY
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            let resp = BrokerResponse::Denied(format!("spawn failed: {e}"));
+            write_broker_message(&mut writer, &resp).await?;
+            return Ok(());
+        }
+    };
+    drop(pair.slave);
+
+    let pty_reader = pair.master.try_clone_reader().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pty_writer = pair.master.take_writer().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // PTY reader thread → tokio channel
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn({
+        let mut pty_reader = pty_reader;
+        let output_tx = output_tx;
+        move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty_reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
                         }
                     }
-                });
+                    Err(_) => break,
+                }
             }
+        }
+    });
 
-            if let Some(mut stderr) = child.stderr.take() {
-                let tx = output_tx.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stderr.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if tx.send(buf[..n].to_vec()).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+    // PTY control thread — owns writer + master (for resize)
+    let (pty_cmd_tx, pty_cmd_rx) = std::sync::mpsc::channel::<PtyCmd>();
+    std::thread::spawn({
+        let mut pty_writer = pty_writer;
+        let master = pair.master;
+        move || {
+            use std::io::Write as _;
+            while let Ok(cmd) = pty_cmd_rx.recv() {
+                match cmd {
+                    PtyCmd::Write(data) => {
+                        let _ = pty_writer.write_all(&data);
+                        let _ = pty_writer.flush();
+                    }
+                    PtyCmd::Resize { rows, cols } => {
+                        let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+                        let _ = master.resize(size);
+                    }
+                    PtyCmd::Shutdown => break,
+                }
+            }
+            // master dropped here → SIGHUP → child exits
+        }
+    });
+
+    // Child exit watcher
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait() {
+            let code: i32 = status.exit_code().try_into().unwrap_or(1);
+            let _ = exit_tx.send(code);
+        }
+    });
+
+    // Bidirectional select loop
+    let mut exit_rx = exit_rx;
+    let exit_code;
+
+    loop {
+        tokio::select! {
+            // PTY output → client
+            data = output_rx.recv() => {
+                match data {
+                    Some(d) => {
+                        if write_broker_message(&mut writer, &BrokerResponse::Output(d)).await.is_err() {
+                            // Client disconnected
+                            let _ = pty_cmd_tx.send(PtyCmd::Shutdown);
+                            return Ok(());
                         }
                     }
-                });
+                    None => {
+                        // PTY reader closed — child likely exited, wait for exit
+                    }
+                }
             }
-
-            // Drop sender so output_rx closes when both stdout/stderr finish
-            drop(output_tx);
-
-            // Forward output chunks
-            while let Some(data) = output_rx.recv().await {
-                write_broker_message(&mut writer, &BrokerResponse::Output(data)).await?;
+            // Client → PTY (Input, Resize, or new Exec which we ignore)
+            msg = read_broker_message::<BrokerRequest>(&mut reader) => {
+                match msg {
+                    Ok(BrokerRequest::Input(data)) => {
+                        let _ = pty_cmd_tx.send(PtyCmd::Write(data));
+                    }
+                    Ok(BrokerRequest::Resize { rows, cols }) => {
+                        let _ = pty_cmd_tx.send(PtyCmd::Resize { rows, cols });
+                    }
+                    Ok(BrokerRequest::Exec { .. }) => {
+                        // Ignore duplicate Exec
+                    }
+                    Err(_) => {
+                        // Client disconnected
+                        let _ = pty_cmd_tx.send(PtyCmd::Shutdown);
+                        return Ok(());
+                    }
+                }
             }
-
-            // Wait for exit
-            let status = child.wait().await?;
-            let code = status.code().unwrap_or(1);
-            write_broker_message(&mut writer, &BrokerResponse::Exit(code)).await?;
+            // Child exited
+            code = &mut exit_rx => {
+                exit_code = code.unwrap_or(1);
+                break;
+            }
         }
     }
+
+    // Drain remaining output
+    while let Ok(data) = output_rx.try_recv() {
+        let _ = write_broker_message(&mut writer, &BrokerResponse::Output(data)).await;
+    }
+
+    let _ = write_broker_message(&mut writer, &BrokerResponse::Exit(exit_code)).await;
+    let _ = pty_cmd_tx.send(PtyCmd::Shutdown);
 
     Ok(())
 }
 
-/// Build a command to run as the session user (unsandboxed).
-fn build_broker_command(
+/// Build a PTY command to run as the session user (unsandboxed).
+fn build_broker_pty_command(
     real_bin: &Path,
     args: &[String],
     username: Option<&str>,
-) -> tokio::process::Command {
-    use std::process::Stdio;
+) -> portable_pty::CommandBuilder {
+    use portable_pty::CommandBuilder;
 
-    if let Some(user) = username {
+    let mut cmd = if let Some(user) = username {
         #[cfg(target_os = "macos")]
         {
-            let mut cmd = tokio::process::Command::new("login");
-            cmd.args(["-fp", user])
-                .arg(real_bin)
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let mut cmd = CommandBuilder::new("login");
+            cmd.args(["-fp", user]);
+            cmd.arg(real_bin.to_string_lossy().as_ref());
+            for a in args {
+                cmd.arg(a.as_str());
+            }
             cmd
         }
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -473,31 +552,29 @@ fn build_broker_command(
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let mut cmd = tokio::process::Command::new("su");
-            cmd.args(["-", user, "-c", &full])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let mut cmd = CommandBuilder::new("su");
+            cmd.args(["-", user, "-c", &full]);
             cmd
         }
         #[cfg(not(unix))]
         {
             let _ = user;
-            let mut cmd = tokio::process::Command::new(real_bin);
-            cmd.args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let mut cmd = CommandBuilder::new(real_bin);
+            for a in args {
+                cmd.arg(a.as_str());
+            }
             cmd
         }
     } else {
-        let mut cmd = tokio::process::Command::new(real_bin);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut cmd = CommandBuilder::new(real_bin);
+        for a in args {
+            cmd.arg(a.as_str());
+        }
         cmd
-    }
+    };
+
+    cmd.env("TERM", "xterm-256color");
+    cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -527,38 +604,332 @@ pub fn broker_client_main(command: &str, args: &[String]) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Client-side terminal helpers (libc-based, no extra deps)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+}
+
+#[cfg(unix)]
+fn get_terminal_size() -> (u16, u16) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        (ws.ws_row, ws.ws_col)
+    } else {
+        (24, 80)
+    }
+}
+
+/// RAII guard that restores the terminal to its original state on drop.
+#[cfg(unix)]
+struct TermGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TermGuard {
+    fn enter_raw() -> Option<Self> {
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return None;
+        }
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+            return None;
+        }
+        Some(Self { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+/// Global pipe fd for SIGWINCH self-pipe trick.
+#[cfg(unix)]
+static SIGWINCH_PIPE_WR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn sigwinch_handler(_sig: libc::c_int) {
+    let fd = SIGWINCH_PIPE_WR.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(fd, b"W".as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
 /// Synchronous broker client logic using std Unix sockets.
+/// Supports bidirectional PTY I/O with raw mode for interactive commands.
 fn broker_client_sync(command: &str, args: &[String], sock_path: &str) -> anyhow::Result<i32> {
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(sock_path)?;
+    let stream = UnixStream::connect(sock_path)?;
+
+    let is_tty = stdin_is_tty();
+    let (rows, cols) = if is_tty { get_terminal_size() } else { (24, 80) };
 
     // Send the exec request
     let request = BrokerRequest::Exec {
         command: command.to_string(),
         args: args.to_vec(),
+        rows,
+        cols,
     };
-    write_broker_message_sync(&mut stream, &request)?;
+    write_broker_message_sync(&mut &stream, &request)?;
 
-    // Read responses and write output to stdout
+    // Read first response — if Denied or Exit, return before entering raw mode
+    let first: BrokerResponse = read_broker_message_sync(&mut &stream)?;
+    match first {
+        BrokerResponse::Denied(msg) => {
+            eprintln!("hop broker: denied: {msg}");
+            return Ok(126);
+        }
+        BrokerResponse::Exit(code) => {
+            return Ok(code);
+        }
+        BrokerResponse::Output(data) => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&data)?;
+            stdout.flush()?;
+        }
+    }
+
+    // Non-TTY fallback: simple read loop (no raw mode, no stdin forwarding)
+    if !is_tty {
+        return broker_client_pipe_loop(&stream);
+    }
+
+    // Enter raw mode
+    let _term_guard = TermGuard::enter_raw();
+
+    // Set up SIGWINCH self-pipe
+    let mut sigwinch_fds = [-1i32; 2];
+    unsafe { libc::pipe(sigwinch_fds.as_mut_ptr()) };
+    let sigwinch_rd = sigwinch_fds[0];
+    let sigwinch_wr = sigwinch_fds[1];
+    SIGWINCH_PIPE_WR.store(sigwinch_wr, std::sync::atomic::Ordering::Relaxed);
+
+    // Set read end non-blocking
+    unsafe {
+        let flags = libc::fcntl(sigwinch_rd, libc::F_GETFL);
+        libc::fcntl(sigwinch_rd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    // Install signal handler
+    unsafe {
+        libc::signal(libc::SIGWINCH, sigwinch_handler as *const () as libc::sighandler_t);
+    }
+
+    // Set stdin and socket non-blocking for poll()
+    use std::os::unix::io::AsRawFd;
+    let sock_fd = stream.as_raw_fd();
+    let stdin_fd = libc::STDIN_FILENO;
+
+    unsafe {
+        let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
+        libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    unsafe {
+        let flags = libc::fcntl(sock_fd, libc::F_GETFL);
+        libc::fcntl(sock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let exit_code;
+    let mut sock_buf = Vec::new(); // partial message buffer for socket reads
+
+    // poll() loop
+    loop {
+        let mut pollfds = [
+            libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sock_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sigwinch_rd, events: libc::POLLIN, revents: 0 },
+        ];
+
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), 3, -1) };
+        if ret < 0 {
+            // EINTR is expected (from SIGWINCH), just loop
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            anyhow::bail!("poll failed: {errno}");
+        }
+
+        // stdin → send Input to server
+        if pollfds[0].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 4096];
+            let n = unsafe {
+                libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n > 0 {
+                let data = buf[..n as usize].to_vec();
+                // Temporarily set socket to blocking for the write
+                unsafe {
+                    let flags = libc::fcntl(sock_fd, libc::F_GETFL);
+                    libc::fcntl(sock_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                }
+                let _ = write_broker_message_sync(&mut &stream, &BrokerRequest::Input(data));
+                unsafe {
+                    let flags = libc::fcntl(sock_fd, libc::F_GETFL);
+                    libc::fcntl(sock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+
+        // socket → read response
+        if pollfds[1].revents & libc::POLLIN != 0 {
+            // Read available data into sock_buf
+            let mut tmp = [0u8; 8192];
+            loop {
+                let n = unsafe {
+                    libc::read(sock_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
+                };
+                if n > 0 {
+                    sock_buf.extend_from_slice(&tmp[..n as usize]);
+                } else {
+                    break;
+                }
+            }
+
+            // Try to decode complete messages from sock_buf
+            while let Some((msg, consumed)) = try_decode_broker_message::<BrokerResponse>(&sock_buf) {
+                sock_buf.drain(..consumed);
+                match msg {
+                    BrokerResponse::Output(data) => {
+                        use std::io::Write;
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(&data);
+                        let _ = stdout.flush();
+                    }
+                    BrokerResponse::Exit(code) => {
+                        exit_code = code;
+                        // Restore stdin to blocking before returning
+                        unsafe {
+                            let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
+                            libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                        }
+                        // Uninstall SIGWINCH handler
+                        unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
+                        SIGWINCH_PIPE_WR.store(-1, std::sync::atomic::Ordering::Relaxed);
+                        unsafe {
+                            libc::close(sigwinch_rd);
+                            libc::close(sigwinch_wr);
+                        }
+                        // _term_guard drops here, restoring terminal
+                        return Ok(exit_code);
+                    }
+                    BrokerResponse::Denied(msg) => {
+                        // Shouldn't happen after first message, but handle it
+                        unsafe {
+                            let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
+                            libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+                        }
+                        unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
+                        SIGWINCH_PIPE_WR.store(-1, std::sync::atomic::Ordering::Relaxed);
+                        unsafe {
+                            libc::close(sigwinch_rd);
+                            libc::close(sigwinch_wr);
+                        }
+                        eprintln!("hop broker: denied: {msg}");
+                        return Ok(126);
+                    }
+                }
+            }
+        }
+
+        // socket hangup/error
+        if pollfds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0
+            && pollfds[1].revents & libc::POLLIN == 0
+        {
+            exit_code = 1;
+            break;
+        }
+
+        // SIGWINCH → send Resize
+        if pollfds[2].revents & libc::POLLIN != 0 {
+            // Drain the pipe
+            let mut drain = [0u8; 64];
+            unsafe {
+                libc::read(sigwinch_rd, drain.as_mut_ptr() as *mut libc::c_void, drain.len());
+            }
+            let (rows, cols) = get_terminal_size();
+            // Temporarily set socket to blocking for the write
+            unsafe {
+                let flags = libc::fcntl(sock_fd, libc::F_GETFL);
+                libc::fcntl(sock_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+            let _ = write_broker_message_sync(&mut &stream, &BrokerRequest::Resize { rows, cols });
+            unsafe {
+                let flags = libc::fcntl(sock_fd, libc::F_GETFL);
+                libc::fcntl(sock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
+
+    // Cleanup
+    unsafe {
+        let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
+        libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+    unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
+    SIGWINCH_PIPE_WR.store(-1, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        libc::close(sigwinch_rd);
+        libc::close(sigwinch_wr);
+    }
+    // _term_guard drops here, restoring terminal
+    Ok(exit_code)
+}
+
+/// Simple pipe-mode loop for non-TTY clients (e.g. `echo | ps`).
+fn broker_client_pipe_loop(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<i32> {
     let mut stdout = std::io::stdout();
     loop {
-        let response: BrokerResponse = read_broker_message_sync(&mut stream)?;
+        let response: BrokerResponse = read_broker_message_sync(&mut &*stream)?;
         match response {
             BrokerResponse::Output(data) => {
                 use std::io::Write;
                 stdout.write_all(&data)?;
                 stdout.flush()?;
             }
-            BrokerResponse::Exit(code) => {
-                return Ok(code);
-            }
+            BrokerResponse::Exit(code) => return Ok(code),
             BrokerResponse::Denied(msg) => {
                 eprintln!("hop broker: denied: {msg}");
                 return Ok(126);
             }
         }
     }
+}
+
+/// Try to decode a length-prefixed bincode message from a buffer.
+/// Returns `Some((message, bytes_consumed))` or `None` if incomplete.
+fn try_decode_broker_message<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Option<(T, usize)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len > 16 * 1024 * 1024 {
+        return None; // corrupt
+    }
+    let total = 4 + len;
+    if buf.len() < total {
+        return None;
+    }
+    let (msg, _): (T, _) =
+        bincode::serde::decode_from_slice(&buf[4..total], bincode::config::standard()).ok()?;
+    Some((msg, total))
 }
 
 // ---------------------------------------------------------------------------
@@ -657,10 +1028,10 @@ fn read_broker_message_sync<T: for<'de> Deserialize<'de>>(
 /// Remove the broker socket and shim directory for a session.
 pub fn cleanup_broker(config_dir: &Path, session_id: &str) {
     let dir = broker_dir(config_dir, session_id);
-    if dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!("Failed to clean up broker dir {}: {e}", dir.display());
-        }
+    if dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        tracing::debug!("Failed to clean up broker dir {}: {e}", dir.display());
     }
 }
 
@@ -673,7 +1044,7 @@ mod tests {
         assert!(is_broker_safe("ps"));
         assert!(is_broker_safe("PS"));
         assert!(is_broker_safe("netstat"));
-        assert!(!is_broker_safe("top")); // interactive/ncurses — not brokered
+        assert!(is_broker_safe("top"));
         assert!(!is_broker_safe("rm"));
         assert!(!is_broker_safe("bash"));
     }

@@ -1,4 +1,4 @@
-use crate::skills::{Skill, SkillExample};
+use crate::skills::Skill;
 use super::super::data::{s, tags, ex};
 
 pub fn skills() -> Vec<Skill> {

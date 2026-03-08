@@ -157,6 +157,7 @@ fn handle_remove_peer(config_dir: &Path, node_id_prefix: &str) -> AdminResponse 
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn handle_create_user(
     config_dir: &Path,
     relay_url: Option<&str>,

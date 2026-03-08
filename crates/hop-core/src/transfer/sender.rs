@@ -211,6 +211,7 @@ async fn send_single_file(
 /// - Directories, symlinks, and deletes go on the control stream (preserves ordering).
 /// - Regular files are distributed across N data streams opened on the connection.
 /// - Each data stream sends a `StreamHeader` followed by one or more files.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_files_parallel(
     conn: &Connection,
     control_send: &mut SendStream,

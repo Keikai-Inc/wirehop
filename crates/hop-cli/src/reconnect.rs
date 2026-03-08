@@ -289,15 +289,15 @@ fn poll_quit(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<ReconnectAction> 
 
     // Also check crossterm events (covers cases where raw mode is active
     // and crossterm event polling picks up keys)
-    if event::poll(Duration::from_millis(250)).ok()? {
-        if let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read() {
-            match code {
-                KeyCode::Char('q') => return Some(ReconnectAction::Quit),
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Some(ReconnectAction::Quit);
-                }
-                _ => {}
+    if event::poll(Duration::from_millis(250)).ok()?
+        && let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read()
+    {
+        match code {
+            KeyCode::Char('q') => return Some(ReconnectAction::Quit),
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(ReconnectAction::Quit);
             }
+            _ => {}
         }
     }
 

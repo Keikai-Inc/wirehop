@@ -423,6 +423,7 @@ async fn read_setup_messages(
 /// The PTY master lives in a background task that handles resize commands
 /// and keeps the PTY alive. Dropping the returned channels causes the
 /// background tasks to exit and the PTY to close (SIGHUP to the shell).
+#[allow(clippy::type_complexity)]
 fn spawn_persistent_pty(
     username: Option<&str>,
     size: PtySize,
@@ -632,6 +633,7 @@ async fn run_attached_loop(
 /// Uses the session registry to store/retrieve PTY sessions. On disconnect,
 /// the PTY stays alive. On reconnect with the same session_id, the client
 /// resumes the existing session.
+#[allow(clippy::too_many_arguments)]
 pub async fn host_shell_session_persistent(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -1118,16 +1120,11 @@ pub async fn host_exec_session(
     // Proxy client stdin to child stdin
     if let Some(mut child_in) = child_stdin {
         tokio::spawn(async move {
-            loop {
-                match proto::read_message::<ClientMessage>(&mut recv).await {
-                    Ok(ClientMessage::Input(data)) => {
-                        if child_in.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = child_in.flush().await;
-                    }
-                    _ => break,
+            while let Ok(ClientMessage::Input(data)) = proto::read_message::<ClientMessage>(&mut recv).await {
+                if child_in.write_all(&data).await.is_err() {
+                    break;
                 }
+                let _ = child_in.flush().await;
             }
             // Drop child_in so the child sees EOF
         });

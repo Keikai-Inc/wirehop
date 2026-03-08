@@ -208,15 +208,10 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         let relay_path = config_dir.join("relay_url");
         let mut watcher = endpoint.watch_addr();
         tokio::spawn(async move {
-            loop {
-                match watcher.updated().await {
-                    Ok(addr) => {
-                        if let Some(new_relay) = addr.relay_urls().next() {
-                            let _ = std::fs::write(&relay_path, new_relay.to_string());
-                            tracing::debug!("Updated relay_url file: {new_relay}");
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(addr) = watcher.updated().await {
+                if let Some(new_relay) = addr.relay_urls().next() {
+                    let _ = std::fs::write(&relay_path, new_relay.to_string());
+                    tracing::debug!("Updated relay_url file: {new_relay}");
                 }
             }
         });
@@ -424,36 +419,32 @@ async fn handle_incoming(
 
     // Additional bi-streams: already authenticated (same QUIC connection = same peer).
     // This enables connection multiplexing — multiple sessions over one connection.
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, mut recv)) => {
-                let msg: ClientMessage = match proto::read_message(&mut recv).await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::debug!("Failed to read message on multiplexed stream: {e:#}");
-                        continue;
-                    }
-                };
-                let conn_c = conn.clone();
-                let reg = registry.clone();
-                let u = username.clone();
-                let r = role.clone();
-                let s = sandbox.clone();
-                let pid = peer_id.clone();
-                let cd = config_dir.to_path_buf();
-                tokio::spawn(async move {
-                    if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
-                        tracing::error!("Session error: {e:#}");
-                    }
-                });
+    while let Ok((send, mut recv)) = conn.accept_bi().await {
+        let msg: ClientMessage = match proto::read_message(&mut recv).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::debug!("Failed to read message on multiplexed stream: {e:#}");
+                continue;
             }
-            Err(_) => break, // Connection closed
-        }
+        };
+        let conn_c = conn.clone();
+        let reg = registry.clone();
+        let u = username.clone();
+        let r = role.clone();
+        let s = sandbox.clone();
+        let pid = peer_id.clone();
+        let cd = config_dir.to_path_buf();
+        tokio::spawn(async move {
+            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
+                tracing::error!("Session error: {e:#}");
+            }
+        });
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_session(
     msg: Option<ClientMessage>,
     conn: iroh::endpoint::Connection,
@@ -738,11 +729,11 @@ fn cmd_ps() -> Result<()> {
         pids.retain(|&p| p > 0);
         pids.sort_unstable();
 
-        println!("{:<12} {:>7} {}", "USER", "PID", "COMMAND");
+        println!("{:<12} {:>7} COMMAND", "USER", "PID");
         for &pid in &pids {
             // Get UID via KERN_PROC/KERN_PROC_PID sysctl
             let user = get_proc_uid(pid)
-                .and_then(|uid| resolve_username(uid))
+                .and_then(resolve_username)
                 .unwrap_or_else(|| "-".to_string());
 
             // Get command name via KERN_PROCARGS2
