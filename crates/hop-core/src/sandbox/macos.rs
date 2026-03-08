@@ -221,6 +221,30 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_exec_actually_denies_writes() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let profile = generate_sbpl_profile(&policy);
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/bin/sh",
+                "-c",
+                "echo test > /var/tmp/hop-sandbox-test 2>&1 && echo WRITE_OK || echo WRITE_DENIED",
+            ])
+            .output()
+            .expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("WRITE_DENIED"),
+            "sandbox-exec must deny writes to /var/tmp in read-only mode, got: {stdout}"
+        );
+    }
+
+    #[test]
     fn sandboxed_shell_command_without_user() {
         let policy = SandboxPolicy {
             read_only: true,
@@ -230,5 +254,109 @@ mod tests {
         assert_eq!(bin, "/usr/bin/sandbox-exec");
         assert!(args.contains(&"/bin/bash".to_string()));
         assert!(args.contains(&"-l".to_string()));
+    }
+
+    // --- sandbox-exec integration tests ---
+
+    #[test]
+    fn sandbox_exec_readonly_allows_reads() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let profile = generate_sbpl_profile(&policy);
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/sh", "-c", "cat /etc/hosts"])
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "read-only sandbox should allow reading /etc/hosts, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("localhost"),
+            "/etc/hosts should contain localhost, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn sandbox_exec_no_network_blocks_connections() {
+        let policy = SandboxPolicy {
+            no_network: true,
+            ..Default::default()
+        };
+        let profile = generate_sbpl_profile(&policy);
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/bin/sh",
+                "-c",
+                "curl -s --connect-timeout 2 http://1.1.1.1 2>&1 && echo NET_OK || echo NET_BLOCKED",
+            ])
+            .output()
+            .expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("NET_BLOCKED") || combined.contains("deny") || !output.status.success(),
+            "no-network sandbox should block outbound connections, got stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn sandbox_exec_scoped_paths_restricts_reads() {
+        let policy = SandboxPolicy {
+            allowed_paths: vec![PathBuf::from("/etc")],
+            ..Default::default()
+        };
+        let profile = generate_sbpl_profile(&policy);
+        // Try to read a file outside allowed paths (home directory)
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".into());
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/bin/sh",
+                "-c",
+                &format!("ls {home}"),
+            ])
+            .output()
+            .expect("sandbox-exec should run");
+        // The sandbox should deny reads outside allowed paths — either non-zero exit
+        // or stderr contains denial info. sandbox-exec may suppress stderr.
+        assert!(
+            !output.status.success(),
+            "scoped sandbox should deny reads outside allowed paths (exit={}), stdout: {}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sandbox_exec_unrestricted_allows_writes() {
+        let policy = SandboxPolicy::default();
+        let profile = generate_sbpl_profile(&policy);
+        let test_file = "/tmp/hop-sandbox-unrestricted-test";
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/bin/sh",
+                "-c",
+                &format!("echo ok > {test_file} && cat {test_file} && rm {test_file}"),
+            ])
+            .output()
+            .expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("ok"),
+            "unrestricted sandbox should allow writes, got: {stdout}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

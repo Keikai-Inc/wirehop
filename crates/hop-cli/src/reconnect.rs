@@ -35,7 +35,7 @@ pub enum ReconnectAction {
 pub async fn try_quick_reconnect(
     config_dir: &Path,
     resolved: &ResolvedHost,
-    old_session_id: Option<&String>,
+    session_request: &ClientMessage,
     timeout: Duration,
 ) -> Option<ReconnectAction> {
     use std::io::Write;
@@ -48,9 +48,7 @@ pub async fn try_quick_reconnect(
 
     let start = Instant::now();
 
-    let session_request = ClientMessage::RequestShellV2 {
-        session_id: old_session_id.cloned(),
-    };
+    let session_request = session_request.clone();
 
     // Retry loop within the timeout window
     while start.elapsed() < timeout {
@@ -116,7 +114,7 @@ pub async fn try_quick_reconnect(
 pub async fn show_reconnect_tui_via_agent(
     config_dir: &Path,
     resolved: &ResolvedHost,
-    old_session_id: Option<&String>,
+    session_request: &ClientMessage,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     initial_attempt_offset: u32,
 ) -> ReconnectAction {
@@ -159,9 +157,7 @@ pub async fn show_reconnect_tui_via_agent(
         let elapsed_total = start.elapsed().as_secs();
         render_frame(&mut term, attempt, elapsed_total, 0, true);
 
-        let session_request = ClientMessage::RequestShellV2 {
-            session_id: old_session_id.cloned(),
-        };
+        let session_request = session_request.clone();
 
         let connect_result = tokio::time::timeout(Duration::from_secs(10), async {
             let (mut send, mut recv) = mux::open_agent_stream_pub(

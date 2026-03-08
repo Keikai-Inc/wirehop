@@ -40,7 +40,7 @@ pub enum HostMessage {
 }
 
 /// Messages sent from the client to the host.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Shell input data.
     Input(Vec<u8>),
@@ -486,4 +486,192 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
         bincode::serde::decode_from_slice(&payload, bincode::config::standard())
             .context("decode failed")?;
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::SandboxPolicy;
+
+    #[test]
+    fn sandbox_policy_bincode_roundtrip() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let msg = ClientMessage::RequestShellV3 {
+            session_id: None,
+            sandbox: policy,
+        };
+        let encoded =
+            bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .unwrap();
+        match decoded {
+            ClientMessage::RequestShellV3 { sandbox, .. } => {
+                assert!(sandbox.read_only, "read_only must survive roundtrip");
+                assert!(!sandbox.no_network);
+                assert!(sandbox.allowed_paths.is_empty());
+                assert!(sandbox.allowed_commands.is_empty());
+                assert!(sandbox.denied_commands.is_empty());
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn exec_v2_sandbox_bincode_roundtrip() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            ..Default::default()
+        };
+        let msg = ClientMessage::RequestExecV2 {
+            command: "ls -la".into(),
+            sandbox: policy,
+        };
+        let encoded =
+            bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .unwrap();
+        match decoded {
+            ClientMessage::RequestExecV2 { command, sandbox } => {
+                assert_eq!(command, "ls -la");
+                assert!(sandbox.read_only);
+                assert!(sandbox.no_network);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn all_client_message_variants_roundtrip() {
+        use std::collections::HashMap;
+
+        let variants: Vec<ClientMessage> = vec![
+            ClientMessage::Input(b"hello".to_vec()),
+            ClientMessage::WindowSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 640,
+                pixel_height: 480,
+            },
+            ClientMessage::AuthResponse {
+                secret: b"deadbeef".to_vec(),
+            },
+            ClientMessage::RequestShell,
+            ClientMessage::RequestShellV2 {
+                session_id: Some("abc123".into()),
+            },
+            ClientMessage::RequestShellV2 { session_id: None },
+            ClientMessage::RequestExec {
+                command: "ls -la".into(),
+            },
+            ClientMessage::RequestShellV3 {
+                session_id: Some("xyz".into()),
+                sandbox: SandboxPolicy::preset_monitor(),
+            },
+            ClientMessage::RequestExecV2 {
+                command: "ps aux".into(),
+                sandbox: SandboxPolicy::preset_audit(),
+            },
+            ClientMessage::SetEnv {
+                vars: HashMap::from([
+                    ("TERM".into(), "xterm-256color".into()),
+                    ("LANG".into(), "en_US.UTF-8".into()),
+                ]),
+            },
+        ];
+
+        for msg in &variants {
+            let encoded =
+                bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                    .expect("encode should succeed");
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                    .expect("decode should succeed");
+            // Verify variant discriminant matches via Debug format prefix
+            let orig_debug = format!("{:?}", msg);
+            let decoded_debug = format!("{:?}", decoded);
+            let orig_variant = orig_debug.split('(').next().unwrap_or(&orig_debug)
+                .split('{').next().unwrap_or(&orig_debug)
+                .split(' ').next().unwrap_or(&orig_debug);
+            let decoded_variant = decoded_debug.split('(').next().unwrap_or(&decoded_debug)
+                .split('{').next().unwrap_or(&decoded_debug)
+                .split(' ').next().unwrap_or(&decoded_debug);
+            assert_eq!(orig_variant, decoded_variant, "variant mismatch for: {orig_debug}");
+        }
+    }
+
+    #[test]
+    fn fully_populated_sandbox_policy_roundtrip() {
+        use std::path::PathBuf;
+
+        let policy = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            allowed_paths: vec![
+                PathBuf::from("/etc"),
+                PathBuf::from("/var/log"),
+                PathBuf::from("/proc"),
+            ],
+            allowed_commands: vec!["ps".into(), "ls".into(), "cat".into()],
+            denied_commands: vec!["rm".into(), "dd".into(), "shutdown".into()],
+        };
+        let msg = ClientMessage::RequestShellV3 {
+            session_id: Some("full-test".into()),
+            sandbox: policy.clone(),
+        };
+        let encoded =
+            bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        match decoded {
+            ClientMessage::RequestShellV3 { session_id, sandbox } => {
+                assert_eq!(session_id, Some("full-test".into()));
+                assert_eq!(sandbox, policy);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn host_message_variants_roundtrip() {
+        let variants: Vec<HostMessage> = vec![
+            HostMessage::Output(b"hello world".to_vec()),
+            HostMessage::Exit(0),
+            HostMessage::Exit(127),
+            HostMessage::WindowSizeAck,
+            HostMessage::AuthResult { authorized: true },
+            HostMessage::AuthResult { authorized: false },
+            HostMessage::SessionInfo {
+                session_id: "sess-abc".into(),
+                resumed: false,
+            },
+            HostMessage::SessionInfo {
+                session_id: "sess-xyz".into(),
+                resumed: true,
+            },
+        ];
+
+        for msg in &variants {
+            let encoded =
+                bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                    .expect("encode should succeed");
+            let (decoded, _): (HostMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                    .expect("decode should succeed");
+            let orig_debug = format!("{:?}", msg);
+            let decoded_debug = format!("{:?}", decoded);
+            let orig_variant = orig_debug.split('(').next().unwrap_or(&orig_debug)
+                .split('{').next().unwrap_or(&orig_debug)
+                .split(' ').next().unwrap_or(&orig_debug);
+            let decoded_variant = decoded_debug.split('(').next().unwrap_or(&decoded_debug)
+                .split('{').next().unwrap_or(&decoded_debug)
+                .split(' ').next().unwrap_or(&decoded_debug);
+            assert_eq!(orig_variant, decoded_variant, "variant mismatch for: {orig_debug}");
+        }
+    }
 }

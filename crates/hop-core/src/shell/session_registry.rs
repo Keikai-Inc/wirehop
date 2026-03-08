@@ -157,3 +157,104 @@ pub fn generate_session_id() -> String {
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a DetachedSession for testing.
+    fn make_session(id: &str, attached: bool, exited: Option<i32>) -> DetachedSession {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (output_route, _output_rx) = watch::channel(None);
+        let (resize_tx, _resize_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = watch::channel(exited);
+        drop(exit_tx); // keep the value set
+
+        DetachedSession {
+            session_id: id.into(),
+            input_tx,
+            output_route,
+            resize_tx,
+            exit_rx,
+            detached_at: if attached { None } else { Some(Instant::now()) },
+            attached,
+        }
+    }
+
+    fn make_key(peer: &str) -> SessionKey {
+        SessionKey {
+            peer_id: peer.into(),
+            username: None,
+        }
+    }
+
+    #[test]
+    fn reap_removes_expired_detached_sessions() {
+        let mut reg = SessionRegistry::new(Duration::from_millis(0), 10);
+        let mut session = make_session("s1", false, None);
+        // Set detached_at to the past so it's already expired
+        session.detached_at = Some(Instant::now() - Duration::from_secs(10));
+        reg.insert(make_key("peer1"), session);
+        assert_eq!(reg.len(), 1);
+
+        reg.reap_expired();
+        assert_eq!(reg.len(), 0, "expired detached session should be reaped");
+    }
+
+    #[test]
+    fn reap_preserves_attached_sessions() {
+        let mut reg = SessionRegistry::new(Duration::from_millis(0), 10);
+        let session = make_session("s1", true, None);
+        reg.insert(make_key("peer1"), session);
+        assert_eq!(reg.len(), 1);
+
+        reg.reap_expired();
+        assert_eq!(reg.len(), 1, "attached session should not be reaped");
+    }
+
+    #[test]
+    fn eviction_at_capacity_removes_oldest_detached() {
+        let mut reg = SessionRegistry::new(Duration::from_secs(3600), 2);
+
+        // Insert first detached session (oldest)
+        let mut s1 = make_session("s1", false, None);
+        s1.detached_at = Some(Instant::now() - Duration::from_secs(60));
+        reg.insert(make_key("peer1"), s1);
+
+        // Insert attached session
+        let s2 = make_session("s2", true, None);
+        reg.insert(make_key("peer2"), s2);
+
+        assert_eq!(reg.len(), 2);
+
+        // Insert third session — should evict s1 (oldest detached), not s2 (attached)
+        let s3 = make_session("s3", false, None);
+        reg.insert(make_key("peer3"), s3);
+
+        assert_eq!(reg.len(), 2);
+        assert!(
+            reg.lookup(&make_key("peer1")).is_none(),
+            "oldest detached session should be evicted"
+        );
+        assert!(
+            reg.lookup(&make_key("peer2")).is_some(),
+            "attached session should survive eviction"
+        );
+        assert!(
+            reg.lookup(&make_key("peer3")).is_some(),
+            "new session should be inserted"
+        );
+    }
+
+    #[test]
+    fn has_exited_detection() {
+        let session_alive = make_session("alive", true, None);
+        assert!(!session_alive.has_exited(), "session with no exit code should not be exited");
+
+        let session_dead = make_session("dead", true, Some(0));
+        assert!(session_dead.has_exited(), "session with exit code should be exited");
+
+        let session_error = make_session("error", true, Some(1));
+        assert!(session_error.has_exited(), "session with non-zero exit should be exited");
+    }
+}

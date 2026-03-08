@@ -611,6 +611,20 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Vec<u8>> {
     input_rx
 }
 
+/// Rebuild a session request with a different session_id, preserving sandbox policy.
+fn rebuild_session_request(
+    original: &ClientMessage,
+    session_id: Option<String>,
+) -> ClientMessage {
+    match original {
+        ClientMessage::RequestShellV3 { sandbox, .. } => ClientMessage::RequestShellV3 {
+            session_id,
+            sandbox: sandbox.clone(),
+        },
+        _ => ClientMessage::RequestShellV2 { session_id },
+    }
+}
+
 async fn cmd_connect(
     _secret_key: iroh::SecretKey,
     target: &str,
@@ -666,11 +680,16 @@ async fn cmd_connect(
 
                 // Tier 1: Quick inline reconnect (non-disruptive, 5s window)
                 // Skip if flapping — go straight to full TUI with backoff
+                let reconnect_msg = rebuild_session_request(
+                    &session_msg,
+                    session_id.clone(),
+                );
+
                 let quick_result = if flap_attempt_offset == 0 {
                     reconnect::try_quick_reconnect(
                         config_dir,
                         &resolved,
-                        session_id.as_ref(),
+                        &reconnect_msg,
                         Duration::from_secs(5),
                     )
                     .await
@@ -685,7 +704,7 @@ async fn cmd_connect(
                     reconnect::show_reconnect_tui_via_agent(
                         config_dir,
                         &resolved,
-                        session_id.as_ref(),
+                        &reconnect_msg,
                         &mut stdin_rx,
                         flap_attempt_offset,
                     )
@@ -1693,6 +1712,90 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
                 }
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hop_core::proto::ClientMessage;
+    use hop_core::sandbox::SandboxPolicy;
+
+    #[test]
+    fn rebuild_v3_preserves_sandbox() {
+        let policy = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            allowed_commands: vec!["ps".into()],
+            denied_commands: vec!["rm".into()],
+            ..Default::default()
+        };
+        let original = ClientMessage::RequestShellV3 {
+            session_id: Some("old-id".into()),
+            sandbox: policy.clone(),
+        };
+        let rebuilt = rebuild_session_request(&original, Some("new-id".into()));
+        match rebuilt {
+            ClientMessage::RequestShellV3 { session_id, sandbox } => {
+                assert_eq!(session_id, Some("new-id".into()));
+                assert_eq!(sandbox, policy, "sandbox policy must be preserved");
+            }
+            _ => panic!("V3 should rebuild as V3"),
+        }
+    }
+
+    #[test]
+    fn rebuild_v2_stays_v2() {
+        let original = ClientMessage::RequestShellV2 {
+            session_id: Some("old-id".into()),
+        };
+        let rebuilt = rebuild_session_request(&original, Some("new-id".into()));
+        match rebuilt {
+            ClientMessage::RequestShellV2 { session_id } => {
+                assert_eq!(session_id, Some("new-id".into()));
+            }
+            _ => panic!("V2 should rebuild as V2"),
+        }
+    }
+
+    #[test]
+    fn rebuild_v3_with_none_session_id() {
+        let original = ClientMessage::RequestShellV3 {
+            session_id: Some("existing".into()),
+            sandbox: SandboxPolicy::preset_monitor(),
+        };
+        let rebuilt = rebuild_session_request(&original, None);
+        match rebuilt {
+            ClientMessage::RequestShellV3 { session_id, sandbox } => {
+                assert_eq!(session_id, None);
+                assert!(sandbox.read_only);
+                assert!(sandbox.no_network);
+            }
+            _ => panic!("V3 with None session_id should still be V3"),
+        }
+    }
+
+    #[test]
+    fn rebuild_other_variants_fall_through_to_v2() {
+        let variants: Vec<ClientMessage> = vec![
+            ClientMessage::RequestShell,
+            ClientMessage::RequestExec {
+                command: "ls".into(),
+            },
+            ClientMessage::Input(b"data".to_vec()),
+        ];
+        for original in &variants {
+            let rebuilt = rebuild_session_request(original, Some("sess".into()));
+            match rebuilt {
+                ClientMessage::RequestShellV2 { session_id } => {
+                    assert_eq!(session_id, Some("sess".into()));
+                }
+                _ => panic!(
+                    "non-V3 variant {:?} should fall through to V2",
+                    original
+                ),
+            }
         }
     }
 }

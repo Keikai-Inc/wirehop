@@ -336,4 +336,97 @@ mod tests {
     fn shell_split_unbalanced() {
         assert_eq!(shell_split("echo \"hello"), None);
     }
+
+    // --- Bypass vector edge cases ---
+
+    #[test]
+    fn readonly_rejects_ampersand_chaining() {
+        let p = policy_readonly();
+        assert!(matches!(
+            validate_command("echo safe & rm -rf /", &p),
+            Err(ValidationError::ShellMetacharacter('&'))
+        ));
+    }
+
+    #[test]
+    fn readonly_rejects_command_substitution_in_double_quotes() {
+        let p = policy_readonly();
+        assert!(matches!(
+            validate_command(r#"echo "$(whoami)""#, &p),
+            Err(ValidationError::ShellMetacharacter('$'))
+        ));
+    }
+
+    #[test]
+    fn single_quoted_metacharacters_are_safe() {
+        let p = policy_readonly();
+        assert!(validate_command("echo ';|>&<'", &p).is_ok());
+    }
+
+    #[test]
+    fn escaped_semicolon_still_rejected() {
+        // The validator does NOT treat backslash-escaped metacharacters as safe
+        // in the current implementation (prev == '\\' is only checked for quotes).
+        // This documents the actual behavior.
+        let p = policy_readonly();
+        let result = validate_command("echo \\;", &p);
+        assert!(matches!(
+            result,
+            Err(ValidationError::ShellMetacharacter(';'))
+        ));
+    }
+
+    #[test]
+    fn denylist_case_insensitive() {
+        let p = policy_denylist();
+        assert!(matches!(
+            validate_command("RM /tmp/file", &p),
+            Err(ValidationError::DeniedCommand(_))
+        ));
+        assert!(matches!(
+            validate_command("Rm /tmp/file", &p),
+            Err(ValidationError::DeniedCommand(_))
+        ));
+        assert!(matches!(
+            validate_command("DD if=/dev/zero", &p),
+            Err(ValidationError::DeniedCommand(_))
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_command_is_empty() {
+        let p = SandboxPolicy::default();
+        assert!(matches!(
+            validate_command("   ", &p),
+            Err(ValidationError::EmptyCommand)
+        ));
+    }
+
+    #[test]
+    fn denylist_wins_over_allowlist() {
+        let p = SandboxPolicy {
+            allowed_commands: vec!["rm".into(), "ls".into()],
+            denied_commands: vec!["rm".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_command("rm /tmp/file", &p),
+            Err(ValidationError::DeniedCommand(_))
+        ));
+        // ls should still work
+        assert!(validate_command("ls", &p).is_ok());
+    }
+
+    #[test]
+    fn allowlist_still_rejects_metacharacters() {
+        let p = policy_allowlist();
+        assert!(matches!(
+            validate_command("ls | grep foo", &p),
+            Err(ValidationError::ShellMetacharacter('|'))
+        ));
+        assert!(matches!(
+            validate_command("cat /etc/passwd > /tmp/out", &p),
+            Err(ValidationError::ShellMetacharacter('>'))
+        ));
+    }
 }

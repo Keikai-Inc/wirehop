@@ -8,30 +8,26 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SandboxPolicy {
     /// Prevent all filesystem writes, deletes, and modifications.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub read_only: bool,
 
     /// Block outbound network access from spawned commands.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub no_network: bool,
 
     /// Restrict filesystem visibility to these paths (empty = unrestricted).
     /// Each path gets read (+ execute for dirs) access only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub allowed_paths: Vec<PathBuf>,
 
     /// If non-empty, only these command basenames may be executed.
     /// e.g., ["ps", "ls", "cat"]. Empty = allow all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub allowed_commands: Vec<String>,
 
     /// Deny execution of these commands even if not using an allowlist.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub denied_commands: Vec<String>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// Serde helper: skip serializing a `SandboxPolicy` field when unrestricted.
@@ -250,10 +246,12 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_serializes_minimal() {
+    fn unrestricted_serializes_all_fields() {
         let p = SandboxPolicy::default();
         let json = serde_json::to_string(&p).unwrap();
-        assert_eq!(json, "{}");
+        // All fields are now always serialized (required for bincode compat)
+        let p2: SandboxPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
     }
 
     #[test]
@@ -372,5 +370,100 @@ mod tests {
     fn sandbox_is_unrestricted_serde_helper() {
         assert!(super::sandbox_is_unrestricted(&SandboxPolicy::default()));
         assert!(!super::sandbox_is_unrestricted(&SandboxPolicy::preset_audit()));
+    }
+
+    // --- merge_stricter edge cases ---
+
+    #[test]
+    fn merge_stricter_subpath_no_prefix_matching() {
+        // /var/log and /var/log/app are treated as distinct paths —
+        // intersection yields empty because they are not equal.
+        let a = SandboxPolicy {
+            allowed_paths: vec![PathBuf::from("/var/log")],
+            ..Default::default()
+        };
+        let b = SandboxPolicy {
+            allowed_paths: vec![PathBuf::from("/var/log/app")],
+            ..Default::default()
+        };
+        let m = a.merge_stricter(&b);
+        assert!(
+            m.allowed_paths.is_empty(),
+            "intersection of /var/log and /var/log/app should be empty (no prefix matching)"
+        );
+    }
+
+    #[test]
+    fn merge_stricter_is_symmetric() {
+        let a = SandboxPolicy {
+            read_only: true,
+            no_network: false,
+            allowed_paths: vec![PathBuf::from("/etc"), PathBuf::from("/proc")],
+            allowed_commands: vec!["ps".into(), "ls".into()],
+            denied_commands: vec!["rm".into()],
+        };
+        let b = SandboxPolicy {
+            read_only: false,
+            no_network: true,
+            allowed_paths: vec![PathBuf::from("/proc"), PathBuf::from("/var/log")],
+            allowed_commands: vec!["ls".into(), "cat".into()],
+            denied_commands: vec!["dd".into()],
+        };
+        let ab = a.merge_stricter(&b);
+        let ba = b.merge_stricter(&a);
+        assert_eq!(ab.read_only, ba.read_only);
+        assert_eq!(ab.no_network, ba.no_network);
+        // Paths and commands: same elements (order may differ)
+        let mut ab_paths = ab.allowed_paths.clone();
+        let mut ba_paths = ba.allowed_paths.clone();
+        ab_paths.sort();
+        ba_paths.sort();
+        assert_eq!(ab_paths, ba_paths);
+        let mut ab_cmds = ab.allowed_commands.clone();
+        let mut ba_cmds = ba.allowed_commands.clone();
+        ab_cmds.sort();
+        ba_cmds.sort();
+        assert_eq!(ab_cmds, ba_cmds);
+        let mut ab_denied = ab.denied_commands.clone();
+        let mut ba_denied = ba.denied_commands.clone();
+        ab_denied.sort();
+        ba_denied.sort();
+        assert_eq!(ab_denied, ba_denied);
+    }
+
+    #[test]
+    fn merge_stricter_idempotent() {
+        let a = SandboxPolicy::preset_monitor();
+        let m = a.merge_stricter(&a);
+        assert_eq!(m, a, "merging with self should be idempotent");
+    }
+
+    #[test]
+    fn merge_stricter_client_cannot_weaken_host() {
+        let host = SandboxPolicy {
+            read_only: true,
+            no_network: true,
+            allowed_commands: vec!["ps".into(), "ls".into()],
+            denied_commands: vec!["rm".into()],
+            ..Default::default()
+        };
+        let client = SandboxPolicy {
+            read_only: false,  // client tries to remove read_only
+            no_network: false, // client tries to remove no_network
+            allowed_commands: vec!["ps".into(), "ls".into(), "bash".into()], // client tries to add bash
+            denied_commands: Vec::new(), // client tries to clear deny list
+            ..Default::default()
+        };
+        let merged = host.merge_stricter(&client);
+        assert!(merged.read_only, "client cannot disable read_only");
+        assert!(merged.no_network, "client cannot disable no_network");
+        assert!(
+            !merged.allowed_commands.contains(&"bash".into()),
+            "client cannot add commands not in host's allowlist"
+        );
+        assert!(
+            merged.denied_commands.contains(&"rm".into()),
+            "host's denied commands are preserved"
+        );
     }
 }
