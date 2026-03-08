@@ -52,6 +52,54 @@ pub fn user_login_shell(username: &str) -> String {
         .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
 }
 
+/// Returns the value of `SUDO_USER` if set and not empty/root.
+///
+/// When `hop host` is launched via `sudo`, the original username is
+/// preserved in this variable.
+pub fn sudo_user() -> Option<String> {
+    std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root")
+}
+
+/// Returns the first regular user (UID >= 1000) with a valid login shell
+/// by parsing `/etc/passwd`.
+///
+/// "Valid" means the shell is not `/usr/sbin/nologin`, `/bin/false`, or
+/// `/sbin/nologin`.
+pub fn first_regular_user() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let username = fields[0];
+        let uid: u32 = match fields[2].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let shell = fields[6];
+        if uid >= 1000
+            && !username.is_empty()
+            && username != "nobody"
+            && !shell.ends_with("/nologin")
+            && !shell.ends_with("/false")
+        {
+            return Some(username.to_string());
+        }
+    }
+    None
+}
+
+/// Picks a username for the creator invite when running as root.
+///
+/// Tries `SUDO_USER` first, then falls back to the first regular user
+/// in `/etc/passwd`.
+pub fn default_creator_username() -> Option<String> {
+    sudo_user().or_else(first_regular_user)
+}
+
 /// Validate a username for use with per-user shell sessions.
 ///
 /// Checks:
@@ -86,4 +134,65 @@ pub fn validate_username(username: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sudo_user_filters_empty_and_root() {
+        // SAFETY: test-only; these tests must run with --test-threads=1
+        // if they share env vars, but each is self-contained here.
+        unsafe {
+            // Empty string
+            std::env::set_var("SUDO_USER", "");
+            assert_eq!(sudo_user(), None);
+
+            // Root
+            std::env::set_var("SUDO_USER", "root");
+            assert_eq!(sudo_user(), None);
+
+            // Valid user
+            std::env::set_var("SUDO_USER", "alice");
+            assert_eq!(sudo_user(), Some("alice".into()));
+
+            // Clean up
+            std::env::remove_var("SUDO_USER");
+        }
+    }
+
+    #[test]
+    fn sudo_user_unset() {
+        // SAFETY: test-only env manipulation
+        unsafe {
+            std::env::remove_var("SUDO_USER");
+        }
+        assert_eq!(sudo_user(), None);
+    }
+
+    #[test]
+    fn first_regular_user_parses_passwd() {
+        // This test only works on systems with /etc/passwd and at least one
+        // regular user. On CI/macOS it may return None; that's fine.
+        let result = first_regular_user();
+        if let Some(ref name) = result {
+            assert!(!name.is_empty());
+            assert_ne!(name, "root");
+            assert_ne!(name, "nobody");
+        }
+    }
+
+    #[test]
+    fn default_creator_username_prefers_sudo_user() {
+        // SAFETY: test-only env manipulation
+        unsafe {
+            std::env::set_var("SUDO_USER", "bob");
+        }
+        let result = default_creator_username();
+        assert_eq!(result, Some("bob".into()));
+        unsafe {
+            std::env::remove_var("SUDO_USER");
+        }
+    }
 }

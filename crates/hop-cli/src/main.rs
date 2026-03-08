@@ -246,11 +246,31 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         let creator_invite_path = config_dir.join("creator_invite");
         if peers.peers.is_empty() && !creator_invite_path.exists() {
             let relay_url_str = relay_url.as_ref().map(|u| u.to_string());
+
+            // Bind the creator invite to a username so the shell guard
+            // doesn't reject it when hop is running as root.
+            #[cfg(unix)]
+            let creator_username = if hop_core::unix_user::is_running_as_root() {
+                let u = hop_core::unix_user::default_creator_username();
+                if u.is_none() {
+                    eprintln!(
+                        "WARNING: running as root but could not detect a regular user.\n\
+                         The creator invite will have no bound username.\n\
+                         Re-invite with: hop invite --user <username> --role creator"
+                    );
+                }
+                u
+            } else {
+                hop_core::unix_user::current_username()
+            };
+            #[cfg(not(unix))]
+            let creator_username: Option<String> = None;
+
             match invite::generate_invite_with_role(
                 &public_key,
                 config_dir,
                 relay_url_str.as_deref(),
-                None,
+                creator_username.as_deref(),
                 None,
                 PeerRole::Creator,
                 3600, // 1-hour expiry

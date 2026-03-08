@@ -39,6 +39,62 @@ pub enum AuthOutcome {
     Rejected,
 }
 
+/// Derive a short suffix that hints at a sandbox preset.
+///
+/// Compares the policy against known presets and falls back to flag-based
+/// labels so that `hop peers` output is immediately informative.
+pub fn sandbox_suffix(sandbox: &crate::sandbox::SandboxPolicy) -> &'static str {
+    use crate::sandbox::SandboxPolicy;
+
+    if *sandbox == SandboxPolicy::preset_monitor() {
+        return "monitor";
+    }
+    if *sandbox == SandboxPolicy::preset_audit() {
+        return "audit";
+    }
+    if *sandbox == SandboxPolicy::preset_deploy() {
+        return "deploy";
+    }
+
+    // Fall back to flag-based labels
+    if sandbox.read_only && sandbox.no_network {
+        return "readonly";
+    }
+    if sandbox.read_only {
+        return "readonly";
+    }
+    if !sandbox.allowed_commands.is_empty() {
+        return "restricted";
+    }
+    ""
+}
+
+/// Build a human-friendly display name for a newly-authorized peer.
+///
+/// Priority:
+/// 1. `{username}-{short_id}` when a username is bound
+/// 2. `creator-{short_id}` for the Creator role
+/// 3. `peer-{short_id}-{suffix}` when the sandbox matches a known preset
+/// 4. `peer-{short_id}` as the default
+pub fn generate_peer_display_name(
+    short_id: &str,
+    username: Option<&str>,
+    role: &PeerRole,
+    sandbox: &crate::sandbox::SandboxPolicy,
+) -> String {
+    if let Some(user) = username {
+        return format!("{user}-{short_id}");
+    }
+    if *role == PeerRole::Creator {
+        return format!("creator-{short_id}");
+    }
+    let suffix = sandbox_suffix(sandbox);
+    if !suffix.is_empty() {
+        return format!("peer-{short_id}-{suffix}");
+    }
+    format!("peer-{short_id}")
+}
+
 /// Host-side: authenticate an incoming connection.
 ///
 /// Reads the first message from the client. If it's an `AuthResponse` (invite flow),
@@ -75,9 +131,16 @@ pub async fn authenticate_client(
             if let Some(consumed) = consumed {
                 // Add to authorized peers
                 let mut peers = peers;
+                let short_id = remote_id.fmt_short().to_string();
+                let display_name = generate_peer_display_name(
+                    &short_id,
+                    consumed.username.as_deref(),
+                    &consumed.role,
+                    &consumed.sandbox,
+                );
                 peers.add_peer(
                     remote_id,
-                    format!("peer-{}", remote_id.fmt_short()),
+                    display_name,
                     consumed.username.clone(),
                     consumed.role.clone(),
                     consumed.sandbox.clone(),
@@ -127,5 +190,85 @@ pub async fn authenticate_client(
             );
             Ok((AuthOutcome::Rejected, None))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::SandboxPolicy;
+
+    #[test]
+    fn name_with_username() {
+        let name = generate_peer_display_name("abc1", Some("alice"), &PeerRole::Peer, &SandboxPolicy::default());
+        assert_eq!(name, "alice-abc1");
+    }
+
+    #[test]
+    fn name_creator_no_username() {
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Creator, &SandboxPolicy::default());
+        assert_eq!(name, "creator-abc1");
+    }
+
+    #[test]
+    fn name_creator_with_username_prefers_username() {
+        let name = generate_peer_display_name("abc1", Some("bob"), &PeerRole::Creator, &SandboxPolicy::default());
+        assert_eq!(name, "bob-abc1");
+    }
+
+    #[test]
+    fn name_peer_monitor_sandbox() {
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &SandboxPolicy::preset_monitor());
+        assert_eq!(name, "peer-abc1-monitor");
+    }
+
+    #[test]
+    fn name_peer_audit_sandbox() {
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &SandboxPolicy::preset_audit());
+        assert_eq!(name, "peer-abc1-audit");
+    }
+
+    #[test]
+    fn name_peer_deploy_sandbox() {
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &SandboxPolicy::preset_deploy());
+        assert_eq!(name, "peer-abc1-deploy");
+    }
+
+    #[test]
+    fn name_peer_readonly_sandbox() {
+        let sandbox = SandboxPolicy {
+            read_only: true,
+            ..Default::default()
+        };
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &sandbox);
+        assert_eq!(name, "peer-abc1-readonly");
+    }
+
+    #[test]
+    fn name_peer_restricted_sandbox() {
+        let sandbox = SandboxPolicy {
+            allowed_commands: vec!["ls".into(), "cat".into()],
+            ..Default::default()
+        };
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &sandbox);
+        assert_eq!(name, "peer-abc1-restricted");
+    }
+
+    #[test]
+    fn name_peer_default_sandbox() {
+        let name = generate_peer_display_name("abc1", None, &PeerRole::Peer, &SandboxPolicy::default());
+        assert_eq!(name, "peer-abc1");
+    }
+
+    #[test]
+    fn sandbox_suffix_empty_for_default() {
+        assert_eq!(sandbox_suffix(&SandboxPolicy::default()), "");
+    }
+
+    #[test]
+    fn sandbox_suffix_known_presets() {
+        assert_eq!(sandbox_suffix(&SandboxPolicy::preset_monitor()), "monitor");
+        assert_eq!(sandbox_suffix(&SandboxPolicy::preset_audit()), "audit");
+        assert_eq!(sandbox_suffix(&SandboxPolicy::preset_deploy()), "deploy");
     }
 }

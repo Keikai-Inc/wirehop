@@ -4,6 +4,7 @@
 #   curl -fsSL https://hop.keik.ai/install.sh | bash
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
+#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --daemon
 
 set -euo pipefail
 
@@ -32,11 +33,13 @@ trap 'rm -rf "${TMPDIR_HOP}"' EXIT
 
 INSTALL_DIR="/usr/local/bin"
 VERSION=""
+DAEMON=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
     --dir)     INSTALL_DIR="$2"; shift 2 ;;
+    --daemon)  DAEMON=true; shift ;;
     *)         die "Unknown option: $1" ;;
   esac
 done
@@ -161,6 +164,19 @@ else
   fi
 fi
 
+# --- Daemon setup (--daemon) -------------------------------------------------
+
+if [[ "${DAEMON}" == "true" ]]; then
+  info "Delegating to install-daemon.sh for full daemon setup..."
+  if command -v curl >/dev/null 2>&1; then
+    exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh")
+  elif command -v wget >/dev/null 2>&1; then
+    exec bash <(wget -qO- "${BASE_URL}/install-daemon.sh")
+  else
+    die "Neither curl nor wget found."
+  fi
+fi
+
 # --- PATH check --------------------------------------------------------------
 
 if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
@@ -172,3 +188,17 @@ fi
 
 printf "\n${BOLD}hop v${VERSION}${RESET} installed successfully!\n"
 printf "Run ${BOLD}hop --help${RESET} to get started.\n"
+
+# Hint about daemon setup if service not already running
+if [[ "${DAEMON}" == "false" ]]; then
+  if [[ "${OS}" == "linux" ]] && ! systemctl is-active --quiet hop 2>/dev/null; then
+    printf "\nTo run as a daemon (starts on boot):\n"
+    printf "  curl -fsSL https://hop.keik.ai/install-daemon.sh | bash\n"
+  elif [[ "${OS}" == "darwin" ]]; then
+    DAEMON_LABEL="com.hop.daemon"
+    if ! launchctl print "system/${DAEMON_LABEL}" &>/dev/null 2>&1; then
+      printf "\nTo run as a daemon (starts on boot):\n"
+      printf "  curl -fsSL https://hop.keik.ai/install-daemon.sh | bash\n"
+    fi
+  fi
+fi
