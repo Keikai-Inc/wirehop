@@ -11,7 +11,19 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 /// Generate an SBPL profile string from a `SandboxPolicy`.
+///
+/// If `broker_config_dir` is provided, the broker directory is added to the
+/// allowed read paths so the sandboxed shell can access shim symlinks and
+/// connect to the broker Unix socket.
 pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
+    generate_sbpl_profile_with_broker(policy, None)
+}
+
+/// Generate an SBPL profile, optionally allowing access to a broker directory.
+pub fn generate_sbpl_profile_with_broker(
+    policy: &SandboxPolicy,
+    broker_config_dir: Option<&std::path::Path>,
+) -> String {
     let mut p = String::with_capacity(2048);
     p.push_str("(version 1)\n");
 
@@ -46,6 +58,7 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
             "/var/select",
             "/var/db",
             "/etc",
+            "/private/tmp",
             "/tmp",
         ];
         for sys_path in &system_paths {
@@ -59,6 +72,15 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
                 canon.display()
             ));
         }
+
+        // Allow reads to broker directory so shim symlinks + socket are accessible
+        if let Some(config_dir) = broker_config_dir {
+            let broker_dir = config_dir.join("broker");
+            p.push_str(&format!(
+                "(allow file-read* (subpath \"{}\"))\n",
+                broker_dir.display()
+            ));
+        }
     }
 
     // --- Write restrictions ---
@@ -70,12 +92,17 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
         p.push_str("(allow file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n");
         p.push_str("(allow file-write* (regex #\"^/dev/pty[a-z][0-9a-f]$\"))\n");
         p.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
+        p.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
         p.push_str("(allow file-write* (subpath \"/tmp\"))\n");
     }
 
     // --- Network restrictions ---
     if policy.no_network {
-        p.push_str("(deny network*)\n");
+        // Block TCP/UDP but allow Unix domain sockets (needed for broker IPC).
+        // `(deny network*)` blocks ALL sockets including Unix domain sockets.
+        // IP-specific denies block TCP/UDP while preserving Unix socket access.
+        p.push_str("(deny network-outbound (remote ip \"*:*\"))\n");
+        p.push_str("(deny network-inbound (local ip \"*:*\"))\n");
     }
 
     p
@@ -104,12 +131,15 @@ pub fn sandboxed_command(cmd: &str, policy: &SandboxPolicy) -> tokio::process::C
 /// Build a `portable_pty::CommandBuilder` that runs a shell under sandbox-exec.
 ///
 /// Used for interactive PTY sessions where the shell itself is sandboxed.
-pub fn sandboxed_shell_command(
+/// If `broker_config_dir` is provided, the SBPL profile will allow access
+/// to the broker directory for shim symlinks and Unix socket communication.
+pub fn sandboxed_shell_command_with_broker(
     policy: &SandboxPolicy,
     shell: &str,
     username: Option<&str>,
+    broker_config_dir: Option<&std::path::Path>,
 ) -> (String, Vec<String>) {
-    let profile = generate_sbpl_profile(policy);
+    let profile = generate_sbpl_profile_with_broker(policy, broker_config_dir);
 
     // We wrap the shell invocation through sandbox-exec.
     // For per-user shells, the caller handles login/su wrapping separately.
@@ -167,7 +197,7 @@ mod tests {
         // No deny rules for an unrestricted policy
         assert!(!profile.contains("(deny file-write*)"));
         assert!(!profile.contains("(deny file-read*)"));
-        assert!(!profile.contains("(deny network*)"));
+        assert!(!profile.contains("(deny network"));
     }
 
     #[test]
@@ -190,7 +220,9 @@ mod tests {
             ..Default::default()
         };
         let profile = generate_sbpl_profile(&policy);
-        assert!(profile.contains("(deny network*)"));
+        // IP-specific denies block TCP/UDP while allowing Unix domain sockets
+        assert!(profile.contains("(deny network-outbound (remote ip \"*:*\"))"));
+        assert!(profile.contains("(deny network-inbound (local ip \"*:*\"))"));
     }
 
     #[test]
@@ -212,7 +244,7 @@ mod tests {
             read_only: true,
             ..Default::default()
         };
-        let (bin, args) = sandboxed_shell_command(&policy, "/bin/bash", Some("alice"));
+        let (bin, args) = sandboxed_shell_command_with_broker(&policy, "/bin/bash", Some("alice"), None);
         // login runs first (setuid), then sandbox-exec wraps the shell
         assert_eq!(bin, "login");
         assert!(args.contains(&"-fp".to_string()));
@@ -251,7 +283,7 @@ mod tests {
             read_only: true,
             ..Default::default()
         };
-        let (bin, args) = sandboxed_shell_command(&policy, "/bin/bash", None);
+        let (bin, args) = sandboxed_shell_command_with_broker(&policy, "/bin/bash", None, None);
         assert_eq!(bin, "/usr/bin/sandbox-exec");
         assert!(args.contains(&"/bin/bash".to_string()));
         assert!(args.contains(&"-l".to_string()));
@@ -338,8 +370,8 @@ mod tests {
         );
     }
 
-    /// Regression test: verify the PTY/shell path (sandboxed_shell_command)
-    /// also enforces sandboxing, not just the exec path (sandboxed_command).
+    /// Regression test: verify the PTY/shell path also enforces sandboxing,
+    /// not just the exec path (sandboxed_command).
     /// This catches Bug 2 where PTY sessions could bypass the sandbox.
     #[test]
     fn sandbox_shell_path_denies_writes() {
@@ -348,7 +380,7 @@ mod tests {
             ..Default::default()
         };
         // Without a username, bin is sandbox-exec directly
-        let (bin, args) = sandboxed_shell_command(&policy, "/bin/sh", None);
+        let (bin, args) = sandboxed_shell_command_with_broker(&policy, "/bin/sh", None, None);
         assert_eq!(bin, "/usr/bin/sandbox-exec");
         assert!(args.len() >= 2, "expected at least -p and profile");
         let output = std::process::Command::new(&bin)
@@ -362,7 +394,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("WRITE_DENIED"),
-            "sandboxed_shell_command must deny writes in read-only mode via the PTY path, got: {stdout}"
+            "sandboxed shell must deny writes in read-only mode via the PTY path, got: {stdout}"
         );
     }
 

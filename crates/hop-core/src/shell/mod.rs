@@ -39,6 +39,7 @@ pub async fn host_shell_session(
     mut recv: RecvStream,
     username: Option<&str>,
     sandbox: &crate::sandbox::SandboxPolicy,
+    config_dir: &std::path::Path,
 ) -> Result<()> {
     // --- Pre-spawn security checks ---
     #[cfg(unix)]
@@ -118,7 +119,8 @@ pub async fn host_shell_session(
         .context("Failed to open PTY")?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username);
+    let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
+    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
     let mut cmd = CommandBuilder::new(&bin);
     cmd.args(args.iter().map(|s| s.as_str()));
     // Apply environment variables from client through a security allowlist
@@ -419,6 +421,7 @@ fn spawn_persistent_pty(
     size: PtySize,
     env_vars: &HashMap<String, String>,
     sandbox: &crate::sandbox::SandboxPolicy,
+    config_dir: &std::path::Path,
 ) -> Result<(
     String,                                          // session_id
     mpsc::Sender<Vec<u8>>,                           // input_tx
@@ -426,11 +429,14 @@ fn spawn_persistent_pty(
     mpsc::Sender<PtySize>,                           // resize_tx
     watch::Receiver<Option<i32>>,                     // exit_rx
 )> {
+    let session_id = session_registry::generate_session_id();
+
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).context("Failed to open PTY")?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username);
+    let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
+    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
     let mut cmd = CommandBuilder::new(&bin);
     cmd.args(args.iter().map(|s| s.as_str()));
 
@@ -445,6 +451,18 @@ fn spawn_persistent_pty(
     }
     if !env_vars.contains_key("TERM") {
         cmd.env("TERM", "xterm-256color");
+    }
+
+    // On macOS, when sandbox is restricted, set up broker shim directory
+    // so the sandboxed shell can proxy setuid-blocked commands through the daemon.
+    #[cfg(target_os = "macos")]
+    if sandbox.is_restricted() {
+        if let Ok(shim_bin_dir) = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id) {
+            let sock_path = crate::sandbox::broker::broker_sock_path(config_dir, &session_id);
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", shim_bin_dir.display(), current_path));
+            cmd.env("HOP_BROKER_SOCK", sock_path.to_string_lossy().as_ref());
+        }
     }
 
     let mut child = pair
@@ -511,8 +529,6 @@ fn spawn_persistent_pty(
             let _ = exit_tx.send(Some(code));
         }
     });
-
-    let session_id = session_registry::generate_session_id();
 
     Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx))
 }
@@ -602,6 +618,7 @@ pub async fn host_shell_session_persistent(
     _requested_session_id: Option<String>,
     registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
     sandbox: &crate::sandbox::SandboxPolicy,
+    config_dir: &std::path::Path,
 ) -> Result<()> {
     check_shell_security(username)?;
 
@@ -648,7 +665,7 @@ pub async fn host_shell_session_persistent(
             }
 
             let (sid, itx, output_route, rtx, erx) =
-                spawn_persistent_pty(username, initial_size, &env_vars, sandbox)?;
+                spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
 
             // Route output to this client
             let _ = output_route.send(Some(client_output_tx));
@@ -661,6 +678,7 @@ pub async fn host_shell_session_persistent(
                 exit_rx: erx.clone(),
                 detached_at: None,
                 attached: true,
+                broker_handle: None,
             };
 
             // Only insert if no attached session exists (avoid eviction)
@@ -670,6 +688,29 @@ pub async fn host_shell_session_persistent(
             (sid, false, itx, rtx, erx)
         }
     };
+
+    // Start broker for sandboxed sessions (macOS)
+    #[cfg(target_os = "macos")]
+    if !resumed && sandbox.is_restricted() {
+        match crate::sandbox::broker::start_broker(
+            config_dir.to_path_buf(),
+            session_id.clone(),
+            sandbox.clone(),
+            username.map(String::from),
+        )
+        .await
+        {
+            Ok(handle) => {
+                let mut reg = registry.lock().await;
+                if let Some(session) = reg.lookup_mut(&key) {
+                    session.broker_handle = Some(handle);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start broker: {e}");
+            }
+        }
+    }
 
     // Send SessionInfo to client
     proto::write_message(
@@ -703,7 +744,13 @@ pub async fn host_shell_session_persistent(
     match outcome {
         AttachOutcome::Exited => {
             let mut reg = registry.lock().await;
-            reg.remove(&key);
+            if let Some(session) = reg.remove(&key) {
+                // Abort broker and clean up shim directory
+                if let Some(handle) = session.broker_handle {
+                    handle.abort();
+                }
+                crate::sandbox::broker::cleanup_broker(config_dir, &session.session_id);
+            }
             let _ = send.finish();
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(200),

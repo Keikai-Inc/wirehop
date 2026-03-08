@@ -32,6 +32,22 @@ use hop_core::transfer::{self, PathSpec};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Broker shim detection: when invoked via symlink (e.g., "ps"),
+    // argv[0] won't be "hop". Enter broker client mode immediately.
+    if let Some(argv0) = std::env::args().next() {
+        let name = std::path::Path::new(&argv0)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name != "hop"
+            && !name.is_empty()
+            && hop_core::sandbox::broker::is_broker_safe(name)
+        {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            std::process::exit(hop_core::sandbox::broker::broker_client_main(name, &args));
+        }
+    }
+
     let cli = Cli::parse();
 
     // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag
@@ -457,16 +473,16 @@ async fn dispatch_session(
     match msg {
         Some(ClientMessage::RequestShell) => {
             tracing::info!("Starting shell session");
-            shell::host_shell_session(send, recv, username, sandbox).await?;
+            shell::host_shell_session(send, recv, username, sandbox, config_dir).await?;
         }
         Some(ClientMessage::RequestShellV2 { session_id }) => {
             tracing::info!("Starting persistent shell session (resume: {})", session_id.is_some());
-            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, sandbox).await?;
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, sandbox, config_dir).await?;
         }
         Some(ClientMessage::RequestShellV3 { session_id, sandbox: client_sandbox }) => {
             let merged = sandbox.merge_stricter(&client_sandbox);
             tracing::info!("Starting persistent shell session with client sandbox (resume: {})", session_id.is_some());
-            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged).await?;
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged, config_dir).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);

@@ -12,6 +12,7 @@
 //! 3. **Hardcoded safety net**: `PR_SET_NO_NEW_PRIVS` on Linux to prevent
 //!    privilege escalation via setuid binaries.
 
+pub mod broker;
 pub mod policy;
 pub mod validator;
 
@@ -157,10 +158,14 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
 /// Build a sandboxed shell command for PTY sessions.
 ///
 /// Returns `(binary, args)` suitable for `CommandBuilder::new(binary).args(args)`.
+///
+/// If `broker_config_dir` is provided (macOS only), the SBPL profile will allow
+/// access to the broker directory for shim symlinks and Unix socket communication.
 pub fn sandboxed_shell(
     policy: &SandboxPolicy,
     shell: &str,
     username: Option<&str>,
+    broker_config_dir: Option<&std::path::Path>,
 ) -> (String, Vec<String>) {
     if !policy.is_restricted() {
         // No sandbox — return plain shell command
@@ -169,11 +174,12 @@ pub fn sandboxed_shell(
 
     #[cfg(target_os = "macos")]
     {
-        return macos::sandboxed_shell_command(policy, shell, username);
+        return macos::sandboxed_shell_command_with_broker(policy, shell, username, broker_config_dir);
     }
 
     #[cfg(target_os = "linux")]
     {
+        let _ = broker_config_dir;
         // On Linux, the sandbox is applied via a self-exec wrapper:
         // hop __sandbox-shell --policy <json> -- <shell> <args>
         return linux::sandboxed_shell_command(policy, shell, username);
@@ -181,7 +187,7 @@ pub fn sandboxed_shell(
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = policy;
+        let _ = (policy, broker_config_dir);
         plain_shell(shell, username)
     }
 }
@@ -216,7 +222,7 @@ mod tests {
     #[test]
     fn sandboxed_shell_unrestricted_returns_plain_shell() {
         let policy = SandboxPolicy::unrestricted();
-        let (bin, args) = sandboxed_shell(&policy, "/bin/bash", None);
+        let (bin, args) = sandboxed_shell(&policy, "/bin/bash", None, None);
         // Should be the shell itself, not sandbox-exec or hop wrapper
         assert_eq!(bin, "/bin/bash");
         assert_eq!(args, vec!["-l"]);
@@ -230,7 +236,7 @@ mod tests {
             read_only: true,
             ..Default::default()
         };
-        let (bin, _args) = sandboxed_shell(&policy, "/bin/bash", None);
+        let (bin, _args) = sandboxed_shell(&policy, "/bin/bash", None, None);
         // On macOS: sandbox-exec; on Linux: hop __sandbox-shell wrapper
         #[cfg(target_os = "macos")]
         assert_eq!(bin, "/usr/bin/sandbox-exec", "macOS must use sandbox-exec");

@@ -34,6 +34,9 @@ pub struct DetachedSession {
     pub detached_at: Option<Instant>,
     /// Whether a client is currently attached.
     pub attached: bool,
+    /// Handle for the broker background task (macOS sandbox proxy).
+    /// Aborted when the session is cleaned up.
+    pub broker_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DetachedSession {
@@ -178,6 +181,7 @@ mod tests {
             exit_rx,
             detached_at: if attached { None } else { Some(Instant::now()) },
             attached,
+            broker_handle: None,
         }
     }
 
