@@ -211,6 +211,9 @@ pub struct Peer {
     /// Role of this peer (default: Peer). Creator peers get admin access.
     #[serde(default)]
     pub role: PeerRole,
+    /// Sandbox restrictions for this peer (default: unrestricted).
+    #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
+    pub sandbox: crate::sandbox::SandboxPolicy,
 }
 
 /// Authorized peers store.
@@ -242,7 +245,7 @@ impl PeersStore {
         self.peers.iter().any(|p| p.node_id == id_str)
     }
 
-    pub fn add_peer(&mut self, node_id: &PublicKey, name: String, username: Option<String>, role: PeerRole) {
+    pub fn add_peer(&mut self, node_id: &PublicKey, name: String, username: Option<String>, role: PeerRole, sandbox: crate::sandbox::SandboxPolicy) {
         let id_str = node_id.to_string();
         if !self.peers.iter().any(|p| p.node_id == id_str) {
             self.peers.push(Peer {
@@ -252,6 +255,7 @@ impl PeersStore {
                 last_seen: None,
                 username,
                 role,
+                sandbox,
             });
         }
     }
@@ -263,6 +267,16 @@ impl PeersStore {
             .iter()
             .find(|p| p.node_id == id_str)
             .map(|p| p.role.clone())
+            .unwrap_or_default()
+    }
+
+    /// Look up the sandbox policy for a peer.
+    pub fn peer_sandbox(&self, node_id: &PublicKey) -> crate::sandbox::SandboxPolicy {
+        let id_str = node_id.to_string();
+        self.peers
+            .iter()
+            .find(|p| p.node_id == id_str)
+            .map(|p| p.sandbox.clone())
             .unwrap_or_default()
     }
 
@@ -463,6 +477,10 @@ impl HostConfig {
     }
 }
 
+fn sandbox_is_unrestricted(policy: &crate::sandbox::SandboxPolicy) -> bool {
+    !policy.is_restricted()
+}
+
 fn chrono_now() -> String {
     // Simple ISO 8601 timestamp without pulling in the chrono crate
     use std::time::SystemTime;
@@ -539,13 +557,13 @@ mod tests {
         let key = iroh::SecretKey::from_bytes(&key_bytes);
         let public = key.public();
 
-        store.add_peer(&public, "admin".into(), None, PeerRole::Creator);
+        store.add_peer(&public, "admin".into(), None, PeerRole::Creator, crate::sandbox::SandboxPolicy::default());
         assert_eq!(store.peers.len(), 1);
         assert_eq!(store.peers[0].role, PeerRole::Creator);
         assert_eq!(store.peer_role(&public), PeerRole::Creator);
 
         // Duplicate add is ignored
-        store.add_peer(&public, "admin2".into(), None, PeerRole::Peer);
+        store.add_peer(&public, "admin2".into(), None, PeerRole::Peer, crate::sandbox::SandboxPolicy::default());
         assert_eq!(store.peers.len(), 1);
         assert_eq!(store.peers[0].name, "admin");
     }
@@ -610,7 +628,7 @@ mod tests {
         let mut store = PeersStore::default();
         let key = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let public = key.public();
-        store.add_peer(&public, "test-peer".into(), Some("alice".into()), PeerRole::Creator);
+        store.add_peer(&public, "test-peer".into(), Some("alice".into()), PeerRole::Creator, crate::sandbox::SandboxPolicy::default());
         store.save(dir.path()).unwrap();
 
         let loaded = PeersStore::load(dir.path()).unwrap();

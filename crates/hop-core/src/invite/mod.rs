@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::config::PeerRole;
+use crate::sandbox::SandboxPolicy;
 
 /// The invite token payload, encoded as base64url JSON.
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,10 +31,17 @@ pub struct InviteToken {
     /// Role assigned to the invited peer (default: Peer).
     #[serde(default, skip_serializing_if = "is_default_peer_role")]
     pub role: PeerRole,
+    /// Sandbox restrictions for this invite (default: unrestricted).
+    #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
+    pub sandbox: SandboxPolicy,
 }
 
 fn is_default_peer_role(role: &PeerRole) -> bool {
     *role == PeerRole::Peer
+}
+
+fn sandbox_is_unrestricted(policy: &SandboxPolicy) -> bool {
+    !policy.is_restricted()
 }
 
 /// A pending invite stored on the host side.
@@ -49,6 +57,9 @@ pub struct PendingInvite {
     /// Role assigned to the invited peer (default: Peer).
     #[serde(default)]
     pub role: PeerRole,
+    /// Sandbox restrictions for this invite.
+    #[serde(default)]
+    pub sandbox: SandboxPolicy,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -103,6 +114,7 @@ impl PendingInvitesStore {
             Some(ConsumedInvite {
                 username: invite.username,
                 role: invite.role,
+                sandbox: invite.sandbox,
             })
         } else {
             None
@@ -114,6 +126,7 @@ impl PendingInvitesStore {
 pub struct ConsumedInvite {
     pub username: Option<String>,
     pub role: PeerRole,
+    pub sandbox: SandboxPolicy,
 }
 
 /// Get the system hostname via libc.
@@ -149,6 +162,7 @@ pub fn generate_invite(
         host_name,
         PeerRole::Peer,
         15 * 60,
+        SandboxPolicy::default(),
     )
 }
 
@@ -163,6 +177,7 @@ pub fn generate_invite_with_role(
     host_name: Option<&str>,
     role: PeerRole,
     expiry_secs: u64,
+    sandbox: SandboxPolicy,
 ) -> Result<String> {
     // Validate the username early so bad values never reach storage.
     // Skip validation for Creator role (maps to root).
@@ -198,6 +213,7 @@ pub fn generate_invite_with_role(
         created_at: unix_now(),
         username: username.map(String::from),
         role: role.clone(),
+        sandbox: sandbox.clone(),
     });
     store.save(config_dir)?;
 
@@ -212,6 +228,7 @@ pub fn generate_invite_with_role(
         username: username.map(String::from),
         host_name: resolved_host_name,
         role,
+        sandbox,
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -276,6 +293,7 @@ mod tests {
             username: None,
             host_name: None,
             role: PeerRole::Peer,
+            sandbox: SandboxPolicy::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(!json.contains("role"), "Peer role should not be serialized: {json}");
@@ -290,6 +308,7 @@ mod tests {
             username: None,
             host_name: None,
             role: PeerRole::Creator,
+            sandbox: SandboxPolicy::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(json.contains(r#""role":"creator""#), "Creator role should be serialized: {json}");
@@ -316,6 +335,7 @@ mod tests {
             Some("test-host"),
             PeerRole::Creator,
             3600,
+            SandboxPolicy::default(),
         )
         .unwrap();
 
@@ -352,6 +372,7 @@ mod tests {
             None,
             PeerRole::Creator,
             3600,
+            SandboxPolicy::default(),
         )
         .unwrap();
 
@@ -404,12 +425,14 @@ mod tests {
                     created_at: 1000,
                     username: None,
                     role: PeerRole::Peer,
+                    sandbox: SandboxPolicy::default(),
                 },
                 PendingInvite {
                     secret_hash: "new".into(),
                     created_at: unix_now(),
                     username: None,
                     role: PeerRole::Creator,
+                    sandbox: SandboxPolicy::default(),
                 },
             ],
         };

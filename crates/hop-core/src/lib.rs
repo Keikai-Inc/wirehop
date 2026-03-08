@@ -5,6 +5,7 @@ pub mod fleet;
 pub mod invite;
 pub mod net;
 pub mod proto;
+pub mod sandbox;
 pub mod shell;
 pub mod transfer;
 #[cfg(unix)]

@@ -102,6 +102,7 @@ fn handle_create_invite(
         None,
         role,
         expiry_secs,
+        crate::sandbox::SandboxPolicy::default(),
     ) {
         Ok(token) => {
             log_admin_action(config_dir, "create_invite", &format!("user={:?}", username));
@@ -201,6 +202,7 @@ fn handle_create_user(
             None,
             PeerRole::Peer,
             15 * 60,
+            crate::sandbox::SandboxPolicy::default(),
         ) {
             Ok(token) => Some(token),
             Err(e) => {
@@ -476,7 +478,7 @@ mod tests {
 
         let key2 = iroh::SecretKey::from_bytes(&[11u8; 32]);
         let mut store = PeersStore::default();
-        store.add_peer(&key2.public(), "alice".into(), Some("alice".into()), PeerRole::Creator);
+        store.add_peer(&key2.public(), "alice".into(), Some("alice".into()), PeerRole::Creator, crate::sandbox::SandboxPolicy::default());
         store.save(dir.path()).unwrap();
 
         let resp = handle_admin_request(AdminRequest::ListPeers, dir.path(), None, &public);
@@ -498,7 +500,7 @@ mod tests {
         let key2 = iroh::SecretKey::from_bytes(&[12u8; 32]);
         let peer_id = key2.public().to_string();
         let mut store = PeersStore::default();
-        store.add_peer(&key2.public(), "bob".into(), None, PeerRole::Peer);
+        store.add_peer(&key2.public(), "bob".into(), None, PeerRole::Peer, crate::sandbox::SandboxPolicy::default());
         store.save(dir.path()).unwrap();
 
         let resp = handle_admin_request(

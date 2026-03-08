@@ -33,6 +33,21 @@ pub enum Command {
         /// Human-readable name for this host (defaults to system hostname)
         #[arg(long)]
         name: Option<String>,
+        /// Restrict to read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Block outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
     },
 
     /// Connect to a host (NodeId, invite token, or known host alias)
@@ -42,6 +57,21 @@ pub enum Command {
         /// Override the name saved for this host in known_hosts
         #[arg(long)]
         name: Option<String>,
+        /// Request read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Request blocking outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
     },
 
     /// View or update host configuration
@@ -112,6 +142,21 @@ pub enum Command {
     Exec {
         /// Host NodeId, invite token, or known host alias
         target: String,
+        /// Request read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Request blocking outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
         /// Command and arguments to execute
         #[arg(required = true, last = true)]
         command: Vec<String>,
@@ -124,6 +169,21 @@ pub enum Command {
         /// Override the name saved for this host in known_hosts
         #[arg(long)]
         name: Option<String>,
+        /// Request read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Request blocking outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
     },
 
     /// Remote administration (requires creator role)
@@ -197,6 +257,21 @@ pub enum AdminAction {
         /// Create a creator invite (admin access)
         #[arg(long)]
         creator: bool,
+        /// Restrict to read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Block outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// List authorized peers on the remote host
     Peers,

@@ -78,7 +78,7 @@
 
     .roles-row {
       display: grid;
-      grid-template-columns: 1fr 2fr 1fr 1fr;
+      grid-template-columns: 1fr 2fr 1fr 1fr 1fr;
       border-bottom: 1px solid var(--color-border);
     }
 
@@ -286,30 +286,35 @@
               <div class="roles-cell roles-header">Host Tags</div>
               <div class="roles-cell roles-header">Sudo</div>
               <div class="roles-cell roles-header">User Mode</div>
+              <div class="roles-cell roles-header">Sandbox</div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">developer</div>
               <div class="roles-cell role-detail" data-label="Host Tags">developer, staging</div>
               <div class="roles-cell role-detail" data-label="Sudo">No</div>
               <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">&mdash;</div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">ops</div>
               <div class="roles-cell role-detail" data-label="Host Tags">* (all hosts)</div>
               <div class="roles-cell role-detail" data-label="Sudo">Yes</div>
               <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">&mdash;</div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">security</div>
               <div class="roles-cell role-detail" data-label="Host Tags">production, staging</div>
               <div class="roles-cell role-detail" data-label="Sudo">No</div>
               <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox" style="color: var(--color-accent-teal);">audit</div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">ci</div>
               <div class="roles-cell role-detail" data-label="Host Tags">build</div>
               <div class="roles-cell role-detail" data-label="Sudo">No</div>
               <div class="roles-cell role-detail" data-label="User Mode">Shared</div>
+              <div class="roles-cell role-detail" data-label="Sandbox" style="color: var(--color-accent-teal);">deploy</div>
             </div>
           </div>
 
@@ -330,6 +335,11 @@
       <span class="cmd">"sudo"</span>: <span class="url">false</span>
     },
     {
+      <span class="cmd">"name"</span>: <span class="flag">"security"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"production"</span>, <span class="flag">"staging"</span>],
+      <span class="cmd">"sandbox"</span>: { <span class="cmd">"read_only"</span>: <span class="url">true</span>, <span class="cmd">"no_network"</span>: <span class="url">true</span> }
+    },
+    {
       <span class="cmd">"name"</span>: <span class="flag">"ops"</span>,
       <span class="cmd">"host_tags"</span>: [<span class="flag">"*"</span>],
       <span class="cmd">"user_mode"</span>: <span class="flag">"individual"</span>,
@@ -338,6 +348,54 @@
     }
   ]
 <span class="output">}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Sandbox Policies -->
+  <section id="sandbox">
+    <div class="container">
+      <div class="section-header">
+        <h2>Sandbox Policies</h2>
+        <p>Restrict what peers can do at the OS level. Policies are enforced via macOS Seatbelt and Linux Landlock.</p>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-info">
+          <h3>Three layers of enforcement</h3>
+          <p>Sandbox policies flow through three layers: role definition (orchestrator sets the baseline), invite creation (host can further restrict), and client connection (client can self-restrict). The result is always the strictest combination.</p>
+          <ul class="concept-list">
+            <li><strong>Presets</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code> (read-only, no network, scoped paths), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code> (read-only, no network), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code> (scoped write, dangerous commands blocked)</li>
+            <li><strong>Custom policies</strong> &mdash; combine <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--read-only</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-network</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--scope</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--allow-command</code></li>
+            <li><strong>Role-based</strong> &mdash; assign sandbox policies per role in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code></li>
+            <li><strong>Client self-restriction</strong> &mdash; peers can request stricter sandbox at connect time</li>
+            <li><strong>Merge logic</strong> &mdash; restrictions only tighten, never loosen</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">Terminal — Sandbox examples</span>
+            </div>
+            <div class="code-body">
+<span class="comment"># Create a monitor-only invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--preset monitor</span>
+
+<span class="comment"># Create a custom sandboxed invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--read-only --no-network --scope /var/log</span>
+
+<span class="comment"># Connect with self-imposed restrictions</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1 --preset audit</span>
+
+<span class="comment"># Execute a command in read-only mode</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1 --read-only</span> -- cat /etc/hosts
             </div>
           </div>
         </div>

@@ -13,6 +13,7 @@ use crate::invite;
 use crate::proto::{
     AdminResponse, FleetMemberInfo, RoleDefinition, RoleUpdates, UserMode,
 };
+use crate::sandbox::SandboxPolicy;
 
 // --- Fleet store ---
 
@@ -99,6 +100,7 @@ impl RolesStore {
                     user_mode: UserMode::Individual,
                     groups: vec!["docker".into()],
                     shell: None,
+                    sandbox: SandboxPolicy::default(),
                 },
                 RoleDefinition {
                     name: "ops".into(),
@@ -108,6 +110,7 @@ impl RolesStore {
                     user_mode: UserMode::Individual,
                     groups: vec!["docker".into()],
                     shell: None,
+                    sandbox: SandboxPolicy::default(),
                 },
                 RoleDefinition {
                     name: "developer".into(),
@@ -117,6 +120,7 @@ impl RolesStore {
                     user_mode: UserMode::Individual,
                     groups: vec![],
                     shell: None,
+                    sandbox: SandboxPolicy::default(),
                 },
                 RoleDefinition {
                     name: "security".into(),
@@ -126,6 +130,7 @@ impl RolesStore {
                     user_mode: UserMode::Individual,
                     groups: vec![],
                     shell: None,
+                    sandbox: SandboxPolicy::preset_audit(),
                 },
                 RoleDefinition {
                     name: "ci".into(),
@@ -135,6 +140,7 @@ impl RolesStore {
                     user_mode: UserMode::Shared,
                     groups: vec![],
                     shell: None,
+                    sandbox: SandboxPolicy::preset_deploy(),
                 },
             ],
         };
@@ -243,6 +249,7 @@ pub fn handle_create_fleet_invite(
         None,
         PeerRole::Creator,
         expiry_secs,
+        crate::sandbox::SandboxPolicy::default(),
     ) {
         Ok(token) => {
             // Store tags metadata alongside the invite for fleet registration
@@ -389,6 +396,9 @@ pub fn handle_update_role(config_dir: &Path, name: &str, updates: RoleUpdates) -
                 }
                 if let Some(user_mode) = updates.user_mode {
                     role.user_mode = user_mode;
+                }
+                if let Some(sandbox) = updates.sandbox {
+                    role.sandbox = sandbox;
                 }
                 if let Err(e) = store.save(config_dir) {
                     return AdminResponse::Error {
@@ -652,6 +662,20 @@ mod tests {
     use super::*;
     use crate::proto::UserMode;
 
+    /// Helper to build a RoleDefinition with default sandbox for tests.
+    fn test_role(name: &str, host_tags: Vec<String>, user_mode: UserMode, sudo: bool, admin: bool, groups: Vec<String>, shell: Option<String>) -> RoleDefinition {
+        RoleDefinition {
+            name: name.into(),
+            host_tags,
+            user_mode,
+            sudo,
+            admin,
+            groups,
+            shell,
+            sandbox: SandboxPolicy::default(),
+        }
+    }
+
     // --- RolesStore tests ---
 
     #[test]
@@ -666,24 +690,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RolesStore {
             roles: vec![
-                RoleDefinition {
-                    name: "developer".into(),
-                    host_tags: vec!["dev".into(), "staging".into()],
-                    user_mode: UserMode::Individual,
-                    sudo: false,
-                    admin: false,
-                    groups: vec![],
-                    shell: None,
-                },
-                RoleDefinition {
-                    name: "ops".into(),
-                    host_tags: vec!["*".into()],
-                    user_mode: UserMode::Individual,
-                    sudo: true,
-                    admin: false,
-                    groups: vec!["docker".into()],
-                    shell: Some("/bin/bash".into()),
-                },
+                test_role("developer", vec!["dev".into(), "staging".into()], UserMode::Individual, false, false, vec![], None),
+                test_role("ops", vec!["*".into()], UserMode::Individual, true, false, vec!["docker".into()], Some("/bin/bash".into())),
             ],
         };
         store.save(dir.path()).unwrap();
@@ -698,15 +706,7 @@ mod tests {
     #[test]
     fn roles_store_find_role() {
         let store = RolesStore {
-            roles: vec![RoleDefinition {
-                name: "ci".into(),
-                host_tags: vec!["build".into()],
-                user_mode: UserMode::Shared,
-                sudo: false,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            }],
+            roles: vec![test_role("ci", vec!["build".into()], UserMode::Shared, false, false, vec![], None)],
         };
         assert!(store.find_role("ci").is_some());
         assert_eq!(store.find_role("ci").unwrap().user_mode, UserMode::Shared);
@@ -810,15 +810,7 @@ mod tests {
     #[test]
     fn handle_create_role_success() {
         let dir = tempfile::tempdir().unwrap();
-        let def = RoleDefinition {
-            name: "developer".into(),
-            host_tags: vec!["dev".into()],
-            user_mode: UserMode::Individual,
-            sudo: false,
-            admin: false,
-            groups: vec![],
-            shell: None,
-        };
+        let def = test_role("developer", vec!["dev".into()], UserMode::Individual, false, false, vec![], None);
         let resp = handle_create_role(dir.path(), def);
         match resp {
             AdminResponse::RoleCreated { name } => assert_eq!(name, "developer"),
@@ -833,15 +825,7 @@ mod tests {
     #[test]
     fn handle_create_role_duplicate_error() {
         let dir = tempfile::tempdir().unwrap();
-        let def = RoleDefinition {
-            name: "developer".into(),
-            host_tags: vec!["dev".into()],
-            user_mode: UserMode::Individual,
-            sudo: false,
-            admin: false,
-            groups: vec![],
-            shell: None,
-        };
+        let def = test_role("developer", vec!["dev".into()], UserMode::Individual, false, false, vec![], None);
         handle_create_role(dir.path(), def.clone());
         let resp = handle_create_role(dir.path(), def);
         match resp {
@@ -862,15 +846,7 @@ mod tests {
         // Add a role
         handle_create_role(
             dir.path(),
-            RoleDefinition {
-                name: "ops".into(),
-                host_tags: vec!["*".into()],
-                user_mode: UserMode::Individual,
-                sudo: true,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            },
+            test_role("ops", vec!["*".into()], UserMode::Individual, true, false, vec![], None),
         );
 
         match handle_list_roles(dir.path()) {
@@ -888,15 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         handle_create_role(
             dir.path(),
-            RoleDefinition {
-                name: "developer".into(),
-                host_tags: vec!["dev".into()],
-                user_mode: UserMode::Individual,
-                sudo: false,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            },
+            test_role("developer", vec!["dev".into()], UserMode::Individual, false, false, vec![], None),
         );
 
         let updates = RoleUpdates {
@@ -922,15 +890,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         handle_create_role(
             dir.path(),
-            RoleDefinition {
-                name: "developer".into(),
-                host_tags: vec!["dev".into(), "staging".into(), "production".into()],
-                user_mode: UserMode::Individual,
-                sudo: false,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            },
+            test_role("developer", vec!["dev".into(), "staging".into(), "production".into()], UserMode::Individual, false, false, vec![], None),
         );
 
         let updates = RoleUpdates {
@@ -959,15 +919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         handle_create_role(
             dir.path(),
-            RoleDefinition {
-                name: "temp".into(),
-                host_tags: vec![],
-                user_mode: UserMode::Individual,
-                sudo: false,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            },
+            test_role("temp", vec![], UserMode::Individual, false, false, vec![], None),
         );
         let resp = handle_delete_role(dir.path(), "temp");
         match resp {
@@ -1021,16 +973,26 @@ mod tests {
         assert!(!dev.sudo);
         assert_eq!(dev.user_mode, UserMode::Individual);
 
-        // security role
+        // security role — audit sandbox preset
         let sec = store.find_role("security").unwrap();
         assert_eq!(sec.host_tags, vec!["production", "staging"]);
         assert!(!sec.sudo);
+        assert!(sec.sandbox.read_only);
+        assert!(sec.sandbox.no_network);
 
-        // ci role
+        // ci role — deploy sandbox preset
         let ci = store.find_role("ci").unwrap();
         assert_eq!(ci.host_tags, vec!["build"]);
         assert!(!ci.sudo);
         assert_eq!(ci.user_mode, UserMode::Shared);
+        assert!(!ci.sandbox.read_only);
+        assert!(!ci.sandbox.no_network);
+        assert!(!ci.sandbox.denied_commands.is_empty()); // deploy preset has denied_commands
+
+        // admin/ops/developer — unrestricted sandbox
+        assert!(!admin.sandbox.is_restricted());
+        assert!(!ops.sandbox.is_restricted());
+        assert!(!dev.sandbox.is_restricted());
     }
 
     #[test]
@@ -1176,15 +1138,7 @@ mod tests {
     fn roles_json_human_readable_format() {
         let dir = tempfile::tempdir().unwrap();
         let store = RolesStore {
-            roles: vec![RoleDefinition {
-                name: "developer".into(),
-                host_tags: vec!["developer".into(), "staging".into()],
-                user_mode: UserMode::Individual,
-                sudo: false,
-                admin: false,
-                groups: vec![],
-                shell: None,
-            }],
+            roles: vec![test_role("developer", vec!["developer".into(), "staging".into()], UserMode::Individual, false, false, vec![], None)],
         };
         store.save(dir.path()).unwrap();
 

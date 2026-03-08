@@ -54,20 +54,23 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet).await
         }
-        Command::Invite { user, name } => {
+        Command::Invite { user, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_identity(&config_dir)?;
-            cmd_invite(secret_key, &config_dir, user.as_deref(), name.as_deref())
+            let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
+            cmd_invite(secret_key, &config_dir, user.as_deref(), name.as_deref(), sandbox)
         }
-        Command::Connect { target, name } => {
+        Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
+            let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
+            cmd_connect(secret_key, &target, &config_dir, name.as_deref(), sandbox).await
         }
-        Command::Exec { target, command } => {
+        Command::Exec { target, read_only, no_network, scopes, allow_commands, preset, command } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_exec(secret_key, &target, &config_dir, &command).await
+            let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
+            cmd_exec(secret_key, &target, &config_dir, &command, sandbox).await
         }
         Command::Cp { recursive, paths } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -102,10 +105,11 @@ async fn main() -> Result<()> {
             let user_config_dir = config::default_config_dir()?;
             cmd_peers(action, &host_config_dir, &user_config_dir)
         }
-        Command::On { target, name } => {
+        Command::On { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_connect(secret_key, &target, &config_dir, name.as_deref()).await
+            let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
+            cmd_connect(secret_key, &target, &config_dir, name.as_deref(), sandbox).await
         }
         Command::Admin { target, action } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -155,9 +159,9 @@ async fn main() -> Result<()> {
                 if command.is_empty() {
                     anyhow::bail!("no command specified after --");
                 }
-                cmd_exec(secret_key, target, &config_dir, &command).await
+                cmd_exec(secret_key, target, &config_dir, &command, hop_core::sandbox::SandboxPolicy::default()).await
             } else {
-                cmd_connect(secret_key, target, &config_dir, None).await
+                cmd_connect(secret_key, target, &config_dir, None, hop_core::sandbox::SandboxPolicy::default()).await
             }
         }
     }
@@ -232,6 +236,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 None,
                 PeerRole::Creator,
                 3600, // 1-hour expiry
+                hop_core::sandbox::SandboxPolicy::default(),
             ) {
                 Ok(token) => {
                     // Write to file with restricted permissions
@@ -356,24 +361,25 @@ async fn handle_incoming(
 
     let peer_id = remote_id.to_string();
 
-    let (username, role) = match outcome {
-        AuthOutcome::Authorized { username, role } => {
+    let (username, role, sandbox) = match outcome {
+        AuthOutcome::Authorized { username, role, sandbox } => {
             tracing::info!("Authorized peer {} (role: {:?})", remote_id.fmt_short(), role);
             // Spawn first session
             let conn_c = conn.clone();
             let reg = registry.clone();
             let u = username.clone();
             let r = role.clone();
+            let s = sandbox.clone();
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
-            (username, role)
+            (username, role, sandbox)
         }
-        AuthOutcome::InviteAccepted { username, role } => {
+        AuthOutcome::InviteAccepted { username, role, sandbox } => {
             tracing::info!("Invite accepted for {} (role: {:?}), waiting for session request", remote_id.fmt_short(), role);
             let msg: ClientMessage = proto::read_message(&mut recv).await?;
             // Spawn first session
@@ -381,14 +387,15 @@ async fn handle_incoming(
             let reg = registry.clone();
             let u = username.clone();
             let r = role.clone();
+            let s = sandbox.clone();
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
-            (username, role)
+            (username, role, sandbox)
         }
         AuthOutcome::Rejected => {
             tracing::info!("Rejected connection from {}", remote_id.fmt_short());
@@ -412,10 +419,11 @@ async fn handle_incoming(
                 let reg = registry.clone();
                 let u = username.clone();
                 let r = role.clone();
+                let s = sandbox.clone();
                 let pid = peer_id.clone();
                 let cd = config_dir.to_path_buf();
                 tokio::spawn(async move {
-                    if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &cd, reg).await {
+                    if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
                         tracing::error!("Session error: {e:#}");
                     }
                 });
@@ -436,17 +444,23 @@ async fn dispatch_session(
     protocol_version: u8,
     peer_id: &str,
     role: &config::PeerRole,
+    sandbox: &hop_core::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
     registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
             tracing::info!("Starting shell session");
-            shell::host_shell_session(send, recv, username).await?;
+            shell::host_shell_session(send, recv, username, sandbox).await?;
         }
         Some(ClientMessage::RequestShellV2 { session_id }) => {
             tracing::info!("Starting persistent shell session (resume: {})", session_id.is_some());
-            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry).await?;
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, sandbox).await?;
+        }
+        Some(ClientMessage::RequestShellV3 { session_id, sandbox: client_sandbox }) => {
+            let merged = sandbox.merge_stricter(&client_sandbox);
+            tracing::info!("Starting persistent shell session with client sandbox (resume: {})", session_id.is_some());
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
@@ -454,7 +468,12 @@ async fn dispatch_session(
         }
         Some(ClientMessage::RequestExec { command }) => {
             tracing::info!("Starting exec session: {command}");
-            shell::host_exec_session(send, recv, &command, username).await?;
+            shell::host_exec_session(send, recv, &command, username, sandbox).await?;
+        }
+        Some(ClientMessage::RequestExecV2 { command, sandbox: client_sandbox }) => {
+            let merged = sandbox.merge_stricter(&client_sandbox);
+            tracing::info!("Starting exec session with client sandbox: {command}");
+            shell::host_exec_session(send, recv, &command, username, &merged).await?;
         }
         Some(ClientMessage::RequestAdmin(request)) => {
             if *role != config::PeerRole::Creator {
@@ -487,7 +506,13 @@ async fn dispatch_session(
     Ok(())
 }
 
-fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, username: Option<&str>, host_name: Option<&str>) -> Result<()> {
+fn cmd_invite(
+    secret_key: iroh::SecretKey,
+    config_dir: &std::path::Path,
+    username: Option<&str>,
+    host_name: Option<&str>,
+    sandbox: hop_core::sandbox::SandboxPolicy,
+) -> Result<()> {
     let public_key = secret_key.public();
 
     // Default to current user when --user is not specified.
@@ -506,7 +531,16 @@ fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, usernam
     // Read relay URL persisted by the daemon (if available) so the client
     // can connect via relay immediately instead of waiting for discovery.
     let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
-    let token = invite::generate_invite(&public_key, config_dir, relay_url.as_deref(), username, host_name)?;
+    let token = invite::generate_invite_with_role(
+        &public_key,
+        config_dir,
+        relay_url.as_deref(),
+        username,
+        host_name,
+        PeerRole::Peer,
+        15 * 60,
+        sandbox.clone(),
+    )?;
 
     println!("Invite token (share with the client):");
     println!();
@@ -516,8 +550,44 @@ fn cmd_invite(secret_key: iroh::SecretKey, config_dir: &std::path::Path, usernam
     println!("  hop connect {token}");
     println!();
     println!("This invite expires in 15 minutes and is single-use.");
+    if sandbox.is_restricted() {
+        println!();
+        println!("Sandbox restrictions:");
+        if sandbox.read_only { println!("  - Read-only filesystem"); }
+        if sandbox.no_network { println!("  - No network access"); }
+        if !sandbox.allowed_paths.is_empty() {
+            println!("  - Scoped to: {}", sandbox.allowed_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+        }
+        if !sandbox.allowed_commands.is_empty() {
+            println!("  - Allowed commands: {}", sandbox.allowed_commands.join(", "));
+        }
+    }
 
     Ok(())
+}
+
+/// Build a SandboxPolicy from CLI flags.
+fn build_sandbox_policy(
+    preset: Option<&str>,
+    read_only: bool,
+    no_network: bool,
+    scopes: &[std::path::PathBuf],
+    allow_commands: &[String],
+) -> Result<hop_core::sandbox::SandboxPolicy> {
+    use hop_core::sandbox::SandboxPolicy;
+
+    let base = if let Some(name) = preset {
+        SandboxPolicy::from_preset(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown sandbox preset: '{name}' (valid: monitor, audit, deploy)"))?
+    } else {
+        SandboxPolicy::default()
+    };
+
+    // Apply overrides — only set flags that were explicitly passed
+    let ro = if read_only { Some(true) } else { None };
+    let nn = if no_network { Some(true) } else { None };
+
+    Ok(base.with_overrides(ro, nn, scopes, allow_commands))
 }
 
 /// Spawn a blocking stdin reader and return the receiver half.
@@ -546,12 +616,20 @@ async fn cmd_connect(
     target: &str,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
+    sandbox: hop_core::sandbox::SandboxPolicy,
 ) -> Result<()> {
+    // Choose the protocol variant based on whether sandbox is restricted
+    let session_msg: ClientMessage = if sandbox.is_restricted() {
+        ClientMessage::RequestShellV3 { session_id: None, sandbox }
+    } else {
+        ClientMessage::RequestShellV2 { session_id: None }
+    };
+
     // Connect through the agent (avoids relay conflicts, enables multiplexing)
     let (resolved, first_send, first_recv) =
         mux::connect_to_host(
             config_dir, target, cli_name,
-            &ClientMessage::RequestShellV2 { session_id: None },
+            &session_msg,
         ).await?;
 
     // Spawn stdin reader once — shared across reconnections
@@ -644,14 +722,21 @@ async fn cmd_exec(
     target: &str,
     config_dir: &std::path::Path,
     command: &[String],
+    sandbox: hop_core::sandbox::SandboxPolicy,
 ) -> Result<()> {
     let command_str = command.join(" ");
+
+    let exec_msg: ClientMessage = if sandbox.is_restricted() {
+        ClientMessage::RequestExecV2 { command: command_str, sandbox }
+    } else {
+        ClientMessage::RequestExec { command: command_str }
+    };
 
     let (_resolved, send, recv) = mux::connect_to_host(
         config_dir,
         target,
         None,
-        &ClientMessage::RequestExec { command: command_str },
+        &exec_msg,
     )
     .await?;
 
@@ -1110,7 +1195,7 @@ async fn cmd_admin(
     action: AdminAction,
 ) -> Result<()> {
     let request = match &action {
-        AdminAction::Invite { user, creator } => AdminRequest::CreateInvite {
+        AdminAction::Invite { user, creator, .. } => AdminRequest::CreateInvite {
             username: user.clone(),
             role: if *creator { PeerRole::Creator } else { PeerRole::Peer },
         },
@@ -1169,6 +1254,7 @@ async fn cmd_admin(
                     admin: *admin,
                     groups: groups.clone(),
                     shell: shell.clone(),
+                    sandbox: hop_core::sandbox::SandboxPolicy::default(),
                 },
             },
             RoleAction::List => AdminRequest::ListRoles,

@@ -23,6 +23,8 @@ pub enum AuthOutcome {
         username: Option<String>,
         /// Role of this peer.
         role: PeerRole,
+        /// Sandbox restrictions for this peer.
+        sandbox: crate::sandbox::SandboxPolicy,
     },
     /// Client was authorized via invite (newly added).
     InviteAccepted {
@@ -30,6 +32,8 @@ pub enum AuthOutcome {
         username: Option<String>,
         /// Role assigned via the invite.
         role: PeerRole,
+        /// Sandbox restrictions from the invite.
+        sandbox: crate::sandbox::SandboxPolicy,
     },
     /// Client was rejected.
     Rejected,
@@ -76,6 +80,7 @@ pub async fn authenticate_client(
                     format!("peer-{}", remote_id.fmt_short()),
                     consumed.username.clone(),
                     consumed.role.clone(),
+                    consumed.sandbox.clone(),
                 );
                 peers.save(config_dir)?;
 
@@ -83,7 +88,7 @@ pub async fn authenticate_client(
                 proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
 
                 tracing::info!("Invite accepted for peer {} (role: {:?})", remote_id.fmt_short(), consumed.role);
-                Ok((AuthOutcome::InviteAccepted { username: consumed.username, role: consumed.role }, None))
+                Ok((AuthOutcome::InviteAccepted { username: consumed.username, role: consumed.role, sandbox: consumed.sandbox }, None))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;
@@ -99,11 +104,12 @@ pub async fn authenticate_client(
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
                 let role = peers.peer_role(remote_id);
+                let sandbox = peers.peer_sandbox(remote_id);
                 // Update last seen
                 let mut peers = peers;
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;
-                Ok((AuthOutcome::Authorized { username, role }, Some(msg)))
+                Ok((AuthOutcome::Authorized { username, role, sandbox }, Some(msg)))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;

@@ -12,7 +12,6 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 use tokio::sync::{mpsc, watch};
 
-use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::proto::{self, ClientMessage, HostMessage};
@@ -32,10 +31,14 @@ pub enum SessionOutcome {
 /// If `username` is `Some`, the shell runs as that Unix user via `login -fp`
 /// (macOS) or `su -` (other Unix). This requires the host to run as root.
 /// If `None`, the shell runs as the current user (backward compatible).
+///
+/// If `sandbox` has restrictions, the shell is spawned inside an OS-native
+/// sandbox (macOS Seatbelt / Linux Landlock).
 pub async fn host_shell_session(
     mut send: SendStream,
     mut recv: RecvStream,
     username: Option<&str>,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<()> {
     // --- Pre-spawn security checks ---
     #[cfg(unix)]
@@ -114,32 +117,10 @@ pub async fn host_shell_session(
         .openpty(initial_size)
         .context("Failed to open PTY")?;
 
-    let mut cmd = if let Some(user) = username {
-        // Spawn a login shell as the specified user.
-        // Requires the hop host process to run as root.
-        #[cfg(target_os = "macos")]
-        {
-            let mut c = CommandBuilder::new("login");
-            c.args(["-fp", user]);
-            c
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let mut c = CommandBuilder::new("su");
-            c.args(["-", user]);
-            c
-        }
-        #[cfg(not(unix))]
-        {
-            anyhow::bail!("Per-user shell sessions are only supported on Unix");
-        }
-    } else {
-        // Default: run the host user's own login shell
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut c = CommandBuilder::new(&shell);
-        c.arg("-l");
-        c
-    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username);
+    let mut cmd = CommandBuilder::new(&bin);
+    cmd.args(args.iter().map(|s| s.as_str()));
     // Apply environment variables from client through a security allowlist
     const ENV_ALLOWLIST: &[&str] = &[
         "TERM",
@@ -437,6 +418,7 @@ fn spawn_persistent_pty(
     username: Option<&str>,
     size: PtySize,
     env_vars: &HashMap<String, String>,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<(
     String,                                          // session_id
     mpsc::Sender<Vec<u8>>,                           // input_tx
@@ -447,30 +429,10 @@ fn spawn_persistent_pty(
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).context("Failed to open PTY")?;
 
-    let mut cmd = if let Some(user) = username {
-        #[cfg(target_os = "macos")]
-        {
-            let mut c = CommandBuilder::new("login");
-            c.args(["-fp", user]);
-            c
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let mut c = CommandBuilder::new("su");
-            c.args(["-", user]);
-            c
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = user;
-            anyhow::bail!("Per-user shell sessions are only supported on Unix");
-        }
-    } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut c = CommandBuilder::new(&shell);
-        c.arg("-l");
-        c
-    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username);
+    let mut cmd = CommandBuilder::new(&bin);
+    cmd.args(args.iter().map(|s| s.as_str()));
 
     const ENV_ALLOWLIST: &[&str] = &[
         "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
@@ -639,6 +601,7 @@ pub async fn host_shell_session_persistent(
     peer_id: &str,
     _requested_session_id: Option<String>,
     registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<()> {
     check_shell_security(username)?;
 
@@ -685,7 +648,7 @@ pub async fn host_shell_session_persistent(
             }
 
             let (sid, itx, output_route, rtx, erx) =
-                spawn_persistent_pty(username, initial_size, &env_vars)?;
+                spawn_persistent_pty(username, initial_size, &env_vars, sandbox)?;
 
             // Route output to this client
             let _ = output_route.send(Some(client_output_tx));
@@ -1007,6 +970,7 @@ pub async fn host_exec_session(
     mut recv: RecvStream,
     command: &str,
     username: Option<&str>,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<()> {
     // --- Pre-spawn security checks (same as shell) ---
     #[cfg(unix)]
@@ -1035,39 +999,9 @@ pub async fn host_exec_session(
         }
     }
 
-    // Build the command
-    let mut child = if let Some(user) = username {
-        #[cfg(target_os = "macos")]
-        {
-            let mut cmd = tokio::process::Command::new("login");
-            cmd.args(["-fp", user, "/bin/sh", "-c", command]);
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().context("Failed to spawn command")?
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let mut cmd = tokio::process::Command::new("su");
-            cmd.args(["-", user, "-c", command]);
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().context("Failed to spawn command")?
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = user;
-            anyhow::bail!("Per-user exec sessions are only supported on Unix");
-        }
-    } else {
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.args(["-c", command]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.spawn().context("Failed to spawn command")?
-    };
+    // Build the command with sandbox enforcement
+    let mut child = crate::sandbox::spawn_sandboxed_command(command, sandbox, username)
+        .context("Failed to spawn sandboxed command")?;
 
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take();

@@ -415,5 +415,139 @@ for (const r of results) {
             related: tags(&["security/ssh-key-audit", "security/firewall-audit"]),
             sub_skills: vec![],
         },
+        // --- Sandbox skills ---
+        Skill {
+            id: s("security/sandbox-overview"),
+            category: s("security"),
+            title: s("Sandbox Overview"),
+            description: s("Understand hop's 3-layer sandbox system: invite-time policy, OS-native enforcement (macOS Seatbelt, Linux Landlock), and client self-restriction. Presets: monitor (read-only, no network, scoped paths), audit (read-only, no network, full read), deploy (scoped write + network, dangerous commands blocked)."),
+            tags: tags(&["sandbox", "security", "policy", "seatbelt", "landlock", "isolation"]),
+            prerequisites: vec![s("getting-started/hosting")],
+            examples: vec![
+                ex(
+                    "Inspect sandbox presets",
+                    r#"// Sandbox presets available in hop:
+//   monitor — read-only, no network, scoped to /proc, /sys, /var/log, /etc
+//   audit   — read-only, no network, full filesystem read
+//   deploy  — write-enabled, network-enabled, dangerous commands blocked
+
+// Create a sandboxed invite
+const token = await hop.exec("localhost", "hop invite --preset monitor");
+hop.log(`Monitor invite: ${token.stdout.trim()}`);
+
+// Check current sandbox status on a host
+const r = await hop.exec("web-1", "cat /proc/self/status | grep -i seccomp || echo 'No kernel sandbox info'");
+hop.log(r.stdout.trim());"#,
+                    Some("Monitor invite: eyJ0eX...\nSeccomp: 2"),
+                ),
+            ],
+            pitfalls: vec![
+                s("OS enforcement requires kernel support — macOS 10.15+ for Seatbelt, Linux 5.13+ for Landlock."),
+                s("Sandbox policies are enforced on the host side; a malicious binary could attempt to bypass process-level restrictions."),
+            ],
+            related: tags(&["security/sandbox-invites", "security/sandbox-roles", "security/sandbox-connect"]),
+            sub_skills: vec![],
+        },
+        Skill {
+            id: s("security/sandbox-invites"),
+            category: s("security"),
+            title: s("Sandboxed Invites"),
+            description: s("Create invite tokens with sandbox restrictions. Use --preset for common patterns or individual flags (--read-only, --no-network, --scope, --allow-command) for custom policies."),
+            tags: tags(&["sandbox", "invite", "restrict", "preset", "read-only"]),
+            prerequisites: vec![s("getting-started/inviting-peers"), s("security/sandbox-overview")],
+            examples: vec![
+                ex(
+                    "Create sandboxed invites with presets and custom flags",
+                    r#"// Monitor preset — read-only, no network, scoped paths
+const monitorInvite = await hop.exec("web-1",
+    "hop invite --preset monitor");
+hop.log(`Monitor: ${monitorInvite.stdout.trim().slice(0, 40)}...`);
+
+// Audit preset — read-only, no network, full read
+const auditInvite = await hop.exec("web-1",
+    "hop invite --preset audit");
+hop.log(`Audit: ${auditInvite.stdout.trim().slice(0, 40)}...`);
+
+// Custom: read-only, scoped to /var/log, only allow log commands
+const customInvite = await hop.exec("web-1",
+    "hop invite --read-only --scope /var/log --allow-command cat --allow-command grep --allow-command tail");
+hop.log(`Custom: ${customInvite.stdout.trim().slice(0, 40)}...`);"#,
+                    Some("Monitor: eyJ0eXAiOiJpbnZpdGUiLCJub2RlX2lk...\nAudit: eyJ0eXAiOiJpbnZpdGUiLCJub2RlX2lk...\nCustom: eyJ0eXAiOiJpbnZpdGUiLCJub2RlX2lk..."),
+                ),
+            ],
+            pitfalls: vec![
+                s("Preset flags and individual flags can be combined — individual flags override the preset."),
+                s("Sandbox restrictions cannot be loosened after the invite is created."),
+            ],
+            related: tags(&["security/sandbox-overview", "getting-started/inviting-peers", "admin/remote-invite"]),
+            sub_skills: vec![],
+        },
+        Skill {
+            id: s("security/sandbox-roles"),
+            category: s("security"),
+            title: s("Role-Based Sandbox"),
+            description: s("Assign sandbox policies to fleet roles. The security role defaults to audit (read-only, no network), CI defaults to deploy (scoped write, dangerous commands blocked). Custom sandbox policies can be set per role."),
+            tags: tags(&["sandbox", "role", "rbac", "fleet", "policy"]),
+            prerequisites: vec![s("roles/creating-roles"), s("security/sandbox-overview")],
+            examples: vec![
+                ex(
+                    "Inspect and update role sandbox policies",
+                    r#"// List roles and their sandbox settings
+const roles = await hop.roles.list("orchestrator");
+for (const role of roles) {
+    const sb = role.sandbox || {};
+    const flags = [];
+    if (sb.read_only) flags.push("read-only");
+    if (sb.no_network) flags.push("no-network");
+    if (sb.denied_commands?.length) flags.push(`${sb.denied_commands.length} denied cmds`);
+    hop.log(`${role.name}: ${flags.length ? flags.join(", ") : "unrestricted"}`);
+}
+
+// Update a role's sandbox policy
+await hop.roles.update("orchestrator", "intern", {
+    sandbox: { read_only: true, no_network: true }
+});
+hop.log("Updated intern role with audit sandbox");"#,
+                    Some("admin: unrestricted\nops: unrestricted\ndeveloper: unrestricted\nsecurity: read-only, no-network, 18 denied cmds\nci: 18 denied cmds\nUpdated intern role with audit sandbox"),
+                ),
+            ],
+            pitfalls: vec![
+                s("Role sandbox applies to all peers with that role — test changes before applying broadly."),
+                s("Existing sessions are not affected; sandbox applies to new connections only."),
+            ],
+            related: tags(&["security/sandbox-overview", "roles/creating-roles", "roles/updating-roles"]),
+            sub_skills: vec![],
+        },
+        Skill {
+            id: s("security/sandbox-connect"),
+            category: s("security"),
+            title: s("Client Self-Restriction"),
+            description: s("Clients can request additional sandbox restrictions when connecting. The host merges the client request with its stored policy — restrictions can only be tightened, never loosened. Useful for AI agents or automation that want to self-limit their access."),
+            tags: tags(&["sandbox", "client", "connect", "self-restrict", "merge"]),
+            prerequisites: vec![s("getting-started/connecting"), s("security/sandbox-overview")],
+            examples: vec![
+                ex(
+                    "Connect with client-requested sandbox restrictions",
+                    r#"// Connect to a host in read-only mode
+const r1 = await hop.exec("web-1", "hop web-1 --read-only -- ls /tmp");
+hop.log(r1.stdout.trim());
+
+// Connect with monitor preset
+const r2 = await hop.exec("web-1", "hop web-1 --preset monitor -- ps aux | head -5");
+hop.log(r2.stdout.trim());
+
+// Execute a command with no-network restriction
+const r3 = await hop.exec("web-1", "hop web-1 --no-network -- curl example.com 2>&1 || echo 'blocked'");
+hop.log(r3.stdout.trim());"#,
+                    Some("file1.txt  file2.txt\nUSER       PID %CPU %MEM COMMAND\nroot         1  0.0  0.1 /sbin/init\nblocked"),
+                ),
+            ],
+            pitfalls: vec![
+                s("Client restrictions are merged with the host policy — the strictest combination always wins."),
+                s("If the host already enforces a restriction, the client cannot loosen it."),
+            ],
+            related: tags(&["security/sandbox-overview", "security/sandbox-invites", "getting-started/connecting"]),
+            sub_skills: vec![],
+        },
     ]
 }

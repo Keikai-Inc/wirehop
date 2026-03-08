@@ -7,7 +7,7 @@ pub fn skills() -> Vec<Skill> {
             id: s("admin/remote-invite"),
             category: s("admin"),
             title: s("Remote Invite Generation"),
-            description: s("Create invite tokens on remote hosts. Useful for managing access to hosts you administer without needing local console access."),
+            description: s("Create invite tokens on remote hosts with optional sandbox restrictions. Useful for managing access to hosts you administer without needing local console access. Supports --preset (monitor/audit/deploy) and individual flags (--read-only, --no-network, --scope)."),
             tags: tags(&["invite", "remote", "admin", "access", "token"]),
             prerequisites: vec![s("getting-started/inviting-peers"), s("getting-started/hosting")],
             examples: vec![

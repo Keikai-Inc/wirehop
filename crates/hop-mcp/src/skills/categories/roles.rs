@@ -7,12 +7,12 @@ pub fn skills() -> Vec<Skill> {
             id: s("roles/creating-roles"),
             category: s("roles"),
             title: s("Creating Roles"),
-            description: s("Create RBAC role definitions that control what peers can do on hosts. Roles define allowed commands, file access patterns, and which hosts they apply to via tag matching."),
+            description: s("Create RBAC role definitions that control what peers can do on hosts. Roles define allowed commands, file access patterns, which hosts they apply to via tag matching, and optional sandbox policies (read-only, no-network, scoped paths)."),
             tags: tags(&["rbac", "role", "create", "permissions", "access-control"]),
             prerequisites: vec![s("getting-started/hosting")],
             examples: vec![
                 ex(
-                    "Create a developer role",
+                    "Create a developer role with sandbox policy",
                     r#"const roleId = await hop.roles.create("orchestrator", {
     name: "developer",
     description: "Web application developers",
@@ -23,9 +23,18 @@ pub fn skills() -> Vec<Skill> {
     allowFileWrite: false,
     userMode: "shared",
     sharedUser: "deploy",
+    sandbox: { read_only: false, no_network: false },  // unrestricted (default)
 });
-hop.log(`Created role: ${roleId}`);"#,
-                    Some("Created role: developer"),
+hop.log(`Created role: ${roleId}`);
+
+// Create a security role with audit sandbox
+const secId = await hop.roles.create("orchestrator", {
+    name: "security-auditor",
+    matchTags: ["production", "staging"],
+    sandbox: { read_only: true, no_network: true },  // audit preset
+});
+hop.log(`Created role: ${secId}`);"#,
+                    Some("Created role: developer\nCreated role: security-auditor"),
                 ),
             ],
             pitfalls: vec![

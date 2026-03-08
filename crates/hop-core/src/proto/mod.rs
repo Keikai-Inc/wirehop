@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::PeerRole;
+use crate::sandbox::policy::{sandbox_is_unrestricted, SandboxPolicy};
 
 /// ALPN protocol identifier for hop connections (legacy).
 pub const ALPN_V0: &[u8] = b"hop/0";
@@ -66,6 +67,16 @@ pub enum ClientMessage {
     RequestTransfer(TransferRequest),
     /// Request a remote command execution session (after auth).
     RequestExec { command: String },
+    /// Request a shell session with optional persistence and client-requested sandbox.
+    RequestShellV3 {
+        session_id: Option<String>,
+        sandbox: SandboxPolicy,
+    },
+    /// Request a remote command execution with client-requested sandbox.
+    RequestExecV2 {
+        command: String,
+        sandbox: SandboxPolicy,
+    },
     /// Client environment variables (TERM, LANG, LC_*, COLORTERM).
     SetEnv { vars: HashMap<String, String> },
     /// Admin request (hop/2+). Requires creator role.
@@ -212,6 +223,9 @@ pub struct RoleDefinition {
     pub groups: Vec<String>,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Sandbox policy enforced for peers with this role.
+    #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
+    pub sandbox: SandboxPolicy,
 }
 
 /// Whether users for a role get individual or shared Unix accounts.
@@ -233,6 +247,7 @@ pub struct RoleUpdates {
     pub groups: Option<Vec<String>>,
     pub shell: Option<Option<String>>,
     pub user_mode: Option<UserMode>,
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 /// Entry returned when redeeming an aggregate invite.

@@ -78,6 +78,14 @@ hop.log(token);"#,
 hop.log(`Developer invite (expires in 24h): ${token}`);"#,
                     Some("Developer invite (expires in 24h): hop://invite/eyJyb2xlIjoi..."),
                 ),
+                ex(
+                    "Generate sandboxed invite (read-only monitoring)",
+                    r#"// Use --preset flag for common sandbox configurations
+const token = await hop.exec("localhost", "hop invite --preset monitor");
+hop.log(`Monitor invite: ${token.stdout.trim()}`);
+// Presets: monitor (read-only, no network, scoped), audit (read-only, no network), deploy (scoped write)"#,
+                    Some("Monitor invite: eyJ0eXAiOiJpbnZpdGUi..."),
+                ),
             ],
             pitfalls: vec![
                 s("Invite tokens are single-use by default — generate one per peer."),

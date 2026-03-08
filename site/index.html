@@ -312,6 +312,14 @@
           <h3>Fleet Management</h3>
           <p>Manage dozens to thousands of machines with role-based access, tagging, and aggregate invites. <a href="fleet.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">Learn more &rarr;</a></p>
         </div>
+
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <h3>Kernel-Level Sandboxing</h3>
+          <p>Restrict peers to read-only, no-network, or scoped paths. OS-native enforcement via macOS Seatbelt and Linux Landlock. Use presets (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code>) or custom policies. Clients can self-restrict for defense-in-depth.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -369,6 +377,11 @@
           <div class="comparison-cell comparison-label">AI integration</div>
           <div class="comparison-cell hop-col">Built-in MCP server</div>
           <div class="comparison-cell comparison-other">None (external tools only)</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Kernel sandboxing</div>
+          <div class="comparison-cell hop-col">Built-in (Seatbelt / Landlock)</div>
+          <div class="comparison-cell comparison-other">Manual config (SELinux, AppArmor)</div>
         </div>
       </div>
     </div>
@@ -584,6 +597,7 @@
             <li><strong style="color: var(--color-text);">Built-in Skills Library</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_skills</code> provides 80+ searchable skills across 12 categories (fleet, security, monitoring, and more)</li>
             <li><strong style="color: var(--color-text);">Works with Claude Code, Cursor, etc.</strong> &mdash; Standard MCP protocol, plug into any compatible AI tool</li>
             <li><strong style="color: var(--color-text);">Safe by Design</strong> &mdash; Memory limits, timeouts, no shell escape&mdash;agents operate within defined boundaries</li>
+            <li><strong style="color: var(--color-text);">Sandbox Presets</strong> &mdash; Restrict AI agents to read-only monitoring, auditing, or scoped deploys with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--preset monitor|audit|deploy</code>. Clients can self-restrict for defense-in-depth</li>
           </ul>
         </div>
 
