@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::proto::{self, ClientMessage, HostMessage};
-use session_registry::{DetachedSession, SessionKey, SessionRegistry};
+use session_registry::{DetachedSession, RegistryHandle, SessionKey};
 
 /// Outcome of a client shell session.
 #[derive(Debug)]
@@ -638,7 +638,7 @@ pub async fn host_shell_session_persistent(
     username: Option<&str>,
     peer_id: &str,
     _requested_session_id: Option<String>,
-    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    registry: RegistryHandle,
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
 ) -> Result<()> {
@@ -654,45 +654,24 @@ pub async fn host_shell_session_persistent(
     // Channel for receiving routed PTY output during this attachment.
     let (client_output_tx, mut client_output_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    // Phase 1: Check if we can resume an existing session (short lock).
-    // Phase 2: If not, spawn a new PTY *outside* the lock, then re-lock to insert.
-    //
-    // IMPORTANT: PTY spawn must NEVER happen while holding the registry
-    // mutex. If spawn blocks (PTY exhaustion, fork delay, etc.) the lock
-    // would be held indefinitely, dead-locking all other sessions.
-    // Phase 1: Check if we can resume an existing session (short lock).
-    let can_resume = {
-        let reg = registry.lock().await;
-        reg.lookup(&key).map(|s| !s.has_exited()).unwrap_or(false)
-    };
+    // Check if we can resume an existing session.
+    let can_resume = registry.check_resume(key.clone()).await;
 
-    // Phase 2: Either resume or spawn a new PTY.
-    //
-    // IMPORTANT: PTY spawn must NEVER happen while holding the registry
-    // mutex. If spawn blocks (PTY exhaustion, fork delay, etc.) the lock
-    // would be held indefinitely, dead-locking all other sessions.
+    // Either attach to the existing session or spawn a new PTY.
+    // PTY spawn happens outside the actor — no lock to hold, can't deadlock.
     let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch) = if can_resume {
-        let mut reg = registry.lock().await;
-        // Re-check under lock (another task may have removed it).
-        let still_resumable = reg.lookup(&key).map(|s| !s.has_exited()).unwrap_or(false);
-        if still_resumable {
-            let session = reg.lookup_mut(&key).unwrap();
-            session.resize(initial_size);
-            let epoch = session.attach(client_output_tx);
-            let r = (
-                session.session_id.clone(),
+        if let Some(result) = registry.attach(key.clone(), client_output_tx.clone(), initial_size).await {
+            (
+                result.session_id,
                 true,
-                session.input_tx.clone(),
-                session.resize_tx.clone(),
-                session.exit_rx.clone(),
-                epoch,
-            );
-            r
+                result.input_tx,
+                result.resize_tx,
+                result.exit_rx,
+                result.attach_epoch,
+            )
         } else {
-            // Race: session was removed between our two lock acquisitions.
-            // Fall through to create a new one.
-            reg.remove(&key);
-            drop(reg);
+            // Race: session was removed between check and attach. Spawn new.
+            registry.remove_stale(key.clone()).await;
 
             let (sid, itx, output_route, rtx, erx) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
@@ -708,16 +687,12 @@ pub async fn host_shell_session_persistent(
                 attach_epoch: 1,
                 broker_handle: None,
             };
-            let mut reg = registry.lock().await;
-            reg.insert(key.clone(), session);
+            registry.insert(key.clone(), session).await;
             (sid, false, itx, rtx, erx, 1u64)
         }
     } else {
-        // No session to resume — spawn a new PTY outside the lock.
-        {
-            let mut reg = registry.lock().await;
-            reg.remove(&key);
-        }
+        // No session to resume — remove any stale entry, spawn a new PTY.
+        registry.remove_stale(key.clone()).await;
 
         let (sid, itx, output_route, rtx, erx) =
             spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
@@ -733,8 +708,7 @@ pub async fn host_shell_session_persistent(
             attach_epoch: 1,
             broker_handle: None,
         };
-        let mut reg = registry.lock().await;
-        reg.insert(key.clone(), session);
+        registry.insert(key.clone(), session).await;
         (sid, false, itx, rtx, erx, 1u64)
     };
 
@@ -750,10 +724,7 @@ pub async fn host_shell_session_persistent(
         .await
         {
             Ok(handle) => {
-                let mut reg = registry.lock().await;
-                if let Some(session) = reg.lookup_mut(&key) {
-                    session.broker_handle = Some(handle);
-                }
+                registry.set_broker_handle(key.clone(), handle).await;
             }
             Err(e) => {
                 tracing::warn!("Failed to start broker: {e}");
@@ -792,15 +763,11 @@ pub async fn host_shell_session_persistent(
 
     match outcome {
         AttachOutcome::Exited => {
-            let mut reg = registry.lock().await;
-            // Only clean up if we're still the current attachment.
-            if reg.lookup(&key).map(|s| s.attach_epoch == attach_epoch).unwrap_or(false) {
-                if let Some(session) = reg.remove(&key) {
-                    if let Some(handle) = session.broker_handle {
-                        handle.abort();
-                    }
-                    crate::sandbox::broker::cleanup_broker(config_dir, &session.session_id);
+            if let Some(result) = registry.cleanup_exited(key.clone(), attach_epoch).await {
+                if let Some(handle) = result.broker_handle {
+                    handle.abort();
                 }
+                crate::sandbox::broker::cleanup_broker(config_dir, &result.session_id);
             }
             let _ = send.finish();
             let _ = tokio::time::timeout(
@@ -810,10 +777,7 @@ pub async fn host_shell_session_persistent(
             .await;
         }
         AttachOutcome::Disconnected => {
-            let mut reg = registry.lock().await;
-            // Only detach if we're still the current attachment.
-            // A newer connection may have already taken over.
-            if reg.detach_if_current(&key, attach_epoch) {
+            if registry.detach_if_current(key.clone(), attach_epoch).await {
                 tracing::info!(
                     "Session {} detached for peer {}",
                     &session_id[..8],

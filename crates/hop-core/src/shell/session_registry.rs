@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use portable_pty::PtySize;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Key identifying a session: one session per (peer_id, username) pair.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -167,6 +167,236 @@ impl SessionRegistry {
         if let Some(key) = oldest {
             tracing::info!("Evicting oldest detached session for {:?} (at capacity)", key);
             self.sessions.remove(&key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Actor pattern: RegistryHandle + RegistryCommand + actor loop
+// ---------------------------------------------------------------------------
+
+/// Result of attaching to an existing session.
+pub struct AttachResult {
+    pub session_id: String,
+    pub input_tx: mpsc::Sender<Vec<u8>>,
+    pub resize_tx: mpsc::Sender<PtySize>,
+    pub exit_rx: watch::Receiver<Option<i32>>,
+    pub attach_epoch: u64,
+}
+
+/// Info returned when cleaning up an exited session.
+pub struct CleanupResult {
+    pub session_id: String,
+    pub broker_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Commands processed by the registry actor.
+pub enum RegistryCommand {
+    CheckResume {
+        key: SessionKey,
+        reply: oneshot::Sender<bool>,
+    },
+    Attach {
+        key: SessionKey,
+        client_tx: mpsc::Sender<Vec<u8>>,
+        size: PtySize,
+        reply: oneshot::Sender<Option<AttachResult>>,
+    },
+    RemoveStale {
+        key: SessionKey,
+    },
+    Insert {
+        key: SessionKey,
+        session: DetachedSession,
+    },
+    SetBrokerHandle {
+        key: SessionKey,
+        handle: tokio::task::JoinHandle<()>,
+    },
+    CleanupExited {
+        key: SessionKey,
+        epoch: u64,
+        reply: oneshot::Sender<Option<CleanupResult>>,
+    },
+    DetachIfCurrent {
+        key: SessionKey,
+        epoch: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    ReapExpired,
+}
+
+/// Cloneable handle to the registry actor.
+#[derive(Clone)]
+pub struct RegistryHandle {
+    tx: mpsc::Sender<RegistryCommand>,
+}
+
+impl RegistryHandle {
+    fn new(tx: mpsc::Sender<RegistryCommand>) -> Self {
+        Self { tx }
+    }
+
+    /// Check if a resumable (non-exited) session exists for the given key.
+    pub async fn check_resume(&self, key: SessionKey) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(RegistryCommand::CheckResume { key, reply }).await;
+        rx.await.unwrap_or(false)
+    }
+
+    /// Attach to an existing session: resize, route output, bump epoch.
+    /// Returns `None` if the session doesn't exist or has exited.
+    pub async fn attach(
+        &self,
+        key: SessionKey,
+        client_tx: mpsc::Sender<Vec<u8>>,
+        size: PtySize,
+    ) -> Option<AttachResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RegistryCommand::Attach {
+                key,
+                client_tx,
+                size,
+                reply,
+            })
+            .await;
+        rx.await.unwrap_or(None)
+    }
+
+    /// Remove a stale/exited session (fire-and-forget).
+    pub async fn remove_stale(&self, key: SessionKey) {
+        let _ = self.tx.send(RegistryCommand::RemoveStale { key }).await;
+    }
+
+    /// Insert a newly spawned session (fire-and-forget).
+    pub async fn insert(&self, key: SessionKey, session: DetachedSession) {
+        let _ = self
+            .tx
+            .send(RegistryCommand::Insert { key, session })
+            .await;
+    }
+
+    /// Set the broker handle on an existing session (fire-and-forget).
+    pub async fn set_broker_handle(&self, key: SessionKey, handle: tokio::task::JoinHandle<()>) {
+        let _ = self
+            .tx
+            .send(RegistryCommand::SetBrokerHandle { key, handle })
+            .await;
+    }
+
+    /// Remove a session if we're still the current attachment (epoch matches).
+    /// Returns the session's broker handle and ID for cleanup.
+    pub async fn cleanup_exited(
+        &self,
+        key: SessionKey,
+        epoch: u64,
+    ) -> Option<CleanupResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RegistryCommand::CleanupExited { key, epoch, reply })
+            .await;
+        rx.await.unwrap_or(None)
+    }
+
+    /// Detach a session only if the given epoch is still current.
+    pub async fn detach_if_current(&self, key: SessionKey, epoch: u64) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RegistryCommand::DetachIfCurrent { key, epoch, reply })
+            .await;
+        rx.await.unwrap_or(false)
+    }
+
+    /// Trigger a reap of expired/exited sessions (fire-and-forget).
+    pub async fn reap_expired(&self) {
+        let _ = self.tx.send(RegistryCommand::ReapExpired).await;
+    }
+}
+
+/// Spawn the registry actor task and return a handle to it.
+pub fn spawn_registry_actor(timeout: Duration, max_sessions: usize) -> RegistryHandle {
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(run_registry_actor(rx, timeout, max_sessions));
+    RegistryHandle::new(tx)
+}
+
+/// The actor loop: owns `SessionRegistry`, processes commands sequentially.
+async fn run_registry_actor(
+    mut rx: mpsc::Receiver<RegistryCommand>,
+    timeout: Duration,
+    max_sessions: usize,
+) {
+    let mut registry = SessionRegistry::new(timeout, max_sessions);
+
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            RegistryCommand::CheckResume { key, reply } => {
+                let resumable = registry
+                    .lookup(&key)
+                    .map(|s| !s.has_exited())
+                    .unwrap_or(false);
+                let _ = reply.send(resumable);
+            }
+            RegistryCommand::Attach {
+                key,
+                client_tx,
+                size,
+                reply,
+            } => {
+                let result = if registry
+                    .lookup(&key)
+                    .map(|s| !s.has_exited())
+                    .unwrap_or(false)
+                {
+                    let session = registry.lookup_mut(&key).unwrap();
+                    session.resize(size);
+                    let epoch = session.attach(client_tx);
+                    Some(AttachResult {
+                        session_id: session.session_id.clone(),
+                        input_tx: session.input_tx.clone(),
+                        resize_tx: session.resize_tx.clone(),
+                        exit_rx: session.exit_rx.clone(),
+                        attach_epoch: epoch,
+                    })
+                } else {
+                    None
+                };
+                let _ = reply.send(result);
+            }
+            RegistryCommand::RemoveStale { key } => {
+                registry.remove(&key);
+            }
+            RegistryCommand::Insert { key, session } => {
+                registry.insert(key, session);
+            }
+            RegistryCommand::SetBrokerHandle { key, handle } => {
+                if let Some(session) = registry.lookup_mut(&key) {
+                    session.broker_handle = Some(handle);
+                }
+            }
+            RegistryCommand::CleanupExited { key, epoch, reply } => {
+                let result =
+                    if registry.lookup(&key).map(|s| s.attach_epoch == epoch).unwrap_or(false) {
+                        registry.remove(&key).map(|s| CleanupResult {
+                            session_id: s.session_id,
+                            broker_handle: s.broker_handle,
+                        })
+                    } else {
+                        None
+                    };
+                let _ = reply.send(result);
+            }
+            RegistryCommand::DetachIfCurrent { key, epoch, reply } => {
+                let detached = registry.detach_if_current(&key, epoch);
+                let _ = reply.send(detached);
+            }
+            RegistryCommand::ReapExpired => {
+                registry.reap_expired();
+            }
         }
     }
 }

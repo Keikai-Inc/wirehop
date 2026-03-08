@@ -7,7 +7,6 @@ mod reconnect;
 
 use std::collections::HashSet;
 use std::io::Read;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,7 +26,7 @@ use hop_core::proto::{
     TransferDirection, TransferMode, TransferMsg, TransferRequest,
 };
 use hop_core::shell::{self, SessionOutcome};
-use hop_core::shell::session_registry::SessionRegistry;
+use hop_core::shell::session_registry::{self as session_registry, RegistryHandle};
 use hop_core::transfer::{self, PathSpec};
 
 #[tokio::main]
@@ -326,13 +325,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         host_config.max_sessions
     );
 
-    // Session registry for persistent PTY sessions
-    let registry = Arc::new(tokio::sync::Mutex::new(
-        SessionRegistry::new(
-            Duration::from_secs(host_config.session_timeout_secs),
-            host_config.max_sessions,
-        ),
-    ));
+    // Session registry actor for persistent PTY sessions
+    let registry = session_registry::spawn_registry_actor(
+        Duration::from_secs(host_config.session_timeout_secs),
+        host_config.max_sessions,
+    );
 
     // Spawn reaper task: every 30s, remove expired/exited sessions
     {
@@ -341,7 +338,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                registry.lock().await.reap_expired();
+                registry.reap_expired().await;
             }
         });
     }
@@ -363,7 +360,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
-    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    registry: RegistryHandle,
 ) -> Result<()> {
     let conn: iroh::endpoint::Connection = incoming.await?;
     let remote_id = conn.remote_id();
@@ -468,7 +465,7 @@ async fn dispatch_session(
     role: &config::PeerRole,
     sandbox: &hop_core::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
-    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    registry: RegistryHandle,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
