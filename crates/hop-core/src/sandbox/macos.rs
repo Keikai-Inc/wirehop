@@ -19,6 +19,7 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
     // Always allow process execution and basic operations
     p.push_str("(allow process-exec)\n");
     p.push_str("(allow process-fork)\n");
+    p.push_str("(allow process-info*)\n"); // needed by ps, top, htop, etc.
     p.push_str("(allow signal)\n");
     p.push_str("(allow sysctl-read)\n");
     p.push_str("(allow mach-lookup)\n");
