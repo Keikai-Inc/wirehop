@@ -151,6 +151,9 @@ async fn main() -> Result<()> {
         Command::SandboxShell { policy, shell_args } => {
             cmd_sandbox_shell(&policy, &shell_args)
         }
+        Command::Ps => {
+            cmd_ps()
+        }
         Command::External(args) => {
             let ext = parse_external_args(&args)?;
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -687,6 +690,165 @@ fn cmd_sandbox_shell(policy_json: &str, shell_args: &[String]) -> Result<()> {
     {
         let status = cmd.status().context("failed to run shell")?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// List processes using libproc + sysctl (works inside macOS sandbox without setuid).
+///
+/// macOS sandbox-exec strips the setuid bit from child processes, so
+/// /bin/ps (which is setuid) cannot run. This uses libproc to enumerate
+/// PIDs, then KERN_PROCARGS2 sysctl to get full command lines.
+fn cmd_ps() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
+        }
+
+        // Get all PIDs via libproc
+        let buf_size = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+        if buf_size <= 0 {
+            anyhow::bail!("proc_listallpids failed");
+        }
+        let capacity = (buf_size as usize) * 2;
+        let mut pids: Vec<i32> = vec![0i32; capacity];
+        let actual = unsafe {
+            proc_listallpids(
+                pids.as_mut_ptr() as *mut libc::c_void,
+                (capacity * std::mem::size_of::<i32>()) as libc::c_int,
+            )
+        };
+        if actual <= 0 {
+            anyhow::bail!("proc_listallpids failed");
+        }
+        pids.truncate(actual as usize);
+        pids.retain(|&p| p > 0);
+        pids.sort_unstable();
+
+        println!("{:<12} {:>7} {}", "USER", "PID", "COMMAND");
+        for &pid in &pids {
+            // Get UID via KERN_PROC/KERN_PROC_PID sysctl
+            let user = get_proc_uid(pid)
+                .and_then(|uid| resolve_username(uid))
+                .unwrap_or_else(|| "-".to_string());
+
+            // Get command name via KERN_PROCARGS2
+            let cmd = get_proc_args(pid)
+                .unwrap_or_else(|| "-".to_string());
+
+            println!("{:<12} {:>7} {}", user, pid, cmd);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On Linux, ps is not setuid — just exec it
+        let status = std::process::Command::new("ps")
+            .args(["aux"])
+            .status()
+            .context("failed to run ps")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Get the UID of a process via sysctl KERN_PROC.
+#[cfg(target_os = "macos")]
+fn get_proc_uid(pid: i32) -> Option<u32> {
+    // KERN_PROC returns an opaque kinfo_proc; the UID is at a known offset.
+    // struct kinfo_proc { struct extern_proc kp_proc; struct eproc kp_eproc; }
+    // UID is in kp_eproc.e_ucred.cr_uid.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut size: libc::size_t = 0;
+    unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 4, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0);
+    }
+    if size == 0 { return None; }
+    let mut buf: Vec<u8> = vec![0u8; size];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(), 4,
+            buf.as_mut_ptr() as *mut libc::c_void, &mut size,
+            std::ptr::null_mut(), 0,
+        )
+    };
+    if ret != 0 || size < 300 { return None; }
+
+    // On macOS (arm64/x86_64), UID (cr_uid) is at offset 304 in kinfo_proc.
+    // This is: kp_eproc (offset 296) → e_ucred (offset 0) → cr_uid (offset 8).
+    // Total: 296 + 0 + 8 = 304.
+    // We read it as a u32.
+    let uid_offset = 304usize;
+    if uid_offset + 4 > buf.len() { return None; }
+    let uid = u32::from_ne_bytes(buf[uid_offset..uid_offset + 4].try_into().ok()?);
+    Some(uid)
+}
+
+/// Resolve a UID to a username.
+#[cfg(target_os = "macos")]
+fn resolve_username(uid: u32) -> Option<String> {
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            Some(format!("{uid}"))
+        } else {
+            Some(std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().to_string())
+        }
+    }
+}
+
+/// Get the command line of a process via KERN_PROCARGS2 sysctl.
+#[cfg(target_os = "macos")]
+fn get_proc_args(pid: i32) -> Option<String> {
+    const KERN_PROCARGS2: libc::c_int = 49;
+    let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0);
+    }
+    if size == 0 { return None; }
+    let mut buf: Vec<u8> = vec![0u8; size];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(), 3,
+            buf.as_mut_ptr() as *mut libc::c_void, &mut size,
+            std::ptr::null_mut(), 0,
+        )
+    };
+    if ret != 0 { return None; }
+    buf.truncate(size);
+
+    // KERN_PROCARGS2 format: [argc: i32] [exec_path\0] [padding\0...] [argv[0]\0] [argv[1]\0] ...
+    if buf.len() < 4 { return None; }
+    let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+
+    // Find the exec_path (starts at offset 4)
+    let rest = &buf[4..];
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    let exec_path = String::from_utf8_lossy(&rest[..exec_end]).to_string();
+
+    // Skip padding nulls after exec_path
+    let mut pos = exec_end;
+    while pos < rest.len() && rest[pos] == 0 {
+        pos += 1;
+    }
+
+    // Collect argv strings
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if pos >= rest.len() { break; }
+        let arg_end = rest[pos..].iter().position(|&b| b == 0).unwrap_or(rest.len() - pos);
+        let arg = String::from_utf8_lossy(&rest[pos..pos + arg_end]).to_string();
+        args.push(arg);
+        pos += arg_end + 1;
+    }
+
+    if args.is_empty() {
+        // Fall back to exec_path basename
+        let basename = exec_path.rsplit('/').next().unwrap_or(&exec_path);
+        Some(basename.to_string())
+    } else {
+        Some(args.join(" "))
     }
 }
 

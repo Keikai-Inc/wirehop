@@ -234,6 +234,10 @@ pub enum Command {
         shell_args: Vec<String>,
     },
 
+    /// Internal: list processes without setuid (works inside macOS sandbox)
+    #[command(name = "__ps", hide = true)]
+    Ps,
+
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
     #[command(external_subcommand)]
     External(Vec<String>),
