@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# test-functions.sh — Test helper library for hop E2E tests
+#
+# Provides: run_test, assert_contains, assert_equals, assert_json_field,
+#           mcp_call, and all individual test_* functions.
+
+# ── Counters ──
+TEST_NUM=0
+PASS_COUNT=0
+FAIL_COUNT=0
+FAILURES=""
+
+# ── Test Runner ──
+
+run_test() {
+    local test_fn="$1"
+    TEST_NUM=$((TEST_NUM + 1))
+    local label="${test_fn#test_}"
+
+    # Capture output and exit code
+    local output
+    output=$("$test_fn" 2>&1) && local rc=0 || local rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        printf "  [%2d] %-30s ... PASS\n" "$TEST_NUM" "$label"
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        printf "  [%2d] %-30s ... FAIL\n" "$TEST_NUM" "$label"
+        FAILURES="${FAILURES}\n  [${TEST_NUM}] ${label}: ${output}"
+    fi
+}
+
+print_results() {
+    local total=$((PASS_COUNT + FAIL_COUNT))
+    echo ""
+    echo "  RESULTS: ${PASS_COUNT}/${total} passed, ${FAIL_COUNT} failed"
+
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        echo ""
+        echo "  FAILURES:"
+        printf '%b\n' "$FAILURES"
+        echo ""
+        exit 1
+    fi
+
+    echo ""
+    exit 0
+}
+
+# ── Assertion Helpers ──
+
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if ! echo "$haystack" | grep -qF "$needle"; then
+        echo "Expected output to contain '$needle', got: $haystack"
+        return 1
+    fi
+}
+
+assert_equals() {
+    local actual="$1"
+    local expected="$2"
+    if [ "$actual" != "$expected" ]; then
+        echo "Expected '$expected', got '$actual'"
+        return 1
+    fi
+}
+
+assert_json_field() {
+    local json="$1"
+    local field="$2"
+    local expected="$3"
+    local actual
+    actual=$(echo "$json" | jq -r "$field" 2>/dev/null)
+    if [ "$actual" != "$expected" ]; then
+        echo "JSON field $field: expected '$expected', got '$actual' (json: $json)"
+        return 1
+    fi
+}
+
+# ── MCP Helper ──
+# Each `hop mcp` invocation is a fresh process. We must send:
+#   1. initialize (has id → produces response line 1)
+#   2. notifications/initialized (no id → no response)
+#   3. actual request (has id → produces response line 2)
+# So we grab the 2nd line of output.
+
+mcp_call() {
+    local request="$1"
+    local init='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}'
+    local notif='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+    printf '%s\n%s\n%s\n' "$init" "$notif" "$request" | \
+        hop --config "$CONFIG_DIR" mcp 2>/dev/null | \
+        grep '^{' | \
+        sed -n '2p'
+}
+
+# Extract the text content from a tools/call MCP response
+mcp_result_text() {
+    local response="$1"
+    echo "$response" | jq -r '.result.content[0].text' 2>/dev/null
+}
+
+# ── Connection & Auth Tests ──
+
+test_auth_via_invite_a() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec "$INVITE_A" -- echo auth-ok 2>&1)
+    assert_contains "$output" "auth-ok"
+}
+
+test_auth_via_invite_b() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec "$INVITE_B" -- echo auth-ok 2>&1)
+    assert_contains "$output" "auth-ok"
+}
+
+# ── Remote Exec Tests ──
+
+test_exec_echo() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- echo hello 2>&1)
+    assert_contains "$output" "hello"
+}
+
+test_exec_uname() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- uname -s 2>&1)
+    assert_contains "$output" "Linux"
+}
+
+test_exec_exit_code() {
+    # hop exec joins command args with spaces, so sh -c "exit 42" loses quoting.
+    # Use `false` which reliably exits with code 1.
+    local rc=0
+    hop --config "$CONFIG_DIR" exec host-a -- false 2>&1 || rc=$?
+    assert_equals "$rc" "1"
+}
+
+test_exec_multiword() {
+    # hop exec joins args with spaces, so avoid sh -c quoting.
+    # "echo hello world" works because join produces "echo hello world".
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- echo hello world 2>&1)
+    assert_contains "$output" "hello world"
+}
+
+test_exec_on_host_b() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-b -- echo hello 2>&1)
+    assert_contains "$output" "hello"
+}
+
+# ── MCP Protocol Tests ──
+
+test_mcp_initialize() {
+    local init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"1.0"}}}'
+    local response
+    response=$(printf '%s\n' "$init" | hop --config "$CONFIG_DIR" mcp 2>/dev/null | grep '^{' | head -1)
+
+    assert_json_field "$response" '.result.protocolVersion' "2024-11-05"
+    assert_json_field "$response" '.result.serverInfo.name' "hop-mcp"
+}
+
+test_mcp_tools_list() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    local response
+    response=$(mcp_call "$request")
+
+    # Should have 4 tools when datastore is available: hop_exec, hop_skills, hop_data, hop_cron
+    local tool_count
+    tool_count=$(echo "$response" | jq '.result.tools | length' 2>/dev/null)
+    assert_equals "$tool_count" "4"
+
+    # Verify tool names exist
+    local tool_names
+    tool_names=$(echo "$response" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ',')
+    assert_contains "$tool_names" "hop_exec"
+    assert_contains "$tool_names" "hop_data"
+    assert_contains "$tool_names" "hop_cron"
+    assert_contains "$tool_names" "hop_skills"
+}
+
+test_mcp_hop_exec_js() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"return 1+1"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "2"
+}
+
+# ── Datastore KV Tests ──
+
+test_mcp_kv_set() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"kv_set","namespace":"e2e","key":"greeting","value":"hello"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"ok":true'
+}
+
+test_mcp_kv_get() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"kv_get","namespace":"e2e","key":"greeting"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "hello"
+}
+
+test_mcp_kv_list() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"kv_list","namespace":"e2e"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "greeting"
+}
+
+test_mcp_kv_delete() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"kv_delete","namespace":"e2e","key":"greeting"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"deleted":true'
+}
+
+# ── Datastore Time-Series Tests ──
+
+test_mcp_ts_insert() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"ts_insert","metric":"cpu.temp","value":72.5,"tags":{"host":"test"}}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"ok":true'
+}
+
+test_mcp_ts_query() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"ts_query","metric":"cpu.temp"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "72.5"
+}
+
+test_mcp_ts_latest() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"ts_latest","metric":"cpu.temp"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "72.5"
+    assert_contains "$text" "test"
+}
+
+# ── Cron Tests ──
+# We store the job_id in a file so subsequent tests can reference it.
+CRON_JOB_ID_FILE="/tmp/e2e_cron_job_id"
+
+test_mcp_cron_create() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"create","name":"test-job","schedule":"0 0 * * * *","script":"return 1"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "job_id"
+
+    # Save job_id for later tests
+    local job_id
+    job_id=$(echo "$text" | jq -r '.job_id' 2>/dev/null)
+    echo "$job_id" > "$CRON_JOB_ID_FILE"
+}
+
+test_mcp_cron_list() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"list"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "test-job"
+}
+
+test_mcp_cron_delete() {
+    local job_id
+    job_id=$(cat "$CRON_JOB_ID_FILE" 2>/dev/null)
+    if [ -z "$job_id" ]; then
+        echo "No job_id found from cron_create test"
+        return 1
+    fi
+
+    local request
+    request=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_cron","arguments":{"action":"delete","job_id":"%s"}}}' "$job_id")
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" '"deleted":true'
+}
+
+# ── File Transfer Tests ──
+
+test_cp_push() {
+    # Write a local file
+    echo "e2e-push-test-content" > /tmp/e2e-push.txt
+
+    # Push to host-a's /tmp/ directory (not a specific filename —
+    # hop cp treats non-existing dest paths as directories)
+    hop --config "$CONFIG_DIR" cp /tmp/e2e-push.txt host-a:/tmp/ 2>&1
+
+    # Verify by reading it back via exec
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-push.txt 2>&1)
+    assert_contains "$output" "e2e-push-test-content"
+}
+
+test_cp_pull() {
+    # The push test already placed e2e-push.txt on host-a.
+    # Remove local copy and pull it back.
+    rm -f /tmp/e2e-push.txt
+
+    # Pull from host-a to local /tmp/
+    hop --config "$CONFIG_DIR" cp host-a:/tmp/e2e-push.txt /tmp/ 2>&1
+
+    # Verify local content
+    local content
+    content=$(cat /tmp/e2e-push.txt)
+    assert_contains "$content" "e2e-push-test-content"
+}
