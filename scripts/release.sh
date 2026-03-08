@@ -125,6 +125,10 @@ if [[ "${SITE_ONLY}" == true ]]; then
     --content-type "text/html"
   aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
     --content-type "text/html"
+  aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
+    --content-type "text/css"
+  aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
+    --content-type "application/javascript"
 
   for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
     if [[ -f "${PROJECT_ROOT}/site/${asset}" ]]; then
@@ -138,7 +142,8 @@ if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
-    --paths "/" "/index.html" "/fleet.html" "/favicon.ico" "/favicon-32x32.png" \
+    --paths "/" "/index.html" "/fleet.html" "/shared.css" "/shared.js" \
+      "/favicon.ico" "/favicon-32x32.png" \
       "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" \
     --output text --query 'Invalidation.Id'
 
@@ -242,6 +247,10 @@ aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
   --content-type "text/html"
 aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
   --content-type "text/html"
+aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
+  --content-type "text/css"
+aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
+  --content-type "application/javascript"
 
 echo "==> Uploading site assets"
 for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
@@ -271,7 +280,8 @@ git -C "${PROJECT_ROOT}" push --tags
 echo "==> Invalidating CloudFront cache"
 aws cloudfront create-invalidation \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
-  --paths "/" "/index.html" "/fleet.html" "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
+  --paths "/" "/index.html" "/fleet.html" "/shared.css" "/shared.js" \
+    "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
     "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" \
     "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*" \
   --output text --query 'Invalidation.Id'
