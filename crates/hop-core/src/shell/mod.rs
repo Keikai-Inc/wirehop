@@ -455,14 +455,20 @@ fn spawn_persistent_pty(
 
     // On macOS, when sandbox is restricted, set up broker shim directory
     // so the sandboxed shell can proxy setuid-blocked commands through the daemon.
+    //
+    // We can't use cmd.env("PATH", ...) because login shell profile scripts
+    // (path_helper via /etc/zprofile) replace PATH entirely. Instead, we use
+    // ZDOTDIR to inject a .zprofile that prepends the shim dir AFTER the
+    // system profile scripts have already rebuilt PATH.
     #[cfg(target_os = "macos")]
     if sandbox.is_restricted() {
-        if let Ok(shim_bin_dir) = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id) {
-            let sock_path = crate::sandbox::broker::broker_sock_path(config_dir, &session_id);
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{}", shim_bin_dir.display(), current_path));
-            cmd.env("HOP_BROKER_SOCK", sock_path.to_string_lossy().as_ref());
+        let _ = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id);
+        if let Ok(zdotdir) = crate::sandbox::broker::setup_zdotdir(config_dir, &session_id) {
+            cmd.env("ZDOTDIR", zdotdir.to_string_lossy().as_ref());
         }
+        // Set HOP_BROKER_SOCK as fallback for non-zsh shells
+        let sock_path = crate::sandbox::broker::broker_sock_path(config_dir, &session_id);
+        cmd.env("HOP_BROKER_SOCK", sock_path.to_string_lossy().as_ref());
     }
 
     let mut child = pair

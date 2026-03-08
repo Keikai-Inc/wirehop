@@ -149,6 +149,62 @@ pub fn setup_shim_dir(config_dir: &Path, session_id: &str) -> anyhow::Result<Pat
     Ok(dir)
 }
 
+/// Create a zsh ZDOTDIR that injects broker PATH after login profile scripts.
+///
+/// On macOS, `zsh -l` sources `/etc/zprofile` which runs `path_helper`,
+/// replacing PATH entirely from `/etc/paths` and `/etc/paths.d/`. Any PATH
+/// set via `cmd.env()` before the shell starts gets wiped out.
+///
+/// ZDOTDIR tells zsh to read dotfiles from our directory instead of `$HOME`.
+/// Our `.zprofile` runs AFTER `/etc/zprofile`, so we can prepend the shim dir
+/// to the already-rebuilt PATH. We also source the user's real dotfiles so
+/// their prompt, aliases, etc. still work.
+///
+/// Returns the zdotdir path to set as the `ZDOTDIR` environment variable.
+pub fn setup_zdotdir(config_dir: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+    let zdir = broker_dir(config_dir, session_id).join("zdotdir");
+    std::fs::create_dir_all(&zdir)?;
+
+    let shim_dir = shim_bin_dir(config_dir, session_id);
+    let sock_path = broker_sock_path(config_dir, session_id);
+
+    // .zshenv — sourced first for ALL zsh invocations.
+    // Source the user's real .zshenv from $HOME.
+    std::fs::write(
+        zdir.join(".zshenv"),
+        "[ -f \"$HOME/.zshenv\" ] && . \"$HOME/.zshenv\"\n",
+    )?;
+
+    // .zprofile — sourced for login shells AFTER /etc/zprofile (path_helper).
+    // This is where we prepend the shim dir to the rebuilt PATH.
+    std::fs::write(
+        zdir.join(".zprofile"),
+        format!(
+            concat!(
+                "[ -f \"$HOME/.zprofile\" ] && . \"$HOME/.zprofile\"\n",
+                "export PATH=\"{}:$PATH\"\n",
+                "export HOP_BROKER_SOCK=\"{}\"\n",
+            ),
+            shim_dir.display(),
+            sock_path.display(),
+        ),
+    )?;
+
+    // .zshrc — sourced for interactive shells.
+    std::fs::write(
+        zdir.join(".zshrc"),
+        "[ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"\n",
+    )?;
+
+    // .zlogin — sourced last for login shells.
+    std::fs::write(
+        zdir.join(".zlogin"),
+        "[ -f \"$HOME/.zlogin\" ] && . \"$HOME/.zlogin\"\n",
+    )?;
+
+    Ok(zdir)
+}
+
 // ---------------------------------------------------------------------------
 // Broker server (runs in the daemon, unsandboxed)
 // ---------------------------------------------------------------------------
