@@ -654,44 +654,49 @@ pub async fn host_shell_session_persistent(
     // Channel for receiving routed PTY output during this attachment.
     let (client_output_tx, mut client_output_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    let (session_id, resumed, input_tx, resize_tx, mut exit_rx) = {
+    // Phase 1: Check if we can resume an existing session (short lock).
+    // Phase 2: If not, spawn a new PTY *outside* the lock, then re-lock to insert.
+    //
+    // IMPORTANT: PTY spawn must NEVER happen while holding the registry
+    // mutex. If spawn blocks (PTY exhaustion, fork delay, etc.) the lock
+    // would be held indefinitely, dead-locking all other sessions.
+    // Phase 1: Check if we can resume an existing session (short lock).
+    let can_resume = {
+        let reg = registry.lock().await;
+        reg.lookup(&key).map(|s| !s.has_exited()).unwrap_or(false)
+    };
+
+    // Phase 2: Either resume or spawn a new PTY.
+    //
+    // IMPORTANT: PTY spawn must NEVER happen while holding the registry
+    // mutex. If spawn blocks (PTY exhaustion, fork delay, etc.) the lock
+    // would be held indefinitely, dead-locking all other sessions.
+    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch) = if can_resume {
         let mut reg = registry.lock().await;
-
-        // Try to resume: if a session exists for this key, is alive, and
-        // not currently attached by another connection, take it over.
-        // We match on the key alone (not session_id) because there's only
-        // one session per (peer_id, username) pair.
-        let can_resume = reg
-            .lookup(&key)
-            .map(|s| !s.has_exited() && !s.attached)
-            .unwrap_or(false);
-
-        if can_resume {
+        // Re-check under lock (another task may have removed it).
+        let still_resumable = reg.lookup(&key).map(|s| !s.has_exited()).unwrap_or(false);
+        if still_resumable {
             let session = reg.lookup_mut(&key).unwrap();
             session.resize(initial_size);
-            session.attach(client_output_tx);
-
-            let sid = session.session_id.clone();
-            let itx = session.input_tx.clone();
-            let rtx = session.resize_tx.clone();
-            let erx = session.exit_rx.clone();
-            (sid, true, itx, rtx, erx)
+            let epoch = session.attach(client_output_tx);
+            let r = (
+                session.session_id.clone(),
+                true,
+                session.input_tx.clone(),
+                session.resize_tx.clone(),
+                session.exit_rx.clone(),
+                epoch,
+            );
+            r
         } else {
-            // Remove stale/exited session, but don't evict an attached one —
-            // let the other connection's I/O loop detect the disconnect naturally.
-            if reg.lookup(&key).map(|s| s.attached).unwrap_or(false) {
-                tracing::debug!("Session for {:?} still attached, not evicting", key);
-            }
-            if !reg.lookup(&key).map(|s| s.attached).unwrap_or(false) {
-                reg.remove(&key);
-            }
+            // Race: session was removed between our two lock acquisitions.
+            // Fall through to create a new one.
+            reg.remove(&key);
+            drop(reg);
 
             let (sid, itx, output_route, rtx, erx) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
-
-            // Route output to this client
             let _ = output_route.send(Some(client_output_tx));
-
             let session = DetachedSession {
                 session_id: sid.clone(),
                 input_tx: itx.clone(),
@@ -700,15 +705,37 @@ pub async fn host_shell_session_persistent(
                 exit_rx: erx.clone(),
                 detached_at: None,
                 attached: true,
+                attach_epoch: 1,
                 broker_handle: None,
             };
-
-            // Only insert if no attached session exists (avoid eviction)
-            if reg.lookup(&key).is_none() {
-                reg.insert(key.clone(), session);
-            }
-            (sid, false, itx, rtx, erx)
+            let mut reg = registry.lock().await;
+            reg.insert(key.clone(), session);
+            (sid, false, itx, rtx, erx, 1u64)
         }
+    } else {
+        // No session to resume — spawn a new PTY outside the lock.
+        {
+            let mut reg = registry.lock().await;
+            reg.remove(&key);
+        }
+
+        let (sid, itx, output_route, rtx, erx) =
+            spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
+        let _ = output_route.send(Some(client_output_tx));
+        let session = DetachedSession {
+            session_id: sid.clone(),
+            input_tx: itx.clone(),
+            output_route,
+            resize_tx: rtx.clone(),
+            exit_rx: erx.clone(),
+            detached_at: None,
+            attached: true,
+            attach_epoch: 1,
+            broker_handle: None,
+        };
+        let mut reg = registry.lock().await;
+        reg.insert(key.clone(), session);
+        (sid, false, itx, rtx, erx, 1u64)
     };
 
     // Start broker for sandboxed sessions (macOS)
@@ -766,12 +793,14 @@ pub async fn host_shell_session_persistent(
     match outcome {
         AttachOutcome::Exited => {
             let mut reg = registry.lock().await;
-            if let Some(session) = reg.remove(&key) {
-                // Abort broker and clean up shim directory
-                if let Some(handle) = session.broker_handle {
-                    handle.abort();
+            // Only clean up if we're still the current attachment.
+            if reg.lookup(&key).map(|s| s.attach_epoch == attach_epoch).unwrap_or(false) {
+                if let Some(session) = reg.remove(&key) {
+                    if let Some(handle) = session.broker_handle {
+                        handle.abort();
+                    }
+                    crate::sandbox::broker::cleanup_broker(config_dir, &session.session_id);
                 }
-                crate::sandbox::broker::cleanup_broker(config_dir, &session.session_id);
             }
             let _ = send.finish();
             let _ = tokio::time::timeout(
@@ -782,12 +811,15 @@ pub async fn host_shell_session_persistent(
         }
         AttachOutcome::Disconnected => {
             let mut reg = registry.lock().await;
-            reg.detach(&key);
-            tracing::info!(
-                "Session {} detached for peer {}",
-                &session_id[..8],
-                peer_id
-            );
+            // Only detach if we're still the current attachment.
+            // A newer connection may have already taken over.
+            if reg.detach_if_current(&key, attach_epoch) {
+                tracing::info!(
+                    "Session {} detached for peer {}",
+                    &session_id[..8],
+                    peer_id
+                );
+            }
         }
     }
 

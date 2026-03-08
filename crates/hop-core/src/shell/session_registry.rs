@@ -34,6 +34,10 @@ pub struct DetachedSession {
     pub detached_at: Option<Instant>,
     /// Whether a client is currently attached.
     pub attached: bool,
+    /// Monotonic epoch incremented on each attach. Allows stale
+    /// disconnect handlers to detect they've been superseded by a
+    /// newer attachment and skip the detach.
+    pub attach_epoch: u64,
     /// Handle for the broker background task (macOS sandbox proxy).
     /// Aborted when the session is cleaned up.
     pub broker_handle: Option<tokio::task::JoinHandle<()>>,
@@ -51,17 +55,28 @@ impl DetachedSession {
     }
 
     /// Attach a client: route output to the given sender.
-    pub fn attach(&mut self, client_tx: mpsc::Sender<Vec<u8>>) {
+    /// Returns the attach epoch so the caller can later detach
+    /// only if no newer attachment has superseded it.
+    pub fn attach(&mut self, client_tx: mpsc::Sender<Vec<u8>>) -> u64 {
+        self.attach_epoch += 1;
         self.attached = true;
         self.detached_at = None;
         let _ = self.output_route.send(Some(client_tx));
+        self.attach_epoch
     }
 
-    /// Detach the client: stop routing output.
-    pub fn detach(&mut self) {
-        self.attached = false;
-        self.detached_at = Some(Instant::now());
-        let _ = self.output_route.send(None);
+    /// Detach the client only if the given epoch matches the current
+    /// attachment. This prevents a stale disconnect handler from
+    /// detaching a session that was already taken over by a new client.
+    pub fn detach_if_current(&mut self, epoch: u64) -> bool {
+        if self.attach_epoch == epoch {
+            self.attached = false;
+            self.detached_at = Some(Instant::now());
+            let _ = self.output_route.send(None);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -101,10 +116,13 @@ impl SessionRegistry {
         self.sessions.insert(key, session);
     }
 
-    /// Mark a session as detached.
-    pub fn detach(&mut self, key: &SessionKey) {
+    /// Detach a session only if the given epoch matches the current attachment.
+    /// Returns true if the session was actually detached.
+    pub fn detach_if_current(&mut self, key: &SessionKey, epoch: u64) -> bool {
         if let Some(session) = self.sessions.get_mut(key) {
-            session.detach();
+            session.detach_if_current(epoch)
+        } else {
+            false
         }
     }
 
@@ -181,6 +199,7 @@ mod tests {
             exit_rx,
             detached_at: if attached { None } else { Some(Instant::now()) },
             attached,
+            attach_epoch: 0,
             broker_handle: None,
         }
     }
