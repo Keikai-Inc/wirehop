@@ -14,25 +14,22 @@ use std::process::Stdio;
 pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
     let mut p = String::with_capacity(2048);
     p.push_str("(version 1)\n");
-    p.push_str("(deny default)\n");
 
-    // Always allow process execution and basic operations
-    p.push_str("(allow process-exec)\n");
-    p.push_str("(allow process-fork)\n");
-    p.push_str("(allow process-info*)\n"); // needed by ps, top, htop, etc.
-    p.push_str("(allow signal)\n");
-    p.push_str("(allow sysctl-read)\n");
-    p.push_str("(allow mach-lookup)\n");
-    p.push_str("(allow mach-register)\n");
-    p.push_str("(allow ipc-posix-shm-read-data)\n");
-    p.push_str("(allow ipc-posix-shm-write-data)\n");
+    // Start permissive — only deny what the policy restricts.
+    //
+    // We intentionally use (allow default) instead of (deny default) because
+    // sandbox-exec strips the setuid bit from child processes under ANY
+    // sandbox profile. A deny-default allowlist blocks setuid binaries like
+    // ps, top, and login even with (allow process-exec). The allow-default
+    // approach still kernel-enforces the restrictions that matter (no writes,
+    // no network) via targeted deny rules below.
+    p.push_str("(allow default)\n");
 
-    // Read access
-    if policy.allowed_paths.is_empty() {
-        // No scope restrictions — allow reading everything
-        p.push_str("(allow file-read*)\n");
-    } else {
-        // Essential system paths required for commands to function
+    // --- Read restrictions (only when paths are scoped) ---
+    if !policy.allowed_paths.is_empty() {
+        // Deny all reads, then re-allow system paths + scoped paths.
+        p.push_str("(deny file-read*)\n");
+
         let system_paths = [
             "/usr",
             "/bin",
@@ -54,7 +51,6 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
         for sys_path in &system_paths {
             p.push_str(&format!("(allow file-read* (subpath \"{sys_path}\"))\n"));
         }
-        // User-specified paths
         for path in &policy.allowed_paths {
             let canon = std::fs::canonicalize(path)
                 .unwrap_or_else(|_| path.clone());
@@ -65,25 +61,22 @@ pub fn generate_sbpl_profile(policy: &SandboxPolicy) -> String {
         }
     }
 
-    // Write access
+    // --- Write restrictions ---
     if policy.read_only {
-        // Allow writing to stdout/stderr/PTY only
+        // Deny all writes, then re-allow PTY/tmp.
+        p.push_str("(deny file-write*)\n");
         p.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         p.push_str("(allow file-write* (literal \"/dev/dfd\"))\n");
         p.push_str("(allow file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n");
         p.push_str("(allow file-write* (regex #\"^/dev/pty[a-z][0-9a-f]$\"))\n");
-        // /tmp write access for temp files that some commands need
         p.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
         p.push_str("(allow file-write* (subpath \"/tmp\"))\n");
-    } else {
-        p.push_str("(allow file-write*)\n");
     }
 
-    // Network access
-    if !policy.no_network {
-        p.push_str("(allow network*)\n");
+    // --- Network restrictions ---
+    if policy.no_network {
+        p.push_str("(deny network*)\n");
     }
-    // If no_network: network is denied by default from (deny default)
 
     p
 }
@@ -167,12 +160,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unrestricted_profile_allows_all_rw() {
+    fn unrestricted_profile_allows_all() {
         let policy = SandboxPolicy::default();
         let profile = generate_sbpl_profile(&policy);
-        assert!(profile.contains("(allow file-read*)"));
-        assert!(profile.contains("(allow file-write*)"));
-        assert!(profile.contains("(allow network*)"));
+        assert!(profile.contains("(allow default)"));
+        // No deny rules for an unrestricted policy
+        assert!(!profile.contains("(deny file-write*)"));
+        assert!(!profile.contains("(deny file-read*)"));
+        assert!(!profile.contains("(deny network*)"));
     }
 
     #[test]
@@ -182,35 +177,32 @@ mod tests {
             ..Default::default()
         };
         let profile = generate_sbpl_profile(&policy);
-        assert!(profile.contains("(allow file-read*)"));
-        // Should NOT have blanket file-write*
-        // (it will have specific write allowances for TTY/tmp)
-        let lines: Vec<&str> = profile.lines().collect();
-        let blanket_write = lines
-            .iter()
-            .any(|l| l.trim() == "(allow file-write*)");
-        assert!(!blanket_write, "should not have blanket file-write*");
+        assert!(profile.contains("(allow default)"));
+        assert!(profile.contains("(deny file-write*)"));
+        // Should have re-allow rules for PTY/tmp
+        assert!(profile.contains("(allow file-write* (subpath \"/tmp\"))"));
     }
 
     #[test]
-    fn no_network_omits_network() {
+    fn no_network_denies_network() {
         let policy = SandboxPolicy {
             no_network: true,
             ..Default::default()
         };
         let profile = generate_sbpl_profile(&policy);
-        assert!(!profile.contains("(allow network*)"));
+        assert!(profile.contains("(deny network*)"));
     }
 
     #[test]
-    fn scoped_paths_appear_in_profile() {
+    fn scoped_paths_restrict_reads() {
         let policy = SandboxPolicy {
             allowed_paths: vec![PathBuf::from("/var/log")],
             ..Default::default()
         };
         let profile = generate_sbpl_profile(&policy);
+        // Should deny reads then re-allow system + scoped paths
+        assert!(profile.contains("(deny file-read*)"));
         assert!(profile.contains("/var/log"));
-        // System paths should also be present
         assert!(profile.contains("/usr"));
     }
 
