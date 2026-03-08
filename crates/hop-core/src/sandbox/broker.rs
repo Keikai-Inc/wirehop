@@ -120,6 +120,28 @@ fn resolve_real_binary(command: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Ownership helpers
+// ---------------------------------------------------------------------------
+
+/// Change ownership of a path to the given username (best-effort, requires root).
+#[cfg(unix)]
+fn chown_to_user(path: &Path, username: &str) {
+    let Ok(c_name) = std::ffi::CString::new(username) else { return };
+    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if pw.is_null() {
+        return;
+    }
+    let uid = unsafe { (*pw).pw_uid };
+    let gid = unsafe { (*pw).pw_gid };
+    let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes().to_vec()) else {
+        return;
+    };
+    unsafe {
+        libc::chown(c_path.as_ptr(), uid, gid);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shim setup
 // ---------------------------------------------------------------------------
 
@@ -127,7 +149,8 @@ fn resolve_real_binary(command: &str) -> Option<PathBuf> {
 /// pointing to the hop binary.
 ///
 /// Returns the path to the shim bin directory (to prepend to PATH).
-pub fn setup_shim_dir(config_dir: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+pub fn setup_shim_dir(config_dir: &Path, session_id: &str, username: Option<&str>) -> anyhow::Result<PathBuf> {
+    let session_dir = broker_dir(config_dir, session_id);
     let dir = shim_bin_dir(config_dir, session_id);
     std::fs::create_dir_all(&dir)?;
 
@@ -146,6 +169,20 @@ pub fn setup_shim_dir(config_dir: &Path, session_id: &str) -> anyhow::Result<Pat
         std::os::unix::fs::symlink(&hop_bin, &link_path)?;
     }
 
+    // chown the broker session dir + bin dir to the session user so the
+    // sandboxed shell (which runs as that user, not root) can traverse it.
+    #[cfg(unix)]
+    if let Some(user) = username {
+        // broker/<sid>/
+        chown_to_user(&session_dir, user);
+        // broker/<sid>/bin/
+        chown_to_user(&dir, user);
+        // broker/ parent
+        if let Some(parent) = session_dir.parent() {
+            chown_to_user(parent, user);
+        }
+    }
+
     Ok(dir)
 }
 
@@ -161,7 +198,7 @@ pub fn setup_shim_dir(config_dir: &Path, session_id: &str) -> anyhow::Result<Pat
 /// their prompt, aliases, etc. still work.
 ///
 /// Returns the zdotdir path to set as the `ZDOTDIR` environment variable.
-pub fn setup_zdotdir(config_dir: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+pub fn setup_zdotdir(config_dir: &Path, session_id: &str, username: Option<&str>) -> anyhow::Result<PathBuf> {
     let zdir = broker_dir(config_dir, session_id).join("zdotdir");
     std::fs::create_dir_all(&zdir)?;
 
@@ -202,6 +239,17 @@ pub fn setup_zdotdir(config_dir: &Path, session_id: &str) -> anyhow::Result<Path
         "[ -f \"$HOME/.zlogin\" ] && . \"$HOME/.zlogin\"\n",
     )?;
 
+    // chown zdotdir and its files to the session user
+    #[cfg(unix)]
+    if let Some(user) = username {
+        chown_to_user(&zdir, user);
+        for entry in std::fs::read_dir(&zdir).into_iter().flatten() {
+            if let Ok(e) = entry {
+                chown_to_user(&e.path(), user);
+            }
+        }
+    }
+
     Ok(zdir)
 }
 
@@ -233,12 +281,25 @@ pub async fn start_broker(
 
     let listener = UnixListener::bind(&sock_path)?;
 
-    // Set socket permissions to 0600
+    // Make the socket accessible to the session user.
+    // The daemon runs as root so the socket is owned by root:wheel.
+    // chown it to the session user; fall back to mode 0666 if no username.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&sock_path, perms)?;
+        if let Some(ref user) = username {
+            chown_to_user(&sock_path, user);
+            // Also chown the parent dirs so the user can traverse
+            if let Some(parent) = sock_path.parent() {
+                chown_to_user(parent, user);
+                if let Some(grandparent) = parent.parent() {
+                    chown_to_user(grandparent, user);
+                }
+            }
+        } else {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o666);
+            let _ = std::fs::set_permissions(&sock_path, perms);
+        }
     }
 
     tracing::debug!("Broker listening on {}", sock_path.display());

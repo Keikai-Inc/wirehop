@@ -478,8 +478,8 @@ fn spawn_persistent_pty(
     // system profile scripts have already rebuilt PATH.
     #[cfg(target_os = "macos")]
     if sandbox.is_restricted() {
-        let _ = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id);
-        if let Ok(zdotdir) = crate::sandbox::broker::setup_zdotdir(config_dir, &session_id) {
+        let _ = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id, username);
+        if let Ok(zdotdir) = crate::sandbox::broker::setup_zdotdir(config_dir, &session_id, username) {
             cmd.env("ZDOTDIR", zdotdir.to_string_lossy().as_ref());
         }
         // Set HOP_BROKER_SOCK as fallback for non-zsh shells
