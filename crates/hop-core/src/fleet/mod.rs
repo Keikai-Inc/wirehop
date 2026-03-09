@@ -53,6 +53,12 @@ impl FleetStore {
         write_shared_file(&path, &data)?;
         Ok(())
     }
+
+    /// Add a member, replacing any existing entry with the same node_id.
+    pub fn add_member(&mut self, member: FleetMember) {
+        self.members.retain(|m| m.node_id != member.node_id);
+        self.members.push(member);
+    }
 }
 
 // --- Roles store ---

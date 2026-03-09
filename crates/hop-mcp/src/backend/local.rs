@@ -181,9 +181,10 @@ async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
 
 /// Resolve a target name to (host_id_bytes, relay_url).
 fn resolve_target(config_dir: &Path, target: &str) -> Result<([u8; 32], Option<String>)> {
-    let hosts = KnownHostsStore::load(config_dir)?;
-
-    if let Some(node_id_str) = hosts.resolve_alias(target) {
+    // 1. Try KnownHostsStore aliases first
+    if let Ok(hosts) = KnownHostsStore::load(config_dir)
+        && let Some(node_id_str) = hosts.resolve_alias(target)
+    {
         let pk: iroh::PublicKey = node_id_str.parse().context("Invalid NodeId in known_hosts")?;
         let relay = hosts
             .hosts
@@ -193,7 +194,15 @@ fn resolve_target(config_dir: &Path, target: &str) -> Result<([u8; 32], Option<S
         return Ok((*pk.as_bytes(), relay));
     }
 
-    // Try parsing as NodeId directly
+    // 2. Try FleetStore — match by hostname
+    if let Ok(fleet) = FleetStore::load(config_dir)
+        && let Some(member) = fleet.members.iter().find(|m| m.hostname == target)
+    {
+        let pk: iroh::PublicKey = member.node_id.parse().context("Invalid NodeId in fleet")?;
+        return Ok((*pk.as_bytes(), member.relay_url.clone()));
+    }
+
+    // 3. Try parsing as raw NodeId
     let pk: iroh::PublicKey = target
         .parse()
         .with_context(|| format!("Unknown host: {target}"))?;

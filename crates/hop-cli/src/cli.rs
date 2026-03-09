@@ -203,6 +203,24 @@ pub enum Command {
         action: FleetAction,
     },
 
+    /// Manage cron jobs on the daemon
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
+
+    /// Read/write key-value data from the daemon datastore
+    Kv {
+        #[command(subcommand)]
+        action: KvAction,
+    },
+
+    /// Query time-series data from the daemon datastore
+    Ts {
+        #[command(subcommand)]
+        action: TsAction,
+    },
+
     /// Start MCP server (Model Context Protocol) for AI agent integration
     Mcp,
 
@@ -427,6 +445,104 @@ pub enum FleetAction {
         /// Command and arguments
         #[arg(required = true, last = true)]
         command: Vec<String>,
+    },
+    /// Add a known host to the daemon's fleet store
+    Add {
+        /// Host alias from known_hosts
+        name: String,
+        /// Tags for this fleet member (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CronAction {
+    /// List all cron jobs
+    List,
+    /// Show full details of a cron job
+    Get {
+        /// Job ID
+        id: String,
+    },
+    /// Create a new cron job
+    Create {
+        /// Job name
+        #[arg(long)]
+        name: String,
+        /// Cron schedule expression (e.g. "0 */5 * * * *")
+        #[arg(long)]
+        schedule: String,
+        /// Inline JavaScript source
+        #[arg(long, conflicts_with = "file")]
+        script: Option<String>,
+        /// Read script from a file
+        #[arg(long, conflicts_with = "script")]
+        file: Option<std::path::PathBuf>,
+        /// Fleet target tag (hosts matching this tag get injected as hop.targets)
+        #[arg(long)]
+        targets: Option<String>,
+        /// Tags for this job (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Delete a cron job
+    Delete {
+        /// Job ID
+        id: String,
+    },
+    /// Enable a cron job
+    Enable {
+        /// Job ID
+        id: String,
+    },
+    /// Disable a cron job
+    Disable {
+        /// Job ID
+        id: String,
+    },
+    /// Trigger immediate execution of a cron job
+    Run {
+        /// Job ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KvAction {
+    /// Get a value by key
+    Get {
+        /// Key to look up
+        key: String,
+    },
+    /// List keys matching an optional prefix
+    List {
+        /// Key prefix to filter by
+        prefix: Option<String>,
+    },
+    /// Set a key-value pair
+    Set {
+        /// Key
+        key: String,
+        /// Value
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TsAction {
+    /// Get the most recent data point for a metric
+    Latest {
+        /// Metric name
+        metric: String,
+    },
+    /// Query time-series data for a metric
+    Query {
+        /// Metric name
+        metric: String,
+        /// Time range to query (e.g. "1h", "30m", "7d"). Default: 1h
+        #[arg(long, default_value = "1h")]
+        last: String,
     },
 }
 

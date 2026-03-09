@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AdminAction, AgentAction, Cli, Command, ConfigAction, FleetAction, PeersAction, RoleAction};
+use cli::{AdminAction, AgentAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, TsAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
@@ -139,6 +139,18 @@ async fn main() -> Result<()> {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_fleet(secret_key, &config_dir, action).await
+        }
+        Command::Cron { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_cron(&config_dir, action)
+        }
+        Command::Kv { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_kv(&config_dir, action)
+        }
+        Command::Ts { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_ts(&config_dir, action)
         }
         Command::Mcp => {
             // MCP server: all output goes to stdout (JSON-RPC), logs to stderr only
@@ -1861,29 +1873,75 @@ async fn cmd_fleet(
             }
             Ok(())
         }
-        FleetAction::List { group } => {
-            let hosts = KnownHostsStore::load(config_dir)?;
-            let filtered: Vec<_> = hosts
+        FleetAction::Add { name, tags } => {
+            // Read from user's known_hosts
+            let host = KnownHostsStore::load(config_dir)?
                 .hosts
                 .iter()
-                .filter(|h| {
-                    group
-                        .as_ref()
-                        .map(|g| h.groups.contains(g))
-                        .unwrap_or(true)
-                })
-                .collect();
-            if filtered.is_empty() {
-                println!("No hosts found.");
+                .find(|h| h.name == name)
+                .cloned()
+                .with_context(|| format!("Host '{name}' not found in known_hosts"))?;
+
+            // Write to daemon's fleet.json
+            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            let mut fleet = hop_core::fleet::FleetStore::load(&host_config_dir)?;
+            fleet.add_member(hop_core::fleet::FleetMember {
+                node_id: host.node_id.clone(),
+                hostname: name.clone(),
+                tags: tags.clone(),
+                registered_at: unix_now_secs().to_string(),
+                last_heartbeat: None,
+                relay_url: host.relay_url.clone(),
+                online: false,
+            });
+            fleet.save(&host_config_dir)?;
+
+            let tag_display = if tags.is_empty() {
+                String::new()
             } else {
-                for h in &filtered {
-                    let groups = if h.groups.is_empty() {
+                format!(" [{}]", tags.join(", "))
+            };
+            println!("Added {} ({}) to fleet{tag_display}", name, &host.node_id[..10]);
+            Ok(())
+        }
+        FleetAction::List { group } => {
+            let mut seen = HashSet::new();
+            let mut any = false;
+
+            // 1. FleetStore members (daemon's fleet.json) — shown with tags
+            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            if let Ok(fleet) = hop_core::fleet::FleetStore::load(&host_config_dir) {
+                for m in &fleet.members {
+                    let matches = group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true);
+                    if !matches { continue; }
+                    seen.insert(m.node_id.clone());
+                    let tags = if m.tags.is_empty() {
                         String::new()
                     } else {
-                        format!(" [{}]", h.groups.join(", "))
+                        format!(" [{}]", m.tags.join(", "))
                     };
-                    println!("  {} ({}){groups}", &h.node_id[..10], h.name);
+                    println!("  {} ({}){tags}", &m.node_id[..10], m.hostname);
+                    any = true;
                 }
+            }
+
+            // 2. KnownHostsStore (user's known_hosts) — shown with groups, skip dupes
+            let hosts = KnownHostsStore::load(config_dir)?;
+            for h in &hosts.hosts {
+                if seen.contains(&h.node_id) { continue; }
+                let matches = group.as_ref().map(|g| h.groups.contains(g)).unwrap_or(true);
+                if !matches { continue; }
+                let groups = if h.groups.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", h.groups.join(", "))
+                };
+                println!("  {} ({}){groups}", &h.node_id[..10], h.name);
+                any = true;
+            }
+
+            if !any {
+                println!("No hosts found.");
             }
             Ok(())
         }
@@ -1933,6 +1991,224 @@ async fn cmd_fleet(
             }
             Ok(())
         }
+    }
+}
+
+fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
+    let ds = hop_core::datastore::Datastore::connect(config_dir)
+        .context("Failed to connect to daemon — is `hop host` running?")?;
+
+    match action {
+        CronAction::List => {
+            let jobs = ds.cron_list()?;
+            if jobs.is_empty() {
+                println!("No cron jobs.");
+            } else {
+                for j in &jobs {
+                    let status = if j.enabled { "enabled" } else { "disabled" };
+                    let targets = j.targets.as_deref().unwrap_or("-");
+                    println!("  {} {} [{}] schedule={} targets={}", j.id, j.name, status, j.schedule, targets);
+                }
+            }
+        }
+        CronAction::Get { id } => {
+            match ds.cron_get(&id)? {
+                Some(j) => {
+                    println!("ID:        {}", j.id);
+                    println!("Name:      {}", j.name);
+                    println!("Schedule:  {}", j.schedule);
+                    println!("Enabled:   {}", j.enabled);
+                    println!("Targets:   {}", j.targets.as_deref().unwrap_or("-"));
+                    println!("Tags:      {}", if j.tags.is_empty() { "-".to_string() } else { j.tags.join(", ") });
+                    println!("Created:   {}", j.created_at);
+                    println!("Last run:  {}", j.last_run.map(|t| t.to_string()).unwrap_or_else(|| "never".into()));
+                    println!("Next run:  {}", j.next_run);
+                    println!("--- script ---");
+                    println!("{}", j.script);
+                }
+                None => anyhow::bail!("Cron job '{id}' not found"),
+            }
+        }
+        CronAction::Create { name, schedule, script, file, targets, tags } => {
+            let script_content = match (script, file) {
+                (Some(s), _) => s,
+                (_, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read script file: {}", path.display()))?,
+                _ => anyhow::bail!("Either --script or --file is required"),
+            };
+
+            // Validate schedule
+            let sched: cron::Schedule = schedule.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid cron expression '{schedule}': {e}"))?;
+
+            let now = unix_now_ms();
+            let next_run = hop_mcp::cron::next_occurrence_ms(&sched, now);
+
+            let id = format!("{:08x}", rand::random::<u32>());
+            let job = hop_core::datastore::types::CronJob {
+                id: id.clone(),
+                name,
+                schedule,
+                script: script_content,
+                enabled: true,
+                last_run: None,
+                next_run,
+                created_at: now,
+                tags,
+                targets,
+                catalog_id: None,
+            };
+            ds.cron_add(&job)?;
+            println!("Created cron job: {id}");
+        }
+        CronAction::Delete { id } => {
+            if ds.cron_remove(&id)? {
+                println!("Deleted cron job: {id}");
+            } else {
+                anyhow::bail!("Cron job '{id}' not found");
+            }
+        }
+        CronAction::Enable { id } => {
+            let mut job = ds.cron_get(&id)?
+                .with_context(|| format!("Cron job '{id}' not found"))?;
+            job.enabled = true;
+            ds.cron_add(&job)?;
+            println!("Enabled cron job: {id}");
+        }
+        CronAction::Disable { id } => {
+            let mut job = ds.cron_get(&id)?
+                .with_context(|| format!("Cron job '{id}' not found"))?;
+            job.enabled = false;
+            ds.cron_add(&job)?;
+            println!("Disabled cron job: {id}");
+        }
+        CronAction::Run { id } => {
+            let mut job = ds.cron_get(&id)?
+                .with_context(|| format!("Cron job '{id}' not found"))?;
+            job.next_run = 0;
+            job.enabled = true;
+            ds.cron_add(&job)?;
+            println!("Triggered cron job: {id} (will run on next scheduler tick, ~15s)");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_kv(config_dir: &std::path::Path, action: KvAction) -> Result<()> {
+    let ds = hop_core::datastore::Datastore::connect(config_dir)
+        .context("Failed to connect to daemon — is `hop host` running?")?;
+    let ns = "default";
+
+    match action {
+        KvAction::Get { key } => {
+            match ds.kv_get(ns, &key)? {
+                Some(entry) => {
+                    let value = String::from_utf8_lossy(&entry.value);
+                    println!("{value}");
+                }
+                None => {
+                    println!("(not found)");
+                }
+            }
+        }
+        KvAction::List { prefix } => {
+            let prefix = prefix.as_deref().unwrap_or("");
+            let entries = ds.kv_list(ns, prefix)?;
+            if entries.is_empty() {
+                println!("No keys found.");
+            } else {
+                for (key, entry) in &entries {
+                    let value = String::from_utf8_lossy(&entry.value);
+                    let truncated = if value.len() > 80 {
+                        format!("{}...", &value[..77])
+                    } else {
+                        value.to_string()
+                    };
+                    println!("  {key} = {truncated}");
+                }
+            }
+        }
+        KvAction::Set { key, value } => {
+            let entry = hop_core::datastore::types::KvEntry {
+                value: value.into_bytes(),
+                content_type: "text/plain".to_string(),
+                updated_at: unix_now_ms(),
+            };
+            ds.kv_set(ns, &key, &entry)?;
+            println!("OK");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_ts(config_dir: &std::path::Path, action: TsAction) -> Result<()> {
+    let ds = hop_core::datastore::Datastore::connect(config_dir)
+        .context("Failed to connect to daemon — is `hop host` running?")?;
+
+    match action {
+        TsAction::Latest { metric } => {
+            match ds.ts_latest(&metric)? {
+                Some((ts, point)) => {
+                    let tags_str = if point.tags.is_empty() {
+                        String::new()
+                    } else {
+                        let pairs: Vec<String> = point.tags.iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect();
+                        format!(" {{{}}}", pairs.join(", "))
+                    };
+                    println!("{ts} {}{tags_str}", point.value);
+                }
+                None => println!("No data for metric '{metric}'"),
+            }
+        }
+        TsAction::Query { metric, last } => {
+            let duration_ms = parse_duration_ms(&last)?;
+            let now = unix_now_ms();
+            let start = now.saturating_sub(duration_ms);
+
+            let query = hop_core::datastore::types::TimeSeriesQuery {
+                metric: metric.clone(),
+                start,
+                end: now,
+                tags_filter: None,
+                limit: None,
+            };
+            let points = ds.ts_query(&query)?;
+            if points.is_empty() {
+                println!("No data for metric '{metric}' in the last {last}");
+            } else {
+                for (ts, point) in &points {
+                    let tags_str = if point.tags.is_empty() {
+                        String::new()
+                    } else {
+                        let pairs: Vec<String> = point.tags.iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect();
+                        format!(" {{{}}}", pairs.join(", "))
+                    };
+                    println!("{ts} {}{tags_str}", point.value);
+                }
+                println!("({} data points)", points.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a human-readable duration like "1h", "30m", "7d" into milliseconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('d') {
+        Ok(n.parse::<u64>().context("invalid number")? * 86_400_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        Ok(n.parse::<u64>().context("invalid number")? * 3_600_000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        Ok(n.parse::<u64>().context("invalid number")? * 60_000)
+    } else if let Some(n) = s.strip_suffix('s') {
+        Ok(n.parse::<u64>().context("invalid number")? * 1_000)
+    } else {
+        Ok(s.parse::<u64>().context("invalid duration — use a suffix like 1h, 30m, 7d")? * 1_000)
     }
 }
 
@@ -1994,6 +2270,20 @@ fn parse_duration_value(s: &str) -> Result<u64> {
     } else {
         Ok(s.parse::<u64>().context("invalid number — use a suffix like 1h, 30m, 1d, or plain seconds")?)
     }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, user_config_dir: &std::path::Path) -> Result<()> {

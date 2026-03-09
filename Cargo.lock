@@ -1456,16 +1456,18 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "anyhow",
  "bincode",
  "clap",
+ "cron",
  "crossterm",
  "hop-core",
  "hop-mcp",
  "iroh",
  "libc",
+ "rand",
  "ratatui",
  "serde",
  "serde_json",
@@ -1478,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1504,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mcp"
-version = "0.2.39"
+version = "0.2.40"
 dependencies = [
  "anyhow",
  "async-trait",
