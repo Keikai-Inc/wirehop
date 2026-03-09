@@ -58,6 +58,14 @@ if [ -f "$SYSTEM_CONFIG/datastore.redb" ]; then
     chown root:admin "$SYSTEM_CONFIG/datastore.redb"
     chmod 660 "$SYSTEM_CONFIG/datastore.redb"
 fi
+if [ -f "$SYSTEM_CONFIG/fleet.json" ]; then
+    chown root:admin "$SYSTEM_CONFIG/fleet.json"
+    chmod 660 "$SYSTEM_CONFIG/fleet.json"
+fi
+if [ -f "$SYSTEM_CONFIG/roles.json" ]; then
+    chown root:admin "$SYSTEM_CONFIG/roles.json"
+    chmod 660 "$SYSTEM_CONFIG/roles.json"
+fi
 
 echo "Starting hop daemon..."
 
@@ -73,9 +81,14 @@ rm -f "$SYSTEM_CONFIG/daemon.sock"
 rm -f "$SYSTEM_CONFIG/agent.sock"
 
 # Load and start the new daemon.
-if ! launchctl bootstrap system "$PLIST" 2>&1; then
-    echo "ERROR: Failed to load hop daemon. Check /var/log/hop-stderr.log"
-    exit 1
+# bootstrap may fail if the service is still partially registered after bootout,
+# so try kickstart as a fallback (which restarts an already-loaded service).
+if ! launchctl bootstrap system "$PLIST" 2>/dev/null; then
+    echo "bootstrap failed, trying kickstart..."
+    if ! launchctl kickstart -k "system/$LABEL" 2>&1; then
+        echo "ERROR: Failed to start hop daemon. Check /var/log/hop-stderr.log"
+        exit 1
+    fi
 fi
 
 # Wait for daemon to start and generate creator invite
