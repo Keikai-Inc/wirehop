@@ -131,11 +131,15 @@ fn now_ms() -> u64 {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() > max {
-        &s[..max]
-    } else {
-        s
+    if s.len() <= max {
+        return s;
     }
+    // Find the largest char boundary at or before `max`
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]

@@ -311,8 +311,9 @@ pub async fn start_broker(
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    tracing::debug!("Broker accept error: {e}");
-                    break;
+                    tracing::warn!("Broker accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
             };
 

@@ -108,7 +108,10 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
     };
 
-    JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    match serde_json::to_value(result) {
+        Ok(v) => JsonRpcResponse::success(id, v),
+        Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("serialize error: {e}")),
+    }
 }
 
 fn handle_tools_list(
@@ -117,7 +120,10 @@ fn handle_tools_list(
 ) -> JsonRpcResponse {
     let tools = registry.list_tools();
     let result = ToolsListResult { tools };
-    JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    match serde_json::to_value(result) {
+        Ok(v) => JsonRpcResponse::success(id, v),
+        Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("serialize error: {e}")),
+    }
 }
 
 async fn handle_tools_call(
@@ -147,7 +153,10 @@ async fn handle_tools_call(
     tracing::info!("tools/call: {tool_name}");
 
     let result = registry.call_tool(&tool_name, arguments).await;
-    JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    match serde_json::to_value(result) {
+        Ok(v) => JsonRpcResponse::success(id, v),
+        Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("serialize error: {e}")),
+    }
 }
 
 async fn write_response(

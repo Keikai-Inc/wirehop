@@ -217,8 +217,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         tokio::spawn(async move {
             while let Ok(addr) = watcher.updated().await {
                 if let Some(new_relay) = addr.relay_urls().next() {
-                    let _ = std::fs::write(&relay_path, new_relay.to_string());
-                    tracing::debug!("Updated relay_url file: {new_relay}");
+                    if let Err(e) = std::fs::write(&relay_path, new_relay.to_string()) {
+                        tracing::warn!("Failed to update relay_url file: {e}");
+                    } else {
+                        tracing::debug!("Updated relay_url file: {new_relay}");
+                    }
                 }
             }
         });
@@ -375,15 +378,38 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // Spawn cron scheduler: every 15s, check for due jobs and execute them
     hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), None);
 
-    while let Some(incoming) = endpoint.accept().await {
-        let config_dir = config_dir.to_path_buf();
-        let registry = registry.clone();
-        let ds = datastore.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_incoming(incoming, &config_dir, registry, ds).await {
-                tracing::error!("Connection error: {e:#}");
+    // Signal handling for graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT handler")?;
+
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                match incoming {
+                    Some(inc) => {
+                        let config_dir = config_dir.to_path_buf();
+                        let registry = registry.clone();
+                        let ds = datastore.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_incoming(inc, &config_dir, registry, ds).await {
+                                tracing::error!("Connection error: {e:#}");
+                            }
+                        });
+                    }
+                    None => break,
+                }
             }
-        });
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down gracefully");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, shutting down gracefully");
+                break;
+            }
+        }
     }
 
     endpoint.close().await;
@@ -397,8 +423,22 @@ async fn handle_incoming(
     datastore: hop_core::datastore::Datastore,
 ) -> Result<()> {
     let conn: iroh::endpoint::Connection = incoming.await?;
+    let result = handle_incoming_inner(&conn, config_dir, registry, datastore).await;
+    // Always close the connection explicitly before dropping it.
+    // Dropping without close triggers an iroh-quinn panic:
+    // "drained connections always have an error"
+    conn.close(0u32.into(), b"done");
+    result
+}
+
+async fn handle_incoming_inner(
+    conn: &iroh::endpoint::Connection,
+    config_dir: &std::path::Path,
+    registry: RegistryHandle,
+    datastore: hop_core::datastore::Datastore,
+) -> Result<()> {
     let remote_id = conn.remote_id();
-    let protocol_version = net::negotiated_protocol_version(&conn);
+    let protocol_version = net::negotiated_protocol_version(conn);
     tracing::info!("Connection from: {} (protocol v{})", remote_id.fmt_short(), protocol_version);
 
     // First bi-stream: full authentication

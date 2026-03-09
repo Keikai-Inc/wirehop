@@ -125,7 +125,7 @@ impl Agent {
             if conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
-            // Dead connection, remove it
+            // Dead connection, close explicitly and remove it
             conns.remove(&host_id);
         }
 
@@ -168,7 +168,8 @@ impl Agent {
         let (quic_send, quic_recv) = match conn.open_bi().await {
             Ok(pair) => pair,
             Err(e) => {
-                // Connection may have died; remove from pool
+                // Connection may have died; close explicitly and remove from pool
+                conn.close(0u32.into(), b"open-bi-failed");
                 self.connections.lock().await.remove(&host_id);
                 let _ = mux::write_ipc_message(
                     &mut ipc,
@@ -305,7 +306,10 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(3)).await;
             if before.elapsed() > Duration::from_secs(7) {
                 tracing::info!("Agent detected sleep/wake, flushing connection pool");
-                wake_conns.lock().await.clear();
+                let mut conns = wake_conns.lock().await;
+                for (_, conn) in conns.drain() {
+                    conn.close(0u32.into(), b"sleep-flush");
+                }
             }
         }
     });
@@ -356,7 +360,13 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
         }
     }
 
-    // Cleanup
+    // Cleanup: close all pooled connections, then the endpoint
+    {
+        let mut conns = agent.connections.lock().await;
+        for (_, conn) in conns.drain() {
+            conn.close(0u32.into(), b"agent-shutdown");
+        }
+    }
     agent.endpoint.close().await;
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);

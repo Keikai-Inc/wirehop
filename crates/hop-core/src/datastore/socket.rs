@@ -115,6 +115,7 @@ pub async fn spawn_listener(config_dir: &Path, datastore: Datastore) -> Result<J
                 }
                 Err(e) => {
                     tracing::warn!("Socket accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }

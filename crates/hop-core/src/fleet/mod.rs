@@ -542,7 +542,14 @@ pub fn handle_create_aggregate_invite(
         role: role.to_string(),
         peer_name: peer_name.to_string(),
     };
-    let json = serde_json::to_string(&token).unwrap();
+    let json = match serde_json::to_string(&token) {
+        Ok(j) => j,
+        Err(e) => {
+            return AdminResponse::Error {
+                message: format!("failed to serialize invite token: {e}"),
+            };
+        }
+    };
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
 
     AdminResponse::AggregateInviteCreated { token: encoded }
