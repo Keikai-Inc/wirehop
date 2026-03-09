@@ -5,15 +5,21 @@ use anyhow::Result;
 use redb::ReadableTable;
 
 use super::tables::TS_TABLE;
+use super::DatastoreInner;
 use super::Datastore;
 
 impl Datastore {
     /// Purge time-series data points older than the given timestamp (exclusive).
     /// Returns the number of deleted points.
+    ///
+    /// Only supported in Local mode — daemon-internal housekeeping only.
     pub fn ts_purge_before(&self, metric: &str, before: u64) -> Result<u64> {
+        if matches!(self.inner.as_ref(), DatastoreInner::Remote(_)) {
+            anyhow::bail!("ts_purge_before is not supported over remote connection");
+        }
         // Phase 1: read keys to delete
         let keys_to_delete = {
-            let txn = self.db.begin_read()?;
+            let txn = self.local_db().begin_read()?;
             let table = match txn.open_table(TS_TABLE) {
                 Ok(t) => t,
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -40,7 +46,7 @@ impl Datastore {
 
         // Phase 2: delete collected keys
         let count = keys_to_delete.len() as u64;
-        let txn = self.db.begin_write()?;
+        let txn = self.local_db().begin_write()?;
         {
             let mut table = txn.open_table(TS_TABLE)?;
             for ts in keys_to_delete {

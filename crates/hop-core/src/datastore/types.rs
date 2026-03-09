@@ -53,7 +53,7 @@ pub struct CronJob {
 }
 
 /// Query parameters for time-series range queries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeSeriesQuery {
     pub metric: String,
     /// Start of range (unix ms, inclusive).

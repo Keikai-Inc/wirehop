@@ -1,8 +1,14 @@
 //! Embedded datastore: KV, time-series, and cron job storage backed by redb.
+//!
+//! Supports two modes:
+//! - **Local**: direct access to a redb database file (used by the daemon).
+//! - **Remote**: connects to the daemon's Unix socket (used by `hop mcp`).
 
 pub mod cron;
 pub mod kv;
+pub mod protocol;
 pub mod retention;
+pub mod socket;
 pub mod tables;
 pub mod timeseries;
 pub mod types;
@@ -12,16 +18,44 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-/// Embedded datastore wrapping a redb database.
+/// Embedded datastore wrapping a redb database or a daemon socket connection.
 ///
-/// Thread-safe via `Arc<redb::Database>` — clone freely across tokio tasks.
+/// Thread-safe — clone freely across tokio tasks.
 #[derive(Clone)]
 pub struct Datastore {
-    db: Arc<redb::Database>,
+    inner: Arc<DatastoreInner>,
 }
 
+pub(crate) enum DatastoreInner {
+    Local(redb::Database),
+    Remote(socket::DaemonConnection),
+}
+
+/// Dispatch a request to the daemon socket and extract the expected response variant.
+///
+/// Usage:
+/// ```ignore
+/// remote_dispatch!(self,
+///     DsRequest::KvGet { ns: ns.into(), key: key.into() },
+///     DsResponse::KvEntry(e) => e
+/// );
+/// ```
+macro_rules! remote_dispatch {
+    ($self:ident, $req:expr, $pat:pat => $val:expr) => {
+        if let $crate::datastore::DatastoreInner::Remote(conn) = $self.inner.as_ref() {
+            let resp = conn.request(&$req)?;
+            return match resp {
+                $pat => Ok($val),
+                $crate::datastore::protocol::DsResponse::Error(msg) => Err(anyhow::anyhow!("{msg}")),
+                other => Err(anyhow::anyhow!("unexpected response: {other:?}")),
+            };
+        }
+    };
+}
+pub(crate) use remote_dispatch;
+
 impl Datastore {
-    /// Open (or create) a datastore at the given file path.
+    /// Open (or create) a datastore at the given file path (Local mode).
     pub fn open(path: &Path) -> Result<Self> {
         let db = redb::Database::create(path)
             .with_context(|| format!("Failed to open datastore at {}", path.display()))?;
@@ -48,7 +82,29 @@ impl Datastore {
             }
         }
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            inner: Arc::new(DatastoreInner::Local(db)),
+        })
+    }
+
+    /// Connect to the daemon's Unix socket (Remote mode).
+    pub fn connect(config_dir: &Path) -> Result<Self> {
+        let conn = socket::DaemonConnection::connect(config_dir)?;
+        Ok(Self {
+            inner: Arc::new(DatastoreInner::Remote(conn)),
+        })
+    }
+
+    /// Get a reference to the local redb database.
+    ///
+    /// # Panics
+    /// Panics if called on a Remote datastore (should never happen — Remote
+    /// methods return early via `remote_dispatch!`).
+    fn local_db(&self) -> &redb::Database {
+        match self.inner.as_ref() {
+            DatastoreInner::Local(db) => db,
+            DatastoreInner::Remote(_) => unreachable!("local_db() called on Remote datastore"),
+        }
     }
 }
 

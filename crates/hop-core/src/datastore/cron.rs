@@ -4,6 +4,8 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use redb::ReadableTable;
 
+use super::protocol::{DsRequest, DsResponse};
+use super::remote_dispatch;
 use super::tables::CRON_TABLE;
 use super::types::CronJob;
 use super::Datastore;
@@ -11,13 +13,17 @@ use super::Datastore;
 impl Datastore {
     /// Add a cron job. Overwrites if the ID already exists.
     pub fn cron_add(&self, job: &CronJob) -> Result<()> {
+        remote_dispatch!(self,
+            DsRequest::CronAdd { job: job.clone() },
+            DsResponse::Ok => ()
+        );
         // Validate the cron expression
         job.schedule.parse::<cron::Schedule>().map_err(|e| {
             anyhow::anyhow!("Invalid cron expression '{}': {e}", job.schedule)
         })?;
 
         let bytes = bincode::serde::encode_to_vec(job, bincode::config::standard())?;
-        let txn = self.db.begin_write()?;
+        let txn = self.local_db().begin_write()?;
         {
             let mut table = txn.open_table(CRON_TABLE)?;
             table.insert(job.id.as_str(), bytes.as_slice())?;
@@ -28,7 +34,11 @@ impl Datastore {
 
     /// Remove a cron job. Returns true if it existed.
     pub fn cron_remove(&self, id: &str) -> Result<bool> {
-        let txn = self.db.begin_write()?;
+        remote_dispatch!(self,
+            DsRequest::CronRemove { id: id.into() },
+            DsResponse::Bool(b) => b
+        );
+        let txn = self.local_db().begin_write()?;
         let existed = {
             let mut table = txn.open_table(CRON_TABLE)?;
             table.remove(id)?.is_some()
@@ -39,7 +49,11 @@ impl Datastore {
 
     /// List all cron jobs.
     pub fn cron_list(&self) -> Result<Vec<CronJob>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::CronList,
+            DsResponse::CronJobs(jobs) => jobs
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(CRON_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -59,7 +73,11 @@ impl Datastore {
 
     /// Get a cron job by ID.
     pub fn cron_get(&self, id: &str) -> Result<Option<CronJob>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::CronGet { id: id.into() },
+            DsResponse::CronJob(j) => j
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(CRON_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -78,6 +96,10 @@ impl Datastore {
 
     /// Find a cron job by its catalog ID. Returns the first match.
     pub fn cron_find_by_catalog_id(&self, catalog_id: &str) -> Result<Option<CronJob>> {
+        remote_dispatch!(self,
+            DsRequest::CronFindByCatalogId { catalog_id: catalog_id.into() },
+            DsResponse::CronJob(j) => j
+        );
         let jobs = self.cron_list()?;
         Ok(jobs
             .into_iter()
@@ -86,6 +108,10 @@ impl Datastore {
 
     /// Get all enabled cron jobs that are due for execution.
     pub fn cron_get_due(&self, now: u64) -> Result<Vec<CronJob>> {
+        remote_dispatch!(self,
+            DsRequest::CronGetDue { now_ms: now },
+            DsResponse::CronJobs(jobs) => jobs
+        );
         let jobs = self.cron_list()?;
         Ok(jobs
             .into_iter()
@@ -95,7 +121,11 @@ impl Datastore {
 
     /// Update the last_run timestamp and compute the next_run for a cron job.
     pub fn cron_update_last_run(&self, id: &str, timestamp: u64, next_run: u64) -> Result<()> {
-        let txn = self.db.begin_write()?;
+        remote_dispatch!(self,
+            DsRequest::CronUpdateLastRun { id: id.into(), ts: timestamp, next_run },
+            DsResponse::Ok => ()
+        );
+        let txn = self.local_db().begin_write()?;
         {
             let mut table = txn.open_table(CRON_TABLE)?;
             let guard = table

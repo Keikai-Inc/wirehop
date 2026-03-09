@@ -8,6 +8,7 @@ use iroh::PublicKey;
 use std::path::Path;
 
 use crate::config::{PeerRole, PeersStore};
+use crate::datastore::Datastore;
 use crate::invite;
 use crate::proto::{AdminRequest, AdminResponse, PeerInfo};
 
@@ -16,11 +17,13 @@ pub use crate::proto::{AdminRequest as Request, AdminResponse as Response};
 /// Handle an admin request from a creator peer.
 ///
 /// Caller must verify the peer has Creator role before calling this.
+/// `datastore` is passed by the daemon to avoid opening redundant handles.
 pub fn handle_admin_request(
     request: AdminRequest,
     config_dir: &Path,
     relay_url: Option<&str>,
     host_public_key: &PublicKey,
+    datastore: Option<&Datastore>,
 ) -> AdminResponse {
     match request {
         AdminRequest::CreateInvite { username, role } => {
@@ -81,18 +84,17 @@ pub fn handle_admin_request(
             crate::fleet::handle_redeem_aggregate_invite(config_dir, relay_url, host_public_key, &secret)
         }
         AdminRequest::PushMetrics { points } => {
-            handle_push_metrics(config_dir, points)
+            handle_push_metrics(datastore, points)
         }
     }
 }
 
-fn handle_push_metrics(config_dir: &Path, points: Vec<crate::proto::PushMetricPoint>) -> AdminResponse {
-    let ds_path = config_dir.join("datastore.redb");
-    let ds = match crate::datastore::Datastore::open(&ds_path) {
-        Ok(ds) => ds,
-        Err(e) => {
+fn handle_push_metrics(datastore: Option<&Datastore>, points: Vec<crate::proto::PushMetricPoint>) -> AdminResponse {
+    let ds = match datastore {
+        Some(ds) => ds,
+        None => {
             return AdminResponse::Error {
-                message: format!("failed to open datastore: {e}"),
+                message: "datastore not available".to_string(),
             }
         }
     };
@@ -458,6 +460,7 @@ mod tests {
             dir.path(),
             None,
             &public,
+            None,
         );
 
         match resp {
@@ -483,6 +486,7 @@ mod tests {
             dir.path(),
             Some("https://relay.example.com"),
             &public,
+            None,
         );
 
         match resp {
@@ -500,7 +504,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_key, public) = test_key();
 
-        let resp = handle_admin_request(AdminRequest::ListPeers, dir.path(), None, &public);
+        let resp = handle_admin_request(AdminRequest::ListPeers, dir.path(), None, &public, None);
         match resp {
             AdminResponse::PeerList { peers } => assert!(peers.is_empty()),
             other => panic!("expected PeerList, got {other:?}"),
@@ -517,7 +521,7 @@ mod tests {
         store.add_peer(&key2.public(), "alice".into(), Some("alice".into()), PeerRole::Creator, crate::sandbox::SandboxPolicy::default());
         store.save(dir.path()).unwrap();
 
-        let resp = handle_admin_request(AdminRequest::ListPeers, dir.path(), None, &public);
+        let resp = handle_admin_request(AdminRequest::ListPeers, dir.path(), None, &public, None);
         match resp {
             AdminResponse::PeerList { peers } => {
                 assert_eq!(peers.len(), 1);
@@ -546,6 +550,7 @@ mod tests {
             dir.path(),
             None,
             &public,
+            None,
         );
         match resp {
             AdminResponse::PeerRemoved { success } => assert!(success),
@@ -568,6 +573,7 @@ mod tests {
             dir.path(),
             None,
             &public,
+            None,
         );
         match resp {
             AdminResponse::PeerRemoved { success } => assert!(!success),
@@ -580,7 +586,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_key, public) = test_key();
 
-        let resp = handle_admin_request(AdminRequest::Status, dir.path(), None, &public);
+        let resp = handle_admin_request(AdminRequest::Status, dir.path(), None, &public, None);
         match resp {
             AdminResponse::HostStatus {
                 version,
@@ -609,6 +615,7 @@ mod tests {
             dir.path(),
             None,
             &public,
+            None,
         );
 
         let log_path = dir.path().join("admin_log.json");
@@ -628,6 +635,7 @@ mod tests {
             dir.path(),
             None,
             &public,
+            None,
         );
         match resp {
             AdminResponse::FleetList { members } => assert!(members.is_empty()),
@@ -635,7 +643,7 @@ mod tests {
         }
 
         // ListRoles should work on empty store
-        let resp = handle_admin_request(AdminRequest::ListRoles, dir.path(), None, &public);
+        let resp = handle_admin_request(AdminRequest::ListRoles, dir.path(), None, &public, None);
         match resp {
             AdminResponse::RoleList { roles } => assert!(roles.is_empty()),
             other => panic!("expected RoleList, got {other:?}"),

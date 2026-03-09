@@ -143,9 +143,14 @@ async fn main() -> Result<()> {
         Command::Mcp => {
             // MCP server: all output goes to stdout (JSON-RPC), logs to stderr only
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            let ds_path = config_dir.join("datastore.redb");
-            let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
-            hop_mcp::run_stdio_server_with_datastore(&config_dir, Some(datastore)).await
+            let datastore = match hop_core::datastore::Datastore::connect(&config_dir) {
+                Ok(ds) => Some(ds),
+                Err(e) => {
+                    eprintln!("Daemon not available ({e}), running without datastore tools");
+                    None
+                }
+            };
+            hop_mcp::run_stdio_server_with_datastore(&config_dir, datastore).await
         }
         Command::Id => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -360,18 +365,22 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         });
     }
 
+    // Open datastore once; share with socket listener, cron scheduler, and admin handler
+    let ds_path = config_dir.join("datastore.redb");
+    let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
+
+    // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
+    let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
+
     // Spawn cron scheduler: every 15s, check for due jobs and execute them
-    {
-        let ds_path = config_dir.join("datastore.redb");
-        let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
-        hop_mcp::cron::spawn_cron_scheduler(datastore, Duration::from_secs(15), None);
-    }
+    hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), None);
 
     while let Some(incoming) = endpoint.accept().await {
         let config_dir = config_dir.to_path_buf();
         let registry = registry.clone();
+        let ds = datastore.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming(incoming, &config_dir, registry).await {
+            if let Err(e) = handle_incoming(incoming, &config_dir, registry, ds).await {
                 tracing::error!("Connection error: {e:#}");
             }
         });
@@ -385,6 +394,7 @@ async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
     registry: RegistryHandle,
+    datastore: hop_core::datastore::Datastore,
 ) -> Result<()> {
     let conn: iroh::endpoint::Connection = incoming.await?;
     let remote_id = conn.remote_id();
@@ -415,8 +425,9 @@ async fn handle_incoming(
             let s = sandbox.clone();
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
+            let ds = datastore.clone();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
+                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -433,8 +444,9 @@ async fn handle_incoming(
             let s = sandbox.clone();
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
+            let ds = datastore.clone();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
+                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -463,8 +475,9 @@ async fn handle_incoming(
         let s = sandbox.clone();
         let pid = peer_id.clone();
         let cd = config_dir.to_path_buf();
+        let ds = datastore.clone();
         tokio::spawn(async move {
-            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg).await {
+            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
                 tracing::error!("Session error: {e:#}");
             }
         });
@@ -486,6 +499,7 @@ async fn dispatch_session(
     sandbox: &hop_core::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
     registry: RegistryHandle,
+    datastore: hop_core::datastore::Datastore,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
@@ -532,6 +546,7 @@ async fn dispatch_session(
                 config_dir,
                 relay_url.as_deref(),
                 &host_public_key,
+                Some(&datastore),
             );
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }

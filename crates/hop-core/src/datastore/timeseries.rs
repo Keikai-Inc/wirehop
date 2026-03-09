@@ -4,6 +4,8 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use redb::ReadableTable;
 
+use super::protocol::{DsRequest, DsResponse};
+use super::remote_dispatch;
 use super::tables::TS_TABLE;
 use super::types::{MetricPoint, TimeSeriesQuery};
 use super::Datastore;
@@ -11,13 +13,21 @@ use super::Datastore;
 impl Datastore {
     /// Insert a time-series data point at the current time.
     pub fn ts_insert(&self, metric: &str, point: &MetricPoint) -> Result<()> {
+        remote_dispatch!(self,
+            DsRequest::TsInsert { metric: metric.into(), point: point.clone() },
+            DsResponse::Ok => ()
+        );
         self.ts_insert_at(metric, now_ms(), point)
     }
 
     /// Insert a time-series data point at a specific timestamp.
     pub fn ts_insert_at(&self, metric: &str, timestamp: u64, point: &MetricPoint) -> Result<()> {
+        remote_dispatch!(self,
+            DsRequest::TsInsertAt { metric: metric.into(), ts: timestamp, point: point.clone() },
+            DsResponse::Ok => ()
+        );
         let bytes = bincode::serde::encode_to_vec(point, bincode::config::standard())?;
-        let txn = self.db.begin_write()?;
+        let txn = self.local_db().begin_write()?;
         {
             let mut table = txn.open_table(TS_TABLE)?;
             table.insert((metric, timestamp), bytes.as_slice())?;
@@ -28,7 +38,11 @@ impl Datastore {
 
     /// Query time-series data points in a range.
     pub fn ts_query(&self, query: &TimeSeriesQuery) -> Result<Vec<(u64, MetricPoint)>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::TsQuery { query: query.clone() },
+            DsResponse::TsPoints(pts) => pts
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(TS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -72,7 +86,11 @@ impl Datastore {
 
     /// Get the latest data point for a metric.
     pub fn ts_latest(&self, metric: &str) -> Result<Option<(u64, MetricPoint)>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::TsLatest { metric: metric.into() },
+            DsResponse::TsLatest(v) => v
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(TS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),

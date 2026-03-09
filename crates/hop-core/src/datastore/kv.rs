@@ -4,6 +4,8 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use redb::ReadableTable;
 
+use super::protocol::{DsRequest, DsResponse};
+use super::remote_dispatch;
 use super::tables::KV_TABLE;
 use super::types::KvEntry;
 use super::Datastore;
@@ -11,7 +13,11 @@ use super::Datastore;
 impl Datastore {
     /// Get a KV entry by namespace and key.
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<KvEntry>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::KvGet { ns: ns.into(), key: key.into() },
+            DsResponse::KvEntry(e) => e
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(KV_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -30,8 +36,12 @@ impl Datastore {
 
     /// Set a KV entry.
     pub fn kv_set(&self, ns: &str, key: &str, entry: &KvEntry) -> Result<()> {
+        remote_dispatch!(self,
+            DsRequest::KvSet { ns: ns.into(), key: key.into(), entry: entry.clone() },
+            DsResponse::Ok => ()
+        );
         let bytes = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
-        let txn = self.db.begin_write()?;
+        let txn = self.local_db().begin_write()?;
         {
             let mut table = txn.open_table(KV_TABLE)?;
             table.insert((ns, key), bytes.as_slice())?;
@@ -42,7 +52,11 @@ impl Datastore {
 
     /// Delete a KV entry. Returns true if the key existed.
     pub fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
-        let txn = self.db.begin_write()?;
+        remote_dispatch!(self,
+            DsRequest::KvDelete { ns: ns.into(), key: key.into() },
+            DsResponse::Bool(b) => b
+        );
+        let txn = self.local_db().begin_write()?;
         let existed = {
             let mut table = txn.open_table(KV_TABLE)?;
             table.remove((ns, key))?.is_some()
@@ -53,7 +67,11 @@ impl Datastore {
 
     /// List KV entries in a namespace, optionally filtered by key prefix.
     pub fn kv_list(&self, ns: &str, prefix: &str) -> Result<Vec<(String, KvEntry)>> {
-        let txn = self.db.begin_read()?;
+        remote_dispatch!(self,
+            DsRequest::KvList { ns: ns.into(), prefix: prefix.into() },
+            DsResponse::KvEntries(e) => e
+        );
+        let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(KV_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
