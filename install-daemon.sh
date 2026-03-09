@@ -89,7 +89,15 @@ if [[ "${OS}" == "Darwin" ]]; then
   sudo installer -pkg "${TMPDIR_HOP}/${PKG_NAME}" -target /
 
   printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
-  printf "The daemon is running.\n"
+
+  # Verify the daemon is actually running (postinstall should have started it).
+  sleep 1
+  if sudo launchctl print system/com.hop.daemon >/dev/null 2>&1; then
+    printf "The daemon is running.\n"
+  else
+    warn "The daemon may not be running. Check: sudo launchctl kickstart system/com.hop.daemon"
+    warn "Logs: /var/log/hop-stderr.log"
+  fi
 
   # Wait briefly for daemon to generate creator invite
   sleep 2

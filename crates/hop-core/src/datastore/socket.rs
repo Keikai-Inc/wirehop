@@ -83,10 +83,10 @@ impl DaemonConnection {
 pub async fn spawn_listener(config_dir: &Path, datastore: Datastore) -> Result<JoinHandle<()>> {
     let path = socket_path(config_dir);
 
-    // Remove stale socket from a previous crash
+    // Remove stale socket from a previous crash (best-effort; bind will
+    // fail with a clear error if removal didn't work).
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove stale socket at {}", path.display()))?;
+        let _ = std::fs::remove_file(&path);
     }
 
     let listener = UnixListener::bind(&path)

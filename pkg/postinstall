@@ -61,16 +61,31 @@ fi
 
 echo "Starting hop daemon..."
 
-# Load the daemon into the system domain
-if launchctl bootstrap system "$PLIST" 2>/dev/null; then
-    echo "Hop daemon loaded."
-else
-    echo "Already loaded — restarting..."
-    launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
+# Stop old daemon cleanly before starting the new one.
+# bootout fully unloads the service; we ignore errors if it wasn't loaded.
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+
+# Give the old process time to exit and release file locks / sockets.
+sleep 1
+
+# Remove stale Unix sockets that a crashed daemon may have left behind.
+rm -f "$SYSTEM_CONFIG/daemon.sock"
+rm -f "$SYSTEM_CONFIG/agent.sock"
+
+# Load and start the new daemon.
+if ! launchctl bootstrap system "$PLIST" 2>&1; then
+    echo "ERROR: Failed to load hop daemon. Check /var/log/hop-stderr.log"
+    exit 1
 fi
 
-# Wait briefly for daemon to start and generate creator invite
+# Wait for daemon to start and generate creator invite
 sleep 2
+
+# Verify the daemon is actually running.
+if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    echo "WARNING: Hop daemon may not be running. Check /var/log/hop-stderr.log"
+    tail -5 /var/log/hop-stderr.log 2>/dev/null || true
+fi
 
 # Display creator invite if available
 CREATOR_INVITE="$SYSTEM_CONFIG/creator_invite"
