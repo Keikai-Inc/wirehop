@@ -1882,8 +1882,8 @@ async fn cmd_fleet(
                 .cloned()
                 .with_context(|| format!("Host '{name}' not found in known_hosts"))?;
 
-            // Write to daemon's fleet.json
-            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            // Write to daemon's fleet.json (resolve without override to find system config dir)
+            let host_config_dir = config::resolve_host_config_dir(None)?;
             let mut fleet = hop_core::fleet::FleetStore::load(&host_config_dir)?;
             fleet.add_member(hop_core::fleet::FleetMember {
                 node_id: host.node_id.clone(),
@@ -1909,7 +1909,7 @@ async fn cmd_fleet(
             let mut any = false;
 
             // 1. FleetStore members (daemon's fleet.json) — shown with tags
-            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            let host_config_dir = config::resolve_host_config_dir(None)?;
             if let Ok(fleet) = hop_core::fleet::FleetStore::load(&host_config_dir) {
                 for m in &fleet.members {
                     let matches = group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true);
