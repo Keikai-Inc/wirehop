@@ -376,7 +376,10 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
 
     // Spawn cron scheduler: every 15s, check for due jobs and execute them
-    hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), None);
+    let cron_backend: hop_mcp::backend::BoxedBackend = std::sync::Arc::new(
+        hop_mcp::backend::local::LocalBackend::new(config_dir.to_path_buf()),
+    );
+    hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), Some(cron_backend));
 
     // Signal handling for graceful shutdown
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
