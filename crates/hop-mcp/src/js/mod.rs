@@ -336,7 +336,7 @@ mod tests {
             try {
                 hop.kv.set("test", "greeting", "hello");
                 const result = hop.kv.get("test", "greeting");
-                return result.value;
+                return result;
             } catch(e) {
                 return "ERROR: " + e.message + " | " + e.stack;
             }

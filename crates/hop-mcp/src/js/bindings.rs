@@ -659,7 +659,9 @@ fn install_datastore_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
         hop.kv = {
             get: function(ns, key) {
                 var r = __hop_kv_get(ns, key);
-                return r === "null" ? null : JSON.parse(r);
+                if (r === "null") return null;
+                var entry = JSON.parse(r);
+                return entry.value;
             },
             set: function(ns, key, value, contentType) {
                 if (contentType !== undefined) {
