@@ -1,5 +1,11 @@
 //! Cron scheduler: polls for due jobs and executes their JS scripts.
+//!
+//! Design follows the Kubernetes CronJob `Forbid` / APScheduler `max_instances=1`
+//! pattern: only one instance of a given job runs at a time. If a job is still
+//! running when its next fire time arrives, that tick is skipped. Missed runs
+//! (e.g. daemon was down) are coalesced into a single execution on startup.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,58 +41,85 @@ pub fn spawn_cron_scheduler(
     backend: Option<Arc<dyn OrchestratorBackend>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Track which jobs are currently executing. Checked synchronously on
+        // each tick before spawning — prevents duplicate runs entirely.
+        let running: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
         let mut interval = tokio::time::interval(poll_interval);
         loop {
             interval.tick().await;
-            if let Err(e) = run_due_jobs(&datastore, backend.as_ref()).await {
+            if let Err(e) =
+                run_due_jobs(&datastore, backend.as_ref(), &running).await
+            {
                 tracing::error!("Cron scheduler error: {e:#}");
             }
         }
     })
 }
 
-/// Query for due jobs and spawn a task for each one.
+/// Query for due jobs and spawn a task for each one (skipping in-flight jobs).
 async fn run_due_jobs(
     datastore: &Datastore,
     backend: Option<&Arc<dyn OrchestratorBackend>>,
+    running: &Arc<std::sync::Mutex<HashSet<String>>>,
 ) -> Result<()> {
     let now = now_ms();
     let due_jobs = datastore.cron_get_due(now)?;
 
-    if !due_jobs.is_empty() {
-        tracing::info!("Cron: {} job(s) due for execution", due_jobs.len());
-    }
-
     for job in due_jobs {
+        // --- Concurrency guard: skip if already running ---
+        {
+            let set = running.lock().unwrap();
+            if set.contains(&job.id) {
+                tracing::debug!(
+                    "Cron: skipping '{}' ({}) — already running",
+                    job.name,
+                    job.id
+                );
+                continue;
+            }
+        }
+
+        // Advance next_run before spawning so cron_get_due won't return this
+        // job again even if the running set check somehow races.
+        let next_run = job
+            .schedule
+            .parse::<cron::Schedule>()
+            .map(|s| next_occurrence_ms(&s, now))
+            .unwrap_or(now + 60_000);
+        datastore.cron_update_last_run(&job.id, now, next_run)?;
+
+        // Mark as running before spawning the task.
+        {
+            let mut set = running.lock().unwrap();
+            set.insert(job.id.clone());
+        }
+
         let ds = datastore.clone();
         let be = backend.cloned();
+        let running = Arc::clone(running);
+        let job_id = job.id.clone();
+
         tokio::spawn(async move {
             if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
                 tracing::error!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
             }
+            // Always clear the running flag, even on failure.
+            let mut set = running.lock().unwrap();
+            set.remove(&job_id);
         });
     }
 
     Ok(())
 }
 
-/// Execute a single cron job's JS script and update last_run/next_run.
+/// Execute a single cron job's JS script.
 async fn execute_cron_job(
     datastore: &Datastore,
     job: &hop_core::datastore::types::CronJob,
     backend: Option<&Arc<dyn OrchestratorBackend>>,
 ) -> Result<()> {
-    let now = now_ms();
-
-    // Advance next_run BEFORE execution so the scheduler won't re-spawn
-    // this job while it's still running (e.g. if exec hangs for 60s).
-    let next_run = job
-        .schedule
-        .parse::<cron::Schedule>()
-        .map(|s| next_occurrence_ms(&s, now))
-        .unwrap_or(now + 60_000);
-    datastore.cron_update_last_run(&job.id, now, next_run)?;
-
     tracing::info!("Cron: executing job '{}' ({})", job.name, job.id);
 
     let mut runtime = JsRuntime::new();
@@ -103,8 +136,7 @@ async fn execute_cron_job(
 
     // Timeout must exceed the 60s exec timeout in LocalBackend so that
     // hop.exec() can fire its own timeout error instead of the JS runtime
-    // killing the script silently. Jobs without network calls still finish
-    // quickly — this is just a generous upper bound.
+    // killing the script silently.
     let js_timeout = Duration::from_secs(120);
 
     let result = if let Some(be) = backend {
@@ -177,25 +209,22 @@ mod tests {
     async fn run_due_jobs_executes_script_writes_kv() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        // Create a due job that writes to KV
         let job = make_job(
             "j1",
             "0 * * * * *",
             "hop.kv.set('cron_test', 'proof', 'it_ran')",
             true,
-            0, // next_run=0 means it's always due
+            0,
         );
         ds.cron_add(&job).unwrap();
 
-        run_due_jobs(&ds, None).await.unwrap();
-
-        // Give the spawned task a moment to complete
+        run_due_jobs(&ds, None, &running).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let entry = ds.kv_get("cron_test", "proof").unwrap();
         assert!(entry.is_some(), "KV entry should exist after cron execution");
-        // JS strings are stored JSON-encoded (with quotes)
         assert_eq!(entry.unwrap().value, b"\"it_ran\"");
     }
 
@@ -203,18 +232,14 @@ mod tests {
     async fn run_due_jobs_handles_failing_script() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        // Create a due job with invalid JS
         let job = make_job("j_fail", "0 * * * * *", "throw new Error('boom')", true, 0);
         ds.cron_add(&job).unwrap();
 
-        // Should not panic
-        run_due_jobs(&ds, None).await.unwrap();
-
-        // Give the spawned task time to complete
+        run_due_jobs(&ds, None, &running).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // last_run should still be updated
         let updated = ds.cron_get("j_fail").unwrap().unwrap();
         assert!(
             updated.last_run.is_some(),
@@ -226,8 +251,8 @@ mod tests {
     async fn disabled_jobs_are_not_executed() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        // Create a disabled job
         let job = make_job(
             "j_disabled",
             "0 * * * * *",
@@ -237,11 +262,63 @@ mod tests {
         );
         ds.cron_add(&job).unwrap();
 
-        run_due_jobs(&ds, None).await.unwrap();
+        run_due_jobs(&ds, None, &running).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let entry = ds.kv_get("cron_test", "disabled").unwrap();
         assert!(entry.is_none(), "Disabled job should not execute");
+    }
+
+    #[tokio::test]
+    async fn skips_already_running_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        // Simulate a long-running job by pre-inserting its ID in the running set
+        let job = make_job(
+            "j_slow",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'slow', 'should_not_run_twice')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        // Mark as already running
+        running.lock().unwrap().insert("j_slow".to_string());
+
+        // This tick should skip it
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let entry = ds.kv_get("cron_test", "slow").unwrap();
+        assert!(entry.is_none(), "Already-running job should be skipped");
+    }
+
+    #[tokio::test]
+    async fn running_flag_cleared_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let job = make_job(
+            "j_clear",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'clear', 'done')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // After completion, the running set should be empty
+        assert!(
+            !running.lock().unwrap().contains("j_clear"),
+            "Running flag should be cleared after job completes"
+        );
     }
 
     #[tokio::test]
@@ -258,12 +335,8 @@ mod tests {
         );
         ds.cron_add(&job).unwrap();
 
-        // Spawn scheduler with a short interval
         let handle = spawn_cron_scheduler(ds.clone(), Duration::from_millis(100), None);
-
-        // Wait for at least one tick
         tokio::time::sleep(Duration::from_millis(800)).await;
-
         handle.abort();
 
         let entry = ds.kv_get("cron_test", "sched").unwrap();
@@ -272,7 +345,6 @@ mod tests {
             "Scheduler should have executed the due job"
         );
 
-        // Verify next_run was advanced
         let updated = ds.cron_get("j_sched").unwrap().unwrap();
         assert!(updated.next_run > 0, "next_run should be advanced");
         assert!(
