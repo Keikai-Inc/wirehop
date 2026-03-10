@@ -1,8 +1,10 @@
 #!/bin/bash
 # postinstall — Set permissions, migrate config, and start the hop daemon.
 # Runs as root during .pkg installation.
-
-set -e
+#
+# IMPORTANT: This script must NOT fail the installation. The binary and plist
+# are already installed by the time this runs. If the daemon can't start,
+# warn the user but exit 0 so the pkg install succeeds.
 
 LABEL="com.hop.daemon"
 PLIST="/Library/LaunchDaemons/com.hop.daemon.plist"
@@ -42,62 +44,56 @@ fi
 
 # Set per-file permissions: identity is read-only for admin users,
 # peers and pending_invites are read-write (shared between daemon and CLI).
-if [ -f "$SYSTEM_CONFIG/identity.json" ]; then
-    chown root:admin "$SYSTEM_CONFIG/identity.json"
-    chmod 640 "$SYSTEM_CONFIG/identity.json"
-fi
-if [ -f "$SYSTEM_CONFIG/peers.json" ]; then
-    chown root:admin "$SYSTEM_CONFIG/peers.json"
-    chmod 660 "$SYSTEM_CONFIG/peers.json"
-fi
-if [ -f "$SYSTEM_CONFIG/pending_invites.json" ]; then
-    chown root:admin "$SYSTEM_CONFIG/pending_invites.json"
-    chmod 660 "$SYSTEM_CONFIG/pending_invites.json"
-fi
-if [ -f "$SYSTEM_CONFIG/datastore.redb" ]; then
-    chown root:admin "$SYSTEM_CONFIG/datastore.redb"
-    chmod 660 "$SYSTEM_CONFIG/datastore.redb"
-fi
-if [ -f "$SYSTEM_CONFIG/fleet.json" ]; then
-    chown root:admin "$SYSTEM_CONFIG/fleet.json"
-    chmod 660 "$SYSTEM_CONFIG/fleet.json"
-fi
-if [ -f "$SYSTEM_CONFIG/roles.json" ]; then
-    chown root:admin "$SYSTEM_CONFIG/roles.json"
-    chmod 660 "$SYSTEM_CONFIG/roles.json"
-fi
+for f in identity.json; do
+    [ -f "$SYSTEM_CONFIG/$f" ] && chown root:admin "$SYSTEM_CONFIG/$f" && chmod 640 "$SYSTEM_CONFIG/$f"
+done
+for f in peers.json pending_invites.json datastore.redb fleet.json roles.json; do
+    [ -f "$SYSTEM_CONFIG/$f" ] && chown root:admin "$SYSTEM_CONFIG/$f" && chmod 660 "$SYSTEM_CONFIG/$f"
+done
 
 echo "Starting hop daemon..."
 
 # Stop old daemon cleanly before starting the new one.
-# bootout fully unloads the service; we ignore errors if it wasn't loaded.
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 
-# Give the old process time to exit and release file locks / sockets.
-sleep 1
+# Wait for the old process to fully exit and release file locks / sockets.
+# Retry up to 5 seconds — bootout can be slow on upgrades.
+for i in 1 2 3 4 5; do
+    if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
 # Remove stale Unix sockets that a crashed daemon may have left behind.
 rm -f "$SYSTEM_CONFIG/daemon.sock"
 rm -f "$SYSTEM_CONFIG/agent.sock"
 
 # Load and start the new daemon.
-# bootstrap may fail if the service is still partially registered after bootout,
-# so try kickstart as a fallback (which restarts an already-loaded service).
-if ! launchctl bootstrap system "$PLIST" 2>/dev/null; then
-    echo "bootstrap failed, trying kickstart..."
-    if ! launchctl kickstart -k "system/$LABEL" 2>&1; then
-        echo "ERROR: Failed to start hop daemon. Check /var/log/hop-stderr.log"
-        exit 1
-    fi
+# Try bootstrap first (modern API), then load (legacy API), then kickstart.
+STARTED=false
+if launchctl bootstrap system "$PLIST" 2>/dev/null; then
+    STARTED=true
+elif launchctl load -w "$PLIST" 2>/dev/null; then
+    STARTED=true
+elif launchctl kickstart -k "system/$LABEL" 2>/dev/null; then
+    STARTED=true
 fi
 
-# Wait for daemon to start and generate creator invite
-sleep 2
+if [ "$STARTED" = true ]; then
+    sleep 2
 
-# Verify the daemon is actually running.
-if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
-    echo "WARNING: Hop daemon may not be running. Check /var/log/hop-stderr.log"
-    tail -5 /var/log/hop-stderr.log 2>/dev/null || true
+    # Verify the daemon is actually running.
+    if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+        echo "Hop daemon started successfully."
+    else
+        echo "WARNING: Hop daemon may not be running. Check: /var/log/hop-stderr.log"
+    fi
+else
+    echo "WARNING: Could not start hop daemon automatically."
+    echo "The binary and configuration are installed. Start manually with:"
+    echo "  sudo launchctl bootstrap system $PLIST"
+    echo "Or check: /var/log/hop-stderr.log"
 fi
 
 # Display creator invite if available
@@ -114,4 +110,5 @@ if [ -f "$CREATOR_INVITE" ]; then
     echo ""
 fi
 
+# Always exit 0 — the install succeeded even if the daemon didn't start.
 exit 0
