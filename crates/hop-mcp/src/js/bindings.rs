@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use hop_core::datastore::types::{KvEntry, MetricPoint, TimeSeriesQuery};
@@ -14,6 +15,28 @@ use rquickjs::{Ctx, Function, Object, Value};
 use tokio::runtime::Handle;
 
 use crate::backend::OrchestratorBackend;
+
+/// Default timeout for `block_on` calls from the JS thread.
+/// `Handle::block_on` + `tokio::time::timeout` doesn't reliably deliver
+/// timer wakeups to a parked std thread. We use a thread-level timeout
+/// (oneshot channel with `recv_timeout`) as the true deadline.
+const BLOCK_ON_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run an async future on the tokio runtime from a std thread, with a hard
+/// timeout that works even if the tokio timer doesn't wake the blocked thread.
+fn block_on_with_timeout<F, T>(handle: &Handle, timeout: Duration, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    handle.spawn(async move {
+        let result = fut.await;
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(timeout)
+        .map_err(|_| anyhow::anyhow!("operation timed out after {}s", timeout.as_secs()))?
+}
 
 /// Create a rquickjs error with an owned message.
 fn js_err(msg: String) -> rquickjs::Error {
@@ -125,7 +148,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_exec",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, command: String| -> rquickjs::Result<String> {
-                match h.block_on(b.exec(&host, &command)) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.exec(&host2, &command).await }) {
                     Ok(result) => serde_json::to_string(&result)
                         .map_err(|e| js_err(format!("serialize exec result: {e}"))),
                     Err(e) => Err(js_err(format!("hop.exec({host}, ...) failed: {e}"))),
@@ -141,7 +166,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_fleet_list",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, tag: rquickjs::function::Opt<String>| -> rquickjs::Result<String> {
-                match h.block_on(b.list_hosts(tag.0.as_deref())) {
+                let b2 = Arc::clone(&b);
+                let tag2 = tag.0.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.list_hosts(tag2.as_deref()).await }) {
                     Ok(hosts) => serde_json::to_string(&hosts)
                         .map_err(|e| js_err(format!("serialize fleet list: {e}"))),
                     Err(e) => Err(js_err(format!("hop.fleet.list() failed: {e}"))),
@@ -157,10 +184,11 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_fleet_exec",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, group: String, command: String| -> rquickjs::Result<String> {
-                match h.block_on(b.fleet_exec(&group, &command)) {
+                let b2 = Arc::clone(&b);
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.fleet_exec(&group, &command).await }) {
                     Ok(results) => serde_json::to_string(&results)
                         .map_err(|e| js_err(format!("serialize fleet exec: {e}"))),
-                    Err(e) => Err(js_err(format!("hop.fleet.exec({group}, ...) failed: {e}"))),
+                    Err(e) => Err(js_err(format!("hop.fleet.exec() failed: {e}"))),
                 }
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -173,7 +201,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_admin_status",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
-                match h.block_on(b.admin_status(&host)) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.admin_status(&host2).await }) {
                     Ok(status) => serde_json::to_string(&status)
                         .map_err(|e| js_err(format!("serialize admin status: {e}"))),
                     Err(e) => Err(js_err(format!("hop.admin.status({host}) failed: {e}"))),
@@ -189,7 +219,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_admin_peers",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
-                match h.block_on(b.admin_peers(&host)) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.admin_peers(&host2).await }) {
                     Ok(peers) => serde_json::to_string(&peers)
                         .map_err(|e| js_err(format!("serialize admin peers: {e}"))),
                     Err(e) => Err(js_err(format!("hop.admin.peers({host}) failed: {e}"))),
@@ -205,7 +237,11 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_admin_invite",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, username: rquickjs::function::Opt<String>, role: rquickjs::function::Opt<String>| -> rquickjs::Result<String> {
-                match h.block_on(b.admin_invite(&host, username.0.as_deref(), role.0.as_deref())) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                let u = username.0.clone();
+                let r = role.0.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.admin_invite(&host2, u.as_deref(), r.as_deref()).await }) {
                     Ok(token) => Ok(token),
                     Err(e) => Err(js_err(format!("hop.admin.invite({host}) failed: {e}"))),
                 }
@@ -220,7 +256,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_admin_remove_peer",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, prefix: String| -> rquickjs::Result<String> {
-                match h.block_on(b.admin_remove_peer(&host, &prefix)) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.admin_remove_peer(&host2, &prefix).await }) {
                     Ok(success) => Ok(serde_json::json!({"success": success}).to_string()),
                     Err(e) => Err(js_err(format!("hop.admin.removePeer({host}) failed: {e}"))),
                 }
@@ -235,7 +273,9 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_roles_list",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String| -> rquickjs::Result<String> {
-                match h.block_on(b.list_roles(&host)) {
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.list_roles(&host2).await }) {
                     Ok(roles) => serde_json::to_string(&roles)
                         .map_err(|e| js_err(format!("serialize roles: {e}"))),
                     Err(e) => Err(js_err(format!("hop.roles.list({host}) failed: {e}"))),
@@ -251,7 +291,10 @@ fn install_live_raw_bindings(
         let h = handle.clone();
         ctx.globals().set("__hop_roles_delete",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, name: String| -> rquickjs::Result<()> {
-                h.block_on(b.delete_role(&host, &name))
+                let b2 = Arc::clone(&b);
+                let host2 = host.clone();
+                let name2 = name.clone();
+                block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.delete_role(&host2, &name2).await })
                     .map_err(|e| js_err(format!("hop.roles.delete({host}, {name}) failed: {e}")))
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -266,7 +309,8 @@ fn install_live_raw_bindings(
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, points_json: String| -> rquickjs::Result<String> {
                 let points: Vec<hop_core::proto::PushMetricPoint> = serde_json::from_str(&points_json)
                     .map_err(|e| js_err(format!("invalid points JSON: {e}")))?;
-                match h.block_on(b.push_metrics(points)) {
+                let b2 = Arc::clone(&b);
+                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.push_metrics(points).await }) {
                     Ok(count) => Ok(serde_json::json!({"count": count}).to_string()),
                     Err(e) => Err(js_err(format!("hop.metrics.push() failed: {e}"))),
                 }
