@@ -34,8 +34,17 @@ where
         let result = fut.await;
         let _ = tx.send(result);
     });
-    rx.recv_timeout(timeout)
-        .map_err(|_| anyhow::anyhow!("operation timed out after {}s", timeout.as_secs()))?
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!("block_on_with_timeout: timed out after {}s", timeout.as_secs());
+            Err(anyhow::anyhow!("operation timed out after {}s", timeout.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!("block_on_with_timeout: channel disconnected (task panicked?)");
+            Err(anyhow::anyhow!("operation failed: task panicked or was cancelled"))
+        }
+    }
 }
 
 /// Create a rquickjs error with an owned message.

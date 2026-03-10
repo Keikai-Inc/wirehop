@@ -387,9 +387,15 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
     let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
 
-    // Spawn cron scheduler: every 15s, check for due jobs and execute them
+    // Spawn cron scheduler: every 15s, check for due jobs and execute them.
+    // Uses DirectBackend so cron jobs connect via the daemon's own iroh endpoint
+    // instead of spawning a separate mux agent process (which would conflict
+    // with the daemon's identity).
     let cron_backend: hop_mcp::backend::BoxedBackend = std::sync::Arc::new(
-        hop_mcp::backend::local::LocalBackend::new(config_dir.to_path_buf()),
+        hop_mcp::backend::direct::DirectBackend::new(
+            std::sync::Arc::new(endpoint.clone()),
+            config_dir.to_path_buf(),
+        ),
     );
     hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), Some(cron_backend));
 

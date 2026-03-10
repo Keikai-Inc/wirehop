@@ -102,12 +102,16 @@ async fn run_due_jobs(
         let job_id = job.id.clone();
 
         tokio::spawn(async move {
+            // RAII guard: clears the running flag on drop, even if the task
+            // panics (e.g. from iroh-quinn connection bugs). Without this,
+            // a panicked task would leave the job permanently stuck.
+            let _guard = RunningGuard {
+                set: Arc::clone(&running),
+                id: job_id,
+            };
             if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
                 tracing::error!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
             }
-            // Always clear the running flag, even on failure.
-            let mut set = running.lock().unwrap();
-            set.remove(&job_id);
         });
     }
 
@@ -155,6 +159,19 @@ async fn execute_cron_job(
     }
 
     Ok(())
+}
+
+/// RAII guard that removes a job ID from the running set on drop.
+/// Ensures cleanup even if the spawned task panics (e.g. from iroh-quinn bugs).
+struct RunningGuard {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.id);
+    }
 }
 
 fn now_ms() -> u64 {

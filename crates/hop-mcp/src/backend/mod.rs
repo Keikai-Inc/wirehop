@@ -3,6 +3,7 @@
 //! Abstracts fleet operations so the JS bindings work with both
 //! the local mux agent (current) and keik.ai (future).
 
+pub mod direct;
 pub mod local;
 
 use std::sync::Arc;
