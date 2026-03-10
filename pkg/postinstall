@@ -53,24 +53,42 @@ done
 
 echo "Starting hop daemon..."
 
-# Stop old daemon cleanly before starting the new one.
+# --- Stop the old daemon and wait for it to actually die ---
+# launchctl bootout is async: it tells launchd to stop the service but the
+# process may linger while it flushes the redb database and closes sockets.
+# We must wait for the *process* to exit, not just for launchd to unregister it.
+
+# Grab the PID before bootout (if the service is loaded).
+OLD_PID=$(launchctl print "system/$LABEL" 2>/dev/null | grep -m1 'pid =' | awk '{print $3}')
+
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 
-# Wait for the old process to fully exit and release file locks / sockets.
-# Retry up to 5 seconds — bootout can be slow on upgrades.
-for i in 1 2 3 4 5; do
-    if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
-        break
+if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "0" ]; then
+    echo "Waiting for old daemon (pid $OLD_PID) to exit..."
+    # Poll the actual process — kill -0 succeeds while the PID is alive.
+    for i in $(seq 1 10); do
+        if ! kill -0 "$OLD_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    # If it's still alive after 10s, force-kill it.
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "Old daemon still running after 10s, sending SIGKILL..."
+        kill -9 "$OLD_PID" 2>/dev/null || true
+        sleep 1
     fi
-    sleep 1
-done
+fi
 
-# Remove stale Unix sockets that a crashed daemon may have left behind.
+# Also kill any orphaned hop host processes (e.g. from a crashed launchd state).
+pkill -f "hop host.*--config.*/Library/Application Support/hop" 2>/dev/null || true
+sleep 0.5
+
+# Remove stale Unix sockets and lock files.
 rm -f "$SYSTEM_CONFIG/daemon.sock"
 rm -f "$SYSTEM_CONFIG/agent.sock"
 
-# Load and start the new daemon.
-# Try bootstrap first (modern API), then load (legacy API), then kickstart.
+# --- Load and start the new daemon ---
 STARTED=false
 if launchctl bootstrap system "$PLIST" 2>/dev/null; then
     STARTED=true
