@@ -514,6 +514,9 @@ pub enum KvAction {
     Get {
         /// Key to look up
         key: String,
+        /// Output raw value (unwrap JSON strings for piping to files)
+        #[arg(long)]
+        raw: bool,
     },
     /// List keys matching an optional prefix
     List {

@@ -2100,11 +2100,27 @@ fn cmd_kv(config_dir: &std::path::Path, action: KvAction) -> Result<()> {
     let ns = "default";
 
     match action {
-        KvAction::Get { key } => {
+        KvAction::Get { key, raw } => {
             match ds.kv_get(ns, &key)? {
                 Some(entry) => {
-                    let value = String::from_utf8_lossy(&entry.value);
-                    println!("{value}");
+                    let text = String::from_utf8_lossy(&entry.value);
+                    if raw {
+                        // --raw: unwrap JSON strings so binary/HTML content
+                        // can be piped directly to a file.
+                        if text.starts_with('"') {
+                            if let Ok(serde_json::Value::String(s)) =
+                                serde_json::from_str(&text)
+                            {
+                                print!("{s}");
+                            } else {
+                                print!("{text}");
+                            }
+                        } else {
+                            print!("{text}");
+                        }
+                    } else {
+                        println!("{text}");
+                    }
                 }
                 None => {
                     println!("(not found)");
