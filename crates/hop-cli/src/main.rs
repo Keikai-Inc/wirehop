@@ -54,9 +54,9 @@ async fn main() -> Result<()> {
         EnvFilter::from_default_env()
     } else {
         EnvFilter::new(match cli.verbose {
-            0 => "hop=info",
-            1 => "hop=debug",
-            _ => "hop=trace",
+            0 => "hop=info,hop_core=info,hop_mcp=info",
+            1 => "hop=debug,hop_core=debug,hop_mcp=debug",
+            _ => "hop=trace,hop_core=trace,hop_mcp=trace",
         })
     };
     tracing_subscriber::fmt()
