@@ -78,6 +78,15 @@ async fn execute_cron_job(
 ) -> Result<()> {
     let now = now_ms();
 
+    // Advance next_run BEFORE execution so the scheduler won't re-spawn
+    // this job while it's still running (e.g. if exec hangs for 60s).
+    let next_run = job
+        .schedule
+        .parse::<cron::Schedule>()
+        .map(|s| next_occurrence_ms(&s, now))
+        .unwrap_or(now + 60_000);
+    datastore.cron_update_last_run(&job.id, now, next_run)?;
+
     tracing::info!("Cron: executing job '{}' ({})", job.name, job.id);
 
     let mut runtime = JsRuntime::new();
@@ -92,14 +101,16 @@ async fn execute_cron_job(
         job.script.clone()
     };
 
+    // Timeout must exceed the 60s exec timeout in LocalBackend so that
+    // hop.exec() can fire its own timeout error instead of the JS runtime
+    // killing the script silently. Jobs without network calls still finish
+    // quickly — this is just a generous upper bound.
+    let js_timeout = Duration::from_secs(120);
+
     let result = if let Some(be) = backend {
-        runtime
-            .execute(&script, be, Some(Duration::from_secs(30)))
-            .await
+        runtime.execute(&script, be, Some(js_timeout)).await
     } else {
-        runtime
-            .execute_script(&script, Some(Duration::from_secs(30)))
-            .await
+        runtime.execute_script(&script, Some(js_timeout)).await
     };
 
     match &result {
@@ -110,15 +121,6 @@ async fn execute_cron_job(
         ),
         Err(e) => tracing::error!("Cron job '{}' script error: {e:#}", job.name),
     }
-
-    // Always update last_run/next_run, even on script failure
-    let next_run = job
-        .schedule
-        .parse::<cron::Schedule>()
-        .map(|s| next_occurrence_ms(&s, now))
-        .unwrap_or(now + 60_000);
-
-    datastore.cron_update_last_run(&job.id, now, next_run)?;
 
     Ok(())
 }
