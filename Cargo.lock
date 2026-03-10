@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.2.52"
+version = "0.2.53"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.2.52"
+version = "0.2.53"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mcp"
-version = "0.2.52"
+version = "0.2.53"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -151,9 +151,29 @@ fn execute_js_sync(
 
         let wrapped = format!("(function() {{\n{code}\n}})()");
 
-        let result: rquickjs::Value = ctx
-            .eval(wrapped)
-            .map_err(|e| anyhow::anyhow!("JS execution error: {e}"))?;
+        let result: rquickjs::Value = ctx.eval(wrapped).map_err(|e| {
+            // Try to extract the actual JS exception message
+            let exception_msg = ctx
+                .catch()
+                .as_exception()
+                .map(|ex| {
+                    let msg = ex.message().unwrap_or_default();
+                    let stack = ex
+                        .stack()
+                        .unwrap_or_default();
+                    if stack.is_empty() {
+                        msg
+                    } else {
+                        format!("{msg}\n{stack}")
+                    }
+                })
+                .unwrap_or_default();
+            if exception_msg.is_empty() {
+                anyhow::anyhow!("JS execution error: {e}")
+            } else {
+                anyhow::anyhow!("JS error: {exception_msg}")
+            }
+        })?;
 
         value_to_string(&ctx, &result)
     })?;
