@@ -4,12 +4,15 @@
 //! connects to remote hosts directly through the endpoint that the daemon already
 //! owns. This is the correct backend for cron jobs running inside the daemon.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use iroh::Endpoint;
+use iroh::endpoint::Connection;
+use iroh::{Endpoint, PublicKey};
+use tokio::sync::Mutex;
 
 use hop_core::config::{self, KnownHostsStore, PeerRole};
 use hop_core::fleet::FleetStore;
@@ -22,9 +25,14 @@ use crate::backend::OrchestratorBackend;
 use crate::js::types::*;
 
 /// Backend that uses an existing iroh endpoint to connect to remote hosts.
+///
+/// Maintains a connection pool so multiple operations to the same host reuse
+/// a single QUIC connection, opening new bi-streams for each operation (same
+/// pattern as the mux agent).
 pub struct DirectBackend {
     endpoint: Arc<Endpoint>,
     config_dir: PathBuf,
+    connections: Mutex<HashMap<PublicKey, Connection>>,
 }
 
 impl DirectBackend {
@@ -32,7 +40,30 @@ impl DirectBackend {
         Self {
             endpoint,
             config_dir,
+            connections: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get an existing live connection or create a new one (same pattern as agent.rs).
+    async fn get_or_connect(
+        &self,
+        host_id: PublicKey,
+        relay_url: Option<&iroh::RelayUrl>,
+    ) -> Result<Connection> {
+        let mut conns = self.connections.lock().await;
+
+        if let Some(conn) = conns.get(&host_id) {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+            conns.remove(&host_id);
+        }
+
+        let (conn, _direct) =
+            net::connect_to_host(&self.endpoint, host_id, relay_url).await?;
+
+        conns.insert(host_id, conn.clone());
+        Ok(conn)
     }
 
     /// Open a bi-directional QUIC stream to a remote host and send a session request.
@@ -45,15 +76,23 @@ impl DirectBackend {
         iroh::endpoint::RecvStream,
     )> {
         let (pk, relay_url) = resolve_target(&self.config_dir, host)?;
-        let public_key = iroh::PublicKey::from_bytes(&pk)?;
+        let public_key = PublicKey::from_bytes(&pk)?;
         let relay = relay_url
             .as_ref()
             .and_then(|u| u.parse::<iroh::RelayUrl>().ok());
 
-        let (conn, _direct) =
-            net::connect_to_host(&self.endpoint, public_key, relay.as_ref()).await?;
+        let conn = self.get_or_connect(public_key, relay.as_ref()).await?;
 
-        let (mut send, recv) = conn.open_bi().await.context("Failed to open bi-stream")?;
+        let bi_result = conn.open_bi().await;
+        let (mut send, recv) = match bi_result {
+            Ok(pair) => pair,
+            Err(_) => {
+                // Connection went stale — remove from pool and reconnect
+                self.connections.lock().await.remove(&public_key);
+                let conn = self.get_or_connect(public_key, relay.as_ref()).await?;
+                conn.open_bi().await.context("Failed to open bi-stream")?
+            }
+        };
 
         // Send the session request (hop protocol)
         proto::write_message(&mut send, session_request).await?;
@@ -193,35 +232,27 @@ impl OrchestratorBackend for DirectBackend {
 
     async fn fleet_exec(&self, group: &str, command: &str) -> Result<Vec<FleetExecResult>> {
         let hosts = self.list_hosts(Some(group)).await?;
-        let mut handles = Vec::new();
-
-        for host in hosts {
-            let endpoint = Arc::clone(&self.endpoint);
-            let config_dir = self.config_dir.clone();
-            let cmd = command.to_string();
-            let host_name = host.name.clone();
-            handles.push(tokio::spawn(async move {
-                let backend = DirectBackend::new(endpoint, config_dir);
-                match backend.exec_on_host(&host_name, &cmd).await {
-                    Ok(result) => FleetExecResult {
-                        host: host_name,
-                        stdout: result.stdout,
-                        stderr: result.stderr,
-                        exit_code: result.exit_code,
-                    },
-                    Err(e) => FleetExecResult {
-                        host: host_name,
-                        stdout: String::new(),
-                        stderr: format!("Connection error: {e}"),
-                        exit_code: -1,
-                    },
-                }
-            }));
-        }
-
         let mut results = Vec::new();
-        for handle in handles {
-            results.push(handle.await?);
+
+        // Execute sequentially. Each call reuses the connection pool, so the
+        // first exec to a host pays the handshake cost and subsequent calls
+        // open new bi-streams on the existing connection.
+        for host in hosts {
+            let host_name = host.name.clone();
+            match self.exec_on_host(&host_name, command).await {
+                Ok(result) => results.push(FleetExecResult {
+                    host: host_name,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    exit_code: result.exit_code,
+                }),
+                Err(e) => results.push(FleetExecResult {
+                    host: host_name,
+                    stdout: String::new(),
+                    stderr: format!("Connection error: {e}"),
+                    exit_code: -1,
+                }),
+            }
         }
         Ok(results)
     }
