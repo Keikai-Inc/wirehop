@@ -65,6 +65,19 @@ impl LocalBackend {
         host: &str,
         request: AdminRequest,
     ) -> Result<AdminResponse> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.send_admin_request_inner(host, request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Admin request to '{host}' timed out after 30s"))?
+    }
+
+    async fn send_admin_request_inner(
+        &self,
+        host: &str,
+        request: AdminRequest,
+    ) -> Result<AdminResponse> {
         let session_request = ClientMessage::RequestAdmin(request);
         let (_write, mut read) = self.open_host_stream(host, &session_request).await?;
 
@@ -83,6 +96,17 @@ impl LocalBackend {
 
     /// Execute a command on a host, reading output until Exit.
     async fn exec_on_host(&self, host: &str, command: &str) -> Result<ExecResult> {
+        // 60-second timeout on the entire exec flow (connect + execute + read).
+        // Prevents cron jobs from hanging indefinitely when a host is unreachable.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.exec_on_host_inner(host, command),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Exec on '{host}' timed out after 60s"))?
+    }
+
+    async fn exec_on_host_inner(&self, host: &str, command: &str) -> Result<ExecResult> {
         let session_request = ClientMessage::RequestExec {
             command: command.to_string(),
         };
