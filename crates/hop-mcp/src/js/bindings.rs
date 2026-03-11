@@ -5,6 +5,8 @@
 //! will be bridged via a channel back to the tokio runtime (Phase 2+).
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use std::time::Duration;
 
