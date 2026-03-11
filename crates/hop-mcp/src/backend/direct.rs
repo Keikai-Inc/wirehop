@@ -23,6 +23,7 @@ use hop_core::proto::{
 
 use crate::backend::OrchestratorBackend;
 use crate::js::types::*;
+use hop_core::sandbox::SandboxPolicy;
 
 /// Backend that uses an existing iroh endpoint to connect to remote hosts.
 ///
@@ -136,6 +137,58 @@ impl DirectBackend {
         )
         .await
         .map_err(|_| anyhow::anyhow!("Exec on '{host}' timed out after 60s"))?
+    }
+
+    /// Execute a command on a host with a sandbox policy and 60-second timeout.
+    async fn exec_on_host_sandboxed(
+        &self,
+        host: &str,
+        command: &str,
+        sandbox: &SandboxPolicy,
+    ) -> Result<ExecResult> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.exec_on_host_sandboxed_inner(host, command, sandbox),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Exec on '{host}' timed out after 60s"))?
+    }
+
+    async fn exec_on_host_sandboxed_inner(
+        &self,
+        host: &str,
+        command: &str,
+        sandbox: &SandboxPolicy,
+    ) -> Result<ExecResult> {
+        let session_request = ClientMessage::RequestExecV2 {
+            command: command.to_string(),
+            sandbox: sandbox.clone(),
+        };
+        let (_send, mut recv) = self.open_host_stream(host, &session_request).await?;
+
+        let mut stdout = Vec::new();
+        let stderr = Vec::new();
+
+        loop {
+            let msg: HostMessage = proto::read_message(&mut recv)
+                .await
+                .context("Connection lost during exec")?;
+
+            match msg {
+                HostMessage::Output(data) => stdout.extend_from_slice(&data),
+                HostMessage::Exit(code) => {
+                    return Ok(ExecResult {
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        exit_code: code,
+                    });
+                }
+                HostMessage::AuthResult { authorized: false } => {
+                    anyhow::bail!("Not authorized on host '{host}'")
+                }
+                _ => {} // Ignore WindowSizeAck etc.
+            }
+        }
     }
 
     async fn exec_on_host_inner(&self, host: &str, command: &str) -> Result<ExecResult> {
@@ -415,6 +468,47 @@ impl OrchestratorBackend for DirectBackend {
             AdminResponse::Error { message } => anyhow::bail!("{message}"),
             _ => anyhow::bail!("Unexpected response"),
         }
+    }
+
+    async fn exec_sandboxed(
+        &self,
+        host: &str,
+        command: &str,
+        sandbox: &SandboxPolicy,
+    ) -> Result<ExecResult> {
+        self.exec_on_host_sandboxed(host, command, sandbox).await
+    }
+
+    async fn fleet_exec_sandboxed(
+        &self,
+        group: &str,
+        command: &str,
+        sandbox: &SandboxPolicy,
+    ) -> Result<Vec<FleetExecResult>> {
+        let hosts = self.list_hosts(Some(group)).await?;
+        let mut results = Vec::new();
+
+        for host in hosts {
+            let host_name = host.name.clone();
+            match self
+                .exec_on_host_sandboxed(&host_name, command, sandbox)
+                .await
+            {
+                Ok(result) => results.push(FleetExecResult {
+                    host: host_name,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    exit_code: result.exit_code,
+                }),
+                Err(e) => results.push(FleetExecResult {
+                    host: host_name,
+                    stdout: String::new(),
+                    stderr: format!("Connection error: {e}"),
+                    exit_code: -1,
+                }),
+            }
+        }
+        Ok(results)
     }
 
     async fn fs_push(

@@ -15,6 +15,7 @@ use rquickjs::{Ctx, Function, Object, Value};
 use tokio::runtime::Handle;
 
 use crate::backend::OrchestratorBackend;
+use hop_core::sandbox::SandboxPolicy;
 
 /// Default timeout for `block_on` calls from the JS thread.
 /// `Handle::block_on` + `tokio::time::timeout` doesn't reliably deliver
@@ -61,6 +62,7 @@ pub fn install_hop_bindings(
     ctx: &Ctx<'_>,
     datastore: Option<&Datastore>,
     backend: Option<(Arc<dyn OrchestratorBackend>, Handle)>,
+    sandbox: Option<&SandboxPolicy>,
 ) -> Result<()> {
     let globals = ctx.globals();
 
@@ -122,9 +124,12 @@ pub fn install_hop_bindings(
         .map_err(|e| anyhow::anyhow!("Failed to set hop global: {e}"))?;
 
     if let Some((backend, handle)) = backend {
-        install_live_raw_bindings(ctx, backend, handle)?;
+        install_live_raw_bindings(ctx, backend, handle, sandbox.cloned())?;
         install_backend_js_wrappers(ctx)?;
     }
+
+    // Install hop.local() binding — runs commands on the local machine with sandbox
+    install_local_binding(ctx, sandbox.cloned())?;
 
     // Install datastore bindings via JS wrapper
     if let Some(ds) = datastore {
@@ -150,16 +155,24 @@ fn install_live_raw_bindings(
     ctx: &Ctx<'_>,
     backend: Arc<dyn OrchestratorBackend>,
     handle: Handle,
+    sandbox: Option<SandboxPolicy>,
 ) -> Result<()> {
     // __hop_exec(host, command) → JSON string
+    // When sandbox is set, uses exec_sandboxed to enforce the policy on the remote host.
     {
         let b = Arc::clone(&backend);
         let h = handle.clone();
+        let sb = sandbox.clone();
         ctx.globals().set("__hop_exec",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, host: String, command: String| -> rquickjs::Result<String> {
                 let b2 = Arc::clone(&b);
                 let host2 = host.clone();
-                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.exec(&host2, &command).await }) {
+                let result = if let Some(policy) = sb.clone() {
+                    block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.exec_sandboxed(&host2, &command, &policy).await })
+                } else {
+                    block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.exec(&host2, &command).await })
+                };
+                match result {
                     Ok(result) => serde_json::to_string(&result)
                         .map_err(|e| js_err(format!("serialize exec result: {e}"))),
                     Err(e) => Err(js_err(format!("hop.exec({host}, ...) failed: {e}"))),
@@ -188,13 +201,20 @@ fn install_live_raw_bindings(
     }
 
     // __hop_fleet_exec(group, command) → JSON string
+    // When sandbox is set, uses fleet_exec_sandboxed.
     {
         let b = Arc::clone(&backend);
         let h = handle.clone();
+        let sb = sandbox.clone();
         ctx.globals().set("__hop_fleet_exec",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, group: String, command: String| -> rquickjs::Result<String> {
                 let b2 = Arc::clone(&b);
-                match block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.fleet_exec(&group, &command).await }) {
+                let result = if let Some(policy) = sb.clone() {
+                    block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.fleet_exec_sandboxed(&group, &command, &policy).await })
+                } else {
+                    block_on_with_timeout(&h, BLOCK_ON_TIMEOUT, async move { b2.fleet_exec(&group, &command).await })
+                };
+                match result {
                     Ok(results) => serde_json::to_string(&results)
                         .map_err(|e| js_err(format!("serialize fleet exec: {e}"))),
                     Err(e) => Err(js_err(format!("hop.fleet.exec() failed: {e}"))),
@@ -385,6 +405,112 @@ fn install_backend_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to install backend JS wrappers: {e}"))?;
 
     Ok(())
+}
+
+/// Install the `hop.local(command)` binding for running commands on the local machine.
+///
+/// When a sandbox policy is set, commands are run through `spawn_sandboxed_command`.
+/// When no sandbox is set, commands are run unsandboxed via `/bin/sh -c`.
+/// Returns `{ stdout, stderr, exit_code }` — same shape as `hop.exec()`.
+fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>) -> Result<()> {
+    let globals = ctx.globals();
+
+    globals.set("__hop_local",
+        Function::new(ctx.clone(), move |_ctx: Ctx<'_>, command: String| -> rquickjs::Result<String> {
+            let result = run_local_command_sync(&command, sandbox.as_ref());
+            match result {
+                Ok(exec_result) => serde_json::to_string(&exec_result)
+                    .map_err(|e| js_err(format!("serialize local result: {e}"))),
+                Err(e) => Err(js_err(format!("hop.local() failed: {e}"))),
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // JS wrapper
+    ctx.eval::<(), _>(r#"
+        hop.local = function(command) {
+            return JSON.parse(__hop_local(command));
+        };
+    "#)
+    .map_err(|e| anyhow::anyhow!("Failed to install hop.local wrapper: {e}"))?;
+
+    Ok(())
+}
+
+/// Run a command locally using std::process::Command (synchronous, for the JS thread).
+/// If sandbox is provided, validates the command first and applies OS-level sandboxing.
+fn run_local_command_sync(
+    command: &str,
+    sandbox: Option<&SandboxPolicy>,
+) -> Result<crate::js::types::ExecResult> {
+    use crate::js::types::ExecResult;
+
+    // Validate command against sandbox policy
+    if let Some(policy) = sandbox
+        && policy.is_restricted()
+        && let Err(e) = hop_core::sandbox::validate_command(command, policy)
+    {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("command denied: {e}"),
+            exit_code: -1,
+        });
+    }
+
+    // Build the command — apply OS-level sandbox if policy is restricted
+    let output = if let Some(policy) = sandbox {
+        if policy.is_restricted() {
+            #[cfg(target_os = "macos")]
+            {
+                let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
+                std::process::Command::new("/usr/bin/sandbox-exec")
+                    .args(["-p", &profile, "/bin/sh", "-c", command])
+                    .output()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // On Linux, apply Landlock in a forked child
+                let policy_clone = policy.clone();
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]);
+                unsafe {
+                    cmd.pre_exec(move || {
+                        hop_core::sandbox::linux::apply_sandbox(&policy_clone);
+                        Ok(())
+                    });
+                }
+                cmd.output()
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .output()
+            }
+        } else {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .output()
+        }
+    } else {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .output()
+    };
+
+    match output {
+        Ok(o) => Ok(ExecResult {
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            exit_code: o.status.code().unwrap_or(-1),
+        }),
+        Err(e) => Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("failed to spawn: {e}"),
+            exit_code: -1,
+        }),
+    }
 }
 
 /// Install stub bindings (no backend available, e.g. cron jobs).

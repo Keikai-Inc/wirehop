@@ -13,6 +13,7 @@ use async_trait::async_trait;
 
 use crate::js::types::*;
 use hop_core::proto::RoleDefinition;
+use hop_core::sandbox::SandboxPolicy;
 
 pub type BoxedBackend = Arc<dyn OrchestratorBackend>;
 
@@ -72,6 +73,28 @@ pub trait OrchestratorBackend: Send + Sync {
 
     /// Push metric points to the orchestrator's datastore via admin channel.
     async fn push_metrics(&self, points: Vec<hop_core::proto::PushMetricPoint>) -> Result<usize>;
+
+    /// Execute a command on a single host with a sandbox policy.
+    /// Default: falls back to unsandboxed exec (backward compat).
+    async fn exec_sandboxed(
+        &self,
+        host: &str,
+        command: &str,
+        _sandbox: &SandboxPolicy,
+    ) -> Result<ExecResult> {
+        self.exec(host, command).await
+    }
+
+    /// Execute a sandboxed command across a fleet group.
+    /// Default: falls back to unsandboxed fleet_exec (backward compat).
+    async fn fleet_exec_sandboxed(
+        &self,
+        group: &str,
+        command: &str,
+        _sandbox: &SandboxPolicy,
+    ) -> Result<Vec<FleetExecResult>> {
+        self.fleet_exec(group, command).await
+    }
 
     /// Get our own NodeId.
     fn whoami(&self) -> Result<UserInfo>;

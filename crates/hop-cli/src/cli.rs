@@ -203,6 +203,12 @@ pub enum Command {
         action: FleetAction,
     },
 
+    /// Manage built-in capabilities (health, log-search, security-baseline)
+    Cap {
+        #[command(subcommand)]
+        action: CapAction,
+    },
+
     /// Manage cron jobs on the daemon
     Cron {
         #[command(subcommand)]
@@ -546,6 +552,49 @@ pub enum TsAction {
         /// Time range to query (e.g. "1h", "30m", "7d"). Default: 1h
         #[arg(long, default_value = "1h")]
         last: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CapAction {
+    /// List available capabilities
+    List,
+    /// Enable a capability (creates a cron job)
+    Enable {
+        /// Capability ID (e.g. health, log-search, security-baseline)
+        id: String,
+        /// Fleet target tag (hosts to monitor)
+        #[arg(long)]
+        targets: Option<String>,
+        /// Override the default schedule (cron expression)
+        #[arg(long)]
+        schedule: Option<String>,
+    },
+    /// Disable a capability (removes its cron job)
+    Disable {
+        /// Capability ID
+        id: String,
+    },
+    /// Show status of enabled capabilities
+    Status,
+    /// Run a capability once (on-demand)
+    Run {
+        /// Capability ID
+        id: String,
+        /// Fleet target tag
+        #[arg(long)]
+        targets: Option<String>,
+        /// Parameters as key=value pairs
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
+    /// Deploy a capability to remote nodes
+    Deploy {
+        /// Capability ID
+        id: String,
+        /// Fleet target tag (required)
+        #[arg(long)]
+        targets: String,
     },
 }
 

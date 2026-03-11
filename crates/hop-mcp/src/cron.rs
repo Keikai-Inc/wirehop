@@ -129,6 +129,11 @@ async fn execute_cron_job(
     let mut runtime = JsRuntime::new();
     runtime.set_datastore(datastore.clone());
 
+    // Apply sandbox policy if the job specifies one
+    if let Some(ref sandbox) = job.sandbox {
+        runtime.set_sandbox(sandbox.clone());
+    }
+
     // Build the script, optionally prepending hop.targets injection
     let script = if let (Some(tag), Some(be)) = (&job.targets, backend) {
         let hosts = be.list_hosts(Some(tag)).await.unwrap_or_default();
@@ -211,6 +216,7 @@ mod tests {
             tags: vec![],
             targets: None,
             catalog_id: None,
+            sandbox: None,
         }
     }
 

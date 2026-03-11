@@ -34,6 +34,6 @@ pub enum DsResponse {
     KvEntries(Vec<(String, KvEntry)>),
     TsPoints(Vec<(u64, MetricPoint)>),
     TsLatest(Option<(u64, MetricPoint)>),
-    CronJob(Option<CronJob>),
+    CronJob(Box<Option<CronJob>>),
     CronJobs(Vec<CronJob>),
 }

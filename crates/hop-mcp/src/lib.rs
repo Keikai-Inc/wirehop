@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod backend;
+pub mod capabilities;
 pub mod cron;
 pub mod js;
 pub mod policy;

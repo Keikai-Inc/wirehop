@@ -21,6 +21,9 @@ struct CronArgs {
     targets: Option<String>,
     /// Catalog identifier for dedup. Used by `ensure` to prevent duplicate jobs.
     catalog_id: Option<String>,
+    /// Sandbox preset name (monitor, audit, deploy). Restricts what commands
+    /// the job's scripts can execute via hop.exec/fleet.exec/local.
+    sandbox_preset: Option<String>,
 }
 
 pub fn tool_definition() -> ToolDefinition {
@@ -67,6 +70,11 @@ pub fn tool_definition() -> ToolDefinition {
                 "catalog_id": {
                     "type": "string",
                     "description": "Catalog identifier for dedup (required for ensure, optional for create). When using 'ensure', if a job with this catalog_id already exists, the existing job is returned instead of creating a duplicate."
+                },
+                "sandbox_preset": {
+                    "type": "string",
+                    "enum": ["monitor", "audit", "deploy"],
+                    "description": "Sandbox preset to apply to this job (optional, for create/ensure). Restricts commands the job can run via hop.exec/fleet.exec/local."
                 }
             },
             "required": ["action"]
@@ -116,6 +124,8 @@ fn cron_create(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         }
     };
 
+    let sandbox = resolve_sandbox_preset(args.sandbox_preset.as_deref());
+
     let now = now_ms();
     let next_run = next_occurrence_ms(&parsed, now);
     let job_id = generate_id();
@@ -132,6 +142,7 @@ fn cron_create(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         tags: args.tags.clone().unwrap_or_default(),
         targets: args.targets.clone(),
         catalog_id: args.catalog_id.clone(),
+        sandbox,
     };
 
     match ds.cron_add(&job) {
@@ -198,6 +209,8 @@ fn cron_ensure(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         }
     };
 
+    let sandbox = resolve_sandbox_preset(args.sandbox_preset.as_deref());
+
     let now = now_ms();
     let next_run = next_occurrence_ms(&parsed, now);
     let job_id = generate_id();
@@ -214,6 +227,7 @@ fn cron_ensure(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         tags: args.tags.clone().unwrap_or_default(),
         targets: args.targets.clone(),
         catalog_id: Some(catalog_id.to_string()),
+        sandbox,
     };
 
     match ds.cron_add(&job) {
@@ -355,6 +369,10 @@ fn now_ms() -> u64 {
 
 fn next_occurrence_ms(schedule: &cron::Schedule, after_ms: u64) -> u64 {
     crate::cron::next_occurrence_ms(schedule, after_ms)
+}
+
+fn resolve_sandbox_preset(preset: Option<&str>) -> Option<hop_core::sandbox::SandboxPolicy> {
+    preset.and_then(hop_core::sandbox::SandboxPolicy::from_preset)
 }
 
 fn generate_id() -> String {

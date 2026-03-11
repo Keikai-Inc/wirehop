@@ -75,7 +75,7 @@ impl Datastore {
     pub fn cron_get(&self, id: &str) -> Result<Option<CronJob>> {
         remote_dispatch!(self,
             DsRequest::CronGet { id: id.into() },
-            DsResponse::CronJob(j) => j
+            DsResponse::CronJob(j) => *j
         );
         let txn = self.local_db().begin_read()?;
         let table = match txn.open_table(CRON_TABLE) {
@@ -98,7 +98,7 @@ impl Datastore {
     pub fn cron_find_by_catalog_id(&self, catalog_id: &str) -> Result<Option<CronJob>> {
         remote_dispatch!(self,
             DsRequest::CronFindByCatalogId { catalog_id: catalog_id.into() },
-            DsResponse::CronJob(j) => j
+            DsResponse::CronJob(j) => *j
         );
         let jobs = self.cron_list()?;
         Ok(jobs
@@ -164,6 +164,7 @@ mod tests {
             tags: vec![],
             targets: None,
             catalog_id: None,
+            sandbox: None,
         }
     }
 

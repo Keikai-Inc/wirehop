@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AdminAction, AgentAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, TsAction};
+use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, TsAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
@@ -139,6 +139,10 @@ async fn main() -> Result<()> {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_fleet(secret_key, &config_dir, action).await
+        }
+        Command::Cap { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_cap(&config_dir, action).await
         }
         Command::Cron { action } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -2000,6 +2004,227 @@ async fn cmd_fleet(
     }
 }
 
+async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> {
+    use hop_mcp::capabilities::{CapabilityDefinition, registry::builtin_capabilities};
+
+    match action {
+        CapAction::List => {
+            let caps = builtin_capabilities();
+            println!("Available capabilities:\n");
+            for cap in caps {
+                let trigger = match &cap.trigger {
+                    hop_mcp::capabilities::TriggerMode::Scheduled { default_schedule } => {
+                        format!("scheduled ({})", default_schedule)
+                    }
+                    hop_mcp::capabilities::TriggerMode::OnDemand => "on-demand".to_string(),
+                    hop_mcp::capabilities::TriggerMode::Both { default_schedule } => {
+                        format!("scheduled ({}) + on-demand", default_schedule)
+                    }
+                };
+                println!("  {:20} {} [{}] [{}]", cap.id, cap.description.split('.').next().unwrap_or(""), cap.tier.name(), trigger);
+            }
+        }
+        CapAction::Enable { id, targets, schedule } => {
+            let cap = CapabilityDefinition::find(&id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'. Run `hop cap list` to see available capabilities."))?;
+
+            if !cap.is_schedulable() {
+                anyhow::bail!("Capability '{id}' is on-demand only — use `hop cap run {id}` instead");
+            }
+
+            let schedule = schedule
+                .or_else(|| cap.default_schedule().map(String::from))
+                .ok_or_else(|| anyhow::anyhow!("No schedule provided and capability has no default"))?;
+
+            // Validate the schedule
+            let sched: cron::Schedule = schedule.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid cron expression '{schedule}': {e}"))?;
+
+            let ds = hop_core::datastore::Datastore::connect(config_dir)
+                .context("Failed to connect to daemon — is `hop host` running?")?;
+
+            let catalog_id = cap.catalog_id();
+
+            // Check if already enabled
+            if let Ok(Some(existing)) = ds.cron_find_by_catalog_id(&catalog_id) {
+                println!("Capability '{}' already enabled (job {})", id, existing.id);
+                return Ok(());
+            }
+
+            let now = unix_now_ms();
+            let next_run = hop_mcp::cron::next_occurrence_ms(&sched, now);
+            let job_id = format!("{:08x}", rand::random::<u32>());
+
+            let job = hop_core::datastore::types::CronJob {
+                id: job_id.clone(),
+                name: format!("cap:{}", id),
+                schedule,
+                script: cap.script.to_string(),
+                enabled: true,
+                last_run: None,
+                next_run,
+                created_at: now,
+                tags: vec![format!("cap:{}", id)],
+                targets,
+                catalog_id: Some(catalog_id),
+                sandbox: Some(cap.tier.to_sandbox()),
+            };
+            ds.cron_add(&job)?;
+            println!("Enabled capability '{}' (job {}, sandbox: {})", id, job_id, cap.tier.name());
+        }
+        CapAction::Disable { id } => {
+            let cap = CapabilityDefinition::find(&id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'"))?;
+
+            let ds = hop_core::datastore::Datastore::connect(config_dir)
+                .context("Failed to connect to daemon — is `hop host` running?")?;
+
+            let catalog_id = cap.catalog_id();
+            match ds.cron_find_by_catalog_id(&catalog_id) {
+                Ok(Some(job)) => {
+                    ds.cron_remove(&job.id)?;
+                    println!("Disabled capability '{}' (removed job {})", id, job.id);
+                }
+                Ok(None) => {
+                    println!("Capability '{}' is not enabled", id);
+                }
+                Err(e) => anyhow::bail!("Failed to check capability status: {e}"),
+            }
+        }
+        CapAction::Status => {
+            let ds = hop_core::datastore::Datastore::connect(config_dir)
+                .context("Failed to connect to daemon — is `hop host` running?")?;
+
+            let jobs = ds.cron_list()?;
+            let cap_jobs: Vec<_> = jobs.iter()
+                .filter(|j| j.catalog_id.as_deref().is_some_and(|id| id.starts_with("cap:")))
+                .collect();
+
+            if cap_jobs.is_empty() {
+                println!("No capabilities enabled.");
+            } else {
+                println!("Enabled capabilities:\n");
+                for j in &cap_jobs {
+                    let status = if j.enabled { "active" } else { "paused" };
+                    let targets = j.targets.as_deref().unwrap_or("local");
+                    let last = j.last_run
+                        .map(|t| format!("{}ms ago", unix_now_ms().saturating_sub(t)))
+                        .unwrap_or_else(|| "never".into());
+                    println!("  {:20} [{}] targets={} schedule={} last_run={}",
+                        j.catalog_id.as_deref().unwrap_or(&j.name),
+                        status, targets, j.schedule, last);
+                }
+            }
+        }
+        CapAction::Run { id, targets, params } => {
+            let cap = CapabilityDefinition::find(&id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'"))?;
+
+            let ds = hop_core::datastore::Datastore::connect(config_dir)
+                .context("Failed to connect to daemon — is `hop host` running?")?;
+
+            // Parse params into a JSON object
+            let params_map: std::collections::HashMap<String, String> = params.iter()
+                .filter_map(|p| {
+                    let (key, value) = p.split_once('=')?;
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect();
+
+            // Build the script with params and targets injection
+            let mut script = String::new();
+            if !params_map.is_empty() {
+                let params_json = serde_json::to_string(&params_map).unwrap_or_else(|_| "{}".to_string());
+                script.push_str(&format!("hop.params = {};\n", params_json));
+            }
+
+            // Inject targets if provided — we create a minimal targets array
+            if let Some(ref tag) = targets {
+                // We can't resolve fleet hosts here without a backend, so create a placeholder
+                // that the script can use. The actual host resolution happens in the cron scheduler.
+                // For one-shot execution, create a temporary cron job with next_run=0.
+                let catalog_id = format!("cap:run:{}", id);
+                let now = unix_now_ms();
+                let job_id = format!("{:08x}", rand::random::<u32>());
+
+                let full_script = format!("{}{}", script, cap.script);
+                let job = hop_core::datastore::types::CronJob {
+                    id: job_id.clone(),
+                    name: format!("cap:run:{}", id),
+                    schedule: "0 0 0 1 1 * 2099".to_string(), // far future, won't repeat
+                    script: full_script,
+                    enabled: true,
+                    last_run: None,
+                    next_run: 0, // trigger immediately
+                    created_at: now,
+                    tags: vec![],
+                    targets: Some(tag.clone()),
+                    catalog_id: Some(catalog_id),
+                    sandbox: Some(cap.tier.to_sandbox()),
+                };
+                ds.cron_add(&job)?;
+                println!("Triggered capability '{}' on targets '{}' (job {}, will run on next scheduler tick ~15s)", id, tag, job_id);
+                return Ok(());
+            }
+
+            // No targets — run locally via a one-shot cron job
+            script.push_str(cap.script);
+            let now = unix_now_ms();
+            let job_id = format!("{:08x}", rand::random::<u32>());
+            let job = hop_core::datastore::types::CronJob {
+                id: job_id.clone(),
+                name: format!("cap:run:{}", id),
+                schedule: "0 0 0 1 1 * 2099".to_string(),
+                script,
+                enabled: true,
+                last_run: None,
+                next_run: 0,
+                created_at: now,
+                tags: vec![],
+                targets: None,
+                catalog_id: Some(format!("cap:run:{}", id)),
+                sandbox: Some(cap.tier.to_sandbox()),
+            };
+            ds.cron_add(&job)?;
+            println!("Triggered capability '{}' locally (job {}, will run on next scheduler tick ~15s)", id, job_id);
+        }
+        CapAction::Deploy { id, targets } => {
+            use hop_mcp::backend::OrchestratorBackend;
+
+            let _cap = CapabilityDefinition::find(&id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'"))?;
+
+            // Deploy uses fleet exec to run `hop cap enable <id>` on each node
+            let config_dir2 = config_dir.to_path_buf();
+            let secret_key = config::load_or_generate_identity(&config_dir2)?;
+            let endpoint = net::create_client_endpoint(secret_key).await?;
+
+            let backend = hop_mcp::backend::direct::DirectBackend::new(
+                std::sync::Arc::new(endpoint),
+                config_dir2,
+            );
+
+            let cmd = format!("hop cap enable {}", id);
+            println!("Deploying capability '{}' to targets '{}'...", id, targets);
+
+            match backend.fleet_exec(&targets, &cmd).await {
+                Ok(results) => {
+                    for r in &results {
+                        if r.exit_code == 0 {
+                            println!("  {}: ok", r.host);
+                        } else {
+                            eprintln!("  {}: failed (exit {}): {}", r.host, r.exit_code, r.stderr.trim());
+                        }
+                    }
+                    println!("Deployed to {} hosts", results.len());
+                }
+                Err(e) => anyhow::bail!("Fleet exec failed: {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
     let ds = hop_core::datastore::Datastore::connect(config_dir)
         .context("Failed to connect to daemon — is `hop host` running?")?;
@@ -2063,6 +2288,7 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                 tags,
                 targets,
                 catalog_id: None,
+                sandbox: None,
             };
             ds.cron_add(&job)?;
             println!("Created cron job: {id}");

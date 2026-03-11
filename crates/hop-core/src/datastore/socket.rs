@@ -201,10 +201,10 @@ fn dispatch_request(ds: &Datastore, req: DsRequest) -> Result<DsResponse> {
             DsResponse::CronJobs(ds.cron_list()?)
         }
         DsRequest::CronGet { id } => {
-            DsResponse::CronJob(ds.cron_get(&id)?)
+            DsResponse::CronJob(Box::new(ds.cron_get(&id)?))
         }
         DsRequest::CronFindByCatalogId { catalog_id } => {
-            DsResponse::CronJob(ds.cron_find_by_catalog_id(&catalog_id)?)
+            DsResponse::CronJob(Box::new(ds.cron_find_by_catalog_id(&catalog_id)?))
         }
         DsRequest::CronGetDue { now_ms } => {
             DsResponse::CronJobs(ds.cron_get_due(now_ms)?)
@@ -344,6 +344,7 @@ mod tests {
             tags: vec![],
             targets: None,
             catalog_id: Some("test-cat".into()),
+            sandbox: None,
         };
 
         // Add
@@ -353,7 +354,7 @@ mod tests {
         // Get
         let resp = conn.request(&DsRequest::CronGet { id: "j1".into() }).unwrap();
         match resp {
-            DsResponse::CronJob(Some(j)) => assert_eq!(j.name, "Test Job"),
+            DsResponse::CronJob(j) if j.is_some() => assert_eq!(j.unwrap().name, "Test Job"),
             other => panic!("expected CronJob, got {other:?}"),
         }
 
@@ -367,7 +368,7 @@ mod tests {
         // FindByCatalogId
         let resp = conn.request(&DsRequest::CronFindByCatalogId { catalog_id: "test-cat".into() }).unwrap();
         match resp {
-            DsResponse::CronJob(Some(j)) => assert_eq!(j.id, "j1"),
+            DsResponse::CronJob(j) if j.is_some() => assert_eq!(j.unwrap().id, "j1"),
             other => panic!("expected CronJob, got {other:?}"),
         }
 

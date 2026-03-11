@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::SandboxPolicy;
+
 /// A single time-series data point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricPoint {
@@ -50,6 +52,10 @@ pub struct CronJob {
     /// creation if a job with the same catalog_id already exists.
     #[serde(default)]
     pub catalog_id: Option<String>,
+    /// Optional sandbox policy for this job. When set, the JS runtime applies
+    /// this policy to `hop.exec()`, `hop.fleet.exec()`, and `hop.local()` calls.
+    #[serde(default)]
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 /// Query parameters for time-series range queries.
