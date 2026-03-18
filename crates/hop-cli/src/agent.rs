@@ -314,6 +314,12 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
         }
     });
 
+    // Network interface change detector — flushes pooled connections on change
+    let _netmon = net::netmon::spawn_interface_watcher(
+        agent.endpoint.clone(),
+        Some(agent.connections.clone()),
+    );
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {

@@ -1,5 +1,7 @@
 //! iroh endpoint lifecycle and connection management.
 
+pub mod netmon;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
