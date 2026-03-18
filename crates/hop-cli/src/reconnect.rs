@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -70,7 +71,12 @@ pub async fn try_quick_reconnect(
             )
             .await?;
 
+            // Send session request + setup messages (WindowSize, SetEnv) before
+            // reading SessionInfo.  The host reads setup messages with a 2-second
+            // timeout per message; if we don't send them here the host falls
+            // through to 80×24 defaults and may resize a resumed PTY incorrectly.
             proto::write_message(&mut send, &session_request).await?;
+            send_setup_messages(&mut send).await?;
 
             let response: hop_core::proto::HostMessage =
                 proto::read_message(&mut recv).await?;
@@ -171,6 +177,7 @@ pub async fn show_reconnect_tui_via_agent(
             .await?;
 
             proto::write_message(&mut send, &session_request).await?;
+            send_setup_messages(&mut send).await?;
 
             // Read the HostMessage to get the new session_id
             let response: hop_core::proto::HostMessage =
@@ -308,6 +315,45 @@ fn poll_quit(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<ReconnectAction> 
     }
 
     None
+}
+
+/// Send WindowSize + SetEnv setup messages to the host.
+///
+/// Mirrors the setup phase of `client_shell_session_v2` so the host's
+/// `read_setup_messages` (which has a 2-second timeout per message) receives
+/// them before falling through to defaults.
+async fn send_setup_messages(
+    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    let (cols, rows, pixel_width, pixel_height) = match terminal::window_size() {
+        Ok(size) => (size.columns, size.rows, size.width, size.height),
+        Err(_) => (80, 24, 0, 0),
+    };
+    proto::write_message(
+        send,
+        &ClientMessage::WindowSize {
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        },
+    )
+    .await?;
+
+    let mut vars = HashMap::new();
+    for key in &[
+        "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
+        "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "COLORTERM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            vars.insert(key.to_string(), val);
+        }
+    }
+    vars.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
+    proto::write_message(send, &ClientMessage::SetEnv { vars }).await?;
+
+    Ok(())
 }
 
 fn cleanup(stdout: &mut Stdout) {

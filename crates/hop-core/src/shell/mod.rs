@@ -961,6 +961,24 @@ pub async fn client_shell_session_v2(
     }
 }
 
+/// Client side: enter raw mode and run the I/O loop on a stream that has
+/// already completed the full handshake (setup messages + SessionInfo).
+///
+/// Used on reconnect paths where the reconnect function has already sent
+/// WindowSize/SetEnv and consumed the SessionInfo response.
+pub async fn client_shell_loop_resumed(
+    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut recv: impl tokio::io::AsyncRead + Unpin,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<SessionOutcome> {
+    use crossterm::terminal;
+
+    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
 /// Detect sleep/wake by observing wall-clock time jumps.
 ///
 /// Sleeps for 3s in a loop; if the elapsed time exceeds 15s, the machine

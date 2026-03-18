@@ -1105,9 +1105,12 @@ async fn cmd_connect(
                     } => {
                         last_reconnect_time = Some(std::time::Instant::now());
 
-                        let (new_sid, out) =
-                            shell::client_shell_session_v2(send, recv, &mut stdin_rx).await?;
-                        session_id = new_sid.or(new_session_id);
+                        // The reconnect function already sent setup messages
+                        // (WindowSize + SetEnv) and consumed SessionInfo, so
+                        // use the loop-only variant that skips the handshake.
+                        let out =
+                            shell::client_shell_loop_resumed(send, recv, &mut stdin_rx).await?;
+                        session_id = new_session_id.or(session_id);
                         outcome = out;
                     }
                     reconnect::ReconnectAction::Quit => {
