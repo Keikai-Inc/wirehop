@@ -682,7 +682,7 @@ fn set_metadata(path: &Path, mode: u32, mtime: u64) {
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 
             let ts = libc::timespec {
-                tv_sec: mtime as libc::time_t,
+                tv_sec: mtime as _,
                 tv_nsec: 0,
             };
             let times = [ts, ts]; // [atime, mtime]

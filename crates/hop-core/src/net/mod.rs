@@ -9,7 +9,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, S
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2};
 
 /// Hop's own relay server.
-const HOP_RELAY_URL: &str = "https://relay.keik.ai";
+pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 
 /// QUIC transport configuration tuned for responsive disconnect detection.
 ///

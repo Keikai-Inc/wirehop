@@ -71,7 +71,10 @@ async fn main() -> Result<()> {
         }
         Command::Invite { user, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_identity(&config_dir)?;
+            // Ensure dir exists and auto-generate identity if needed (no need to run `hop id` first)
+            std::fs::create_dir_all(&config_dir)
+                .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
             cmd_invite(secret_key, &config_dir, user.as_deref(), name.as_deref(), sandbox)
         }
@@ -649,7 +652,11 @@ fn cmd_invite(
 
     // Read relay URL persisted by the daemon (if available) so the client
     // can connect via relay immediately instead of waiting for discovery.
-    let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
+    // Fall back to the default relay URL — musl builds lack full DNS resolver
+    // support, so discovery via DNS/pkarr may fail without a relay hint.
+    let relay_url = std::fs::read_to_string(config_dir.join("relay_url"))
+        .ok()
+        .or_else(|| Some(hop_core::net::HOP_RELAY_URL.to_string()));
     let token = invite::generate_invite_with_role(
         &public_key,
         config_dir,

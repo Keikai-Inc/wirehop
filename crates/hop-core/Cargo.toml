@@ -25,5 +25,12 @@ xxhash-rust = { workspace = true }
 redb = { workspace = true }
 cron = { workspace = true }
 
+# Force reqwest to use pure-Rust hickory-resolver instead of libc getaddrinfo.
+# musl's DNS resolver is minimal and fails on TXT lookups / certain AAAA+A combos.
+# Feature unification merges this with iroh's reqwest 0.12 dependency.
+reqwest = { version = "0.12", default-features = false, features = ["hickory-dns"] }
+# Same fix for reqwest 0.13 (used by pkarr for HTTP relay lookups).
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["hickory-dns"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
