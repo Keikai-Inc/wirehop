@@ -1103,9 +1103,6 @@ async fn cmd_connect(
                         recv,
                         new_session_id,
                     } => {
-                        // Brief stabilization delay to let the connection settle
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-
                         last_reconnect_time = Some(std::time::Instant::now());
 
                         let (new_sid, out) =

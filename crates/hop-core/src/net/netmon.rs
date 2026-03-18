@@ -73,12 +73,15 @@ pub fn current_interface_addrs() -> BTreeSet<IpAddr> {
 /// Spawn a background task that polls interface addresses every 5 seconds.
 ///
 /// When a change is detected:
-/// - Calls `endpoint.network_change()` to force iroh to re-probe
+/// - Calls `endpoint.network_change()` to force iroh to re-probe paths
 /// - Logs added/removed addresses at INFO level
-/// - If `connections` is provided, flushes all pooled connections (agent side)
+///
+/// Does NOT flush pooled connections — QUIC supports path migration, so
+/// connections survive IP changes. Dead connections are detected lazily
+/// via `close_reason()` in `get_or_connect()`.
 pub fn spawn_interface_watcher(
     endpoint: Endpoint,
-    connections: Option<Arc<Mutex<HashMap<PublicKey, Connection>>>>,
+    _connections: Option<Arc<Mutex<HashMap<PublicKey, Connection>>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut prev = current_interface_addrs();
@@ -100,20 +103,6 @@ pub fn spawn_interface_watcher(
 
                 endpoint.network_change().await;
                 tracing::info!("Triggered iroh network re-discovery");
-
-                // Flush pooled connections if provided (agent side)
-                if let Some(ref conns) = connections {
-                    let mut pool = conns.lock().await;
-                    if !pool.is_empty() {
-                        tracing::info!(
-                            "Flushing {} pooled connection(s) due to network change",
-                            pool.len()
-                        );
-                        for (_, conn) in pool.drain() {
-                            conn.close(0u32.into(), b"network-change");
-                        }
-                    }
-                }
 
                 prev = curr;
             }

@@ -342,7 +342,7 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
         loop {
             let before = std::time::Instant::now();
             tokio::time::sleep(Duration::from_secs(3)).await;
-            if before.elapsed() > Duration::from_secs(7) {
+            if before.elapsed() > Duration::from_secs(15) {
                 tracing::info!("Agent detected sleep/wake, flushing connection pool");
                 let mut conns = wake_conns.lock().await;
                 for (_, conn) in conns.drain() {

@@ -98,8 +98,8 @@ pub async fn try_quick_reconnect(
                 });
             }
             _ => {
-                // Brief pause before retrying
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Brief pause before retrying (100ms catches quick cellular recoveries)
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }

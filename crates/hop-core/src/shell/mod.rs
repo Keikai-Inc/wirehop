@@ -423,11 +423,12 @@ fn spawn_persistent_pty(
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
 ) -> Result<(
-    String,                                          // session_id
-    mpsc::Sender<Vec<u8>>,                           // input_tx
-    watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,    // output_route
-    mpsc::Sender<PtySize>,                           // resize_tx
-    watch::Receiver<Option<i32>>,                     // exit_rx
+    String,                                                          // session_id
+    mpsc::Sender<Vec<u8>>,                                           // input_tx
+    watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,                    // output_route
+    mpsc::Sender<PtySize>,                                           // resize_tx
+    watch::Receiver<Option<i32>>,                                     // exit_rx
+    Arc<std::sync::Mutex<session_registry::ReplayBuffer>>,           // replay_buffer
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -493,9 +494,15 @@ fn spawn_persistent_pty(
     let (output_route_tx, output_route_rx) =
         watch::channel::<Option<mpsc::Sender<Vec<u8>>>>(None);
 
-    // Persistent PTY reader — routes output based on the watch channel
+    // Replay buffer: captures last 64KB of PTY output for seamless reconnects
+    let replay_buf = Arc::new(std::sync::Mutex::new(
+        session_registry::ReplayBuffer::new(65536),
+    ));
+
+    // Persistent PTY reader — always captures to replay buffer, routes to client if attached
     let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
     let route_rx = output_route_rx.clone();
+    let reader_replay_buf = replay_buf.clone();
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -503,6 +510,9 @@ fn spawn_persistent_pty(
                 Ok(0) => break,
                 Ok(n) => {
                     let data = buf[..n].to_vec();
+                    // Always capture to replay buffer
+                    { reader_replay_buf.lock().unwrap().push(&data); }
+                    // Route to client if attached
                     if let Some(tx) = route_rx.borrow().clone() {
                         let _ = tx.blocking_send(data);
                     }
@@ -545,7 +555,7 @@ fn spawn_persistent_pty(
         }
     });
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, replay_buf))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -661,7 +671,7 @@ pub async fn host_shell_session_persistent(
 
     // Either attach to the existing session or spawn a new PTY.
     // PTY spawn happens outside the actor — no lock to hold, can't deadlock.
-    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch) = if can_resume {
+    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch, replay_buf) = if can_resume {
         if let Some(result) = registry.attach(key.clone(), client_output_tx.clone(), initial_size).await {
             (
                 result.session_id,
@@ -670,12 +680,13 @@ pub async fn host_shell_session_persistent(
                 result.resize_tx,
                 result.exit_rx,
                 result.attach_epoch,
+                result.replay_buffer,
             )
         } else {
             // Race: session was removed between check and attach. Spawn new.
             registry.remove_stale(key.clone()).await;
 
-            let (sid, itx, output_route, rtx, erx) =
+            let (sid, itx, output_route, rtx, erx, rbuf) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
@@ -688,15 +699,16 @@ pub async fn host_shell_session_persistent(
                 attached: true,
                 attach_epoch: 1,
                 broker_handle: None,
+                replay_buffer: rbuf.clone(),
             };
             registry.insert(key.clone(), session).await;
-            (sid, false, itx, rtx, erx, 1u64)
+            (sid, false, itx, rtx, erx, 1u64, rbuf)
         }
     } else {
         // No session to resume — remove any stale entry, spawn a new PTY.
         registry.remove_stale(key.clone()).await;
 
-        let (sid, itx, output_route, rtx, erx) =
+        let (sid, itx, output_route, rtx, erx, rbuf) =
             spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
         let _ = output_route.send(Some(client_output_tx));
         let session = DetachedSession {
@@ -709,9 +721,10 @@ pub async fn host_shell_session_persistent(
             attached: true,
             attach_epoch: 1,
             broker_handle: None,
+            replay_buffer: rbuf.clone(),
         };
         registry.insert(key.clone(), session).await;
-        (sid, false, itx, rtx, erx, 1u64)
+        (sid, false, itx, rtx, erx, 1u64, rbuf)
     };
 
     // Start broker for sandboxed sessions (macOS)
@@ -750,6 +763,20 @@ pub async fn host_shell_session_persistent(
         peer_id,
         resumed
     );
+
+    // Replay buffered output on resume so the client sees what happened while disconnected
+    if resumed {
+        let replay_data = replay_buf.lock().unwrap().drain();
+        if !replay_data.is_empty() {
+            let compress = protocol_version >= 3;
+            tracing::info!(
+                "Replaying {} bytes of buffered output for session {}",
+                replay_data.len(),
+                &session_id[..8]
+            );
+            write_host_message(&mut send, &HostMessage::Output(replay_data), compress).await?;
+        }
+    }
 
     // Run the attached I/O loop
     let outcome = run_attached_loop(
@@ -936,13 +963,14 @@ pub async fn client_shell_session_v2(
 
 /// Detect sleep/wake by observing wall-clock time jumps.
 ///
-/// Sleeps for 3s in a loop; if the elapsed time exceeds 7s, the machine
-/// was almost certainly asleep. Returns immediately on wake detection.
+/// Sleeps for 3s in a loop; if the elapsed time exceeds 15s, the machine
+/// was almost certainly asleep. 15s cleanly separates real sleeps (30s+)
+/// from cellular stalls (5-10s). Returns immediately on wake detection.
 async fn detect_sleep_wake() {
     loop {
         let before = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        if before.elapsed() > std::time::Duration::from_secs(7) {
+        if before.elapsed() > std::time::Duration::from_secs(15) {
             return;
         }
     }

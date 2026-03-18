@@ -1,10 +1,44 @@
 //! Session registry for persistent PTY sessions across client reconnects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::PtySize;
 use tokio::sync::{mpsc, oneshot, watch};
+
+/// Ring buffer that captures the last N bytes of PTY output.
+///
+/// Used to replay recent output when a client reconnects after a disconnect,
+/// so the reconnect feels seamless (like mosh) instead of showing a blank screen.
+pub struct ReplayBuffer {
+    buf: VecDeque<u8>,
+    capacity: usize,
+}
+
+impl ReplayBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Append data, evicting oldest bytes if over capacity.
+    pub fn push(&mut self, data: &[u8]) {
+        for &byte in data {
+            if self.buf.len() == self.capacity {
+                self.buf.pop_front();
+            }
+            self.buf.push_back(byte);
+        }
+    }
+
+    /// Drain all buffered data and return it.
+    pub fn drain(&mut self) -> Vec<u8> {
+        self.buf.drain(..).collect()
+    }
+}
 
 /// Key identifying a session: one session per (peer_id, username) pair.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -41,6 +75,8 @@ pub struct DetachedSession {
     /// Handle for the broker background task (macOS sandbox proxy).
     /// Aborted when the session is cleaned up.
     pub broker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Ring buffer capturing recent PTY output for replay on reconnect.
+    pub replay_buffer: Arc<Mutex<ReplayBuffer>>,
 }
 
 impl DetachedSession {
@@ -187,6 +223,7 @@ pub struct AttachResult {
     pub resize_tx: mpsc::Sender<PtySize>,
     pub exit_rx: watch::Receiver<Option<i32>>,
     pub attach_epoch: u64,
+    pub replay_buffer: Arc<Mutex<ReplayBuffer>>,
 }
 
 /// Info returned when cleaning up an exited session.
@@ -366,6 +403,7 @@ async fn run_registry_actor(
                         resize_tx: session.resize_tx.clone(),
                         exit_rx: session.exit_rx.clone(),
                         attach_epoch: epoch,
+                        replay_buffer: session.replay_buffer.clone(),
                     })
                 } else {
                     None
@@ -436,6 +474,7 @@ mod tests {
             attached,
             attach_epoch: 0,
             broker_handle: None,
+            replay_buffer: Arc::new(Mutex::new(ReplayBuffer::new(65536))),
         }
     }
 
