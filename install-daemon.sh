@@ -170,6 +170,28 @@ for f in peers.json pending_invites.json datastore.redb; do
   fi
 done
 
+# Migrate config to /etc/hop/ if daemon was previously running without
+# --config /etc/hop (pre-0.3.5). Check root's config dir first, then
+# the current user's config dir (covers manual `hop host` runs).
+MIGRATE_SOURCES="/root/.config/hop"
+if [ "$CURRENT_USER" != "root" ]; then
+  USER_HOME=$(eval echo "~$CURRENT_USER")
+  MIGRATE_SOURCES="$MIGRATE_SOURCES $USER_HOME/.config/hop"
+fi
+for f in identity.json peers.json pending_invites.json session_config.json; do
+  if [ ! -f "/etc/hop/$f" ]; then
+    for src in $MIGRATE_SOURCES; do
+      if [ -f "$src/$f" ]; then
+        info "Migrating $f from $src to /etc/hop..."
+        sudo cp "$src/$f" "/etc/hop/$f"
+        sudo chown root:hop "/etc/hop/$f"
+        sudo chmod 660 "/etc/hop/$f"
+        break
+      fi
+    done
+  fi
+done
+
 # Install systemd service
 info "Installing systemd service..."
 SERVICE_URL="${BASE_URL}/hop.service"

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hop host --quiet
+ExecStart=/usr/local/bin/hop host --quiet --config /etc/hop
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

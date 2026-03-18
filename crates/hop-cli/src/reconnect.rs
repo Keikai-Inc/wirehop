@@ -76,6 +76,9 @@ pub async fn try_quick_reconnect(
                 proto::read_message(&mut recv).await?;
             let new_session_id = match response {
                 hop_core::proto::HostMessage::SessionInfo { session_id, .. } => Some(session_id),
+                hop_core::proto::HostMessage::SessionError(msg) => {
+                    anyhow::bail!("Host error: {msg}");
+                }
                 _ => None,
             };
 
@@ -174,6 +177,9 @@ pub async fn show_reconnect_tui_via_agent(
                 proto::read_message(&mut recv).await?;
             let new_session_id = match response {
                 hop_core::proto::HostMessage::SessionInfo { session_id, .. } => Some(session_id),
+                hop_core::proto::HostMessage::SessionError(msg) => {
+                    anyhow::bail!("Host error: {msg}");
+                }
                 _ => None,
             };
 

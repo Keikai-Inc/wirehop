@@ -41,32 +41,9 @@ pub async fn host_shell_session(
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
 ) -> Result<()> {
-    // --- Pre-spawn security checks ---
-    #[cfg(unix)]
-    {
-        use crate::unix_user;
-
-        let is_root = unix_user::is_running_as_root();
-
-        if is_root && username.is_none() {
-            bail!(
-                "hop host is running as root but this peer has no bound username — \
-                 refusing to grant a root shell. Re-invite this peer with \
-                 `hop invite --user <username>` to bind them to a specific account."
-            );
-        }
-
-        if let Some(name) = username {
-            // Defense in depth: the user could have been deleted since invite time
-            unix_user::validate_username(name)?;
-
-            if !is_root {
-                bail!(
-                    "peer is bound to user '{name}' but hop host is not running as root — \
-                     restart with `sudo hop host` to enable per-user shell sessions."
-                );
-            }
-        }
+    if let Err(e) = check_shell_security(username) {
+        let _ = proto::write_message(&mut send, &HostMessage::SessionError(format!("{e:#}"))).await;
+        return Err(e);
     }
 
     // --- Read initial setup messages from the client (WindowSize, SetEnv) ---
@@ -644,7 +621,10 @@ pub async fn host_shell_session_persistent(
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
 ) -> Result<()> {
-    check_shell_security(username)?;
+    if let Err(e) = check_shell_security(username) {
+        let _ = proto::write_message(&mut send, &HostMessage::SessionError(format!("{e:#}"))).await;
+        return Err(e);
+    }
 
     let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut recv).await;
 
@@ -910,6 +890,9 @@ pub async fn client_shell_session_v2(
             );
             Some(session_id)
         }
+        Ok(Ok(HostMessage::SessionError(msg))) => {
+            anyhow::bail!("Host error: {msg}");
+        }
         _ => {
             // Host didn't send SessionInfo — could be old host or error.
             // Continue without a session ID.
@@ -999,6 +982,10 @@ async fn client_shell_loop(
                     }
                     Ok(HostMessage::AdminResponse(_)) => {
                         // Unexpected admin response during shell session — ignore
+                    }
+                    Ok(HostMessage::SessionError(msg)) => {
+                        eprintln!("\r\nHost error: {msg}");
+                        return Ok(SessionOutcome::Disconnected);
                     }
                     Err(_) => {
                         return Ok(SessionOutcome::Disconnected);

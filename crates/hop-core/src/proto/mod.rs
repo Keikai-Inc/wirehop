@@ -37,6 +37,9 @@ pub enum HostMessage {
     },
     /// Response to an admin request (hop/2+).
     AdminResponse(AdminResponse),
+    /// Session setup error — sent instead of SessionInfo when the host
+    /// cannot start a session (e.g. missing root privileges, invalid user).
+    SessionError(String),
 }
 
 /// Messages sent from the client to the host.
