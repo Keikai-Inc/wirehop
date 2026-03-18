@@ -257,12 +257,12 @@ async fn host_sync_receive(
         .filter(|f| {
             !f.is_dir
                 && !f.is_symlink
-                && f.size as usize >= proto::DELTA_MIN_FILE_SIZE
+                && f.size >= proto::DELTA_MIN_FILE_SIZE
                 && dest.join(&f.path).exists()
                 && dest
                     .join(&f.path)
                     .metadata()
-                    .map(|m| m.len() as usize >= proto::DELTA_MIN_FILE_SIZE)
+                    .map(|m| m.len() >= proto::DELTA_MIN_FILE_SIZE)
                     .unwrap_or(false)
         })
         .map(|f| f.path.clone())
@@ -739,12 +739,12 @@ pub async fn client_pull_sync_transfer(
         .filter(|f| {
             !f.is_dir
                 && !f.is_symlink
-                && f.size as usize >= proto::DELTA_MIN_FILE_SIZE
+                && f.size >= proto::DELTA_MIN_FILE_SIZE
                 && local_dir.join(&f.path).exists()
                 && local_dir
                     .join(&f.path)
                     .metadata()
-                    .map(|m| m.len() as usize >= proto::DELTA_MIN_FILE_SIZE)
+                    .map(|m| m.len() >= proto::DELTA_MIN_FILE_SIZE)
                     .unwrap_or(false)
         })
         .map(|f| f.path.clone())

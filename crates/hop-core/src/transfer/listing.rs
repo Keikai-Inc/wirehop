@@ -143,8 +143,8 @@ pub fn compute_sync_plan(
                 if src_entry.size != dst.size {
                     // Size differs — definitely changed, check delta eligibility
                     files_to_send.push(src_entry.clone());
-                    if src_entry.size as usize >= DELTA_MIN_FILE_SIZE
-                        && dst.size as usize >= DELTA_MIN_FILE_SIZE
+                    if src_entry.size >= DELTA_MIN_FILE_SIZE
+                        && dst.size >= DELTA_MIN_FILE_SIZE
                     {
                         delta_candidates.push(src_entry.path.clone());
                     }
@@ -154,7 +154,7 @@ pub fn compute_sync_plan(
                     // Both have content hash — compare directly
                     if src_hash != dst_hash {
                         files_to_send.push(src_entry.clone());
-                        if src_entry.size as usize >= DELTA_MIN_FILE_SIZE {
+                        if src_entry.size >= DELTA_MIN_FILE_SIZE {
                             delta_candidates.push(src_entry.path.clone());
                         }
                     }
@@ -162,8 +162,8 @@ pub fn compute_sync_plan(
                 } else if src_entry.mtime != dst.mtime {
                     // Fallback: mtime comparison
                     files_to_send.push(src_entry.clone());
-                    if src_entry.size as usize >= DELTA_MIN_FILE_SIZE
-                        && dst.size as usize >= DELTA_MIN_FILE_SIZE
+                    if src_entry.size >= DELTA_MIN_FILE_SIZE
+                        && dst.size >= DELTA_MIN_FILE_SIZE
                     {
                         delta_candidates.push(src_entry.path.clone());
                     }

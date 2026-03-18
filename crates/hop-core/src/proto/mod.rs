@@ -292,7 +292,7 @@ pub const DEFAULT_PARALLEL_STREAMS: usize = 4;
 pub const DELTA_BLOCK_SIZE: usize = TRANSFER_CHUNK_SIZE;
 
 /// Minimum file size to consider for delta transfer.
-pub const DELTA_MIN_FILE_SIZE: usize = 64 * 1024;
+pub const DELTA_MIN_FILE_SIZE: u64 = 64 * 1024;
 
 /// Request to initiate a file transfer session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
