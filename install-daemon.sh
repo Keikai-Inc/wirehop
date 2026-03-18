@@ -181,7 +181,7 @@ fi
 for f in identity.json peers.json pending_invites.json session_config.json; do
   if [ ! -f "/etc/hop/$f" ]; then
     for src in $MIGRATE_SOURCES; do
-      if [ -f "$src/$f" ]; then
+      if sudo test -f "$src/$f"; then
         info "Migrating $f from $src to /etc/hop..."
         sudo cp "$src/$f" "/etc/hop/$f"
         sudo chown root:hop "/etc/hop/$f"
