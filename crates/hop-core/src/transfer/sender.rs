@@ -103,7 +103,7 @@ pub async fn send_files(
                 bytes_sent += n as u64;
                 total_bytes += n as u64;
                 sizer.record(n as u64);
-                proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+                proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
                 progress.file_progress(&entry.path, bytes_sent, entry.size);
             }
         } else {
@@ -121,7 +121,7 @@ pub async fn send_files(
                 bytes_sent += n as u64;
                 total_bytes += n as u64;
                 sizer.record(n as u64);
-                proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+                proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
                 progress.file_progress(&entry.path, bytes_sent, entry.size);
             }
         }
@@ -179,7 +179,7 @@ async fn send_single_file(
             let chunk = buf[..n].to_vec();
             total_bytes += n as u64;
             sizer.record(n as u64);
-            proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+            proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
             progress.file_progress(&entry.path, total_bytes, entry.size);
         }
     } else {
@@ -195,7 +195,7 @@ async fn send_single_file(
             let chunk = buf[..n].to_vec();
             total_bytes += n as u64;
             sizer.record(n as u64);
-            proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+            proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
             progress.file_progress(&entry.path, total_bytes, entry.size);
         }
     }
@@ -438,7 +438,7 @@ pub async fn send_files_with_delta(
                     )
                     .await?;
 
-                    // Send delta ops
+                    // Send delta ops (buffered, flush at DeltaEnd)
                     let mut delta_bytes = 0u64;
                     for op in &ops {
                         match op {
@@ -450,7 +450,7 @@ pub async fn send_files_with_delta(
                                 delta_bytes += data.len() as u64;
                             }
                         }
-                        proto::write_message(send, &TransferMsg::DeltaOp(op.clone())).await?;
+                        proto::write_message_buffered(send, &TransferMsg::DeltaOp(op.clone())).await?;
                     }
 
                     proto::write_message(send, &TransferMsg::DeltaEnd).await?;
@@ -527,7 +527,7 @@ async fn send_file_data(
             bytes_sent += n as u64;
             total_bytes += n as u64;
             sizer.record(n as u64);
-            proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+            proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
             progress.file_progress(&entry.path, bytes_sent, entry.size);
         }
     } else {
@@ -544,7 +544,7 @@ async fn send_file_data(
             bytes_sent += n as u64;
             total_bytes += n as u64;
             sizer.record(n as u64);
-            proto::write_message(send, &TransferMsg::FileData(chunk)).await?;
+            proto::write_message_buffered(send, &TransferMsg::FileData(chunk)).await?;
             progress.file_progress(&entry.path, bytes_sent, entry.size);
         }
     }

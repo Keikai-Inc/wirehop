@@ -484,6 +484,24 @@ pub async fn write_message<T: Serialize>(
     Ok(())
 }
 
+/// Write a length-prefixed bincode frame **without flushing**.
+///
+/// Use this for high-throughput data streaming (e.g. FileData chunks) where
+/// flushing after every message would force a stop-and-wait pattern. The
+/// caller must flush explicitly at appropriate boundaries (e.g. after FileEnd).
+pub async fn write_message_buffered<T: Serialize>(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    msg: &T,
+) -> Result<()> {
+    let payload =
+        bincode::serde::encode_to_vec(msg, bincode::config::standard()).context("encode failed")?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).await.context("write frame")?;
+    Ok(())
+}
+
 /// Write a length-prefixed bincode frame, zstd-compressing the payload when beneficial.
 ///
 /// Used on hop/3 connections for Output messages. The high bit of the length

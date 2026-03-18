@@ -105,7 +105,11 @@ impl ChunkSizer {
                 // Scale chunk size proportionally to throughput
                 // At 10 MB/s use 128 KiB, at 100 MB/s use 1 MiB
                 let target = ((throughput_mbps / 10.0) * (128.0 * 1024.0)) as usize;
-                self.current_size = target.clamp(self.min_size, self.max_size);
+                let target = target.clamp(self.min_size, self.max_size);
+                // Dampen shrinks: never drop below 50% of current size in one step
+                // to prevent transient CPU/scheduling jitter from causing a death spiral
+                let floor = self.current_size / 2;
+                self.current_size = target.max(floor).clamp(self.min_size, self.max_size);
             }
             self.bytes_since_check = 0;
             self.last_check = Instant::now();
