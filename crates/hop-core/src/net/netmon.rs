@@ -5,14 +5,11 @@
 //! changes that the OS-level socket monitor sometimes misses (e.g. plugging
 //! in ethernet on macOS).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::Connection;
-use iroh::{Endpoint, PublicKey};
-use tokio::sync::Mutex;
+use iroh::Endpoint;
 
 /// Poll interval for interface address checks.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,7 +78,6 @@ pub fn current_interface_addrs() -> BTreeSet<IpAddr> {
 /// via `close_reason()` in `get_or_connect()`.
 pub fn spawn_interface_watcher(
     endpoint: Endpoint,
-    _connections: Option<Arc<Mutex<HashMap<PublicKey, Connection>>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut prev = current_interface_addrs();

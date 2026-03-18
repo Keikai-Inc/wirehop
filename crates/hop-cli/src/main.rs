@@ -248,7 +248,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 
     // Network interface change detector — belt-and-suspenders over iroh's netwatch.
     // Polls interface addresses every 5s and calls endpoint.network_change() on change.
-    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), None);
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone());
 
     // Warn about legacy peers with no bound username when running as root
     #[cfg(unix)]

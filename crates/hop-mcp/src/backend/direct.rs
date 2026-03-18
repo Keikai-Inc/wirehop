@@ -284,7 +284,8 @@ impl OrchestratorBackend for DirectBackend {
     }
 
     async fn fleet_exec(&self, group: &str, command: &str) -> Result<Vec<FleetExecResult>> {
-        let hosts = self.list_hosts(Some(group)).await?;
+        let tag_filter = if group == "*" { None } else { Some(group) };
+        let hosts = self.list_hosts(tag_filter).await?;
         let mut results = Vec::new();
 
         // Execute sequentially. Each call reuses the connection pool, so the
@@ -485,7 +486,8 @@ impl OrchestratorBackend for DirectBackend {
         command: &str,
         sandbox: &SandboxPolicy,
     ) -> Result<Vec<FleetExecResult>> {
-        let hosts = self.list_hosts(Some(group)).await?;
+        let tag_filter = if group == "*" { None } else { Some(group) };
+        let hosts = self.list_hosts(tag_filter).await?;
         let mut results = Vec::new();
 
         for host in hosts {

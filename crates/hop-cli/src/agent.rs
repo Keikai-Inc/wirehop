@@ -3,18 +3,21 @@
 //! Owns a single iroh Endpoint and multiplexes all sessions over QUIC bi-streams.
 //! Listens on a Unix socket for IPC clients, each of which gets a transparent
 //! byte pipe to a host via a dedicated QUIC bi-stream.
+//!
+//! Uses the actor pattern (like session_registry): all mutable connection state
+//! is owned by a single actor task, accessed via `AgentHandle` + `AgentCommand`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use iroh::{Endpoint, PublicKey};
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, PublicKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 
 use hop_core::config;
 use hop_core::net;
@@ -90,126 +93,352 @@ pub fn agent_status(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Agent {
-    endpoint: Endpoint,
-    connections: Arc<Mutex<HashMap<PublicKey, Connection>>>,
-    config_dir: PathBuf,
-    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
-    last_activity: Arc<Mutex<Instant>>,
+// ---------------------------------------------------------------------------
+// Actor pattern: AgentCommand + AgentHandle + AgentState + actor loop
+// ---------------------------------------------------------------------------
+
+/// Commands processed by the agent actor.
+enum AgentCommand {
+    /// Request a connection + semaphore for a host. If no connection exists,
+    /// one is created (or an in-flight connect is joined).
+    GetConnection {
+        host_id: PublicKey,
+        relay_url: Option<String>,
+        reply: oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>,
+    },
+    /// Self-message from a spawned connect task when the QUIC handshake completes.
+    ConnectDone {
+        host_id: PublicKey,
+        result: Result<Connection>,
+    },
+    /// Evict a stale connection after an open_bi failure.
+    RemoveConnection {
+        host_id: PublicKey,
+    },
+    /// Flush all pooled connections (sleep/wake recovery).
+    FlushAll,
+    /// Bump last_activity timestamp (session start/end).
+    TouchActivity,
+    /// Query whether the agent is idle (no sessions, past timeout).
+    CheckIdle {
+        reply: oneshot::Sender<bool>,
+    },
 }
 
-impl Agent {
-    async fn new(config_dir: &Path) -> Result<Self> {
-        let secret_key = config::load_or_generate_identity(config_dir)?;
-        let endpoint = net::create_client_endpoint(secret_key).await?;
+/// Cloneable handle to the agent actor.
+#[derive(Clone)]
+struct AgentHandle {
+    tx: mpsc::Sender<AgentCommand>,
+}
 
-        Ok(Agent {
-            endpoint,
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            config_dir: config_dir.to_path_buf(),
-            active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            last_activity: Arc::new(Mutex::new(Instant::now())),
-        })
-    }
-
-    /// Get an existing connection or create a new one.
-    async fn get_or_connect(
+impl AgentHandle {
+    /// Request a connection and per-host semaphore for the given host.
+    async fn get_connection(
         &self,
         host_id: PublicKey,
         relay_url: Option<String>,
-    ) -> Result<Connection> {
-        let mut conns = self.connections.lock().await;
-
-        // Check for existing live connection
-        if let Some(conn) = conns.get(&host_id) {
-            // Verify connection is still alive by checking close reason
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
-            // Dead connection, close explicitly and remove it
-            conns.remove(&host_id);
-        }
-
-        // Create new connection — try hop/3 (compressed) first, fall back to hop/2
-        let relay: Option<iroh::RelayUrl> = relay_url
-            .as_deref()
-            .map(|u| u.parse())
-            .transpose()
-            .ok()
-            .flatten();
-
-        let conn = match net::connect_to_host_with_alpn(
-            &self.endpoint, host_id, relay.as_ref(), hop_core::proto::ALPN_V3,
-        ).await {
-            Ok((conn, _)) => conn,
-            Err(_) => {
-                tracing::debug!("hop/3 not supported by {}, falling back to hop/2", host_id.fmt_short());
-                let (conn, _) = net::connect_to_host(&self.endpoint, host_id, relay.as_ref()).await?;
-                conn
-            }
-        };
-
-        conns.insert(host_id, conn.clone());
-        Ok(conn)
+    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::GetConnection {
+                host_id,
+                relay_url,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("agent actor stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("agent actor stopped"))?
     }
 
-    /// Handle a single IPC client connection.
-    async fn handle_client(&self, mut ipc: UnixStream) -> Result<()> {
-        // 1. Read MuxConnect
-        let req: MuxConnect = mux::read_ipc_message(&mut ipc).await?;
-        let host_id = PublicKey::from_bytes(&req.host_id)
-            .context("invalid host_id in MuxConnect")?;
+    /// Evict a stale connection (fire-and-forget).
+    async fn remove_connection(&self, host_id: PublicKey) {
+        let _ = self
+            .tx
+            .send(AgentCommand::RemoveConnection { host_id })
+            .await;
+    }
 
-        // 2. Get or create QUIC connection
-        let conn = match self.get_or_connect(host_id, req.relay_url).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                let _ = mux::write_ipc_message(
-                    &mut ipc,
-                    &MuxResult::Error(format!("{e:#}")),
-                )
-                .await;
-                return Err(e);
+    /// Flush all pooled connections (fire-and-forget).
+    async fn flush_all(&self) {
+        let _ = self.tx.send(AgentCommand::FlushAll).await;
+    }
+
+    /// Bump last_activity timestamp (fire-and-forget).
+    async fn touch_activity(&self) {
+        let _ = self.tx.send(AgentCommand::TouchActivity).await;
+    }
+
+    /// Check whether the agent is idle past the timeout.
+    async fn check_idle(&self) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(AgentCommand::CheckIdle { reply }).await;
+        rx.await.unwrap_or(true)
+    }
+}
+
+/// Reply type for GetConnection: a live connection + per-host semaphore.
+type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>;
+
+/// Mutable state owned exclusively by the actor task.
+struct AgentState {
+    endpoint: Endpoint,
+    connections: HashMap<PublicKey, Connection>,
+    semaphores: HashMap<PublicKey, Arc<tokio::sync::Semaphore>>,
+    /// In-flight connect waiters: queued reply channels for hosts being connected.
+    pending: HashMap<PublicKey, Vec<ConnectReply>>,
+    /// Self-sender for spawned connect tasks to send ConnectDone back.
+    tx: mpsc::Sender<AgentCommand>,
+    last_activity: Instant,
+}
+
+/// Spawn the agent actor and return a handle.
+fn spawn_agent_actor(endpoint: Endpoint) -> AgentHandle {
+    let (tx, rx) = mpsc::channel(64);
+    let state = AgentState {
+        endpoint,
+        connections: HashMap::new(),
+        semaphores: HashMap::new(),
+        pending: HashMap::new(),
+        tx: tx.clone(),
+        last_activity: Instant::now(),
+    };
+    tokio::spawn(run_agent_actor(rx, state));
+    AgentHandle { tx }
+}
+
+/// The actor loop: owns all mutable connection state, processes commands sequentially.
+async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentState) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            AgentCommand::GetConnection {
+                host_id,
+                relay_url,
+                reply,
+            } => {
+                // 1. Check cache for a live connection
+                if let Some(conn) = state.connections.get(&host_id) {
+                    if conn.close_reason().is_none() {
+                        let sem = state
+                            .semaphores
+                            .entry(host_id)
+                            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                            .clone();
+                        let _ = reply.send(Ok((conn.clone(), sem)));
+                        continue;
+                    }
+                    // Dead connection — remove it
+                    state.connections.remove(&host_id);
+                }
+
+                // 2. If a connect is already in-flight, queue this waiter
+                if let Some(waiters) = state.pending.get_mut(&host_id) {
+                    waiters.push(reply);
+                    continue;
+                }
+
+                // 3. No connection, no in-flight connect — spawn one
+                state.pending.insert(host_id, vec![reply]);
+                let endpoint = state.endpoint.clone();
+                let tx = state.tx.clone();
+                tokio::spawn(async move {
+                    let result = do_connect(&endpoint, host_id, relay_url).await;
+                    let _ = tx
+                        .send(AgentCommand::ConnectDone {
+                            host_id,
+                            result,
+                        })
+                        .await;
+                });
             }
-        };
 
-        // 3. Open new bi-stream on the QUIC connection
-        let (quic_send, quic_recv) = match conn.open_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Connection may have died; close explicitly and remove from pool
-                conn.close(0u32.into(), b"open-bi-failed");
-                self.connections.lock().await.remove(&host_id);
-                let _ = mux::write_ipc_message(
-                    &mut ipc,
-                    &MuxResult::Error(format!("failed to open bi-stream: {e:#}")),
-                )
-                .await;
-                anyhow::bail!("open_bi failed: {e:#}");
+            AgentCommand::ConnectDone { host_id, result } => {
+                let waiters = state.pending.remove(&host_id).unwrap_or_default();
+
+                match result {
+                    Ok(conn) => {
+                        state.connections.insert(host_id, conn.clone());
+                        let sem = state
+                            .semaphores
+                            .entry(host_id)
+                            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                            .clone();
+                        for reply in waiters {
+                            let _ = reply.send(Ok((conn.clone(), sem.clone())));
+                        }
+                    }
+                    Err(e) => {
+                        // Fan out the error to all waiters
+                        let msg = format!("{e:#}");
+                        for reply in waiters {
+                            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+                        }
+                    }
+                }
             }
-        };
 
-        // 4. Signal ready
-        mux::write_ipc_message(&mut ipc, &MuxResult::Ready).await?;
+            AgentCommand::RemoveConnection { host_id } => {
+                if let Some(conn) = state.connections.remove(&host_id) {
+                    conn.close(0u32.into(), b"open-bi-failed");
+                }
+            }
 
-        // 5. Track active session
-        self.active_sessions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *self.last_activity.lock().await = Instant::now();
+            AgentCommand::FlushAll => {
+                for (_, conn) in state.connections.drain() {
+                    conn.close(0u32.into(), b"flush");
+                }
+            }
 
-        // 6. Transparent bidirectional proxy
-        let (ipc_read, ipc_write) = ipc.into_split();
-        let result = proxy_quic(ipc_read, ipc_write, quic_send, quic_recv).await;
+            AgentCommand::TouchActivity => {
+                state.last_activity = Instant::now();
+            }
 
-        // 7. Session done
-        self.active_sessions
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        *self.last_activity.lock().await = Instant::now();
-
-        if let Err(e) = result {
-            tracing::debug!("Proxy session ended: {e:#}");
+            AgentCommand::CheckIdle { reply } => {
+                let idle = state.last_activity.elapsed() >= IDLE_TIMEOUT;
+                let _ = reply.send(idle);
+            }
         }
-        Ok(())
+    }
+}
+
+/// Connect to a host via QUIC. Tries hop/3 (compressed) first, falls back to hop/2.
+/// Runs in a spawned task — never blocks the actor loop.
+async fn do_connect(
+    endpoint: &Endpoint,
+    host_id: PublicKey,
+    relay_url: Option<String>,
+) -> Result<Connection> {
+    let relay: Option<iroh::RelayUrl> = relay_url
+        .as_deref()
+        .map(|u| u.parse())
+        .transpose()
+        .ok()
+        .flatten();
+
+    match net::connect_to_host_with_alpn(
+        endpoint,
+        host_id,
+        relay.as_ref(),
+        hop_core::proto::ALPN_V3,
+    )
+    .await
+    {
+        Ok((conn, _)) => Ok(conn),
+        Err(_) => {
+            tracing::debug!(
+                "hop/3 not supported by {}, falling back to hop/2",
+                host_id.fmt_short()
+            );
+            let (conn, _) = net::connect_to_host(endpoint, host_id, relay.as_ref()).await?;
+            Ok(conn)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC client handler (free function, takes AgentHandle)
+// ---------------------------------------------------------------------------
+
+/// Handle a single IPC client connection.
+///
+/// Uses a per-host semaphore to serialize the connect+open_bi phase,
+/// preventing reconnect stampedes when multiple IPC clients queue up
+/// during slow QUIC handshakes. Also monitors IPC liveness so that
+/// timed-out clients don't leave orphaned bi-streams.
+async fn handle_client(
+    mut ipc: UnixStream,
+    handle: AgentHandle,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<()> {
+    // 1. Read MuxConnect
+    let req: MuxConnect = mux::read_ipc_message(&mut ipc).await?;
+    let host_id =
+        PublicKey::from_bytes(&req.host_id).context("invalid host_id in MuxConnect")?;
+
+    // 2. Split IPC early so we can monitor liveness during setup
+    let (mut ipc_read, mut ipc_write) = ipc.into_split();
+
+    // 3. Get connection + per-host semaphore, abort if IPC client disconnects
+    let (conn, sem) = tokio::select! {
+        result = handle.get_connection(host_id, req.relay_url) => {
+            match result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = mux::write_ipc_message(
+                        &mut ipc_write,
+                        &MuxResult::Error(format!("{e:#}")),
+                    ).await;
+                    return Err(e);
+                }
+            }
+        }
+        _ = wait_for_ipc_close(&mut ipc_read) => {
+            tracing::debug!("IPC client disconnected during connect ({})", host_id.fmt_short());
+            return Ok(());
+        }
+    };
+
+    // 4. Acquire semaphore, abort if IPC client disconnects while waiting
+    let permit = tokio::select! {
+        permit = sem.acquire_owned() => {
+            permit.map_err(|_| anyhow::anyhow!("host semaphore closed"))?
+        }
+        _ = wait_for_ipc_close(&mut ipc_read) => {
+            tracing::debug!("IPC client disconnected while waiting for host lock ({})", host_id.fmt_short());
+            return Ok(());
+        }
+    };
+
+    // 5. Open bi-stream (fast on live connection)
+    let (quic_send, quic_recv) = match conn.open_bi().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Connection may have died; evict from pool
+            handle.remove_connection(host_id).await;
+            let _ = mux::write_ipc_message(
+                &mut ipc_write,
+                &MuxResult::Error(format!("open_bi failed: {e:#}")),
+            )
+            .await;
+            anyhow::bail!("open_bi failed: {e:#}");
+        }
+    };
+
+    // 6. Signal ready
+    mux::write_ipc_message(&mut ipc_write, &MuxResult::Ready).await?;
+
+    // 7. Drop semaphore permit — unblocks next waiter, doesn't block proxy
+    drop(permit);
+
+    // 8. Track active session
+    active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    handle.touch_activity().await;
+
+    // 9. Transparent bidirectional proxy
+    let result = proxy_quic(ipc_read, ipc_write, quic_send, quic_recv).await;
+
+    // 10. Session done
+    active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    handle.touch_activity().await;
+
+    if let Err(e) = result {
+        tracing::debug!("Proxy session ended: {e:#}");
+    }
+    Ok(())
+}
+
+/// Detect when an IPC client has disconnected by reading from the socket.
+///
+/// Cancel-safe: `OwnedReadHalf::read` is cancel-safe per tokio docs.
+/// Safe to call during the setup phase — the client sends no data between
+/// MuxConnect and MuxResult::Ready, so any read returning 0 or error
+/// means the client is gone.
+async fn wait_for_ipc_close(ipc_read: &mut tokio::net::unix::OwnedReadHalf) {
+    let mut buf = [0u8; 1];
+    loop {
+        match ipc_read.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
+        }
     }
 }
 
@@ -308,6 +537,33 @@ async fn proxy_streams(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Idle check (actor-based)
+// ---------------------------------------------------------------------------
+
+/// Poll the actor for idle status. Returns when the agent is idle.
+async fn check_idle_actor(
+    active_sessions: &std::sync::atomic::AtomicUsize,
+    handle: &AgentHandle,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let active = active_sessions.load(std::sync::atomic::Ordering::Relaxed);
+        if active > 0 {
+            continue;
+        }
+
+        if handle.check_idle().await {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main agent entry point
+// ---------------------------------------------------------------------------
+
 async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
     let sock_path = mux::agent_sock_path(config_dir);
     let pid_path = mux::agent_pid_path(config_dir);
@@ -334,52 +590,36 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("failed to register SIGINT handler")?;
 
-    let agent = Agent::new(config_dir).await?;
+    let secret_key = config::load_or_generate_identity(config_dir)?;
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+    let handle = spawn_agent_actor(endpoint.clone());
+    let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Background task: flush stale connections on sleep/wake
-    let wake_conns = agent.connections.clone();
+    let wake_handle = handle.clone();
     tokio::spawn(async move {
         loop {
             let before = std::time::Instant::now();
             tokio::time::sleep(Duration::from_secs(3)).await;
             if before.elapsed() > Duration::from_secs(15) {
                 tracing::info!("Agent detected sleep/wake, flushing connection pool");
-                let mut conns = wake_conns.lock().await;
-                for (_, conn) in conns.drain() {
-                    conn.close(0u32.into(), b"sleep-flush");
-                }
+                wake_handle.flush_all().await;
             }
         }
     });
 
     // Network interface change detector — flushes pooled connections on change
-    let _netmon = net::netmon::spawn_interface_watcher(
-        agent.endpoint.clone(),
-        Some(agent.connections.clone()),
-    );
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone());
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        let agent_conns = agent.connections.clone();
-                        let agent_endpoint = agent.endpoint.clone();
-                        let agent_config_dir = agent.config_dir.clone();
-                        let agent_active = agent.active_sessions.clone();
-                        let agent_last = agent.last_activity.clone();
-
-                        // Create a lightweight handle for this client
-                        let handler = Agent {
-                            endpoint: agent_endpoint,
-                            connections: agent_conns,
-                            config_dir: agent_config_dir,
-                            active_sessions: agent_active,
-                            last_activity: agent_last,
-                        };
-
+                        let h = handle.clone();
+                        let sessions = active_sessions.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handler.handle_client(stream).await {
+                            if let Err(e) = handle_client(stream, h, sessions).await {
                                 tracing::debug!("Agent client error: {e:#}");
                             }
                         });
@@ -397,45 +637,21 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
                 tracing::info!("Agent received SIGINT, shutting down");
                 break;
             }
-            _ = check_idle(&agent.active_sessions, &agent.last_activity) => {
+            _ = check_idle_actor(&active_sessions, &handle) => {
                 tracing::info!("Agent idle timeout reached, shutting down");
                 break;
             }
         }
     }
 
-    // Cleanup: close all pooled connections, then the endpoint
-    {
-        let mut conns = agent.connections.lock().await;
-        for (_, conn) in conns.drain() {
-            conn.close(0u32.into(), b"agent-shutdown");
-        }
-    }
-    agent.endpoint.close().await;
+    // Cleanup: flush all pooled connections, then close the endpoint
+    handle.flush_all().await;
+    drop(handle);
+    endpoint.close().await;
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
 
     Ok(())
-}
-
-/// Check idle timeout (public for testing).
-async fn check_idle(
-    active_sessions: &std::sync::atomic::AtomicUsize,
-    last_activity: &Mutex<Instant>,
-) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-
-        let active = active_sessions.load(std::sync::atomic::Ordering::Relaxed);
-        if active > 0 {
-            continue;
-        }
-
-        let last = *last_activity.lock().await;
-        if last.elapsed() >= IDLE_TIMEOUT {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -621,20 +837,44 @@ mod tests {
     #[tokio::test]
     async fn idle_timeout_fires_when_no_sessions() {
         let active = Arc::new(AtomicUsize::new(0));
-        let last_activity = Arc::new(Mutex::new(
-            Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1),
-        ));
 
-        // check_idle polls every 30s, so we use tokio::time::pause to advance
+        // Spawn a minimal actor with last_activity already past the timeout
+        let (tx, mut rx) = mpsc::channel::<AgentCommand>(16);
+        let handle = AgentHandle { tx };
+
+        // Actor that only handles CheckIdle, with last_activity in the past
+        tokio::spawn(async move {
+            let past = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+            while let Some(cmd) = rx.recv().await {
+                if let AgentCommand::CheckIdle { reply } = cmd {
+                    let _ = reply.send(past.elapsed() >= IDLE_TIMEOUT);
+                }
+            }
+        });
+
+        // check_idle_actor polls every 30s, so we use tokio::time::pause to advance
         // the clock instantly.
         tokio::time::pause();
 
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            check_idle(&active, &last_activity).await;
+            check_idle_actor(&active, &handle).await;
         })
         .await;
 
-        assert!(result.is_ok(), "check_idle should have returned promptly");
+        assert!(result.is_ok(), "check_idle_actor should have returned promptly");
+    }
+
+    #[tokio::test]
+    async fn handle_returns_error_when_actor_dropped() {
+        let (tx, rx) = mpsc::channel::<AgentCommand>(1);
+        let handle = AgentHandle { tx };
+
+        // Drop the receiver immediately — actor is "stopped"
+        drop(rx);
+
+        let host_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let result = handle.get_connection(host_id, None).await;
+        assert!(result.is_err(), "should return error when actor is stopped");
     }
 
     // ── Agent IPC Integration ──

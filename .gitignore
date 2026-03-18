@@ -1,2 +1,3 @@
 /target
 target/release-dist/
+tests/e2e/hop

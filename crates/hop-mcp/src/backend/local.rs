@@ -264,7 +264,8 @@ impl OrchestratorBackend for LocalBackend {
     }
 
     async fn fleet_exec(&self, group: &str, command: &str) -> Result<Vec<FleetExecResult>> {
-        let hosts = self.list_hosts(Some(group)).await?;
+        let tag_filter = if group == "*" { None } else { Some(group) };
+        let hosts = self.list_hosts(tag_filter).await?;
         let mut handles = Vec::new();
 
         for host in hosts {

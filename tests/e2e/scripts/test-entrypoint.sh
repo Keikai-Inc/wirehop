@@ -13,6 +13,23 @@ mkdir -p "$HOP_CONFIG_DIR"
 CONFIG_DIR="$HOP_CONFIG_DIR"
 export CONFIG_DIR
 
+# Start a local hop host so hop mcp can access the datastore (daemon.sock).
+# The test runner doesn't serve connections — it only needs the datastore
+# for MCP data/cron tool tests.
+hop --config "$CONFIG_DIR" host --quiet &
+HOP_HOST_PID=$!
+
+# Wait for the daemon socket to appear (max 30s)
+ELAPSED=0
+while [ ! -S "$CONFIG_DIR/daemon.sock" ]; do
+    if [ "$ELAPSED" -ge 30 ]; then
+        echo "WARNING: timed out waiting for local daemon.sock (30s)"
+        break
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+
 # Wait for both hosts to be ready (max 180s)
 echo "Waiting for hosts to be ready..."
 ELAPSED=0
@@ -44,6 +61,35 @@ echo ""
 echo "--- Connection & Auth ---"
 run_test test_auth_via_invite_a
 run_test test_auth_via_invite_b
+
+# Populate fleet.json so hop.fleet.list() / hop.fleet.exec() work.
+# hop fleet add uses resolve_host_config_dir(None) which targets the system
+# config dir, but hop mcp reads from --config $CONFIG_DIR. Write directly.
+cat > "$CONFIG_DIR/fleet.json" <<FLEET
+{
+  "members": [
+    {
+      "node_id": "$NODE_ID_A",
+      "hostname": "host-a",
+      "tags": [],
+      "registered_at": "0",
+      "last_heartbeat": null,
+      "relay_url": null,
+      "online": true
+    },
+    {
+      "node_id": "$NODE_ID_B",
+      "hostname": "host-b",
+      "tags": [],
+      "registered_at": "0",
+      "last_heartbeat": null,
+      "relay_url": null,
+      "online": true
+    }
+  ]
+}
+FLEET
+echo "Fleet configured with host-a and host-b"
 
 # ── Remote Exec ──
 echo ""
