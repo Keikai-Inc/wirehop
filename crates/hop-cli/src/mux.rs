@@ -239,15 +239,21 @@ pub async fn connect_to_host(
 
     println!("Connecting to {}...", host_id.fmt_short());
 
+    // Always pass the default relay URL as a hint so iroh can reach the
+    // host without relying on DNS/pkarr discovery (which can fail on musl
+    // or in restricted network environments).
+    let default_relay = hop_core::net::HOP_RELAY_URL.to_string();
     let (mut ipc_write, ipc_read) =
-        open_agent_stream(config_dir, &host_id, None).await?;
+        open_agent_stream(config_dir, &host_id, Some(default_relay.clone())).await?;
+
+    let relay_url: Option<iroh::RelayUrl> = default_relay.parse().ok();
 
     proto::write_message(&mut ipc_write, session_request).await?;
 
     Ok((
         ResolvedHost {
             host_id,
-            relay_url: None,
+            relay_url,
         },
         ipc_write,
         ipc_read,
