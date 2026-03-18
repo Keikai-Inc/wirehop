@@ -507,11 +507,7 @@ async fn proxy_quic(
     //         drops socket → c2h's ipc_read sees EOF → c2h finishes
     //   Push: client finishes → c2h calls finish() → host sees FIN → host
     //         sends response + finishes → h2c's quic_recv sees EOF → h2c finishes
-    // Cap total wait to 30s to avoid hanging on misbehaving peers.
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
-        let _ = tokio::join!(h2c, c2h);
-    })
-    .await;
+    let _ = tokio::join!(h2c, c2h);
 
     Ok(())
 }
