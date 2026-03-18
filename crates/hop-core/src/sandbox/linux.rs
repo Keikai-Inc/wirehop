@@ -49,10 +49,10 @@ fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
     {
         use std::os::unix::io::AsRawFd;
 
-        // Landlock ABI v1 constants
-        const LANDLOCK_CREATE_RULESET: i64 = 444;
-        const LANDLOCK_ADD_RULE: i64 = 445;
-        const LANDLOCK_RESTRICT_SELF: i64 = 446;
+        // Landlock ABI v1 constants (c_long to support both 32-bit and 64-bit)
+        const LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+        const LANDLOCK_ADD_RULE: libc::c_long = 445;
+        const LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 
         const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 

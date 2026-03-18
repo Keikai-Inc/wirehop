@@ -181,15 +181,16 @@ for target in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 
 # Linux targets (cross)
-for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf; do
   echo "==> Building ${target} (via cross)"
   AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target "${target}" --manifest-path "${PROJECT_ROOT}/Cargo.toml" -p hop-cli
 
   bin="${PROJECT_ROOT}/target/${target}/release/hop"
 
   case "${target}" in
-    x86_64-unknown-linux-gnu)  name="hop-linux-x86_64" ;;
-    aarch64-unknown-linux-gnu) name="hop-linux-arm64" ;;
+    x86_64-unknown-linux-gnu)        name="hop-linux-x86_64" ;;
+    aarch64-unknown-linux-gnu)       name="hop-linux-arm64" ;;
+    armv7-unknown-linux-gnueabihf)   name="hop-linux-armv7" ;;
   esac
 
   cp "${bin}" "${DIST_DIR}/${name}"

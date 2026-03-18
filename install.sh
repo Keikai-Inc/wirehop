@@ -82,6 +82,7 @@ esac
 case "${ARCH}" in
   x86_64|amd64)  ARCH="x86_64" ;;
   arm64|aarch64) ARCH="arm64" ;;
+  armv7l|armv7)  ARCH="armv7" ;;
   *)             die "Unsupported architecture: ${ARCH}" ;;
 esac
 
