@@ -16,6 +16,9 @@ pub const ALPN_V1: &[u8] = b"hop/1";
 /// ALPN protocol identifier for hop v2 (admin, fleet, roles).
 pub const ALPN_V2: &[u8] = b"hop/2";
 
+/// ALPN protocol identifier for hop v3 (zstd compression on large frames).
+pub const ALPN_V3: &[u8] = b"hop/3";
+
 /// Legacy alias — kept so existing callers that reference `ALPN` still compile.
 pub const ALPN: &[u8] = ALPN_V0;
 
@@ -459,6 +462,13 @@ pub enum DeltaOperation {
     Literal(Vec<u8>),
 }
 
+/// Compression flag: high bit of the 4-byte length prefix signals zstd-compressed payload.
+const COMPRESS_FLAG: u32 = 0x8000_0000;
+/// Only compress payloads above this threshold (small messages aren't worth it).
+const COMPRESS_THRESHOLD: usize = 64;
+/// Maximum decompressed size to prevent decompression bombs.
+const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
+
 /// Write a length-prefixed bincode frame to a stream.
 pub async fn write_message<T: Serialize>(
     stream: &mut (impl AsyncWriteExt + Unpin),
@@ -466,19 +476,59 @@ pub async fn write_message<T: Serialize>(
 ) -> Result<()> {
     let payload =
         bincode::serde::encode_to_vec(msg, bincode::config::standard()).context("encode failed")?;
-    let len = (payload.len() as u32).to_be_bytes();
-    stream
-        .write_all(&len)
-        .await
-        .context("write frame length")?;
-    stream
-        .write_all(&payload)
-        .await
-        .context("write frame payload")?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).await.context("write frame")?;
+    stream.flush().await.context("flush frame")?;
+    Ok(())
+}
+
+/// Write a length-prefixed bincode frame, zstd-compressing the payload when beneficial.
+///
+/// Used on hop/3 connections for Output messages. The high bit of the length
+/// prefix signals compression so the receiver can distinguish compressed from
+/// uncompressed frames.
+pub async fn write_message_compressed<T: Serialize>(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    msg: &T,
+) -> Result<()> {
+    let payload =
+        bincode::serde::encode_to_vec(msg, bincode::config::standard()).context("encode failed")?;
+    let frame = if payload.len() > COMPRESS_THRESHOLD {
+        if let Ok(compressed) = zstd::bulk::compress(&payload, 1) {
+            if compressed.len() < payload.len() {
+                let len = (compressed.len() as u32) | COMPRESS_FLAG;
+                let mut f = Vec::with_capacity(4 + compressed.len());
+                f.extend_from_slice(&len.to_be_bytes());
+                f.extend_from_slice(&compressed);
+                f
+            } else {
+                let mut f = Vec::with_capacity(4 + payload.len());
+                f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                f.extend_from_slice(&payload);
+                f
+            }
+        } else {
+            let mut f = Vec::with_capacity(4 + payload.len());
+            f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        }
+    } else {
+        let mut f = Vec::with_capacity(4 + payload.len());
+        f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        f.extend_from_slice(&payload);
+        f
+    };
+    stream.write_all(&frame).await.context("write frame")?;
+    stream.flush().await.context("flush frame")?;
     Ok(())
 }
 
 /// Read a length-prefixed bincode frame from a stream.
+///
+/// Transparently decompresses zstd frames (high bit set in length prefix).
 pub async fn read_message<T: for<'de> Deserialize<'de>>(
     stream: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<T> {
@@ -487,7 +537,9 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
         .read_exact(&mut len_buf)
         .await
         .context("read frame length")?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let raw_len = u32::from_be_bytes(len_buf);
+    let compressed = raw_len & COMPRESS_FLAG != 0;
+    let len = (raw_len & !COMPRESS_FLAG) as usize;
 
     if len > 16 * 1024 * 1024 {
         anyhow::bail!("frame too large: {len} bytes");
@@ -499,8 +551,15 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
         .await
         .context("read frame payload")?;
 
+    let decode_buf = if compressed {
+        zstd::bulk::decompress(&payload, MAX_DECOMPRESSED)
+            .context("zstd decompress failed")?
+    } else {
+        payload
+    };
+
     let (msg, _) =
-        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+        bincode::serde::decode_from_slice(&decode_buf, bincode::config::standard())
             .context("decode failed")?;
     Ok(msg)
 }
@@ -689,6 +748,66 @@ mod tests {
                 .split('{').next().unwrap_or(&decoded_debug)
                 .split(' ').next().unwrap_or(&decoded_debug);
             assert_eq!(orig_variant, decoded_variant, "variant mismatch for: {orig_debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_write_read_roundtrip() {
+        // Large output that benefits from compression
+        let data = "AAAA ".repeat(200); // 1000 bytes, highly compressible
+        let msg = HostMessage::Output(data.as_bytes().to_vec());
+
+        // Write compressed
+        let mut buf = Vec::new();
+        write_message_compressed(&mut buf, &msg).await.unwrap();
+
+        // Verify compression flag is set (high bit of length)
+        let raw_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!(raw_len & COMPRESS_FLAG != 0, "compression flag should be set for large payload");
+        let wire_len = (raw_len & !COMPRESS_FLAG) as usize;
+        assert!(wire_len < 1000, "compressed size ({wire_len}) should be much smaller than 1000");
+
+        // Read back — read_message handles decompression transparently
+        let mut cursor = std::io::Cursor::new(buf);
+        let decoded: HostMessage = read_message(&mut cursor).await.unwrap();
+        match decoded {
+            HostMessage::Output(d) => assert_eq!(d, data.as_bytes()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn small_message_not_compressed() {
+        let msg = HostMessage::Output(b"hello".to_vec());
+
+        let mut buf = Vec::new();
+        write_message_compressed(&mut buf, &msg).await.unwrap();
+
+        // Small payload should NOT be compressed
+        let raw_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert!(raw_len & COMPRESS_FLAG == 0, "small payload should not be compressed");
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let decoded: HostMessage = read_message(&mut cursor).await.unwrap();
+        match decoded {
+            HostMessage::Output(d) => assert_eq!(d, b"hello"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncompressed_write_read_roundtrip() {
+        // Verify old-style write_message still works with new read_message
+        let msg = HostMessage::Output(b"test data".to_vec());
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let decoded: HostMessage = read_message(&mut cursor).await.unwrap();
+        match decoded {
+            HostMessage::Output(d) => assert_eq!(d, b"test data"),
+            _ => panic!("wrong variant"),
         }
     }
 }

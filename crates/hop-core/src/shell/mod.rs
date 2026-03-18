@@ -17,6 +17,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::proto::{self, ClientMessage, HostMessage};
 use session_registry::{DetachedSession, RegistryHandle, SessionKey};
 
+/// Write a HostMessage, using zstd compression when the connection supports it (V3+).
+async fn write_host_message(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    msg: &HostMessage,
+    compress: bool,
+) -> Result<()> {
+    if compress {
+        proto::write_message_compressed(stream, msg).await
+    } else {
+        proto::write_message(stream, msg).await
+    }
+}
+
 /// Outcome of a client shell session.
 #[derive(Debug)]
 pub enum SessionOutcome {
@@ -40,6 +53,7 @@ pub async fn host_shell_session(
     username: Option<&str>,
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
+    protocol_version: u8,
 ) -> Result<()> {
     if let Err(e) = check_shell_security(username) {
         let _ = proto::write_message(&mut send, &HostMessage::SessionError(format!("{e:#}"))).await;
@@ -230,12 +244,13 @@ pub async fn host_shell_session(
     }
 
     // Main loop: multiplex between PTY output, client input, and child exit
+    let compress = protocol_version >= 3;
     let mut clean_exit = false;
     loop {
         tokio::select! {
             // PTY output -> send to client
             Some(data) = output_rx.recv() => {
-                if let Err(e) = proto::write_message(&mut send, &HostMessage::Output(data)).await {
+                if let Err(e) = write_host_message(&mut send, &HostMessage::Output(data), compress).await {
                     tracing::debug!("Failed to send output: {e}");
                     break;
                 }
@@ -279,7 +294,7 @@ pub async fn host_shell_session(
             Ok(code) = &mut exit_rx => {
                 // Drain remaining output
                 while let Ok(data) = output_rx.try_recv() {
-                    let _ = proto::write_message(&mut send, &HostMessage::Output(data)).await;
+                    let _ = write_host_message(&mut send, &HostMessage::Output(data), compress).await;
                 }
                 let _ = proto::write_message(&mut send, &HostMessage::Exit(code)).await;
                 clean_exit = true;
@@ -537,6 +552,7 @@ fn spawn_persistent_pty(
 ///
 /// Returns `Exited(code)` if the shell exits, or `Disconnected` if the client
 /// disconnects (allowing the session to be preserved for reconnection).
+#[allow(clippy::too_many_arguments)]
 async fn run_attached_loop(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -545,7 +561,10 @@ async fn run_attached_loop(
     resize_tx: &mpsc::Sender<PtySize>,
     exit_rx: &mut watch::Receiver<Option<i32>>,
     leftover_msg: Option<ClientMessage>,
+    protocol_version: u8,
 ) -> AttachOutcome {
+    let compress = protocol_version >= 3;
+
     // Process any leftover message from setup phase
     if let Some(msg) = leftover_msg {
         match msg {
@@ -565,7 +584,7 @@ async fn run_attached_loop(
     loop {
         tokio::select! {
             Some(data) = output_rx.recv() => {
-                if let Err(e) = proto::write_message(send, &HostMessage::Output(data)).await {
+                if let Err(e) = write_host_message(send, &HostMessage::Output(data), compress).await {
                     tracing::debug!("Failed to send output: {e}");
                     return AttachOutcome::Disconnected;
                 }
@@ -595,7 +614,7 @@ async fn run_attached_loop(
                 if let Some(code) = exit_code {
                     // Drain remaining output
                     while let Ok(data) = output_rx.try_recv() {
-                        let _ = proto::write_message(send, &HostMessage::Output(data)).await;
+                        let _ = write_host_message(send, &HostMessage::Output(data), compress).await;
                     }
                     let _ = proto::write_message(send, &HostMessage::Exit(code)).await;
                     return AttachOutcome::Exited;
@@ -620,6 +639,7 @@ pub async fn host_shell_session_persistent(
     registry: RegistryHandle,
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
+    protocol_version: u8,
 ) -> Result<()> {
     if let Err(e) = check_shell_security(username) {
         let _ = proto::write_message(&mut send, &HostMessage::SessionError(format!("{e:#}"))).await;
@@ -740,6 +760,7 @@ pub async fn host_shell_session_persistent(
         &resize_tx,
         &mut exit_rx,
         leftover_msg,
+        protocol_version,
     )
     .await;
 
@@ -1025,6 +1046,7 @@ pub async fn host_exec_session(
     command: &str,
     username: Option<&str>,
     sandbox: &crate::sandbox::SandboxPolicy,
+    protocol_version: u8,
 ) -> Result<()> {
     // --- Pre-spawn security checks (same as shell) ---
     #[cfg(unix)]
@@ -1118,11 +1140,12 @@ pub async fn host_exec_session(
     }
 
     // Main loop: forward output, then wait for exit
+    let compress = protocol_version >= 3;
     let mut clean_exit = false;
     loop {
         match output_rx.recv().await {
             Some(data) => {
-                if let Err(e) = proto::write_message(&mut send, &HostMessage::Output(data)).await {
+                if let Err(e) = write_host_message(&mut send, &HostMessage::Output(data), compress).await {
                     tracing::debug!("Failed to send exec output: {e}");
                     break;
                 }

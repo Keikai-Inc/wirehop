@@ -576,16 +576,16 @@ async fn dispatch_session(
     match msg {
         Some(ClientMessage::RequestShell) => {
             tracing::info!("Starting shell session");
-            shell::host_shell_session(send, recv, username, sandbox, config_dir).await?;
+            shell::host_shell_session(send, recv, username, sandbox, config_dir, protocol_version).await?;
         }
         Some(ClientMessage::RequestShellV2 { session_id }) => {
             tracing::info!("Starting persistent shell session (resume: {})", session_id.is_some());
-            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, sandbox, config_dir).await?;
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, sandbox, config_dir, protocol_version).await?;
         }
         Some(ClientMessage::RequestShellV3 { session_id, sandbox: client_sandbox }) => {
             let merged = sandbox.merge_stricter(&client_sandbox);
             tracing::info!("Starting persistent shell session with client sandbox (resume: {})", session_id.is_some());
-            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged, config_dir).await?;
+            shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged, config_dir, protocol_version).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
@@ -593,12 +593,12 @@ async fn dispatch_session(
         }
         Some(ClientMessage::RequestExec { command }) => {
             tracing::info!("Starting exec session: {command}");
-            shell::host_exec_session(send, recv, &command, username, sandbox).await?;
+            shell::host_exec_session(send, recv, &command, username, sandbox, protocol_version).await?;
         }
         Some(ClientMessage::RequestExecV2 { command, sandbox: client_sandbox }) => {
             let merged = sandbox.merge_stricter(&client_sandbox);
             tracing::info!("Starting exec session with client sandbox: {command}");
-            shell::host_exec_session(send, recv, &command, username, &merged).await?;
+            shell::host_exec_session(send, recv, &command, username, &merged, protocol_version).await?;
         }
         Some(ClientMessage::RequestAdmin(request)) => {
             if *role != config::PeerRole::Creator {

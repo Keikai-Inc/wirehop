@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, QuicTransportConfig};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey};
 
-use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2};
+use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
 
 /// Hop's own relay server.
 pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
@@ -44,7 +44,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
-        .alpns(vec![ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
+        .alpns(vec![ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
@@ -96,29 +96,44 @@ pub async fn connect_to_host(
     remote_id: PublicKey,
     relay_url: Option<&RelayUrl>,
 ) -> Result<(Connection, bool)> {
+    connect_to_host_with_alpn(endpoint, remote_id, relay_url, ALPN_V2).await
+}
+
+/// Connect with a specific ALPN protocol version.
+pub async fn connect_to_host_with_alpn(
+    endpoint: &Endpoint,
+    remote_id: PublicKey,
+    relay_url: Option<&RelayUrl>,
+    alpn: &[u8],
+) -> Result<(Connection, bool)> {
     let addr = if let Some(relay) = relay_url {
         EndpointAddr::from(remote_id).with_relay_url(relay.clone())
     } else {
         EndpointAddr::from(remote_id)
     };
 
-    tracing::info!("Connecting to {} (relay hint: {})", remote_id.fmt_short(), relay_url.is_some());
+    tracing::info!("Connecting to {} (relay hint: {}, alpn: {})",
+        remote_id.fmt_short(), relay_url.is_some(),
+        std::str::from_utf8(alpn).unwrap_or("?"));
 
     let conn = endpoint
-        .connect(addr, ALPN_V2)
+        .connect(addr, alpn)
         .await
         .context("Failed to connect to host")?;
 
-    tracing::info!("Connected to {}", remote_id.fmt_short());
+    tracing::info!("Connected to {} ({})", remote_id.fmt_short(),
+        std::str::from_utf8(conn.alpn()).unwrap_or("?"));
 
     Ok((conn, false))
 }
 
 /// Return the protocol version negotiated on a connection.
-/// Returns 2 for `hop/2`, 1 for `hop/1`, 0 for `hop/0` or anything else.
+/// Returns 3 for `hop/3`, 2 for `hop/2`, 1 for `hop/1`, 0 for `hop/0` or anything else.
 pub fn negotiated_protocol_version(conn: &Connection) -> u8 {
     let alpn = conn.alpn();
-    if alpn == ALPN_V2 {
+    if alpn == ALPN_V3 {
+        3
+    } else if alpn == ALPN_V2 {
         2
     } else if alpn == ALPN_V1 {
         1

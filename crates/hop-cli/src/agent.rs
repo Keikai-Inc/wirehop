@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use iroh::{Endpoint, PublicKey};
 use iroh::endpoint::Connection;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -129,7 +130,7 @@ impl Agent {
             conns.remove(&host_id);
         }
 
-        // Create new connection
+        // Create new connection — try hop/3 (compressed) first, fall back to hop/2
         let relay: Option<iroh::RelayUrl> = relay_url
             .as_deref()
             .map(|u| u.parse())
@@ -137,8 +138,16 @@ impl Agent {
             .ok()
             .flatten();
 
-        let (conn, _relay_failed) =
-            net::connect_to_host(&self.endpoint, host_id, relay.as_ref()).await?;
+        let conn = match net::connect_to_host_with_alpn(
+            &self.endpoint, host_id, relay.as_ref(), hop_core::proto::ALPN_V3,
+        ).await {
+            Ok((conn, _)) => conn,
+            Err(_) => {
+                tracing::debug!("hop/3 not supported by {}, falling back to hop/2", host_id.fmt_short());
+                let (conn, _) = net::connect_to_host(&self.endpoint, host_id, relay.as_ref()).await?;
+                conn
+            }
+        };
 
         conns.insert(host_id, conn.clone());
         Ok(conn)
@@ -216,23 +225,52 @@ async fn proxy_quic(
     mut quic_send: iroh::endpoint::SendStream,
     mut quic_recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
-    // Host→Client: copy QUIC data to IPC.
+    // Host→Client: copy QUIC data to IPC, flushing after each chunk
+    // to avoid buffering delays on high-latency links.
     // When this finishes, dropping ipc_write signals EOF to the client.
     let h2c = tokio::spawn(async move {
-        let r = tokio::io::copy(&mut quic_recv, &mut ipc_write).await;
-        if let Err(ref e) = r {
-            tracing::debug!("QUIC→IPC ended: {e:#}");
+        let mut buf = [0u8; 8192];
+        loop {
+            match quic_recv.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => {
+                    if ipc_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if ipc_write.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("QUIC→IPC ended: {e:#}");
+                    break;
+                }
+            }
         }
     });
 
-    // Client→Host: copy IPC data to QUIC.
+    // Client→Host: copy IPC data to QUIC, flushing after each chunk.
     // When this finishes, quic_send.finish() signals FIN to the host.
     let c2h = tokio::spawn(async move {
-        let r = tokio::io::copy(&mut ipc_read, &mut quic_send).await;
-        let _ = quic_send.finish();
-        if let Err(ref e) = r {
-            tracing::debug!("IPC→QUIC ended: {e:#}");
+        let mut buf = [0u8; 8192];
+        loop {
+            match ipc_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if quic_send.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("IPC→QUIC ended: {e:#}");
+                    break;
+                }
+            }
         }
+        let _ = quic_send.finish();
     });
 
     // Both tasks complete naturally via EOF propagation:
