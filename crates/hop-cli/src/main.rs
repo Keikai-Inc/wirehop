@@ -1337,10 +1337,28 @@ async fn cmd_sync(
             anyhow::bail!("sync source must be a directory: {}", local_dir.display());
         }
 
+        // rsync convention: no trailing slash on source → sync the directory
+        // itself into dest (creating dest/source_name/). Trailing slash →
+        // sync the *contents* into dest.
+        let effective_remote = if !source.ends_with('/') {
+            if let Some(dir_name) = local_dir.file_name() {
+                let name = dir_name.to_string_lossy();
+                if remote_path.ends_with('/') {
+                    format!("{}{}", remote_path, name)
+                } else {
+                    format!("{}/{}", remote_path, name)
+                }
+            } else {
+                remote_path.to_string()
+            }
+        } else {
+            remote_path.to_string()
+        };
+
         let request = TransferRequest {
             mode: TransferMode::Sync,
             direction: TransferDirection::Push,
-            remote_path: remote_path.to_string(),
+            remote_path: effective_remote.clone(),
             delete_extraneous: delete,
             dry_run,
         };
@@ -1355,7 +1373,7 @@ async fn cmd_sync(
         // Print rsync-style header
         eprintln!(
             "sending file list to {}:{}",
-            host, remote_path,
+            host, effective_remote,
         );
 
         // Phase 1: negotiate (get plan + local/remote entries for itemize)

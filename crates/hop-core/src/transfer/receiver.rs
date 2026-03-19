@@ -671,6 +671,91 @@ fn tmp_name(path: &Path) -> PathBuf {
     path.with_file_name(format!(".hop-tmp-{file_name}"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::TransferMsg;
+
+    /// Reproduce the sender/receiver zstd roundtrip to verify data integrity.
+    #[tokio::test]
+    async fn zstd_compressed_file_roundtrip() {
+        use crate::transfer::negotiation::NegotiatedParams;
+
+        let original = b"# .bash_profile\nexport PATH=$HOME/bin:$PATH\necho hello world\nsome more content here to make it bigger\n";
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let src_dir = tmp_dir.path().join("src");
+        let dst_dir = tmp_dir.path().join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        // Write source file
+        let src_file = src_dir.join("test.txt");
+        std::fs::write(&src_file, original).unwrap();
+
+        let params = NegotiatedParams::v1_default(); // zstd compression enabled
+
+        // Use duplex streams to simulate sender/receiver
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let entry = crate::proto::FileEntry {
+            path: "test.txt".to_string(),
+            size: original.len() as u64,
+            mtime: 0,
+            mode: 0o644,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            content_hash: None,
+        };
+
+        let params_clone = params.clone();
+        let src_dir_clone = src_dir.clone();
+        let entry_clone = entry.clone();
+        let dst_dir_clone = dst_dir.clone();
+
+        // Sender task
+        let sender = tokio::spawn(async move {
+            let progress = crate::transfer::progress::SilentProgress;
+            crate::transfer::sender::send_files(
+                &mut server_write,
+                &src_dir_clone,
+                &[entry_clone],
+                &progress,
+                &params_clone,
+            )
+            .await
+            .unwrap();
+            crate::proto::write_message(&mut server_write, &TransferMsg::Done)
+                .await
+                .unwrap();
+        });
+
+        // Receiver task
+        let receiver = tokio::spawn(async move {
+            let progress = crate::transfer::progress::SilentProgress;
+            receive_files(
+                &mut client_write,
+                &mut client_read,
+                &dst_dir_clone,
+                &progress,
+                &params,
+            )
+            .await
+            .unwrap();
+        });
+
+        sender.await.unwrap();
+        receiver.await.unwrap();
+
+        // Verify
+        let output = std::fs::read(dst_dir.join("test.txt")).unwrap();
+        assert_eq!(output.len(), original.len(), "Size mismatch");
+        assert_eq!(output, original, "Content mismatch - got all zeros: {}", output.iter().all(|&b| b == 0));
+    }
+}
+
 fn set_metadata(path: &Path, mode: u32, mtime: u64) {
     // Set mtime
     if mtime > 0 {

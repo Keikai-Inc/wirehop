@@ -22,12 +22,31 @@ pub fn walk_directory(root: &Path) -> Result<Vec<FileEntry>> {
 }
 
 fn walk_recursive(base: &Path, current: &Path, entries: &mut Vec<FileEntry>) -> Result<()> {
-    let read_dir = std::fs::read_dir(current)
-        .with_context(|| format!("cannot read directory: {}", current.display()))?;
+    let read_dir = match std::fs::read_dir(current) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // Skip directories we can't read (macOS TCC restrictions, permission
+            // denied, etc.) rather than aborting the entire walk.
+            tracing::warn!("skipping unreadable directory {}: {e}", current.display());
+            return Ok(());
+        }
+    };
 
     for entry in read_dir {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("skipping entry in {}: {e}", current.display());
+                continue;
+            }
+        };
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("skipping {}: {e}", entry.path().display());
+                continue;
+            }
+        };
         let full_path = entry.path();
         let rel_path = full_path
             .strip_prefix(base)
@@ -35,7 +54,13 @@ fn walk_recursive(base: &Path, current: &Path, entries: &mut Vec<FileEntry>) -> 
             .to_string_lossy()
             .to_string();
 
-        let symlink_meta = std::fs::symlink_metadata(&full_path)?;
+        let symlink_meta = match std::fs::symlink_metadata(&full_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("skipping {}: {e}", full_path.display());
+                continue;
+            }
+        };
         let is_symlink = symlink_meta.file_type().is_symlink();
 
         let symlink_target = if is_symlink {
