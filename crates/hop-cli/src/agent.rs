@@ -19,22 +19,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
+use tracing_subscriber::EnvFilter;
+
 use hop_core::config;
 use hop_core::net;
 
 use crate::mux::{self, MuxConnect, MuxResult};
 
+/// Type alias for the reload handle used by the SIGUSR1 debug toggle.
+type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
 /// Idle timeout: shut down the agent after 10 minutes with no active sessions.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Run the agent in foreground mode.
-pub async fn run_foreground(config_dir: &Path) -> Result<()> {
-    run_agent(config_dir, false).await
+pub async fn run_foreground(config_dir: &Path, reload_handle: ReloadHandle) -> Result<()> {
+    run_agent(config_dir, false, reload_handle).await
 }
 
 /// Run the agent in daemon mode (detached, writes PID file).
-pub async fn run_daemon(config_dir: &Path) -> Result<()> {
-    run_agent(config_dir, true).await
+pub async fn run_daemon(config_dir: &Path, reload_handle: ReloadHandle) -> Result<()> {
+    run_agent(config_dir, true, reload_handle).await
 }
 
 /// Stop a running agent by sending it a signal via PID file.
@@ -218,6 +223,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 // 1. Check cache for a live connection
                 if let Some(conn) = state.connections.get(&host_id) {
                     if conn.close_reason().is_none() {
+                        tracing::debug!("actor: cache HIT for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
                         let sem = state
                             .semaphores
                             .entry(host_id)
@@ -227,16 +233,19 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                         continue;
                     }
                     // Dead connection — remove it
+                    tracing::debug!("actor: evicting dead connection for {}", host_id.fmt_short());
                     state.connections.remove(&host_id);
                 }
 
                 // 2. If a connect is already in-flight, queue this waiter
                 if let Some(waiters) = state.pending.get_mut(&host_id) {
+                    tracing::debug!("actor: joining in-flight connect for {} ({} waiters)", host_id.fmt_short(), waiters.len() + 1);
                     waiters.push(reply);
                     continue;
                 }
 
                 // 3. No connection, no in-flight connect — spawn one
+                tracing::debug!("actor: spawning new connect for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
                 state.pending.insert(host_id, vec![reply]);
                 let endpoint = state.endpoint.clone();
                 let tx = state.tx.clone();
@@ -257,6 +266,11 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 match result {
                     Ok(conn) => {
                         state.connections.insert(host_id, conn.clone());
+                        tracing::debug!("actor: connect succeeded for {} (alpn: {}, pool size: {}, notifying {} waiters)",
+                            host_id.fmt_short(),
+                            std::str::from_utf8(conn.alpn()).unwrap_or("?"),
+                            state.connections.len(),
+                            waiters.len());
                         let sem = state
                             .semaphores
                             .entry(host_id)
@@ -267,6 +281,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                         }
                     }
                     Err(e) => {
+                        tracing::debug!("actor: connect failed for {}: {:#}, notifying {} waiters", host_id.fmt_short(), e, waiters.len());
                         // Fan out the error to all waiters
                         let msg = format!("{e:#}");
                         for reply in waiters {
@@ -277,12 +292,14 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
             }
 
             AgentCommand::RemoveConnection { host_id } => {
+                tracing::debug!("actor: evicting connection for {} (open_bi failed, pool size: {})", host_id.fmt_short(), state.connections.len().saturating_sub(1));
                 if let Some(conn) = state.connections.remove(&host_id) {
                     conn.close(0u32.into(), b"open-bi-failed");
                 }
             }
 
             AgentCommand::FlushAll => {
+                tracing::debug!("actor: flushing all connections ({} pooled)", state.connections.len());
                 for (_, conn) in state.connections.drain() {
                     conn.close(0u32.into(), b"flush");
                 }
@@ -314,6 +331,8 @@ async fn do_connect(
         .ok()
         .flatten();
 
+    tracing::debug!("do_connect: {} relay_hint={:?}", host_id.fmt_short(), relay.as_ref().map(|u| u.to_string()));
+
     match net::connect_to_host_with_alpn(
         endpoint,
         host_id,
@@ -322,13 +341,17 @@ async fn do_connect(
     )
     .await
     {
-        Ok((conn, _)) => Ok(conn),
+        Ok((conn, _)) => {
+            tracing::debug!("do_connect: hop/3 connected to {}", host_id.fmt_short());
+            Ok(conn)
+        }
         Err(_) => {
             tracing::debug!(
                 "hop/3 not supported by {}, falling back to hop/2",
                 host_id.fmt_short()
             );
             let (conn, _) = net::connect_to_host(endpoint, host_id, relay.as_ref()).await?;
+            tracing::debug!("do_connect: hop/2 fallback connected to {}", host_id.fmt_short());
             Ok(conn)
         }
     }
@@ -354,14 +377,20 @@ async fn handle_client(
     let host_id =
         PublicKey::from_bytes(&req.host_id).context("invalid host_id in MuxConnect")?;
 
+    tracing::debug!("handle_client: MuxConnect for {} relay={:?}", host_id.fmt_short(), req.relay_url);
+
     // 2. Split IPC early so we can monitor liveness during setup
     let (mut ipc_read, mut ipc_write) = ipc.into_split();
 
     // 3. Get connection + per-host semaphore, abort if IPC client disconnects
+    tracing::debug!("handle_client: getting connection for {}", host_id.fmt_short());
     let (conn, sem) = tokio::select! {
         result = handle.get_connection(host_id, req.relay_url) => {
             match result {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    tracing::debug!("handle_client: connection obtained for {}", host_id.fmt_short());
+                    pair
+                }
                 Err(e) => {
                     let _ = mux::write_ipc_message(
                         &mut ipc_write,
@@ -378,8 +407,10 @@ async fn handle_client(
     };
 
     // 4. Acquire semaphore, abort if IPC client disconnects while waiting
+    tracing::debug!("handle_client: waiting for host semaphore for {}", host_id.fmt_short());
     let permit = tokio::select! {
         permit = sem.acquire_owned() => {
+            tracing::debug!("handle_client: semaphore acquired for {}", host_id.fmt_short());
             permit.map_err(|_| anyhow::anyhow!("host semaphore closed"))?
         }
         _ = wait_for_ipc_close(&mut ipc_read) => {
@@ -390,7 +421,10 @@ async fn handle_client(
 
     // 5. Open bi-stream (fast on live connection)
     let (quic_send, quic_recv) = match conn.open_bi().await {
-        Ok(pair) => pair,
+        Ok(pair) => {
+            tracing::debug!("handle_client: open_bi succeeded for {}", host_id.fmt_short());
+            pair
+        }
         Err(e) => {
             // Connection may have died; evict from pool
             handle.remove_connection(host_id).await;
@@ -410,8 +444,10 @@ async fn handle_client(
     drop(permit);
 
     // 8. Track active session
+    let session_start = Instant::now();
     active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     handle.touch_activity().await;
+    tracing::debug!("handle_client: session started for {}", host_id.fmt_short());
 
     // 9. Transparent bidirectional proxy
     let result = proxy_quic(ipc_read, ipc_write, quic_send, quic_recv).await;
@@ -419,6 +455,7 @@ async fn handle_client(
     // 10. Session done
     active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     handle.touch_activity().await;
+    tracing::debug!("handle_client: session ended for {} (duration: {:?})", host_id.fmt_short(), session_start.elapsed());
 
     if let Err(e) = result {
         tracing::debug!("Proxy session ended: {e:#}");
@@ -560,7 +597,7 @@ async fn check_idle_actor(
 // Main agent entry point
 // ---------------------------------------------------------------------------
 
-async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
+async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle) -> Result<()> {
     let sock_path = mux::agent_sock_path(config_dir);
     let pid_path = mux::agent_pid_path(config_dir);
 
@@ -580,16 +617,21 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
         eprintln!("PID: {}", std::process::id());
     }
 
-    // Set up signal handler for graceful shutdown
+    // Set up signal handlers: graceful shutdown + SIGUSR1 debug toggle
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("failed to register SIGINT handler")?;
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .context("failed to register SIGUSR1 handler")?;
+    let mut debug_enabled = false;
 
     let secret_key = config::load_or_generate_identity(config_dir)?;
     let endpoint = net::create_client_endpoint(secret_key).await?;
     let handle = spawn_agent_actor(endpoint.clone());
     let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tracing::info!("Agent started (PID {})", std::process::id());
 
     // Background task: flush stale connections on sleep/wake
     let wake_handle = handle.clone();
@@ -623,6 +665,19 @@ async fn run_agent(config_dir: &Path, daemon: bool) -> Result<()> {
                     Err(e) => {
                         tracing::warn!("Agent accept error: {e}");
                     }
+                }
+            }
+            _ = sigusr1.recv() => {
+                debug_enabled = !debug_enabled;
+                let new_filter = if debug_enabled {
+                    tracing::info!("Agent debug logging ENABLED (send SIGUSR1 again to disable)");
+                    EnvFilter::new("hop=debug,hop_core=debug,iroh=debug,iroh_relay=debug")
+                } else {
+                    tracing::info!("Agent debug logging DISABLED (back to info level)");
+                    EnvFilter::new("hop=info,hop_core=info")
+                };
+                if let Err(e) = reload_handle.reload(new_filter) {
+                    tracing::error!("Failed to reload log filter: {e}");
                 }
             }
             _ = sigterm.recv() => {

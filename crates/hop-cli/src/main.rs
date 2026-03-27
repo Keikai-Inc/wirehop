@@ -15,7 +15,9 @@ use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronA
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::reload;
 
 use hop_core::auth::{self, AuthOutcome};
 use hop_core::config::{self, HostConfig, KnownHostsStore, PeerRole, PeersStore};
@@ -49,8 +51,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag
-    let filter = if std::env::var("RUST_LOG").is_ok() {
+    // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag.
+    // Uses a reload layer so the host daemon can toggle debug logging at runtime via SIGUSR1.
+    let initial_filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
         EnvFilter::new(match cli.verbose {
@@ -59,15 +62,17 @@ async fn main() -> Result<()> {
             _ => "hop=trace,hop_core=trace,hop_mcp=trace",
         })
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     match cli.command {
         Command::Host { quiet } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_host(secret_key, &config_dir, quiet).await
+            cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
         Command::Invite { user, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -185,8 +190,8 @@ async fn main() -> Result<()> {
             match action {
                 Some(AgentAction::Stop) => agent::stop_agent(&config_dir),
                 Some(AgentAction::Status) => agent::agent_status(&config_dir),
-                None if daemon => agent::run_daemon(&config_dir).await,
-                None => agent::run_foreground(&config_dir).await,
+                None if daemon => agent::run_daemon(&config_dir, reload_handle).await,
+                None => agent::run_foreground(&config_dir, reload_handle).await,
             }
         }
         Command::SandboxShell { policy, shell_args } => {
@@ -214,7 +219,10 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool) -> Result<()> {
+/// Type alias for the reload handle used by the SIGUSR1 debug toggle.
+type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
     let public_key = secret_key.public();
     let endpoint = net::create_host_endpoint(secret_key).await?;
 
@@ -228,6 +236,15 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             tracing::warn!("Failed to write relay_url: {e}");
         }
     }
+
+    // Log addresses for debugging connectivity issues
+    let addr = endpoint.addr();
+    let direct_addrs: Vec<_> = addr.ip_addrs().collect();
+    if !direct_addrs.is_empty() {
+        tracing::info!("Direct addresses: {:?}", direct_addrs);
+    }
+    let relay_urls: Vec<_> = addr.relay_urls().collect();
+    tracing::info!("Relay URLs from endpoint: {:?}", relay_urls);
 
     // Watch for relay URL changes and keep the file up to date
     {
@@ -410,17 +427,21 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     );
     hop_mcp::cron::spawn_cron_scheduler(datastore.clone(), Duration::from_secs(15), Some(cron_backend));
 
-    // Signal handling for graceful shutdown
+    // Signal handling for graceful shutdown + SIGUSR1 debug toggle
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("failed to register SIGINT handler")?;
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .context("failed to register SIGUSR1 handler")?;
+    let mut debug_enabled = false;
 
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
                 match incoming {
                     Some(inc) => {
+                        tracing::info!("Incoming connection attempt (QUIC handshake pending)");
                         let config_dir = config_dir.to_path_buf();
                         let registry = registry.clone();
                         let ds = datastore.clone();
@@ -431,6 +452,19 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         });
                     }
                     None => break,
+                }
+            }
+            _ = sigusr1.recv() => {
+                debug_enabled = !debug_enabled;
+                let new_filter = if debug_enabled {
+                    tracing::info!("Debug logging ENABLED (send SIGUSR1 again to disable)");
+                    EnvFilter::new("hop=debug,hop_core=debug,hop_mcp=debug,iroh=debug,iroh_relay=debug")
+                } else {
+                    tracing::info!("Debug logging DISABLED (back to info level)");
+                    EnvFilter::new("hop=info,hop_core=info,hop_mcp=info")
+                };
+                if let Err(e) = reload_handle.reload(new_filter) {
+                    tracing::error!("Failed to reload log filter: {e}");
                 }
             }
             _ = sigterm.recv() => {
@@ -454,7 +488,9 @@ async fn handle_incoming(
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
 ) -> Result<()> {
+    tracing::debug!("Awaiting QUIC handshake...");
     let conn: iroh::endpoint::Connection = incoming.await?;
+    tracing::debug!("QUIC handshake complete from {}", conn.remote_id().fmt_short());
     let result = handle_incoming_inner(&conn, config_dir, registry, datastore).await;
     // Always close the connection explicitly before dropping it.
     // Dropping without close triggers an iroh-quinn panic:
@@ -475,6 +511,7 @@ async fn handle_incoming_inner(
 
     // First bi-stream: full authentication
     let (mut send, mut recv) = conn.accept_bi().await?;
+    tracing::debug!("First bi-stream accepted from {}", remote_id.fmt_short());
 
     let (outcome, _first_msg) = auth::authenticate_client(
         &mut send,
@@ -483,6 +520,14 @@ async fn handle_incoming_inner(
         config_dir,
     )
     .await?;
+
+    tracing::debug!("Auth outcome for {}: {}",
+        remote_id.fmt_short(),
+        match &outcome {
+            AuthOutcome::Authorized { role, .. } => format!("authorized (role: {role:?})"),
+            AuthOutcome::InviteAccepted { role, .. } => format!("invite accepted (role: {role:?})"),
+            AuthOutcome::Rejected => "rejected".to_string(),
+        });
 
     let peer_id = remote_id.to_string();
 

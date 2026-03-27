@@ -45,6 +45,11 @@ pub fn agent_pid_path(config_dir: &Path) -> PathBuf {
     config_dir.join("agent.pid")
 }
 
+/// Path to the agent log file.
+pub fn agent_log_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("agent.log")
+}
+
 /// Write a length-prefixed bincode IPC message.
 pub async fn write_ipc_message<T: Serialize>(
     stream: &mut (impl AsyncWriteExt + Unpin),
@@ -96,14 +101,19 @@ pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
         return Ok(stream);
     }
 
-    // Start agent in background
+    // Start agent in background, with stderr → agent.log for diagnostics
     let exe = std::env::current_exe().context("could not determine hop executable path")?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(agent_log_path(config_dir))
+        .context("failed to open agent log file")?;
     std::process::Command::new(exe)
         .args(["agent", "--daemon", "--config"])
         .arg(config_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log_file))
         .spawn()
         .context("failed to spawn agent process")?;
 
@@ -158,6 +168,7 @@ pub async fn connect_to_host(
             .flatten();
 
         println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
+        println!("Connecting...");
 
         let (mut ipc_write, ipc_read) =
             open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()))

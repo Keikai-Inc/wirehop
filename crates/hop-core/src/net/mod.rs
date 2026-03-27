@@ -115,6 +115,11 @@ pub async fn connect_to_host_with_alpn(
         EndpointAddr::from(remote_id)
     };
 
+    tracing::debug!("EndpointAddr for {}: relay_urls={:?}, direct_addrs={:?}",
+        remote_id.fmt_short(),
+        addr.relay_urls().collect::<Vec<_>>(),
+        addr.ip_addrs().collect::<Vec<_>>());
+
     tracing::info!("Connecting to {} (relay hint: {}, alpn: {})",
         remote_id.fmt_short(), relay_url.is_some(),
         std::str::from_utf8(alpn).unwrap_or("?"));
