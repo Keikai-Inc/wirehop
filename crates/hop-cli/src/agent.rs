@@ -639,7 +639,7 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
         loop {
             let before = std::time::Instant::now();
             tokio::time::sleep(Duration::from_secs(3)).await;
-            if before.elapsed() > Duration::from_secs(15) {
+            if before.elapsed() > Duration::from_secs(10) {
                 tracing::info!("Agent detected sleep/wake, flushing connection pool");
                 wake_handle.flush_all().await;
             }
@@ -647,7 +647,15 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
     });
 
     // Network interface change detector — flushes pooled connections on change
-    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone());
+    let (netmon_flush_tx, mut netmon_flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), Some(netmon_flush_tx));
+    let netmon_handle = handle.clone();
+    tokio::spawn(async move {
+        while netmon_flush_rx.recv().await.is_some() {
+            tracing::info!("Flushing agent connection pool after network change");
+            netmon_handle.flush_all().await;
+        }
+    });
 
     loop {
         tokio::select! {

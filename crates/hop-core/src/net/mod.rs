@@ -13,16 +13,18 @@ use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
 /// Hop's own relay server.
 pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 
-/// QUIC transport configuration tuned for lossy networks (cellular, satellite).
+/// QUIC transport configuration balancing disconnect detection with lossy-network tolerance.
 ///
-/// - 30s idle timeout (iroh's default; survives 25s of packet loss instead of 6s)
-/// - 5s keepalive interval (still frequent, fewer wasted packets on metered links)
+/// - 15s idle timeout: survives 10s cellular stalls while detecting dead peers in half
+///   the time of iroh's 30s default. With 3s keepalives, 5 missed probes = dead.
+/// - 3s keepalive interval: aggressive enough for responsive detection, light enough
+///   for metered links (~40 bytes/3s).
 /// - 300ms initial RTT estimate for cellular (prevents aggressive retransmission
-///   before QUIC measures actual RTT)
+///   before QUIC measures actual RTT).
 fn hop_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("valid idle timeout")))
-        .keep_alive_interval(Duration::from_secs(5))
+        .max_idle_timeout(Some(Duration::from_secs(15).try_into().expect("valid idle timeout")))
+        .keep_alive_interval(Duration::from_secs(3))
         .initial_rtt(Duration::from_millis(300))
         .build()
 }

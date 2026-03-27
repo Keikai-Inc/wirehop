@@ -17,6 +17,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::proto::{self, ClientMessage, HostMessage};
 use session_registry::{DetachedSession, RegistryHandle};
 
+/// RAII guard that restores the terminal from raw mode on drop.
+///
+/// Ensures the terminal is never left in raw mode even if the shell loop
+/// panics or returns early via `?`.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// Write a HostMessage, using zstd compression when the connection supports it (V3+).
 async fn write_host_message(
     stream: &mut (impl AsyncWriteExt + Unpin),
@@ -573,6 +592,11 @@ async fn run_attached_loop(
     leftover_msg: Option<ClientMessage>,
     protocol_version: u8,
 ) -> AttachOutcome {
+    /// Heartbeat interval: send an empty Output every 5s so the client knows we're alive.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Read deadline: if no message arrives from the client within 18s, the connection is dead.
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(18);
+
     let compress = protocol_version >= 3;
 
     // Process any leftover message from setup phase
@@ -591,6 +615,14 @@ async fn run_attached_loop(
         }
     }
 
+    // Heartbeat: periodic empty Output to keep the client's read deadline alive
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Read deadline: backstop for cases where QUIC fails to report a dead client
+    let read_deadline = tokio::time::sleep(READ_DEADLINE);
+    tokio::pin!(read_deadline);
+
     loop {
         tokio::select! {
             Some(data) = output_rx.recv() => {
@@ -600,6 +632,9 @@ async fn run_attached_loop(
                 }
             }
             msg = proto::read_message::<ClientMessage>(recv) => {
+                // Any message from the client means the connection is alive
+                read_deadline.as_mut().reset(tokio::time::Instant::now() + READ_DEADLINE);
+
                 match msg {
                     Ok(ClientMessage::Input(data)) => {
                         let _ = input_tx.send(data).await;
@@ -618,6 +653,18 @@ async fn run_attached_loop(
                         return AttachOutcome::Disconnected;
                     }
                 }
+            }
+            // Heartbeat: send empty Output to keep client's read deadline alive
+            _ = heartbeat.tick() => {
+                if write_host_message(send, &HostMessage::Output(vec![]), compress).await.is_err() {
+                    tracing::debug!("Heartbeat write failed, client disconnected");
+                    return AttachOutcome::Disconnected;
+                }
+            }
+            // Read deadline: no data from client for too long
+            () = &mut read_deadline => {
+                tracing::info!("No data from client for {}s, treating as disconnected", READ_DEADLINE.as_secs());
+                return AttachOutcome::Disconnected;
             }
             Ok(()) = exit_rx.changed() => {
                 let exit_code = { *exit_rx.borrow_and_update() };
@@ -942,12 +989,9 @@ pub async fn client_shell_session_v2(
         }
     };
 
-    // Enter raw mode
-    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
-
+    let _raw_guard = RawModeGuard::enable()?;
     let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
-
-    let _ = terminal::disable_raw_mode();
+    drop(_raw_guard);
 
     match result {
         Ok(outcome) => Ok((session_id, outcome)),
@@ -965,24 +1009,22 @@ pub async fn client_shell_loop_resumed(
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<SessionOutcome> {
-    use crossterm::terminal;
-
-    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let _raw_guard = RawModeGuard::enable()?;
     let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
-    let _ = terminal::disable_raw_mode();
+    drop(_raw_guard);
     result
 }
 
 /// Detect sleep/wake by observing wall-clock time jumps.
 ///
-/// Sleeps for 3s in a loop; if the elapsed time exceeds 15s, the machine
-/// was almost certainly asleep. 15s cleanly separates real sleeps (30s+)
-/// from cellular stalls (5-10s). Returns immediately on wake detection.
+/// Sleeps for 3s in a loop; if the elapsed time exceeds 10s, the machine
+/// was almost certainly asleep. 10s cleanly separates real sleeps (30s+)
+/// from cellular stalls (5-8s) with a 2s safety margin.
 async fn detect_sleep_wake() {
     loop {
         let before = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        if before.elapsed() > std::time::Duration::from_secs(15) {
+        if before.elapsed() > std::time::Duration::from_secs(10) {
             return;
         }
     }
@@ -994,6 +1036,13 @@ async fn client_shell_loop(
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<SessionOutcome> {
     use crossterm::terminal;
+
+    /// Heartbeat interval: send an empty Input every 5s so the host knows we're alive,
+    /// and so our write path detects a dead connection quickly.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Read deadline: if no message arrives from the host within 18s (QUIC idle timeout
+    /// of 15s + 3s margin), the connection is dead. Heartbeats from the host reset this.
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(18);
 
     // Channel for SIGWINCH resize events (Unix only)
     let (resize_tx, mut resize_rx) = mpsc::channel::<()>(1);
@@ -1016,6 +1065,14 @@ async fn client_shell_loop(
     let wake_detect = detect_sleep_wake();
     tokio::pin!(wake_detect);
 
+    // Heartbeat: periodic empty Input to probe the connection
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Read deadline: backstop for cases where QUIC fails to report a dead connection
+    let read_deadline = tokio::time::sleep(READ_DEADLINE);
+    tokio::pin!(read_deadline);
+
     loop {
         tokio::select! {
             // Stdin -> send to host
@@ -1026,6 +1083,9 @@ async fn client_shell_loop(
             }
             // Host messages -> write to stdout
             msg = proto::read_message::<HostMessage>(recv) => {
+                // Any message from the host means the connection is alive
+                read_deadline.as_mut().reset(tokio::time::Instant::now() + READ_DEADLINE);
+
                 match msg {
                     Ok(HostMessage::Output(data)) => {
                         stdout.write_all(&data)?;
@@ -1069,6 +1129,17 @@ async fn client_shell_loop(
                     },
                 )
                 .await;
+            }
+            // Heartbeat: send empty Input to probe connection liveness
+            _ = heartbeat.tick() => {
+                if proto::write_message(send, &ClientMessage::Input(vec![])).await.is_err() {
+                    return Ok(SessionOutcome::Disconnected);
+                }
+            }
+            // Read deadline: no data from host for too long
+            () = &mut read_deadline => {
+                tracing::info!("No data from host for {}s, treating as disconnected", READ_DEADLINE.as_secs());
+                return Ok(SessionOutcome::Disconnected);
             }
             // Sleep/wake detection — instant disconnect on wake
             () = &mut wake_detect => {
