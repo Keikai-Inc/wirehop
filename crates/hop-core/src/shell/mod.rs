@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::proto::{self, ClientMessage, HostMessage};
-use session_registry::{DetachedSession, RegistryHandle, SessionKey};
+use session_registry::{DetachedSession, RegistryHandle};
 
 /// Write a HostMessage, using zstd compression when the connection supports it (V3+).
 async fn write_host_message(
@@ -645,7 +645,7 @@ pub async fn host_shell_session_persistent(
     mut recv: RecvStream,
     username: Option<&str>,
     peer_id: &str,
-    _requested_session_id: Option<String>,
+    requested_session_id: Option<String>,
     registry: RegistryHandle,
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
@@ -658,39 +658,55 @@ pub async fn host_shell_session_persistent(
 
     let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut recv).await;
 
-    let key = SessionKey {
-        peer_id: peer_id.to_string(),
-        username: username.map(String::from),
-    };
-
     // Channel for receiving routed PTY output during this attachment.
     let (client_output_tx, mut client_output_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    // Check if we can resume an existing session.
-    let can_resume = registry.check_resume(key.clone()).await;
-
-    // Either attach to the existing session or spawn a new PTY.
-    // PTY spawn happens outside the actor — no lock to hold, can't deadlock.
-    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch, replay_buf) = if can_resume {
-        if let Some(result) = registry.attach(key.clone(), client_output_tx.clone(), initial_size).await {
-            (
-                result.session_id,
-                true,
-                result.input_tx,
-                result.resize_tx,
-                result.exit_rx,
-                result.attach_epoch,
-                result.replay_buffer,
-            )
+    // If the client sent a session_id, try to resume that specific session.
+    // Otherwise (new connection), always spawn a new PTY.
+    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch, replay_buf) =
+        if let Some(ref requested_id) = requested_session_id {
+            // Reconnect: try to resume the specific session (peer_id validated inside actor)
+            if let Some(result) = registry.attach(requested_id.clone(), peer_id.to_string(), client_output_tx.clone(), initial_size).await {
+                (
+                    result.session_id,
+                    true,
+                    result.input_tx,
+                    result.resize_tx,
+                    result.exit_rx,
+                    result.attach_epoch,
+                    result.replay_buffer,
+                )
+            } else {
+                // Session gone or exited — spawn new
+                let (sid, itx, output_route, rtx, erx, rbuf) =
+                    spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
+                let _ = output_route.send(Some(client_output_tx));
+                let session = DetachedSession {
+                    session_id: sid.clone(),
+                    peer_id: peer_id.to_string(),
+                    username: username.map(String::from),
+                    input_tx: itx.clone(),
+                    output_route,
+                    resize_tx: rtx.clone(),
+                    exit_rx: erx.clone(),
+                    detached_at: None,
+                    attached: true,
+                    attach_epoch: 1,
+                    broker_handle: None,
+                    replay_buffer: rbuf.clone(),
+                };
+                registry.insert(session).await;
+                (sid, false, itx, rtx, erx, 1u64, rbuf)
+            }
         } else {
-            // Race: session was removed between check and attach. Spawn new.
-            registry.remove_stale(key.clone()).await;
-
+            // New connection — always spawn a new PTY
             let (sid, itx, output_route, rtx, erx, rbuf) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
                 session_id: sid.clone(),
+                peer_id: peer_id.to_string(),
+                username: username.map(String::from),
                 input_tx: itx.clone(),
                 output_route,
                 resize_tx: rtx.clone(),
@@ -701,31 +717,9 @@ pub async fn host_shell_session_persistent(
                 broker_handle: None,
                 replay_buffer: rbuf.clone(),
             };
-            registry.insert(key.clone(), session).await;
+            registry.insert(session).await;
             (sid, false, itx, rtx, erx, 1u64, rbuf)
-        }
-    } else {
-        // No session to resume — remove any stale entry, spawn a new PTY.
-        registry.remove_stale(key.clone()).await;
-
-        let (sid, itx, output_route, rtx, erx, rbuf) =
-            spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
-        let _ = output_route.send(Some(client_output_tx));
-        let session = DetachedSession {
-            session_id: sid.clone(),
-            input_tx: itx.clone(),
-            output_route,
-            resize_tx: rtx.clone(),
-            exit_rx: erx.clone(),
-            detached_at: None,
-            attached: true,
-            attach_epoch: 1,
-            broker_handle: None,
-            replay_buffer: rbuf.clone(),
         };
-        registry.insert(key.clone(), session).await;
-        (sid, false, itx, rtx, erx, 1u64, rbuf)
-    };
 
     // Start broker for sandboxed sessions (macOS)
     #[cfg(target_os = "macos")]
@@ -739,7 +733,7 @@ pub async fn host_shell_session_persistent(
         .await
         {
             Ok(handle) => {
-                registry.set_broker_handle(key.clone(), handle).await;
+                registry.set_broker_handle(session_id.clone(), handle).await;
             }
             Err(e) => {
                 tracing::warn!("Failed to start broker: {e}");
@@ -793,7 +787,7 @@ pub async fn host_shell_session_persistent(
 
     match outcome {
         AttachOutcome::Exited => {
-            if let Some(result) = registry.cleanup_exited(key.clone(), attach_epoch).await {
+            if let Some(result) = registry.cleanup_exited(session_id.clone(), attach_epoch).await {
                 if let Some(handle) = result.broker_handle {
                     handle.abort();
                 }
@@ -807,7 +801,7 @@ pub async fn host_shell_session_persistent(
             .await;
         }
         AttachOutcome::Disconnected => {
-            if registry.detach_if_current(key.clone(), attach_epoch).await {
+            if registry.detach_if_current(session_id.clone(), attach_epoch).await {
                 tracing::info!(
                     "Session {} detached for peer {}",
                     &session_id[..8],

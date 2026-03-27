@@ -1,4 +1,8 @@
 //! Session registry for persistent PTY sessions across client reconnects.
+//!
+//! Sessions are keyed by their unique session_id (random 16-byte hex).
+//! Multiple concurrent sessions per peer are supported — each `hop connect`
+//! gets its own PTY, and reconnects resume a specific session by ID.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -40,13 +44,6 @@ impl ReplayBuffer {
     }
 }
 
-/// Key identifying a session: one session per (peer_id, username) pair.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct SessionKey {
-    pub peer_id: String,
-    pub username: Option<String>,
-}
-
 /// A persistent PTY session that survives client disconnects.
 ///
 /// The PTY master handle lives in a background task (spawned by `spawn_pty_session`)
@@ -54,8 +51,12 @@ pub struct SessionKey {
 /// the resize channel, which causes the background task to exit and drop the master,
 /// sending SIGHUP to the shell.
 pub struct DetachedSession {
-    /// Random 16-byte hex session identifier.
+    /// Random 16-byte hex session identifier (also the registry key).
     pub session_id: String,
+    /// Peer that owns this session (for authorization on resume).
+    pub peer_id: String,
+    /// Unix username the session runs as.
+    pub username: Option<String>,
     /// Send input bytes to the PTY writer task.
     pub input_tx: mpsc::Sender<Vec<u8>>,
     /// Route PTY output: `Some(tx)` = forward to client, `None` = discard.
@@ -116,9 +117,9 @@ impl DetachedSession {
     }
 }
 
-/// Registry of active PTY sessions, keyed by (peer_id, username).
+/// Registry of active PTY sessions, keyed by session_id.
 pub struct SessionRegistry {
-    sessions: HashMap<SessionKey, DetachedSession>,
+    sessions: HashMap<String, DetachedSession>,
     timeout: Duration,
     max_sessions: usize,
 }
@@ -133,29 +134,29 @@ impl SessionRegistry {
         }
     }
 
-    /// Look up a session by key.
-    pub fn lookup(&self, key: &SessionKey) -> Option<&DetachedSession> {
-        self.sessions.get(key)
+    /// Look up a session by session_id.
+    pub fn lookup(&self, session_id: &str) -> Option<&DetachedSession> {
+        self.sessions.get(session_id)
     }
 
-    /// Look up a session by key (mutable).
-    pub fn lookup_mut(&mut self, key: &SessionKey) -> Option<&mut DetachedSession> {
-        self.sessions.get_mut(key)
+    /// Look up a session by session_id (mutable).
+    pub fn lookup_mut(&mut self, session_id: &str) -> Option<&mut DetachedSession> {
+        self.sessions.get_mut(session_id)
     }
 
     /// Insert a new session, evicting the oldest detached session if at capacity.
-    pub fn insert(&mut self, key: SessionKey, session: DetachedSession) {
+    pub fn insert(&mut self, session: DetachedSession) {
         // If we're at the limit, evict the oldest detached (non-attached) session.
         if self.max_sessions > 0 && self.sessions.len() >= self.max_sessions {
             self.evict_oldest_detached();
         }
-        self.sessions.insert(key, session);
+        self.sessions.insert(session.session_id.clone(), session);
     }
 
     /// Detach a session only if the given epoch matches the current attachment.
     /// Returns true if the session was actually detached.
-    pub fn detach_if_current(&mut self, key: &SessionKey, epoch: u64) -> bool {
-        if let Some(session) = self.sessions.get_mut(key) {
+    pub fn detach_if_current(&mut self, session_id: &str, epoch: u64) -> bool {
+        if let Some(session) = self.sessions.get_mut(session_id) {
             session.detach_if_current(epoch)
         } else {
             false
@@ -163,8 +164,8 @@ impl SessionRegistry {
     }
 
     /// Remove a session and return it (dropping it will close the PTY).
-    pub fn remove(&mut self, key: &SessionKey) -> Option<DetachedSession> {
-        self.sessions.remove(key)
+    pub fn remove(&mut self, session_id: &str) -> Option<DetachedSession> {
+        self.sessions.remove(session_id)
     }
 
     /// Number of sessions currently in the registry.
@@ -180,15 +181,15 @@ impl SessionRegistry {
     /// Remove sessions that have expired (detached longer than timeout)
     /// or whose child process has exited.
     pub fn reap_expired(&mut self) {
-        self.sessions.retain(|key, session| {
+        self.sessions.retain(|_id, session| {
             if session.has_exited() && !session.attached {
-                tracing::debug!("Reaping exited session for {:?}", key);
+                tracing::debug!("Reaping exited session {} (peer: {})", &session.session_id[..8], &session.peer_id[..10.min(session.peer_id.len())]);
                 return false;
             }
             if let Some(detached_at) = session.detached_at
                 && !session.attached && detached_at.elapsed() > self.timeout
             {
-                tracing::debug!("Reaping expired session for {:?}", key);
+                tracing::debug!("Reaping expired session {} (peer: {})", &session.session_id[..8], &session.peer_id[..10.min(session.peer_id.len())]);
                 return false;
             }
             true
@@ -203,11 +204,11 @@ impl SessionRegistry {
             .iter()
             .filter(|(_, s)| !s.attached && s.detached_at.is_some())
             .min_by_key(|(_, s)| s.detached_at.unwrap())
-            .map(|(k, _)| k.clone());
+            .map(|(id, _)| id.clone());
 
-        if let Some(key) = oldest {
-            tracing::info!("Evicting oldest detached session for {:?} (at capacity)", key);
-            self.sessions.remove(&key);
+        if let Some(id) = oldest {
+            tracing::info!("Evicting oldest detached session {} (at capacity)", &id[..8.min(id.len())]);
+            self.sessions.remove(&id);
         }
     }
 }
@@ -234,34 +235,27 @@ pub struct CleanupResult {
 
 /// Commands processed by the registry actor.
 pub enum RegistryCommand {
-    CheckResume {
-        key: SessionKey,
-        reply: oneshot::Sender<bool>,
-    },
     Attach {
-        key: SessionKey,
+        session_id: String,
+        peer_id: String,
         client_tx: mpsc::Sender<Vec<u8>>,
         size: PtySize,
         reply: oneshot::Sender<Option<AttachResult>>,
     },
-    RemoveStale {
-        key: SessionKey,
-    },
     Insert {
-        key: SessionKey,
         session: DetachedSession,
     },
     SetBrokerHandle {
-        key: SessionKey,
+        session_id: String,
         handle: tokio::task::JoinHandle<()>,
     },
     CleanupExited {
-        key: SessionKey,
+        session_id: String,
         epoch: u64,
         reply: oneshot::Sender<Option<CleanupResult>>,
     },
     DetachIfCurrent {
-        key: SessionKey,
+        session_id: String,
         epoch: u64,
         reply: oneshot::Sender<bool>,
     },
@@ -279,18 +273,13 @@ impl RegistryHandle {
         Self { tx }
     }
 
-    /// Check if a resumable (non-exited) session exists for the given key.
-    pub async fn check_resume(&self, key: SessionKey) -> bool {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(RegistryCommand::CheckResume { key, reply }).await;
-        rx.await.unwrap_or(false)
-    }
-
-    /// Attach to an existing session: resize, route output, bump epoch.
-    /// Returns `None` if the session doesn't exist or has exited.
+    /// Attach to an existing session by session_id.
+    /// Validates that the requesting peer_id matches the session owner.
+    /// Returns `None` if the session doesn't exist, has exited, or peer_id doesn't match.
     pub async fn attach(
         &self,
-        key: SessionKey,
+        session_id: String,
+        peer_id: String,
         client_tx: mpsc::Sender<Vec<u8>>,
         size: PtySize,
     ) -> Option<AttachResult> {
@@ -298,7 +287,8 @@ impl RegistryHandle {
         let _ = self
             .tx
             .send(RegistryCommand::Attach {
-                key,
+                session_id,
+                peer_id,
                 client_tx,
                 size,
                 reply,
@@ -307,24 +297,19 @@ impl RegistryHandle {
         rx.await.unwrap_or(None)
     }
 
-    /// Remove a stale/exited session (fire-and-forget).
-    pub async fn remove_stale(&self, key: SessionKey) {
-        let _ = self.tx.send(RegistryCommand::RemoveStale { key }).await;
-    }
-
     /// Insert a newly spawned session (fire-and-forget).
-    pub async fn insert(&self, key: SessionKey, session: DetachedSession) {
+    pub async fn insert(&self, session: DetachedSession) {
         let _ = self
             .tx
-            .send(RegistryCommand::Insert { key, session })
+            .send(RegistryCommand::Insert { session })
             .await;
     }
 
     /// Set the broker handle on an existing session (fire-and-forget).
-    pub async fn set_broker_handle(&self, key: SessionKey, handle: tokio::task::JoinHandle<()>) {
+    pub async fn set_broker_handle(&self, session_id: String, handle: tokio::task::JoinHandle<()>) {
         let _ = self
             .tx
-            .send(RegistryCommand::SetBrokerHandle { key, handle })
+            .send(RegistryCommand::SetBrokerHandle { session_id, handle })
             .await;
     }
 
@@ -332,23 +317,23 @@ impl RegistryHandle {
     /// Returns the session's broker handle and ID for cleanup.
     pub async fn cleanup_exited(
         &self,
-        key: SessionKey,
+        session_id: String,
         epoch: u64,
     ) -> Option<CleanupResult> {
         let (reply, rx) = oneshot::channel();
         let _ = self
             .tx
-            .send(RegistryCommand::CleanupExited { key, epoch, reply })
+            .send(RegistryCommand::CleanupExited { session_id, epoch, reply })
             .await;
         rx.await.unwrap_or(None)
     }
 
     /// Detach a session only if the given epoch is still current.
-    pub async fn detach_if_current(&self, key: SessionKey, epoch: u64) -> bool {
+    pub async fn detach_if_current(&self, session_id: String, epoch: u64) -> bool {
         let (reply, rx) = oneshot::channel();
         let _ = self
             .tx
-            .send(RegistryCommand::DetachIfCurrent { key, epoch, reply })
+            .send(RegistryCommand::DetachIfCurrent { session_id, epoch, reply })
             .await;
         rx.await.unwrap_or(false)
     }
@@ -376,55 +361,46 @@ async fn run_registry_actor(
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            RegistryCommand::CheckResume { key, reply } => {
-                let resumable = registry
-                    .lookup(&key)
-                    .map(|s| !s.has_exited())
-                    .unwrap_or(false);
-                let _ = reply.send(resumable);
-            }
             RegistryCommand::Attach {
-                key,
+                session_id,
+                peer_id,
                 client_tx,
                 size,
                 reply,
             } => {
-                let result = if registry
-                    .lookup(&key)
-                    .map(|s| !s.has_exited())
-                    .unwrap_or(false)
-                {
-                    let session = registry.lookup_mut(&key).unwrap();
-                    session.resize(size);
-                    let epoch = session.attach(client_tx);
-                    Some(AttachResult {
-                        session_id: session.session_id.clone(),
-                        input_tx: session.input_tx.clone(),
-                        resize_tx: session.resize_tx.clone(),
-                        exit_rx: session.exit_rx.clone(),
-                        attach_epoch: epoch,
-                        replay_buffer: session.replay_buffer.clone(),
-                    })
+                let result = if let Some(session) = registry.lookup(&session_id) {
+                    if session.has_exited() || session.peer_id != peer_id {
+                        None
+                    } else {
+                        let session = registry.lookup_mut(&session_id).unwrap();
+                        session.resize(size);
+                        let epoch = session.attach(client_tx);
+                        Some(AttachResult {
+                            session_id: session.session_id.clone(),
+                            input_tx: session.input_tx.clone(),
+                            resize_tx: session.resize_tx.clone(),
+                            exit_rx: session.exit_rx.clone(),
+                            attach_epoch: epoch,
+                            replay_buffer: session.replay_buffer.clone(),
+                        })
+                    }
                 } else {
                     None
                 };
                 let _ = reply.send(result);
             }
-            RegistryCommand::RemoveStale { key } => {
-                registry.remove(&key);
+            RegistryCommand::Insert { session } => {
+                registry.insert(session);
             }
-            RegistryCommand::Insert { key, session } => {
-                registry.insert(key, session);
-            }
-            RegistryCommand::SetBrokerHandle { key, handle } => {
-                if let Some(session) = registry.lookup_mut(&key) {
+            RegistryCommand::SetBrokerHandle { session_id, handle } => {
+                if let Some(session) = registry.lookup_mut(&session_id) {
                     session.broker_handle = Some(handle);
                 }
             }
-            RegistryCommand::CleanupExited { key, epoch, reply } => {
+            RegistryCommand::CleanupExited { session_id, epoch, reply } => {
                 let result =
-                    if registry.lookup(&key).map(|s| s.attach_epoch == epoch).unwrap_or(false) {
-                        registry.remove(&key).map(|s| CleanupResult {
+                    if registry.lookup(&session_id).map(|s| s.attach_epoch == epoch).unwrap_or(false) {
+                        registry.remove(&session_id).map(|s| CleanupResult {
                             session_id: s.session_id,
                             broker_handle: s.broker_handle,
                         })
@@ -433,8 +409,8 @@ async fn run_registry_actor(
                     };
                 let _ = reply.send(result);
             }
-            RegistryCommand::DetachIfCurrent { key, epoch, reply } => {
-                let detached = registry.detach_if_current(&key, epoch);
+            RegistryCommand::DetachIfCurrent { session_id, epoch, reply } => {
+                let detached = registry.detach_if_current(&session_id, epoch);
                 let _ = reply.send(detached);
             }
             RegistryCommand::ReapExpired => {
@@ -457,7 +433,7 @@ mod tests {
     use super::*;
 
     /// Helper to create a DetachedSession for testing.
-    fn make_session(id: &str, attached: bool, exited: Option<i32>) -> DetachedSession {
+    fn make_session(id: &str, peer: &str, attached: bool, exited: Option<i32>) -> DetachedSession {
         let (input_tx, _input_rx) = mpsc::channel(1);
         let (output_route, _output_rx) = watch::channel(None);
         let (resize_tx, _resize_rx) = mpsc::channel(1);
@@ -466,6 +442,8 @@ mod tests {
 
         DetachedSession {
             session_id: id.into(),
+            peer_id: peer.into(),
+            username: None,
             input_tx,
             output_route,
             resize_tx,
@@ -478,20 +456,12 @@ mod tests {
         }
     }
 
-    fn make_key(peer: &str) -> SessionKey {
-        SessionKey {
-            peer_id: peer.into(),
-            username: None,
-        }
-    }
-
     #[test]
     fn reap_removes_expired_detached_sessions() {
         let mut reg = SessionRegistry::new(Duration::from_millis(0), 10);
-        let mut session = make_session("s1", false, None);
-        // Set detached_at to the past so it's already expired
+        let mut session = make_session("s1", "peer1", false, None);
         session.detached_at = Some(Instant::now() - Duration::from_secs(10));
-        reg.insert(make_key("peer1"), session);
+        reg.insert(session);
         assert_eq!(reg.len(), 1);
 
         reg.reap_expired();
@@ -501,8 +471,8 @@ mod tests {
     #[test]
     fn reap_preserves_attached_sessions() {
         let mut reg = SessionRegistry::new(Duration::from_millis(0), 10);
-        let session = make_session("s1", true, None);
-        reg.insert(make_key("peer1"), session);
+        let session = make_session("s1", "peer1", true, None);
+        reg.insert(session);
         assert_eq!(reg.len(), 1);
 
         reg.reap_expired();
@@ -513,45 +483,56 @@ mod tests {
     fn eviction_at_capacity_removes_oldest_detached() {
         let mut reg = SessionRegistry::new(Duration::from_secs(3600), 2);
 
-        // Insert first detached session (oldest)
-        let mut s1 = make_session("s1", false, None);
+        let mut s1 = make_session("s1", "peer1", false, None);
         s1.detached_at = Some(Instant::now() - Duration::from_secs(60));
-        reg.insert(make_key("peer1"), s1);
+        reg.insert(s1);
 
-        // Insert attached session
-        let s2 = make_session("s2", true, None);
-        reg.insert(make_key("peer2"), s2);
+        let s2 = make_session("s2", "peer2", true, None);
+        reg.insert(s2);
 
         assert_eq!(reg.len(), 2);
 
-        // Insert third session — should evict s1 (oldest detached), not s2 (attached)
-        let s3 = make_session("s3", false, None);
-        reg.insert(make_key("peer3"), s3);
+        let s3 = make_session("s3", "peer3", false, None);
+        reg.insert(s3);
 
         assert_eq!(reg.len(), 2);
         assert!(
-            reg.lookup(&make_key("peer1")).is_none(),
+            reg.lookup("s1").is_none(),
             "oldest detached session should be evicted"
         );
         assert!(
-            reg.lookup(&make_key("peer2")).is_some(),
+            reg.lookup("s2").is_some(),
             "attached session should survive eviction"
         );
         assert!(
-            reg.lookup(&make_key("peer3")).is_some(),
+            reg.lookup("s3").is_some(),
             "new session should be inserted"
         );
     }
 
     #[test]
     fn has_exited_detection() {
-        let session_alive = make_session("alive", true, None);
+        let session_alive = make_session("alive", "peer1", true, None);
         assert!(!session_alive.has_exited(), "session with no exit code should not be exited");
 
-        let session_dead = make_session("dead", true, Some(0));
+        let session_dead = make_session("dead", "peer1", true, Some(0));
         assert!(session_dead.has_exited(), "session with exit code should be exited");
 
-        let session_error = make_session("error", true, Some(1));
+        let session_error = make_session("error", "peer1", true, Some(1));
         assert!(session_error.has_exited(), "session with non-zero exit should be exited");
+    }
+
+    #[test]
+    fn multiple_sessions_same_peer() {
+        let mut reg = SessionRegistry::new(Duration::from_secs(3600), 10);
+
+        let s1 = make_session("session-a", "peer1", true, None);
+        let s2 = make_session("session-b", "peer1", true, None);
+        reg.insert(s1);
+        reg.insert(s2);
+
+        assert_eq!(reg.len(), 2, "same peer should have two sessions");
+        assert!(reg.lookup("session-a").is_some());
+        assert!(reg.lookup("session-b").is_some());
     }
 }
