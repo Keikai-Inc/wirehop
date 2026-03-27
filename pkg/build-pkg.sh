@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PKG_ID="com.hop.pkg"
 ARCH="native"
+BINARY_DIR=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -21,9 +22,13 @@ while [[ $# -gt 0 ]]; do
             ARCH="$2"
             shift 2
             ;;
+        --binary-dir)
+            BINARY_DIR="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--arch native|arm64|x86_64|universal]"
+            echo "Usage: $0 [--arch native|arm64|x86_64|universal] [--binary-dir <path>]"
             exit 1
             ;;
     esac
@@ -81,8 +86,16 @@ case "$ARCH" in
         BINARY=$(build_for_target "x86_64-apple-darwin")
         ;;
     universal)
-        ARM_BIN=$(build_for_target "aarch64-apple-darwin")
-        X86_BIN=$(build_for_target "x86_64-apple-darwin")
+        if [[ -n "${BINARY_DIR}" ]]; then
+            ARM_BIN="${BINARY_DIR}/hop-darwin-arm64"
+            X86_BIN="${BINARY_DIR}/hop-darwin-x86_64"
+            for b in "$ARM_BIN" "$X86_BIN"; do
+                [[ -f "$b" ]] || { echo "Error: Pre-built binary not found at $b"; exit 1; }
+            done
+        else
+            ARM_BIN=$(build_for_target "aarch64-apple-darwin")
+            X86_BIN=$(build_for_target "x86_64-apple-darwin")
+        fi
         BINARY="$STAGING/hop-universal"
         echo "Creating universal binary with lipo..."
         lipo -create "$ARM_BIN" "$X86_BIN" -output "$BINARY"

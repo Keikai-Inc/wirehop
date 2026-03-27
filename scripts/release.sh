@@ -159,42 +159,85 @@ fi
 echo "==> Running tests"
 cargo test --quiet
 
-# --- Build -------------------------------------------------------------------
+# --- Build (parallel) --------------------------------------------------------
 
 rm -rf "${DIST_DIR}"
 mkdir -p "${DIST_DIR}"
 
-# macOS targets (native cargo)
+BUILD_LOG_DIR=$(mktemp -d)
+BUILD_PIDS=()
+
+# Helper: run a build in the background, log output, track PID
+start_build() {
+  local label="$1"
+  shift
+  local logfile="${BUILD_LOG_DIR}/${label}.log"
+  echo "==> Starting: ${label}"
+  ("$@") > "${logfile}" 2>&1 &
+  BUILD_PIDS+=("$!:${label}:${logfile}")
+}
+
+# macOS targets (native cargo, full LTO)
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
-  echo "==> Building ${target}"
-  cargo build --release --target "${target}" --manifest-path "${PROJECT_ROOT}/Cargo.toml" -p hop-cli
-
-  bin="${PROJECT_ROOT}/target/${target}/release/hop"
-  strip "${bin}"
-
   case "${target}" in
     aarch64-apple-darwin) name="hop-darwin-arm64" ;;
     x86_64-apple-darwin)  name="hop-darwin-x86_64" ;;
   esac
-
-  cp "${bin}" "${DIST_DIR}/${name}"
+  start_build "${name}" bash -c "
+    cargo build --release --target '${target}' --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-cli \
+    && strip '${PROJECT_ROOT}/target/${target}/release/hop' \
+    && cp '${PROJECT_ROOT}/target/${target}/release/hop' '${DIST_DIR}/${name}'
+  "
 done
 
-# Linux targets (cross, static musl)
-for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
-  echo "==> Building ${target} (via cross, static musl)"
-  AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target "${target}" --manifest-path "${PROJECT_ROOT}/Cargo.toml" -p hop-cli
+# Linux aarch64: native arm64 Docker build (no QEMU emulation)
+start_build "hop-linux-arm64" bash -c "
+  docker run --rm \
+    -v '${PROJECT_ROOT}:/build' \
+    -v '${HOME}/.cargo/registry:/usr/local/cargo/registry' \
+    -v '${HOME}/.cargo/git:/usr/local/cargo/git' \
+    hop-cross-aarch64-musl \
+    cargo build --profile release-cross --target aarch64-unknown-linux-musl \
+      --manifest-path /build/Cargo.toml -p hop-cli \
+  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release-cross/hop' '${DIST_DIR}/hop-linux-arm64'
+"
 
-  bin="${PROJECT_ROOT}/target/${target}/release/hop"
+# Linux x86_64 + armv7: cross under QEMU.
+# Uses standard --release profile (not release-cross) because QEMU segfaults
+# on aws-lc-sys assembly under thin LTO rebuilds. Full LTO is single-threaded
+# but stable under emulation. These run sequentially to avoid resource contention.
+start_build "hop-linux-qemu" bash -c "
+  echo 'Building x86_64-unknown-linux-musl...' \
+  && AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target x86_64-unknown-linux-musl \
+    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-cli \
+  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop' '${DIST_DIR}/hop-linux-x86_64' \
+  && echo 'Building armv7-unknown-linux-musleabihf...' \
+  && AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target armv7-unknown-linux-musleabihf \
+    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-cli \
+  && cp '${PROJECT_ROOT}/target/armv7-unknown-linux-musleabihf/release/hop' '${DIST_DIR}/hop-linux-armv7'
+"
 
-  case "${target}" in
-    x86_64-unknown-linux-musl)         name="hop-linux-x86_64" ;;
-    aarch64-unknown-linux-musl)        name="hop-linux-arm64" ;;
-    armv7-unknown-linux-musleabihf)    name="hop-linux-armv7" ;;
-  esac
-
-  cp "${bin}" "${DIST_DIR}/${name}"
+# Wait for all builds, report failures
+echo "==> Waiting for all builds to complete..."
+FAILED=0
+for entry in "${BUILD_PIDS[@]}"; do
+  IFS=':' read -r pid label logfile <<< "${entry}"
+  if wait "${pid}"; then
+    echo "  ✓ ${label}"
+  else
+    echo "  ✗ ${label} FAILED (see ${logfile})"
+    tail -20 "${logfile}"
+    echo ""
+    FAILED=1
+  fi
 done
+
+if [[ "${FAILED}" -ne 0 ]]; then
+  echo "Error: One or more builds failed. Logs in ${BUILD_LOG_DIR}/"
+  exit 1
+fi
+
+rm -rf "${BUILD_LOG_DIR}"
 
 # --- Checksums ---------------------------------------------------------------
 
@@ -208,7 +251,7 @@ cd "${PROJECT_ROOT}"
 # --- macOS .pkg installer ----------------------------------------------------
 
 echo "==> Building macOS universal .pkg"
-"${PROJECT_ROOT}/pkg/build-pkg.sh" --arch universal
+"${PROJECT_ROOT}/pkg/build-pkg.sh" --arch universal --binary-dir "${DIST_DIR}"
 PKG_PATH="${PROJECT_ROOT}/target/pkg-staging/output/hop-${VERSION}.pkg"
 if [[ ! -f "${PKG_PATH}" ]]; then
   echo "Error: .pkg not found at ${PKG_PATH}"

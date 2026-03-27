@@ -64,3 +64,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Faster profile for Linux cross-compilation (QEMU + native arm64 Docker).
+# Thin LTO allows parallel codegen, reducing emulated build times significantly.
+# ~5% larger binaries than full LTO — acceptable tradeoff for CLI tools.
+[profile.release-cross]
+inherits = "release"
+lto = "thin"
+codegen-units = 4

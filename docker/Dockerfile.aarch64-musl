@@ -1,3 +1,25 @@
-FROM ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
+# Native arm64 build image for aarch64-unknown-linux-musl.
+# Runs natively on Apple Silicon (no QEMU emulation).
+FROM rust:1-bookworm
+
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    clang \
+    libclang-dev \
+    musl-tools \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install musl cross-compiler for aarch64
+RUN wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt/
+ENV PATH="/opt/aarch64-linux-musl-cross/bin:${PATH}"
+
+RUN rustup target add aarch64-unknown-linux-musl
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+ENV CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+ENV AWS_LC_SYS_CMAKE_BUILDER=1
+
+WORKDIR /build
