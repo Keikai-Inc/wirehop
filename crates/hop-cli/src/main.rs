@@ -633,6 +633,12 @@ async fn dispatch_session(
             shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged, config_dir, protocol_version).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
+            // Same security check as shell/exec: when daemon runs as root,
+            // require a bound username so files are owned by the user, not root.
+            if let Err(e) = shell::check_shell_security(username) {
+                let _ = proto::write_message(&mut send, &proto::TransferMsg::Error(format!("{e:#}"))).await;
+                return Err(e);
+            }
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
             transfer::host_transfer_session(conn, send, recv, req, username, protocol_version).await?;
         }

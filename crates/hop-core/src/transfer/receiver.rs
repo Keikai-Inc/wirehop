@@ -31,6 +31,7 @@ pub async fn receive_files(
         dest_dir.canonicalize()?
     } else {
         fs::create_dir_all(dest_dir)?;
+        chown_path(dest_dir, owner);
         dest_dir.canonicalize()?
     };
 
@@ -44,6 +45,7 @@ pub async fn receive_files(
                 let target = safe_join(&dest_dir, &header.path)?;
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
+                    chown_path(parent, owner);
                 }
 
                 progress.file_started(&header.path, header.size);
@@ -80,9 +82,11 @@ pub async fn receive_files(
                 send_ack(send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
+                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir, &path)?;
                 if let Some(parent) = link_path.parent() {
                     fs::create_dir_all(parent)?;
+                    chown_path(parent, owner);
                 }
                 // Remove existing symlink/file if present
                 let _ = fs::remove_file(&link_path);
@@ -94,6 +98,7 @@ pub async fn receive_files(
                     // On non-Unix, just skip symlinks
                     tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
                 }
+                chown_path(&link_path, owner);
                 send_ack(send, &path, true, None).await?;
             }
             TransferMsg::DeletePath(path) => {
@@ -366,9 +371,11 @@ pub async fn receive_parallel(
                 send_ack(control_send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
+                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir_canon, &path)?;
                 if let Some(parent) = link_path.parent() {
                     fs::create_dir_all(parent)?;
+                    chown_path(parent, owner);
                 }
                 let _ = fs::remove_file(&link_path);
                 #[cfg(unix)]
@@ -378,6 +385,7 @@ pub async fn receive_parallel(
                 {
                     tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
                 }
+                chown_path(&link_path, owner);
                 send_ack(control_send, &path, true, None).await?;
             }
             TransferMsg::Done => break,
@@ -582,9 +590,11 @@ pub async fn receive_files_with_delta(
                 send_ack(send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
+                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir, &path)?;
                 if let Some(parent) = link_path.parent() {
                     fs::create_dir_all(parent)?;
+                    chown_path(parent, owner);
                 }
                 let _ = fs::remove_file(&link_path);
                 #[cfg(unix)]
@@ -594,6 +604,7 @@ pub async fn receive_files_with_delta(
                 {
                     tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
                 }
+                chown_path(&link_path, owner);
                 send_ack(send, &path, true, None).await?;
             }
             TransferMsg::DeletePath(path) => {
@@ -632,6 +643,18 @@ async fn send_ack(
         },
     )
     .await
+}
+
+/// Validate a symlink target is safe: no absolute paths, no `..` traversal.
+/// Only relative targets that stay within the destination are allowed.
+fn validate_symlink_target(target: &str) -> Result<()> {
+    if target.starts_with('/') {
+        bail!("symlink with absolute target rejected: {target}");
+    }
+    if target.contains("..") {
+        bail!("symlink with traversal target rejected: {target}");
+    }
+    Ok(())
 }
 
 /// Join `base / relative` and validate the result stays within `base`
@@ -761,11 +784,44 @@ mod tests {
     }
 }
 
+/// Chown a path to the given uid/gid if set. Used for intermediate directories
+/// created by `create_dir_all` which don't go through `set_metadata`.
+fn chown_path(path: &Path, owner: Option<(u32, u32)>) {
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok();
+        if let Some(c_path) = c_path {
+            unsafe {
+                libc::lchown(c_path.as_ptr(), uid, gid);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, owner);
+    }
+}
+
 fn set_metadata(path: &Path, mode: u32, mtime: u64, owner: Option<(u32, u32)>) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+
+        // Chown FIRST (before chmod) so that any setuid/setgid bits from a
+        // previous permissions state don't persist on a root-owned file.
+        if let Some((uid, gid)) = owner {
+            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok();
+            if let Some(c_path) = c_path {
+                unsafe {
+                    libc::lchown(c_path.as_ptr(), uid, gid);
+                }
+            }
+        }
+
+        // Strip setuid (04000), setgid (02000), and sticky (01000) bits.
+        // A malicious client could send mode 04755 to create setuid binaries.
+        let safe_mode = mode & 0o0777;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
 
         if mtime > 0 {
             let ts = libc::timespec {
@@ -777,16 +833,6 @@ fn set_metadata(path: &Path, mode: u32, mtime: u64, owner: Option<(u32, u32)>) {
             if let Some(c_path) = c_path {
                 unsafe {
                     libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
-                }
-            }
-        }
-
-        // Chown to the connecting user when the daemon runs as root
-        if let Some((uid, gid)) = owner {
-            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok();
-            if let Some(c_path) = c_path {
-                unsafe {
-                    libc::lchown(c_path.as_ptr(), uid, gid);
                 }
             }
         }

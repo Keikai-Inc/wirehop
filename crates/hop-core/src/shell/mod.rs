@@ -352,8 +352,10 @@ enum AttachOutcome {
     Disconnected,
 }
 
-/// Pre-spawn security checks shared by shell and persistent-shell entry points.
-fn check_shell_security(username: Option<&str>) -> Result<()> {
+/// Validate that the daemon can safely serve this peer.
+/// When running as root, a bound username is required to drop privileges.
+/// Used by shell, exec, and transfer sessions.
+pub fn check_shell_security(username: Option<&str>) -> Result<()> {
     #[cfg(unix)]
     {
         use crate::unix_user;
