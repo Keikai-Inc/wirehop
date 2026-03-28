@@ -97,10 +97,14 @@ pub async fn host_transfer_session(
         NegotiatedParams::legacy()
     };
 
+    // Resolve uid/gid for chown — when the daemon runs as root, files
+    // should be owned by the connecting user, not root.
+    let owner = resolve_owner(username);
+
     let result = match (&request.mode, &request.direction) {
         (TransferMode::Copy { .. }, TransferDirection::Push) => {
             // Client pushes files to us — we receive
-            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await
+            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params, owner).await
         }
         (TransferMode::Copy { .. }, TransferDirection::Pull) => {
             // Client pulls files from us — we send
@@ -108,7 +112,7 @@ pub async fn host_transfer_session(
         }
         (TransferMode::Sync, TransferDirection::Push) => {
             // Client sync-pushes to us
-            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await
+            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params, owner).await
         }
         (TransferMode::Sync, TransferDirection::Pull) => {
             // Client sync-pulls from us
@@ -146,8 +150,9 @@ async fn host_receive_files(
     dest: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<()> {
-    receiver::receive_files(send, recv, dest, progress, params).await?;
+    receiver::receive_files(send, recv, dest, progress, params, owner).await?;
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
 }
@@ -219,6 +224,7 @@ async fn host_sync_receive(
     _request: &TransferRequest,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<()> {
     // 1. Walk our (destination) directory and send the listing to the client
     let dest_entries = if dest.is_dir() {
@@ -280,10 +286,11 @@ async fn host_sync_receive(
             &files_to_send,
             progress,
             params,
+            owner,
         )
         .await?;
     } else {
-        receiver::receive_files(send, recv, dest, progress, params).await?;
+        receiver::receive_files(send, recv, dest, progress, params, owner).await?;
     }
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
@@ -412,17 +419,24 @@ async fn host_sync_send(
 /// Ack reading is pipelined: a background task reads acks from the recv stream
 /// while we continue sending files, so confirmations arrive during sending
 /// rather than in a post-send stall.
+/// Push local files to the remote host.
+///
+/// `contents_only` is parallel to `local_paths`. When `true` (source had a
+/// trailing slash, rsync convention), directory contents are sent without
+/// the directory name prefix. When `false`, the directory name is included
+/// in all entry paths so the receiver creates it under the destination.
 pub async fn client_push_copy(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_paths: &[PathBuf],
+    contents_only: &[bool],
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
-    for local_path in local_paths {
+    for (i, local_path) in local_paths.iter().enumerate() {
         let (base_dir, entries) = if local_path.is_file() {
             let metadata = std::fs::metadata(local_path)?;
             let file_name = local_path
@@ -450,7 +464,26 @@ pub async fn client_push_copy(
                 vec![entry],
             )
         } else if local_path.is_dir() {
-            (local_path.clone(), listing::walk_directory(local_path)?)
+            let is_contents_only = contents_only.get(i).copied().unwrap_or(false);
+            if is_contents_only {
+                // Trailing slash (rsync convention): send contents only,
+                // paths relative to the directory itself.
+                (local_path.clone(), listing::walk_directory(local_path)?)
+            } else {
+                // No trailing slash: include the directory name in all paths
+                // so the receiver creates the directory under the destination.
+                let dir_name = local_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let parent = local_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                let mut entries = listing::walk_directory(local_path)?;
+                for entry in &mut entries {
+                    entry.path = format!("{dir_name}/{}", entry.path);
+                }
+                (parent, entries)
+            }
         } else {
             bail!("path does not exist: {}", local_path.display());
         };
@@ -484,7 +517,7 @@ pub async fn client_pull_copy(
     let mut summary = TransferSummary::default();
 
     // receive_files reads messages until Done (inclusive), sends acks for each file.
-    let bytes = receiver::receive_files(send, recv, local_dest, progress, params).await?;
+    let bytes = receiver::receive_files(send, recv, local_dest, progress, params, None).await?;
     summary.bytes_transferred = bytes;
 
     // Signal to the host that we're done. This may fail if the host has
@@ -770,12 +803,13 @@ pub async fn client_pull_sync_transfer(
             &plan.files_to_send,
             progress,
             params,
+            None,
         )
         .await?;
         summary.bytes_transferred = bytes;
         summary.bytes_saved = saved;
     } else {
-        let bytes = receiver::receive_files(send, recv, local_dir, progress, params).await?;
+        let bytes = receiver::receive_files(send, recv, local_dir, progress, params, None).await?;
         summary.bytes_transferred = bytes;
     }
     tracing::debug!("sync: receive complete, sending client Done");
@@ -889,6 +923,26 @@ pub async fn negotiate_client(
 // ---------------------------------------------------------------------------
 
 /// Resolve `~/...` and relative paths to absolute paths on the host.
+/// Resolve uid/gid for a username. Returns None if no username or lookup fails.
+/// Used to chown received files to the connecting user when the daemon runs as root.
+fn resolve_owner(username: Option<&str>) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        let user = username?;
+        let c_name = std::ffi::CString::new(user).ok()?;
+        let pwd = unsafe { libc::getpwnam(c_name.as_ptr()) };
+        if pwd.is_null() {
+            return None;
+        }
+        Some(unsafe { ((*pwd).pw_uid, (*pwd).pw_gid) })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = username;
+        None
+    }
+}
+
 fn resolve_host_path(remote_path: &str, username: Option<&str>) -> Result<PathBuf> {
     let path = if remote_path.starts_with("~/") || remote_path == "~" {
         let home = if let Some(user) = username {
@@ -937,4 +991,166 @@ fn home_dir_for_user(username: &str) -> Result<PathBuf> {
 #[cfg(not(unix))]
 fn home_dir_for_user(_username: &str) -> Result<PathBuf> {
     dirs_home()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: run a push-copy roundtrip and return the relative paths written to dest.
+    async fn push_roundtrip(
+        local_paths: &[PathBuf],
+        contents_only: &[bool],
+        dest_dir: &Path,
+    ) -> Vec<String> {
+        let params = negotiation::NegotiatedParams::legacy();
+
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let paths = local_paths.to_vec();
+        let co = contents_only.to_vec();
+        let params_c = params.clone();
+
+        // Push side (client)
+        let push = tokio::spawn(async move {
+            let progress = progress::SilentProgress;
+            client_push_copy(&mut client_write, &mut client_read, &paths, &co, &progress, &params_c)
+                .await
+                .unwrap();
+        });
+
+        // Receive side (host)
+        let dest = dest_dir.to_path_buf();
+        let recv = tokio::spawn(async move {
+            let progress = progress::SilentProgress;
+            receiver::receive_files(&mut server_write, &mut server_read, &dest, &progress, &params, None)
+                .await
+                .unwrap();
+            // Send Done so client_push_copy can finish reading acks
+            crate::proto::write_message(&mut server_write, &crate::proto::TransferMsg::Done)
+                .await
+                .unwrap();
+        });
+
+        push.await.unwrap();
+        recv.await.unwrap();
+
+        // Collect relative paths in dest_dir
+        let mut result = Vec::new();
+        collect_paths_recursive(dest_dir, dest_dir, &mut result);
+        result.sort();
+        result
+    }
+
+    fn collect_paths_recursive(base: &Path, current: &Path, out: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                out.push(rel.clone());
+                if path.is_dir() {
+                    collect_paths_recursive(base, &path, out);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn push_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let paths = push_roundtrip(
+            &[src.join("hello.txt")],
+            &[false],
+            &dst,
+        ).await;
+
+        assert_eq!(paths, vec!["hello.txt"]);
+        assert_eq!(std::fs::read_to_string(dst.join("hello.txt")).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn push_dir_no_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("mydir");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::write(src.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), b"bbb").unwrap();
+
+        let paths = push_roundtrip(
+            &[src.clone()],
+            &[false], // no trailing slash — include dir name
+            &dst,
+        ).await;
+
+        assert!(paths.contains(&"mydir".to_string()), "should contain dir entry");
+        assert!(paths.contains(&"mydir/a.txt".to_string()), "should contain mydir/a.txt");
+        assert!(paths.contains(&"mydir/sub/b.txt".to_string()), "should contain mydir/sub/b.txt");
+        assert_eq!(std::fs::read_to_string(dst.join("mydir/a.txt")).unwrap(), "aaa");
+    }
+
+    #[tokio::test]
+    async fn push_dir_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("mydir");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::write(src.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), b"bbb").unwrap();
+
+        let paths = push_roundtrip(
+            &[src.clone()],
+            &[true], // trailing slash — contents only, no dir name prefix
+            &dst,
+        ).await;
+
+        assert!(!paths.iter().any(|p| p.starts_with("mydir")), "should NOT contain mydir/ prefix");
+        assert!(paths.contains(&"a.txt".to_string()), "should contain a.txt");
+        assert!(paths.contains(&"sub/b.txt".to_string()), "should contain sub/b.txt");
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "aaa");
+    }
+
+    #[tokio::test]
+    async fn push_dir_with_nested_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("project");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("src/components")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        std::fs::write(src.join("README.md"), b"# readme").unwrap();
+        std::fs::write(src.join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(src.join("src/components/app.rs"), b"struct App;").unwrap();
+
+        // Without trailing slash
+        let paths = push_roundtrip(&[src.clone()], &[false], &dst).await;
+        assert!(paths.contains(&"project/README.md".to_string()));
+        assert!(paths.contains(&"project/src/main.rs".to_string()));
+        assert!(paths.contains(&"project/src/components/app.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_path_spec_preserves_trailing_slash() {
+        match parse_path_spec("host:~/dir/") {
+            PathSpec::Remote { path, .. } => assert!(path.ends_with('/'), "trailing slash should be preserved in remote path"),
+            _ => panic!("expected Remote"),
+        }
+        match parse_path_spec("host:~/dir") {
+            PathSpec::Remote { path, .. } => assert!(!path.ends_with('/'), "no trailing slash"),
+            _ => panic!("expected Remote"),
+        }
+    }
 }

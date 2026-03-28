@@ -1218,6 +1218,19 @@ async fn cmd_cp(
         .map(|p| transfer::parse_path_spec(p))
         .collect();
 
+    // Detect trailing slash on source paths (rsync convention: trailing slash = contents only).
+    // Must check raw strings before PathBuf normalization strips the slash.
+    let source_contents_only: Vec<bool> = paths[..paths.len() - 1]
+        .iter()
+        .map(|p| {
+            if let Some(colon_pos) = p.find(':') {
+                p[colon_pos + 1..].ends_with('/')
+            } else {
+                p.ends_with('/')
+            }
+        })
+        .collect();
+
     // Determine direction: exactly one side must be remote
     let sources_have_remote = source_specs.iter().any(|s| matches!(s, PathSpec::Remote { .. }));
     let dest_is_remote = matches!(dest_spec, PathSpec::Remote { .. });
@@ -1273,7 +1286,7 @@ async fn cmd_cp(
         let render_handle = progress_ui::spawn_render_loop(state.clone());
 
         let summary =
-            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &state, &params).await?;
+            transfer::client_push_copy(&mut send, &mut recv, &local_paths, &source_contents_only, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
         eprintln!("{summary}");
@@ -1310,7 +1323,9 @@ async fn cmd_cp(
 
         // When pulling a remote directory into an existing local directory,
         // nest under the source directory name (like scp -r / cp -r).
-        let effective_dest = if recursive && local_dest.is_dir() {
+        // Skip nesting when source has trailing slash (rsync convention: contents only).
+        let source_has_trailing_slash = source_contents_only[0];
+        let effective_dest = if recursive && local_dest.is_dir() && !source_has_trailing_slash {
             let dir_name = std::path::Path::new(remote_path)
                 .file_name()
                 .unwrap_or_default();

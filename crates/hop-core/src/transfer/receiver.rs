@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -25,6 +25,7 @@ pub async fn receive_files(
     dest_dir: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<u64> {
     let dest_dir = if dest_dir.exists() {
         dest_dir.canonicalize()?
@@ -57,7 +58,7 @@ pub async fn receive_files(
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
-                        set_metadata(&target, header.mode, header.mtime);
+                        set_metadata(&target, header.mode, header.mtime, owner);
                         total_bytes += header.size; // actual file size, not wire bytes
                         progress.file_done(&header.path);
                         send_ack(send, &header.path, true, None).await?;
@@ -74,7 +75,7 @@ pub async fn receive_files(
                 let target = safe_join(&dest_dir, &dir.path)?;
                 fs::create_dir_all(&target)
                     .with_context(|| format!("mkdir: {}", target.display()))?;
-                set_metadata(&target, dir.mode, dir.mtime);
+                set_metadata(&target, dir.mode, dir.mtime, owner);
                 progress.dir_created(&dir.path);
                 send_ack(send, &dir.path, true, None).await?;
             }
@@ -253,6 +254,7 @@ pub async fn receive_files_from_data_stream(
     dest_dir: &Path,
     ack_tx: mpsc::Sender<TransferMsg>,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<u64> {
     let progress = super::progress::SilentProgress;
     let mut total_bytes = 0u64;
@@ -287,7 +289,7 @@ pub async fn receive_files_from_data_stream(
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
-                        set_metadata(&target, header.mode, header.mtime);
+                        set_metadata(&target, header.mode, header.mtime, owner);
                         total_bytes += bytes_written;
                         let _ = ack_tx
                             .send(TransferMsg::FileAck {
@@ -327,6 +329,7 @@ pub async fn receive_parallel(
     dest_dir: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<u64> {
     let dest_dir_canon = if dest_dir.exists() {
         dest_dir.canonicalize()?
@@ -358,7 +361,7 @@ pub async fn receive_parallel(
                 let target = safe_join(&dest_dir_canon, &dir.path)?;
                 fs::create_dir_all(&target)
                     .with_context(|| format!("mkdir: {}", target.display()))?;
-                set_metadata(&target, dir.mode, dir.mtime);
+                set_metadata(&target, dir.mode, dir.mtime, owner);
                 progress.dir_created(&dir.path);
                 send_ack(control_send, &dir.path, true, None).await?;
             }
@@ -404,7 +407,7 @@ pub async fn receive_parallel(
             let tx = ack_tx.clone();
             let p = params_clone.clone();
             handles.push(tokio::spawn(async move {
-                receive_files_from_data_stream(recv, &dest, tx, &p).await
+                receive_files_from_data_stream(recv, &dest, tx, &p, owner).await
             }));
         }
         // Wait for all data stream tasks
@@ -442,6 +445,7 @@ pub async fn receive_files_with_delta(
     files_to_send: &[crate::proto::FileEntry],
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
+    owner: Option<(u32, u32)>,
 ) -> Result<(u64, u64)> {
     let dest_dir = if dest_dir.exists() {
         dest_dir.canonicalize()?
@@ -505,7 +509,7 @@ pub async fn receive_files_with_delta(
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
-                        set_metadata(&target, header.mode, header.mtime);
+                        set_metadata(&target, header.mode, header.mtime, owner);
                         total_bytes += header.size; // actual file size, not wire bytes
                         progress.file_done(&header.path);
                         send_ack(send, &header.path, true, None).await?;
@@ -554,7 +558,7 @@ pub async fn receive_files_with_delta(
                         fs::rename(&tmp_path, &target).with_context(|| {
                             format!("rename {} -> {}", tmp_path.display(), target.display())
                         })?;
-                        set_metadata(&target, mode, mtime);
+                        set_metadata(&target, mode, mtime, owner);
                         total_bytes += new_size; // actual file size
                         // bytes_saved tracks how much we avoided sending over the wire
                         bytes_saved += new_size; // delta avoided full retransmit
@@ -573,7 +577,7 @@ pub async fn receive_files_with_delta(
                 let target = safe_join(&dest_dir, &dir.path)?;
                 fs::create_dir_all(&target)
                     .with_context(|| format!("mkdir: {}", target.display()))?;
-                set_metadata(&target, dir.mode, dir.mtime);
+                set_metadata(&target, dir.mode, dir.mtime, owner);
                 progress.dir_created(&dir.path);
                 send_ack(send, &dir.path, true, None).await?;
             }
@@ -741,6 +745,7 @@ mod tests {
                 &dst_dir_clone,
                 &progress,
                 &params,
+                None,
             )
             .await
             .unwrap();
@@ -756,16 +761,13 @@ mod tests {
     }
 }
 
-fn set_metadata(path: &Path, mode: u32, mtime: u64) {
-    // Set mtime
-    if mtime > 0 {
-        let _mtime_system = UNIX_EPOCH + Duration::from_secs(mtime);
-        // Use filetime if available, otherwise best-effort
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+fn set_metadata(path: &Path, mode: u32, mtime: u64, owner: Option<(u32, u32)>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 
+        if mtime > 0 {
             let ts = libc::timespec {
                 tv_sec: mtime as _,
                 tv_nsec: 0,
@@ -778,9 +780,19 @@ fn set_metadata(path: &Path, mode: u32, mtime: u64) {
                 }
             }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, mode, mtime_system);
+
+        // Chown to the connecting user when the daemon runs as root
+        if let Some((uid, gid)) = owner {
+            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok();
+            if let Some(c_path) = c_path {
+                unsafe {
+                    libc::lchown(c_path.as_ptr(), uid, gid);
+                }
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, mtime, owner);
     }
 }

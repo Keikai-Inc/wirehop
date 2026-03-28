@@ -371,6 +371,69 @@ test_cp_pull() {
     assert_contains "$content" "e2e-push-test-content"
 }
 
+test_cp_push_recursive() {
+    # Create a local directory structure
+    rm -rf /tmp/e2e-pushdir
+    mkdir -p /tmp/e2e-pushdir/sub
+    echo "file-a" > /tmp/e2e-pushdir/a.txt
+    echo "file-b" > /tmp/e2e-pushdir/sub/b.txt
+
+    # Clean remote destination
+    hop --config "$CONFIG_DIR" exec host-a -- rm -rf /tmp/e2e-pushdir 2>&1 || true
+
+    # Push directory (no trailing slash) — should create /tmp/e2e-pushdir/ on remote
+    hop --config "$CONFIG_DIR" cp -r /tmp/e2e-pushdir host-a:/tmp/ 2>&1
+
+    # Verify structure
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-pushdir/a.txt 2>&1)
+    assert_contains "$output" "file-a"
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-pushdir/sub/b.txt 2>&1)
+    assert_contains "$output" "file-b"
+}
+
+test_cp_push_trailing_slash() {
+    # Push directory CONTENTS (trailing slash) into a new remote dir
+    hop --config "$CONFIG_DIR" exec host-a -- rm -rf /tmp/e2e-contents 2>&1 || true
+    hop --config "$CONFIG_DIR" exec host-a -- mkdir -p /tmp/e2e-contents 2>&1
+
+    # Trailing slash = contents only, no nesting
+    hop --config "$CONFIG_DIR" cp -r /tmp/e2e-pushdir/ host-a:/tmp/e2e-contents 2>&1
+
+    # Verify: a.txt should be directly in /tmp/e2e-contents/, NOT in /tmp/e2e-contents/e2e-pushdir/
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-contents/a.txt 2>&1)
+    assert_contains "$output" "file-a"
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-contents/sub/b.txt 2>&1)
+    assert_contains "$output" "file-b"
+}
+
+test_cp_pull_recursive() {
+    # Pull a directory from host-a into an existing local dir
+    rm -rf /tmp/e2e-pulldir
+    mkdir -p /tmp/e2e-pulldir
+
+    hop --config "$CONFIG_DIR" cp -r host-a:/tmp/e2e-pushdir /tmp/e2e-pulldir 2>&1
+
+    # Verify nesting: should be /tmp/e2e-pulldir/e2e-pushdir/a.txt
+    assert_contains "$(cat /tmp/e2e-pulldir/e2e-pushdir/a.txt)" "file-a"
+    assert_contains "$(cat /tmp/e2e-pulldir/e2e-pushdir/sub/b.txt)" "file-b"
+}
+
+test_cp_pull_trailing_slash() {
+    # Pull directory CONTENTS (trailing slash) into local dir
+    rm -rf /tmp/e2e-pullcontents
+    mkdir -p /tmp/e2e-pullcontents
+
+    hop --config "$CONFIG_DIR" cp -r host-a:/tmp/e2e-pushdir/ /tmp/e2e-pullcontents 2>&1
+
+    # Verify: contents directly in /tmp/e2e-pullcontents/, no nesting
+    assert_contains "$(cat /tmp/e2e-pullcontents/a.txt)" "file-a"
+    assert_contains "$(cat /tmp/e2e-pullcontents/sub/b.txt)" "file-b"
+    # Negative: no nested dir name
+    [ ! -d /tmp/e2e-pullcontents/e2e-pushdir ] || { echo "FAIL: unexpected nesting (e2e-pushdir/ exists)"; return 1; }
+}
+
 # ── JS Bindings Tests (hop.exec / hop.fleet) ──
 
 test_js_exec_on_host() {
