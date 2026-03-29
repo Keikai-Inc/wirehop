@@ -65,7 +65,7 @@ pub async fn proxy_via_helper(
         cmd.pre_exec(move || {
             let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            libc::initgroups(c_name.as_ptr(), gid as libc::c_int);
+            libc::initgroups(c_name.as_ptr(), gid as _);
             Ok(())
         });
     }
