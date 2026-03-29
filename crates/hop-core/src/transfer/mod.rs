@@ -2,6 +2,7 @@
 
 pub mod delta;
 pub mod hashing;
+pub mod helper;
 pub mod listing;
 pub mod negotiation;
 pub mod progress;
@@ -97,25 +98,57 @@ pub async fn host_transfer_session(
         NegotiatedParams::legacy()
     };
 
-    // Resolve uid/gid for chown — when the daemon runs as root, files
-    // should be owned by the connecting user, not root.
-    let owner = resolve_owner(username);
-
     let result = match (&request.mode, &request.direction) {
         (TransferMode::Copy { .. }, TransferDirection::Push) => {
-            // Client pushes files to us — we receive
-            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params, owner).await
+            // Client pushes files to us — we receive.
+            // When running as root with a bound username, use a privilege-separated
+            // helper process so file I/O runs as the target user (kernel-enforced).
+            #[cfg(unix)]
+            if crate::unix_user::is_running_as_root()
+                && let Some(user) = username
+            {
+                return helper::proxy_via_helper(
+                    &mut send, &mut recv, &base_path, user, &params, "receive",
+                ).await;
+            }
+            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await
         }
         (TransferMode::Copy { .. }, TransferDirection::Pull) => {
-            // Client pulls files from us — we send
+            // Client pulls files from us — we send.
+            let recursive = matches!(request.mode, TransferMode::Copy { recursive: true });
+            #[cfg(unix)]
+            if crate::unix_user::is_running_as_root()
+                && let Some(user) = username
+            {
+                let send_mode = if recursive { "send-recursive" } else { "send" };
+                return helper::proxy_via_helper(
+                    &mut send, &mut recv, &base_path, user, &params, send_mode,
+                ).await;
+            }
             host_send_files(&mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
         (TransferMode::Sync, TransferDirection::Push) => {
-            // Client sync-pushes to us
-            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params, owner).await
+            // Client sync-pushes to us.
+            #[cfg(unix)]
+            if crate::unix_user::is_running_as_root()
+                && let Some(user) = username
+            {
+                return helper::proxy_via_helper(
+                    &mut send, &mut recv, &base_path, user, &params, "sync-receive",
+                ).await;
+            }
+            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
         (TransferMode::Sync, TransferDirection::Pull) => {
-            // Client sync-pulls from us
+            // Client sync-pulls from us.
+            #[cfg(unix)]
+            if crate::unix_user::is_running_as_root()
+                && let Some(user) = username
+            {
+                return helper::proxy_via_helper(
+                    &mut send, &mut recv, &base_path, user, &params, "sync-receive",
+                ).await;
+            }
             host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await
         }
     };
@@ -150,9 +183,8 @@ async fn host_receive_files(
     dest: &Path,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
-    owner: Option<(u32, u32)>,
 ) -> Result<()> {
-    receiver::receive_files(send, recv, dest, progress, params, owner).await?;
+    receiver::receive_files(send, recv, dest, progress, params).await?;
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
 }
@@ -224,7 +256,6 @@ async fn host_sync_receive(
     _request: &TransferRequest,
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
-    owner: Option<(u32, u32)>,
 ) -> Result<()> {
     // 1. Walk our (destination) directory and send the listing to the client
     let dest_entries = if dest.is_dir() {
@@ -286,11 +317,10 @@ async fn host_sync_receive(
             &files_to_send,
             progress,
             params,
-            owner,
         )
         .await?;
     } else {
-        receiver::receive_files(send, recv, dest, progress, params, owner).await?;
+        receiver::receive_files(send, recv, dest, progress, params).await?;
     }
     proto::write_message(send, &TransferMsg::Done).await?;
     Ok(())
@@ -517,7 +547,7 @@ pub async fn client_pull_copy(
     let mut summary = TransferSummary::default();
 
     // receive_files reads messages until Done (inclusive), sends acks for each file.
-    let bytes = receiver::receive_files(send, recv, local_dest, progress, params, None).await?;
+    let bytes = receiver::receive_files(send, recv, local_dest, progress, params).await?;
     summary.bytes_transferred = bytes;
 
     // Signal to the host that we're done. This may fail if the host has
@@ -803,13 +833,12 @@ pub async fn client_pull_sync_transfer(
             &plan.files_to_send,
             progress,
             params,
-            None,
         )
         .await?;
         summary.bytes_transferred = bytes;
         summary.bytes_saved = saved;
     } else {
-        let bytes = receiver::receive_files(send, recv, local_dir, progress, params, None).await?;
+        let bytes = receiver::receive_files(send, recv, local_dir, progress, params).await?;
         summary.bytes_transferred = bytes;
     }
     tracing::debug!("sync: receive complete, sending client Done");
@@ -923,26 +952,6 @@ pub async fn negotiate_client(
 // ---------------------------------------------------------------------------
 
 /// Resolve `~/...` and relative paths to absolute paths on the host.
-/// Resolve uid/gid for a username. Returns None if no username or lookup fails.
-/// Used to chown received files to the connecting user when the daemon runs as root.
-fn resolve_owner(username: Option<&str>) -> Option<(u32, u32)> {
-    #[cfg(unix)]
-    {
-        let user = username?;
-        let c_name = std::ffi::CString::new(user).ok()?;
-        let pwd = unsafe { libc::getpwnam(c_name.as_ptr()) };
-        if pwd.is_null() {
-            return None;
-        }
-        Some(unsafe { ((*pwd).pw_uid, (*pwd).pw_gid) })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = username;
-        None
-    }
-}
-
 fn resolve_host_path(remote_path: &str, username: Option<&str>) -> Result<PathBuf> {
     let path = if remote_path.starts_with("~/") || remote_path == "~" {
         let home = if let Some(user) = username {
@@ -1025,7 +1034,7 @@ mod tests {
         let dest = dest_dir.to_path_buf();
         let recv = tokio::spawn(async move {
             let progress = progress::SilentProgress;
-            receiver::receive_files(&mut server_write, &mut server_read, &dest, &progress, &params, None)
+            receiver::receive_files(&mut server_write, &mut server_read, &dest, &progress, &params)
                 .await
                 .unwrap();
             // Send Done so client_push_copy can finish reading acks

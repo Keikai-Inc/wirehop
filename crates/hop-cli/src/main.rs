@@ -200,6 +200,9 @@ async fn main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
+        Command::TransferHelper { mode, dest, compression, chunk_size } => {
+            cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
+        }
         Command::External(args) => {
             let ext = parse_external_args(&args)?;
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -866,6 +869,28 @@ fn cmd_sandbox_shell(policy_json: &str, shell_args: &[String]) -> Result<()> {
         let status = cmd.status().context("failed to run shell")?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// Privilege-separated transfer helper entry point.
+///
+/// Runs as the target user (spawned by the daemon with uid/gid set).
+/// Reads TransferMsg from stdin, writes files, sends acks to stdout.
+async fn cmd_transfer_helper(mode: &str, dest: &str, compression: Option<&str>, chunk_size: usize) -> Result<()> {
+    use hop_core::transfer::negotiation::{Compression, NegotiatedParams};
+
+    let params = NegotiatedParams {
+        compression: compression.and_then(|c| {
+            if let Some(level_str) = c.strip_prefix("zstd:") {
+                level_str.parse().ok().map(|level| Compression::Zstd { level })
+            } else {
+                None
+            }
+        }),
+        max_chunk_size: chunk_size,
+    };
+
+    let dest_path = std::path::Path::new(dest);
+    hop_core::transfer::helper::run_transfer_helper(mode, dest_path, params).await
 }
 
 /// List processes using libproc + sysctl (works inside macOS sandbox without setuid).

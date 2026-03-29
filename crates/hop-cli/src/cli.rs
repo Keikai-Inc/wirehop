@@ -262,6 +262,23 @@ pub enum Command {
     #[command(name = "__ps", hide = true)]
     Ps,
 
+    /// Internal: privilege-separated transfer helper (runs as target user)
+    #[command(name = "__transfer-helper", hide = true)]
+    TransferHelper {
+        /// Transfer mode: receive, send, sync-receive
+        #[arg(long)]
+        mode: String,
+        /// Destination/source directory
+        #[arg(long)]
+        dest: String,
+        /// Compression setting (e.g. "zstd:3")
+        #[arg(long)]
+        compression: Option<String>,
+        /// Max chunk size in bytes
+        #[arg(long, default_value = "65536")]
+        chunk_size: usize,
+    },
+
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
     #[command(external_subcommand)]
     External(Vec<String>),
