@@ -133,6 +133,9 @@ pub fn install_hop_bindings(
     // Install hop.local() binding — runs commands on the local machine with sandbox
     install_local_binding(ctx, sandbox.cloned())?;
 
+    // Install hop.http() binding — makes HTTP requests from JS
+    install_http_binding(ctx, sandbox)?;
+
     // Install datastore bindings via JS wrapper
     if let Some(ds) = datastore {
         install_datastore_raw(ctx, ds)?;
@@ -513,6 +516,120 @@ fn run_local_command_sync(
             exit_code: -1,
         }),
     }
+}
+
+/// Install `hop.http()` binding for making HTTP requests from JS.
+///
+/// Uses `reqwest::blocking` — safe because JS runs on a plain OS thread, not
+/// inside the tokio runtime. Respects `SandboxPolicy.no_network`.
+fn install_http_binding(ctx: &Ctx<'_>, sandbox: Option<&SandboxPolicy>) -> Result<()> {
+    let globals = ctx.globals();
+
+    if sandbox.is_some_and(|s| s.no_network) {
+        ctx.eval::<(), _>(
+            r#"
+            hop.http = function() { throw new Error("hop.http: network access denied by sandbox policy"); };
+        "#,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to install hop.http stub: {e}"))?;
+        return Ok(());
+    }
+
+    // Raw binding: __hop_http(url, method, headersJson, body?) → JSON string
+    globals
+        .set(
+            "__hop_http",
+            Function::new(
+                ctx.clone(),
+                |_ctx: Ctx<'_>,
+                 url: String,
+                 method: String,
+                 headers_json: String,
+                 body: rquickjs::function::Opt<String>|
+                 -> rquickjs::Result<String> {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .map_err(|e| js_err(format!("http client error: {e}")))?;
+
+                    let mut req = match method.as_str() {
+                        "GET" => client.get(&url),
+                        "POST" => client.post(&url),
+                        "PUT" => client.put(&url),
+                        "DELETE" => client.delete(&url),
+                        "PATCH" => client.patch(&url),
+                        "HEAD" => client.head(&url),
+                        other => return Err(js_err(format!("unsupported HTTP method: {other}"))),
+                    };
+
+                    if let Ok(headers) =
+                        serde_json::from_str::<std::collections::HashMap<String, String>>(
+                            &headers_json,
+                        )
+                    {
+                        for (k, v) in headers {
+                            req = req.header(&k, &v);
+                        }
+                    }
+
+                    if let Some(body) = body.0 {
+                        req = req.body(body);
+                    }
+
+                    let resp = req
+                        .send()
+                        .map_err(|e| js_err(format!("http request failed: {e}")))?;
+
+                    let status = resp.status().as_u16();
+                    let resp_headers: std::collections::HashMap<String, String> = resp
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+                    let body_text = resp
+                        .text()
+                        .map_err(|e| js_err(format!("http read body failed: {e}")))?;
+
+                    Ok(serde_json::json!({
+                        "status": status,
+                        "headers": resp_headers,
+                        "body": body_text,
+                    })
+                    .to_string())
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // JS wrapper with convenience methods
+    ctx.eval::<(), _>(r#"
+        hop.http = function(url, options) {
+            options = options || {};
+            var method = (options.method || "GET").toUpperCase();
+            var headers = options.headers || {};
+            if (options.bearer) headers["Authorization"] = "Bearer " + options.bearer;
+            var body = null;
+            if (options.json !== undefined) {
+                if (!headers["Content-Type"] && !headers["content-type"]) {
+                    headers["Content-Type"] = "application/json";
+                }
+                body = JSON.stringify(options.json);
+            } else if (options.body !== undefined) {
+                body = options.body;
+            }
+            var r = JSON.parse(__hop_http(url, method, JSON.stringify(headers), body));
+            r.json = function() { return JSON.parse(r.body); };
+            return r;
+        };
+        hop.http.get = function(url, opts) { opts = opts || {}; opts.method = "GET"; return hop.http(url, opts); };
+        hop.http.post = function(url, opts) { opts = opts || {}; opts.method = "POST"; return hop.http(url, opts); };
+        hop.http.put = function(url, opts) { opts = opts || {}; opts.method = "PUT"; return hop.http(url, opts); };
+        hop.http.delete = function(url, opts) { opts = opts || {}; opts.method = "DELETE"; return hop.http(url, opts); };
+    "#)
+    .map_err(|e| anyhow::anyhow!("Failed to install hop.http wrapper: {e}"))?;
+
+    Ok(())
 }
 
 /// Install stub bindings (no backend available, e.g. cron jobs).
