@@ -126,19 +126,12 @@ fn resolve_real_binary(command: &str) -> Option<PathBuf> {
 /// Change ownership of a path to the given username (best-effort, requires root).
 #[cfg(unix)]
 fn chown_to_user(path: &Path, username: &str) {
-    let Ok(c_name) = std::ffi::CString::new(username) else { return };
-    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if pw.is_null() {
-        return;
-    }
-    let uid = unsafe { (*pw).pw_uid };
-    let gid = unsafe { (*pw).pw_gid };
-    let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes().to_vec()) else {
-        return;
-    };
-    unsafe {
-        libc::chown(c_path.as_ptr(), uid, gid);
-    }
+    let Some(user) = users::get_user_by_name(username) else { return };
+    let _ = nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(user.uid())),
+        Some(nix::unistd::Gid::from_raw(user.primary_group_id())),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -611,12 +604,13 @@ pub fn broker_client_main(command: &str, args: &[String]) -> i32 {
 
 #[cfg(unix)]
 fn stdin_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+    use std::os::unix::io::AsRawFd;
+    nix::unistd::isatty(std::io::stdin().as_raw_fd()).unwrap_or(false)
 }
 
 #[cfg(unix)]
 fn get_terminal_size() -> (u16, u16) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
     if ret == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
         (ws.ws_row, ws.ws_col)
@@ -628,21 +622,17 @@ fn get_terminal_size() -> (u16, u16) {
 /// RAII guard that restores the terminal to its original state on drop.
 #[cfg(unix)]
 struct TermGuard {
-    original: libc::termios,
+    original: nix::sys::termios::Termios,
 }
 
 #[cfg(unix)]
 impl TermGuard {
     fn enter_raw() -> Option<Self> {
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-            return None;
-        }
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-            return None;
-        }
+        let stdin = std::io::stdin();
+        let original = nix::sys::termios::tcgetattr(&stdin).ok()?;
+        let mut raw = original.clone();
+        nix::sys::termios::cfmakeraw(&mut raw);
+        nix::sys::termios::tcsetattr(&stdin, nix::sys::termios::SetArg::TCSANOW, &raw).ok()?;
         Some(Self { original })
     }
 }
@@ -650,9 +640,8 @@ impl TermGuard {
 #[cfg(unix)]
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
-        }
+        let stdin = std::io::stdin();
+        let _ = nix::sys::termios::tcsetattr(&stdin, nix::sys::termios::SetArg::TCSANOW, &self.original);
     }
 }
 

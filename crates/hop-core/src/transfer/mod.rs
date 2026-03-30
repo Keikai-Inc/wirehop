@@ -987,14 +987,10 @@ fn dirs_home() -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn home_dir_for_user(username: &str) -> Result<PathBuf> {
-    use std::ffi::CString;
-    let c_name = CString::new(username)?;
-    let pwd = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if pwd.is_null() {
-        bail!("user not found: {username}");
-    }
-    let home = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_dir) };
-    Ok(PathBuf::from(home.to_string_lossy().to_string()))
+    use users::os::unix::UserExt;
+    let user = users::get_user_by_name(username)
+        .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
+    Ok(user.home_dir().to_path_buf())
 }
 
 #[cfg(not(unix))]

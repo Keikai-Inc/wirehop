@@ -1,55 +1,37 @@
 //! Unix user validation and privilege helpers.
 
 use anyhow::{bail, Result};
-use std::ffi::CString;
+#[cfg(unix)]
+use users::os::unix::UserExt;
 
 /// Returns `true` if the current process is running as root (euid == 0).
 pub fn is_running_as_root() -> bool {
-    // SAFETY: geteuid() is always safe to call.
-    unsafe { libc::geteuid() == 0 }
+    nix::unistd::geteuid().is_root()
 }
 
 /// Returns the username of the current (real) user, or `None` on failure.
 pub fn current_username() -> Option<String> {
-    // SAFETY: getuid() is always safe; getpwuid is safe with a valid uid.
-    let uid = unsafe { libc::getuid() };
-    let pw = unsafe { libc::getpwuid(uid) };
-    if pw.is_null() {
-        return None;
-    }
-    let name = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) };
-    name.to_str().ok().map(String::from)
+    users::get_current_username()
+        .map(|name| name.to_string_lossy().to_string())
 }
 
-/// Returns `true` if `username` exists on the system (via `getpwnam`).
+/// Returns `true` if `username` exists on the system.
 pub fn user_exists(username: &str) -> bool {
-    let Ok(c_name) = CString::new(username) else {
-        return false;
-    };
-    // SAFETY: getpwnam is safe with a valid C string; we only read the return pointer.
-    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    !pw.is_null()
+    users::get_user_by_name(username).is_some()
 }
 
 /// Returns the login shell for `username` from the passwd database.
 ///
 /// Falls back to `$SHELL` or `/bin/sh` if the lookup fails.
 pub fn user_login_shell(username: &str) -> String {
-    let Ok(c_name) = CString::new(username) else {
-        return std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    };
-    // SAFETY: getpwnam is safe with a valid C string; we only read the return pointer.
-    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if pw.is_null() {
-        return std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    }
-    let shell = unsafe { std::ffi::CStr::from_ptr((*pw).pw_shell) };
-    shell
-        .to_str()
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
+    let fallback = || std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+
+    users::get_user_by_name(username)
+        .and_then(|u| {
+            let shell = u.shell().to_string_lossy().to_string();
+            if shell.is_empty() { None } else { Some(shell) }
+        })
+        .unwrap_or_else(fallback)
 }
 
 /// Returns the value of `SUDO_USER` if set and not empty/root.
@@ -142,22 +124,17 @@ mod tests {
 
     #[test]
     fn sudo_user_filters_empty_and_root() {
-        // SAFETY: test-only; these tests must run with --test-threads=1
-        // if they share env vars, but each is self-contained here.
+        // SAFETY: test-only env manipulation
         unsafe {
-            // Empty string
             std::env::set_var("SUDO_USER", "");
             assert_eq!(sudo_user(), None);
 
-            // Root
             std::env::set_var("SUDO_USER", "root");
             assert_eq!(sudo_user(), None);
 
-            // Valid user
             std::env::set_var("SUDO_USER", "alice");
             assert_eq!(sudo_user(), Some("alice".into()));
 
-            // Clean up
             std::env::remove_var("SUDO_USER");
         }
     }
@@ -173,8 +150,6 @@ mod tests {
 
     #[test]
     fn first_regular_user_parses_passwd() {
-        // This test only works on systems with /etc/passwd and at least one
-        // regular user. On CI/macOS it may return None; that's fine.
         let result = first_regular_user();
         if let Some(ref name) = result {
             assert!(!name.is_empty());

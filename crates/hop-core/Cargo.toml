@@ -20,10 +20,17 @@ directories.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 libc = { workspace = true }
+nix = { workspace = true }
+users = { workspace = true }
+hostname = { workspace = true }
+filetime = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 redb = { workspace = true }
 cron = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
 
 # Force reqwest to use pure-Rust hickory-resolver instead of libc getaddrinfo.
 # musl's DNS resolver is minimal and fails on TXT lookups / certain AAAA+A combos.

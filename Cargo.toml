@@ -47,6 +47,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # System
 libc = "0.2"
+nix = { version = "0.29", features = ["user", "net", "term", "signal", "process", "fs"] }
+users = "0.11"
+hostname = "0.4"
+filetime = "0.2"
+landlock = "0.4"
 
 # Compression & Hashing
 zstd = "0.13"

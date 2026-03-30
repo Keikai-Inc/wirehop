@@ -785,17 +785,8 @@ fn set_metadata(path: &Path, mode: u32, mtime: u64) {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
 
         if mtime > 0 {
-            let ts = libc::timespec {
-                tv_sec: mtime as _,
-                tv_nsec: 0,
-            };
-            let times = [ts, ts]; // [atime, mtime]
-            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok();
-            if let Some(c_path) = c_path {
-                unsafe {
-                    libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
-                }
-            }
+            let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
+            let _ = filetime::set_file_mtime(path, ft);
         }
     }
     #[cfg(not(unix))]

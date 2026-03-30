@@ -987,14 +987,11 @@ fn get_proc_uid(pid: i32) -> Option<u32> {
 /// Resolve a UID to a username.
 #[cfg(target_os = "macos")]
 fn resolve_username(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            Some(format!("{uid}"))
-        } else {
-            Some(std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().to_string())
-        }
-    }
+    Some(
+        users::get_user_by_uid(uid)
+            .map(|u| u.name().to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{uid}"))
+    )
 }
 
 /// Get the command line of a process via KERN_PROCARGS2 sysctl.

@@ -15,53 +15,33 @@ use iroh::Endpoint;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Enumerate all non-loopback, non-link-local interface IP addresses.
-///
-/// Uses `libc::getifaddrs` on Unix (libc is already a hop-core dependency).
 #[cfg(unix)]
 pub fn current_interface_addrs() -> BTreeSet<IpAddr> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
     let mut addrs = BTreeSet::new();
 
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            tracing::warn!("getifaddrs failed: {}", std::io::Error::last_os_error());
+    let ifaddrs = match nix::ifaddrs::getifaddrs() {
+        Ok(iter) => iter,
+        Err(e) => {
+            tracing::warn!("getifaddrs failed: {e}");
             return addrs;
         }
+    };
 
-        let mut cursor = ifaddrs;
-        while !cursor.is_null() {
-            let ifa = &*cursor;
-            if !ifa.ifa_addr.is_null() {
-                let family = (*ifa.ifa_addr).sa_family as i32;
+    for ifa in ifaddrs {
+        let Some(addr) = ifa.address else { continue };
 
-                let ip = if family == libc::AF_INET {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    let octets = sa.sin_addr.s_addr.to_ne_bytes();
-                    Some(IpAddr::V4(Ipv4Addr::from(octets)))
-                } else if family == libc::AF_INET6 {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    Some(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)))
-                } else {
-                    None
-                };
+        let ip = addr.as_sockaddr_in().map(|sin| IpAddr::V4(sin.ip()))
+            .or_else(|| addr.as_sockaddr_in6().map(|sin6| IpAddr::V6(sin6.ip())));
 
-                if let Some(ip) = ip {
-                    // Skip loopback and link-local
-                    let dominated = match ip {
-                        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
-                        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
-                    };
-                    if !dominated {
-                        addrs.insert(ip);
-                    }
-                }
+        if let Some(ip) = ip {
+            let skip = match ip {
+                IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+                IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+            };
+            if !skip {
+                addrs.insert(ip);
             }
-            cursor = ifa.ifa_next;
         }
-
-        libc::freeifaddrs(ifaddrs);
     }
 
     addrs

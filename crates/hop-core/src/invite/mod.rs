@@ -129,21 +129,9 @@ pub struct ConsumedInvite {
     pub sandbox: SandboxPolicy,
 }
 
-/// Get the system hostname via libc.
-#[cfg(unix)]
+/// Get the system hostname.
 pub fn system_hostname() -> Option<String> {
-    let mut buf = vec![0u8; 256];
-    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if ret != 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8(buf[..end].to_vec()).ok()
-}
-
-#[cfg(not(unix))]
-pub fn system_hostname() -> Option<String> {
-    None
+    hostname::get().ok().and_then(|h| h.into_string().ok())
 }
 
 /// Generate a new invite: returns the token string to share and stores the hash on disk.

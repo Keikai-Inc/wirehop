@@ -63,8 +63,10 @@ pub async fn proxy_via_helper(
         .gid(gid);
     unsafe {
         cmd.pre_exec(move || {
+            // initgroups sets supplementary groups (staff, admin, etc.)
             let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            // nix::unistd::initgroups is not available on macOS, use libc directly
             libc::initgroups(c_name.as_ptr(), gid as _);
             Ok(())
         });
@@ -166,14 +168,10 @@ pub async fn run_transfer_helper(
     Ok(())
 }
 
-/// Look up uid and gid for a username via getpwnam.
+/// Look up uid and gid for a username.
 #[cfg(unix)]
 pub fn lookup_uid_gid(username: &str) -> Result<(u32, u32)> {
-    let c_name = std::ffi::CString::new(username)
-        .context("invalid username")?;
-    let pwd = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if pwd.is_null() {
-        bail!("user not found: {username}");
-    }
-    Ok(unsafe { ((*pwd).pw_uid, (*pwd).pw_gid) })
+    let user = users::get_user_by_name(username)
+        .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
+    Ok((user.uid(), user.primary_group_id()))
 }

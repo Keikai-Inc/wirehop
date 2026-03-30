@@ -31,15 +31,15 @@ pub fn apply_sandbox(policy: &SandboxPolicy) {
 /// via setuid/setgid binaries (e.g., `su`, `sudo`, `passwd`).
 fn set_no_new_privs() {
     #[cfg(target_os = "linux")]
-    unsafe {
-        let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    {
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
             tracing::warn!("prctl(PR_SET_NO_NEW_PRIVS) failed: {}", std::io::Error::last_os_error());
         }
     }
 }
 
-/// Apply Landlock filesystem access restrictions.
+/// Apply Landlock filesystem access restrictions using the `landlock` crate.
 ///
 /// Landlock is available on Linux 5.13+ and provides unprivileged filesystem
 /// sandboxing. If the kernel doesn't support it, this returns an error but
@@ -47,120 +47,41 @@ fn set_no_new_privs() {
 fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
+        use landlock::{
+            Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr,
+            RulesetCreatedAttr, ABI,
+        };
 
-        // Landlock ABI v1 constants (c_long to support both 32-bit and 64-bit)
-        const LANDLOCK_CREATE_RULESET: libc::c_long = 444;
-        const LANDLOCK_ADD_RULE: libc::c_long = 445;
-        const LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
+        let read_access = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
+        let write_access = AccessFs::WriteFile
+            | AccessFs::RemoveDir
+            | AccessFs::RemoveFile
+            | AccessFs::MakeChar
+            | AccessFs::MakeDir
+            | AccessFs::MakeReg
+            | AccessFs::MakeSock
+            | AccessFs::MakeFifo
+            | AccessFs::MakeBlock
+            | AccessFs::MakeSym;
+        let all_access = read_access | write_access;
 
-        const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
-
-        // Access rights for files and directories
-        const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
-        const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
-        const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
-        const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
-        const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
-        const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
-        const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
-        const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
-        const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
-        const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
-        const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
-        const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
-        const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-
-        const ALL_READ: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-            | LANDLOCK_ACCESS_FS_READ_FILE
-            | LANDLOCK_ACCESS_FS_READ_DIR;
-
-        const ALL_WRITE: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
-            | LANDLOCK_ACCESS_FS_REMOVE_DIR
-            | LANDLOCK_ACCESS_FS_REMOVE_FILE
-            | LANDLOCK_ACCESS_FS_MAKE_CHAR
-            | LANDLOCK_ACCESS_FS_MAKE_DIR
-            | LANDLOCK_ACCESS_FS_MAKE_REG
-            | LANDLOCK_ACCESS_FS_MAKE_SOCK
-            | LANDLOCK_ACCESS_FS_MAKE_FIFO
-            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-            | LANDLOCK_ACCESS_FS_MAKE_SYM;
-
-        const ALL_ACCESS: u64 = ALL_READ | ALL_WRITE;
-
-        // Determine what access mask to handle
-        let handled_access = if policy.read_only {
-            ALL_ACCESS // Handle everything, only grant read
-        } else if !policy.allowed_paths.is_empty() {
-            ALL_ACCESS // Handle everything, grant read+write to specific paths
-        } else {
+        if !policy.read_only && policy.allowed_paths.is_empty() {
             return Ok(()); // No filesystem restrictions
-        };
-
-        #[repr(C)]
-        struct LandlockRulesetAttr {
-            handled_access_fs: u64,
-            handled_access_net: u64,
         }
 
-        #[repr(C)]
-        struct LandlockPathBeneathAttr {
-            allowed_access: u64,
-            parent_fd: i32,
-        }
+        let abi = ABI::V1;
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .map_err(|e| format!("landlock handle_access: {e}"))?
+            .create()
+            .map_err(|e| format!("landlock create: {e}"))?;
 
-        let attr = LandlockRulesetAttr {
-            handled_access_fs: handled_access,
-            handled_access_net: 0,
-        };
-
-        let ruleset_fd = unsafe {
-            libc::syscall(
-                LANDLOCK_CREATE_RULESET,
-                &attr as *const _,
-                std::mem::size_of::<LandlockRulesetAttr>(),
-                0u32,
-            )
-        };
-
-        if ruleset_fd < 0 {
-            return Err(format!(
-                "landlock_create_ruleset failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let ruleset_fd = ruleset_fd as i32;
-
-        // Helper: add a path rule to the ruleset
-        let add_rule = |path: &str, access: u64| -> Result<(), String> {
-            let fd = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return Ok(()), // Skip paths that don't exist
-            };
-
-            let rule = LandlockPathBeneathAttr {
-                allowed_access: access,
-                parent_fd: fd.as_raw_fd(),
-            };
-
-            let ret = unsafe {
-                libc::syscall(
-                    LANDLOCK_ADD_RULE,
-                    ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH,
-                    &rule as *const _,
-                    0u32,
-                )
-            };
-
-            if ret < 0 {
-                return Err(format!(
-                    "landlock_add_rule for {path} failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-
+        // Helper: add a path rule (skip paths that don't exist)
+        let mut add_rule = |path: &str, access: landlock::BitFlags<AccessFs>| -> Result<(), String> {
+            let Ok(fd) = PathFd::new(path) else { return Ok(()) };
+            ruleset.as_mut()
+                .add_rule(PathBeneath::new(fd, access))
+                .map_err(|e| format!("landlock add_rule for {path}: {e}"))?;
             Ok(())
         };
 
@@ -172,52 +93,32 @@ fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
         ];
 
         for sys_path in &system_paths {
-            let _ = add_rule(sys_path, ALL_READ);
+            let _ = add_rule(sys_path, read_access);
         }
 
         if policy.read_only {
-            // Read-only mode: grant read access everywhere (or to scoped paths)
             if policy.allowed_paths.is_empty() {
-                // Unrestricted read — add / with read access
-                add_rule("/", ALL_READ)?;
+                add_rule("/", read_access)?;
             } else {
-                // Scoped read
                 for path in &policy.allowed_paths {
-                    let p = path.to_string_lossy();
-                    add_rule(&p, ALL_READ)?;
+                    add_rule(&path.to_string_lossy(), read_access)?;
                 }
             }
-            // Always allow writing to /tmp and /var/tmp for temp files
-            let _ = add_rule("/tmp", ALL_READ | ALL_WRITE);
-            let _ = add_rule("/var/tmp", ALL_READ | ALL_WRITE);
+            let _ = add_rule("/tmp", all_access);
+            let _ = add_rule("/var/tmp", all_access);
         } else {
-            // Write-enabled mode with path scoping
             if policy.allowed_paths.is_empty() {
-                // No path restrictions — grant full access to everything
-                add_rule("/", ALL_ACCESS)?;
+                add_rule("/", all_access)?;
             } else {
-                // Read everything, write only to specified paths
-                add_rule("/", ALL_READ)?;
+                add_rule("/", read_access)?;
                 for path in &policy.allowed_paths {
-                    let p = path.to_string_lossy();
-                    add_rule(&p, ALL_ACCESS)?;
+                    add_rule(&path.to_string_lossy(), all_access)?;
                 }
             }
         }
 
-        // Enforce the ruleset
-        let ret = unsafe {
-            libc::syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32)
-        };
-
-        unsafe { libc::close(ruleset_fd) };
-
-        if ret < 0 {
-            return Err(format!(
-                "landlock_restrict_self failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        ruleset.restrict_self()
+            .map_err(|e| format!("landlock restrict_self: {e}"))?;
     }
 
     #[cfg(not(target_os = "linux"))]
