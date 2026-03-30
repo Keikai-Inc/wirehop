@@ -208,6 +208,18 @@ async fn main() -> Result<()> {
             cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
         }
         Command::External(args) => {
+            // Check for remote subcommand: hop <host> secrets/cap/kv/cron ...
+            if args.len() >= 2 {
+                match args[1].as_str() {
+                    "secrets" | "cap" | "kv" | "cron" => {
+                        let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+                        let _secret_key = config::load_or_generate_identity(&config_dir)?;
+                        return cmd_remote_peer_op(&args[0], &args[1..], &config_dir).await
+                    }
+                    _ => {}
+                }
+            }
+
             let ext = parse_external_args(&args)?;
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
@@ -659,6 +671,15 @@ async fn dispatch_session(
             tracing::info!("Starting exec session with client sandbox: {command}");
             shell::host_exec_session(send, recv, &command, username, &merged, protocol_version).await?;
         }
+        Some(ClientMessage::RequestPeerOp(request)) => {
+            tracing::info!("Peer op from {}: {:?}", peer_id, request);
+            let response = hop_core::peer_ops::handle_peer_request(
+                request,
+                config_dir,
+                &datastore,
+            );
+            proto::write_message(&mut send, &proto::HostMessage::PeerResponse(response)).await?;
+        }
         Some(ClientMessage::RequestAdmin(request)) => {
             if *role != config::PeerRole::Creator {
                 tracing::warn!("Non-creator peer {} attempted admin request", peer_id);
@@ -682,7 +703,7 @@ async fn dispatch_session(
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
         Some(other) => {
-            tracing::warn!("Expected RequestShell, RequestTransfer, or RequestExec, got: {:?}", other);
+            tracing::warn!("Expected RequestShell/Transfer/Exec/Admin/PeerOp, got: {:?}", other);
         }
         None => {
             tracing::warn!("No session request message received");
@@ -2563,6 +2584,239 @@ fn cmd_secrets(config_dir: &std::path::Path, action: SecretsAction) -> Result<()
             } else {
                 println!("(not found)");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Handle remote peer operations: `hop <host> secrets/cap/kv/cron ...`
+///
+/// Opens a QUIC connection to the host, sends a PeerRequest, and displays the response.
+async fn cmd_remote_peer_op(target: &str, args: &[String], config_dir: &std::path::Path) -> Result<()> {
+    use hop_core::proto::HostMessage;
+
+    // Parse the subcommand and build a PeerRequest
+    let subcmd = args.first().context("no subcommand")?;
+    let sub_args = &args[1..];
+
+    let request = match subcmd.as_str() {
+        "secrets" => parse_remote_secrets(sub_args)?,
+        "kv" => parse_remote_kv(sub_args)?,
+        "cron" => parse_remote_cron(sub_args)?,
+        "cap" => parse_remote_cap(sub_args)?,
+        other => anyhow::bail!("unknown remote subcommand: {other}"),
+    };
+
+    // Connect and send the request
+    let (_resolved, send, mut recv) = mux::connect_to_host(
+        config_dir,
+        target,
+        None,
+        &hop_core::proto::ClientMessage::RequestPeerOp(request),
+    ).await?;
+
+    // Read response
+    let response: HostMessage = hop_core::proto::read_message(&mut recv).await?;
+    drop(send); // close the send side
+
+    match response {
+        HostMessage::PeerResponse(resp) => display_peer_response(subcmd, sub_args, resp),
+        HostMessage::SessionError(msg) => {
+            anyhow::bail!("host error: {msg}");
+        }
+        other => {
+            anyhow::bail!("unexpected response: {other:?}");
+        }
+    }
+}
+
+fn parse_remote_secrets(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "get" => {
+            let name = args.get(1).context("usage: hop <host> secrets get <name>")?;
+            Ok(PeerRequest::SecretsGet { name: name.clone() })
+        }
+        "set" => {
+            let name = args.get(1).context("usage: hop <host> secrets set <name> <value>")?;
+            let value = if let Some(v) = args.get(2) {
+                v.clone()
+            } else {
+                use std::io::{IsTerminal, Read};
+                if std::io::stdin().is_terminal() {
+                    eprint!("Enter secret value: ");
+                    let mut buf = String::new();
+                    std::io::stdin().read_line(&mut buf)?;
+                    buf.trim_end().to_string()
+                } else {
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim_end().to_string()
+                }
+            };
+            Ok(PeerRequest::SecretsSet { name: name.clone(), value: value.into_bytes() })
+        }
+        "delete" => {
+            let name = args.get(1).context("usage: hop <host> secrets delete <name>")?;
+            Ok(PeerRequest::SecretsDelete { name: name.clone() })
+        }
+        "list" => Ok(PeerRequest::SecretsList),
+        _ => anyhow::bail!("usage: hop <host> secrets [get|set|delete|list] ..."),
+    }
+}
+
+fn parse_remote_kv(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    let ns = "default";
+    match action {
+        "get" => {
+            let key = args.get(1).context("usage: hop <host> kv get <key>")?;
+            Ok(PeerRequest::KvGet { ns: ns.into(), key: key.clone() })
+        }
+        "set" => {
+            let key = args.get(1).context("usage: hop <host> kv set <key> <value>")?;
+            let value = args.get(2).context("usage: hop <host> kv set <key> <value>")?;
+            Ok(PeerRequest::KvSet { ns: ns.into(), key: key.clone(), value: value.as_bytes().to_vec() })
+        }
+        "list" => {
+            let prefix = args.get(1).cloned().unwrap_or_default();
+            Ok(PeerRequest::KvList { ns: ns.into(), prefix })
+        }
+        _ => anyhow::bail!("usage: hop <host> kv [get|set|list] ..."),
+    }
+}
+
+fn parse_remote_cron(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "list" => Ok(PeerRequest::CronList),
+        "get" => {
+            let id = args.get(1).context("usage: hop <host> cron get <id>")?;
+            Ok(PeerRequest::CronGet { id: id.clone() })
+        }
+        _ => anyhow::bail!("usage: hop <host> cron [list|get] ..."),
+    }
+}
+
+fn parse_remote_cap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "status" => Ok(PeerRequest::CapStatus),
+        "disable" => {
+            let id = args.get(1).context("usage: hop <host> cap disable <id>")?;
+            Ok(PeerRequest::CapDisable { id: id.clone() })
+        }
+        "list" => Ok(PeerRequest::CapList),
+        _ => anyhow::bail!("usage: hop <host> cap [status|disable|list] ..."),
+    }
+}
+
+fn display_peer_response(_subcmd: &str, _args: &[String], resp: hop_core::proto::PeerResponse) -> Result<()> {
+    use hop_core::proto::PeerResponse;
+    match resp {
+        PeerResponse::Ok => {
+            println!("OK");
+        }
+        PeerResponse::Error(msg) => {
+            anyhow::bail!("{msg}");
+        }
+        PeerResponse::SecretValue(Some(value)) => {
+            let text = String::from_utf8_lossy(&value);
+            println!("{text}");
+        }
+        PeerResponse::SecretValue(None) => {
+            println!("(not found)");
+        }
+        PeerResponse::SecretNames(names) => {
+            if names.is_empty() {
+                println!("No secrets stored.");
+            } else {
+                for name in &names {
+                    println!("  {name}");
+                }
+            }
+        }
+        PeerResponse::KvEntry(Some(entry)) => {
+            let text = String::from_utf8_lossy(&entry.value);
+            println!("{text}");
+        }
+        PeerResponse::KvEntry(None) => {
+            println!("(not found)");
+        }
+        PeerResponse::KvEntries(entries) => {
+            if entries.is_empty() {
+                println!("No keys found.");
+            } else {
+                for (key, entry) in &entries {
+                    let value = String::from_utf8_lossy(&entry.value);
+                    let truncated = if value.len() > 80 { format!("{}...", &value[..77]) } else { value.to_string() };
+                    println!("  {key} = {truncated}");
+                }
+            }
+        }
+        PeerResponse::CapEntries(caps) => {
+            if caps.is_empty() {
+                println!("No capabilities available.");
+            } else {
+                for cap in &caps {
+                    println!("  {:20} {} [{}] [{}]", cap.id, cap.description.split('.').next().unwrap_or(""), cap.tier, cap.trigger);
+                }
+            }
+        }
+        PeerResponse::CapStatusEntries(jobs) => {
+            if jobs.is_empty() {
+                println!("No capabilities enabled.");
+            } else {
+                println!("Enabled capabilities:\n");
+                for j in &jobs {
+                    let status = if j.enabled { "active" } else { "paused" };
+                    let targets = j.targets.as_deref().unwrap_or("local");
+                    let last = j.last_run
+                        .map(|t| {
+                            let ago = unix_now_ms().saturating_sub(t);
+                            format!("{}ms ago", ago)
+                        })
+                        .unwrap_or_else(|| "never".into());
+                    println!("  {:30} [{}] targets={} schedule={} last_run={}",
+                        j.catalog_id, status, targets, j.schedule, last);
+                }
+            }
+        }
+        PeerResponse::CapEnabled { job_id } => {
+            println!("Enabled (job {job_id})");
+        }
+        PeerResponse::CapTriggered { job_id } => {
+            println!("Triggered (job {job_id})");
+        }
+        PeerResponse::CronJobs(jobs) => {
+            if jobs.is_empty() {
+                println!("No cron jobs.");
+            } else {
+                for j in &jobs {
+                    let status = if j.enabled { "active" } else { "paused" };
+                    println!("  {} {:30} [{}] schedule={}", j.id, j.name, status, j.schedule);
+                }
+            }
+        }
+        PeerResponse::CronJob(Some(j)) => {
+            println!("ID:       {}", j.id);
+            println!("Name:     {}", j.name);
+            println!("Schedule: {}", j.schedule);
+            println!("Enabled:  {}", j.enabled);
+            if let Some(last) = j.last_run {
+                println!("Last run: {last}");
+            }
+            println!("Next run: {}", j.next_run);
+            if let Some(targets) = &j.targets {
+                println!("Targets:  {targets}");
+            }
+        }
+        PeerResponse::CronJob(None) => {
+            println!("(not found)");
         }
     }
     Ok(())

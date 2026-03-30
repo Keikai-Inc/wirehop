@@ -1103,8 +1103,8 @@ async fn client_shell_loop(
                     Ok(HostMessage::SessionInfo { .. }) => {
                         // Late SessionInfo — ignore
                     }
-                    Ok(HostMessage::AdminResponse(_)) => {
-                        // Unexpected admin response during shell session — ignore
+                    Ok(HostMessage::AdminResponse(_)) | Ok(HostMessage::PeerResponse(_)) => {
+                        // Unexpected admin/peer response during shell session — ignore
                     }
                     Ok(HostMessage::SessionError(msg)) => {
                         eprintln!("\r\nHost error: {msg}");

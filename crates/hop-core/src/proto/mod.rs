@@ -43,6 +43,8 @@ pub enum HostMessage {
     /// Session setup error — sent instead of SessionInfo when the host
     /// cannot start a session (e.g. missing root privileges, invalid user).
     SessionError(String),
+    /// Response to a peer operation.
+    PeerResponse(PeerResponse),
 }
 
 /// Messages sent from the client to the host.
@@ -87,6 +89,8 @@ pub enum ClientMessage {
     SetEnv { vars: HashMap<String, String> },
     /// Admin request (hop/2+). Requires creator role.
     RequestAdmin(AdminRequest),
+    /// Peer operation (any authenticated peer). Secrets, KV, cap, cron.
+    RequestPeerOp(PeerRequest),
 }
 
 // --- Admin protocol (hop/2+) ---
@@ -277,6 +281,85 @@ pub struct RedeemHostEntry {
     pub node_id: String,
     pub relay_url: Option<String>,
     pub invite_token: String,
+}
+
+// --- Peer operations (any authenticated peer) ---
+
+/// Requests any authenticated peer can perform (no Creator role required).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PeerRequest {
+    SecretsGet { name: String },
+    SecretsSet { name: String, value: Vec<u8> },
+    SecretsDelete { name: String },
+    SecretsList,
+    CapList,
+    CapEnable {
+        id: String,
+        schedule: Option<String>,
+        targets: Option<String>,
+    },
+    CapDisable { id: String },
+    CapStatus,
+    CapRun {
+        id: String,
+        targets: Option<String>,
+        params: Vec<(String, String)>,
+    },
+    KvGet { ns: String, key: String },
+    KvSet { ns: String, key: String, value: Vec<u8> },
+    KvList { ns: String, prefix: String },
+    CronList,
+    CronGet { id: String },
+}
+
+/// Response to a PeerRequest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PeerResponse {
+    Ok,
+    Error(String),
+    SecretValue(Option<Vec<u8>>),
+    SecretNames(Vec<String>),
+    KvEntry(Option<super::datastore::types::KvEntry>),
+    KvEntries(Vec<(String, super::datastore::types::KvEntry)>),
+    CapEntries(Vec<CapInfo>),
+    CapStatusEntries(Vec<CapJobInfo>),
+    CapEnabled { job_id: String },
+    CapTriggered { job_id: String },
+    CronJobs(Vec<CronJobSummary>),
+    CronJob(Option<CronJobSummary>),
+}
+
+/// Summary info for a capability in `hop cap list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tier: String,
+    pub trigger: String,
+    pub category: String,
+}
+
+/// Status of an enabled capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapJobInfo {
+    pub catalog_id: String,
+    pub enabled: bool,
+    pub schedule: String,
+    pub targets: Option<String>,
+    pub last_run: Option<u64>,
+}
+
+/// Summary of a cron job (safe to send over the wire).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJobSummary {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub enabled: bool,
+    pub last_run: Option<u64>,
+    pub next_run: u64,
+    pub targets: Option<String>,
 }
 
 /// Chunk size for file data transfer (64 KiB).
