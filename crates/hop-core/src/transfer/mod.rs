@@ -145,8 +145,9 @@ pub async fn host_transfer_session(
             if crate::unix_user::is_running_as_root()
                 && let Some(user) = username
             {
+                let mode = if request.delete_extraneous { "sync-send-delete" } else { "sync-send" };
                 return helper::proxy_via_helper(
-                    &mut send, &mut recv, &base_path, user, &params, "sync-receive",
+                    &mut send, &mut recv, &base_path, user, &params, mode,
                 ).await;
             }
             host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await

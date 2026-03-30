@@ -434,6 +434,74 @@ test_cp_pull_trailing_slash() {
     [ ! -d /tmp/e2e-pullcontents/e2e-pushdir ] || { echo "FAIL: unexpected nesting (e2e-pushdir/ exists)"; return 1; }
 }
 
+# ── Sync Tests ──
+
+test_sync_push() {
+    # Create a local directory with known content
+    rm -rf /tmp/e2e-syncdir
+    mkdir -p /tmp/e2e-syncdir/sub
+    echo "sync-a" > /tmp/e2e-syncdir/a.txt
+    echo "sync-b" > /tmp/e2e-syncdir/sub/b.txt
+
+    # Clean remote destination
+    hop --config "$CONFIG_DIR" exec host-a -- rm -rf /tmp/e2e-syncdest 2>&1 || true
+    hop --config "$CONFIG_DIR" exec host-a -- mkdir -p /tmp/e2e-syncdest 2>&1
+
+    # Sync push (local → remote)
+    hop --config "$CONFIG_DIR" sync /tmp/e2e-syncdir/ host-a:/tmp/e2e-syncdest 2>&1
+
+    # Verify files arrived
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-syncdest/a.txt 2>&1)
+    assert_contains "$output" "sync-a"
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-syncdest/sub/b.txt 2>&1)
+    assert_contains "$output" "sync-b"
+
+    # Modify locally and re-sync — should update
+    echo "sync-a-updated" > /tmp/e2e-syncdir/a.txt
+    hop --config "$CONFIG_DIR" sync /tmp/e2e-syncdir/ host-a:/tmp/e2e-syncdest 2>&1
+
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- cat /tmp/e2e-syncdest/a.txt 2>&1)
+    assert_contains "$output" "sync-a-updated"
+}
+
+test_sync_pull() {
+    # Sync pull: pull the files that sync_push placed on host-a back to local
+    rm -rf /tmp/e2e-syncpull
+    mkdir -p /tmp/e2e-syncpull
+    hop --config "$CONFIG_DIR" sync host-a:/tmp/e2e-syncdest/ /tmp/e2e-syncpull 2>&1
+
+    # Verify the files from sync_push arrived
+    assert_contains "$(cat /tmp/e2e-syncpull/a.txt)" "sync-a-updated"
+    assert_contains "$(cat /tmp/e2e-syncpull/sub/b.txt)" "sync-b"
+}
+
+test_cp_ownership() {
+    # When daemon runs as root with a username-bound peer, transferred files
+    # should be owned by the bound user, not root.
+    # The e2e hosts run as root with creator invites that bind to user 'hop'.
+
+    # Push a file
+    echo "ownership-test" > /tmp/e2e-own.txt
+    hop --config "$CONFIG_DIR" cp /tmp/e2e-own.txt host-a:/tmp/e2e-own.txt 2>&1
+
+    # Check ownership on remote
+    local owner
+    owner=$(hop --config "$CONFIG_DIR" exec host-a -- stat -c '%U' /tmp/e2e-own.txt 2>&1)
+    # On root daemon with username binding, files should be owned by the bound user
+    # On non-root daemon, files are owned by the daemon's user
+    # Either way, should NOT be root (unless daemon itself is not root, which is fine)
+    if [ "$owner" = "root" ]; then
+        # Check if daemon is running as root — if so, this is a bug
+        local euid
+        euid=$(hop --config "$CONFIG_DIR" exec host-a -- id -u 2>&1)
+        if [ "$euid" = "0" ]; then
+            echo "FAIL: file owned by root but daemon runs as root with user binding"
+            return 1
+        fi
+    fi
+}
+
 # ── JS Bindings Tests (hop.exec / hop.fleet) ──
 
 test_js_exec_on_host() {

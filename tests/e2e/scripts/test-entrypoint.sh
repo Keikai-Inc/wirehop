@@ -142,6 +142,13 @@ run_test test_cp_push_recursive
 run_test test_cp_push_trailing_slash
 run_test test_cp_pull_recursive
 run_test test_cp_pull_trailing_slash
+run_test test_cp_ownership
+
+# ── Sync ──
+echo ""
+echo "--- Sync ---"
+run_test test_sync_push
+run_test test_sync_pull
 
 # ── JS Bindings (hop.exec / hop.fleet) ──
 echo ""
