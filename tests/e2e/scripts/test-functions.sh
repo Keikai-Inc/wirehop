@@ -614,3 +614,153 @@ test_monitor_cron_with_exec() {
     ts_text=$(mcp_result_text "$ts_response")
     assert_contains "$ts_text" "99.1"
 }
+
+# ── Secrets via Remote Peer Ops (CLI) ──
+
+test_secrets_set_get() {
+    # Set a secret on host-a via remote peer op, then retrieve it
+    hop --config "$CONFIG_DIR" host-a secrets set e2e-secret-key e2e-secret-value 2>&1
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a secrets get e2e-secret-key 2>&1)
+    assert_contains "$output" "e2e-secret-value"
+}
+
+test_secrets_list() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a secrets list 2>&1)
+    assert_contains "$output" "e2e-secret-key"
+}
+
+test_secrets_delete() {
+    hop --config "$CONFIG_DIR" host-a secrets delete e2e-secret-key 2>&1
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a secrets get e2e-secret-key 2>&1)
+    assert_contains "$output" "(not found)"
+}
+
+# ── Secrets from JS Tests ──
+
+test_js_secrets_roundtrip() {
+    # Set and get a secret via JS runtime (hop.secrets.set / hop.secrets.get)
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"hop.secrets.set(\"js-test-key\", \"js-test-value\"); return hop.secrets.get(\"js-test-key\");"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "js-test-value"
+}
+
+test_js_secrets_list() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_exec","arguments":{"code":"return JSON.stringify(hop.secrets.list());"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "js-test-key"
+}
+
+# ── Secrets via MCP hop_data tool ──
+
+test_mcp_secrets_set() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"secrets_set","name":"mcp-secret","value":"mcp-secret-val"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "ok"
+}
+
+test_mcp_secrets_get() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"secrets_get","name":"mcp-secret"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "mcp-secret-val"
+}
+
+test_mcp_secrets_list() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"secrets_list"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "mcp-secret"
+}
+
+test_mcp_secrets_delete() {
+    local request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hop_data","arguments":{"action":"secrets_delete","name":"mcp-secret"}}}'
+    local response
+    response=$(mcp_call "$request")
+
+    local text
+    text=$(mcp_result_text "$response")
+    assert_contains "$text" "deleted"
+}
+
+# ── Capabilities Tests ──
+
+test_cap_list() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" exec host-a -- hop cap list 2>&1)
+    assert_contains "$output" "health"
+    assert_contains "$output" "email-monitor"
+}
+
+test_cap_enable_disable() {
+    # Enable health capability
+    hop --config "$CONFIG_DIR" exec host-a -- hop cap enable health 2>&1
+    local status
+    status=$(hop --config "$CONFIG_DIR" exec host-a -- hop cap status 2>&1)
+    assert_contains "$status" "cap:health"
+
+    # Disable it
+    hop --config "$CONFIG_DIR" exec host-a -- hop cap disable health 2>&1
+    status=$(hop --config "$CONFIG_DIR" exec host-a -- hop cap status 2>&1)
+    # Should not contain health anymore (or say "No capabilities")
+    if echo "$status" | grep -q "cap:health"; then
+        echo "FAIL: health still enabled after disable"
+        return 1
+    fi
+}
+
+# ── Remote Peer Ops Tests ──
+
+test_remote_secrets_roundtrip() {
+    # Set a secret on host-a from the test runner (remote peer op)
+    hop --config "$CONFIG_DIR" host-a secrets set remote-test-key "remote-test-val" 2>&1
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a secrets get remote-test-key 2>&1)
+    assert_contains "$output" "remote-test-val"
+}
+
+test_remote_secrets_list() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a secrets list 2>&1)
+    assert_contains "$output" "remote-test-key"
+}
+
+test_remote_cap_status() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a cap status 2>&1)
+    # Should succeed (may say "No capabilities enabled" — that's fine)
+    if [ $? -ne 0 ]; then
+        echo "FAIL: remote cap status failed: $output"
+        return 1
+    fi
+}
+
+test_remote_cron_list() {
+    local output
+    output=$(hop --config "$CONFIG_DIR" host-a cron list 2>&1)
+    # Should succeed
+    if [ $? -ne 0 ]; then
+        echo "FAIL: remote cron list failed: $output"
+        return 1
+    fi
+}

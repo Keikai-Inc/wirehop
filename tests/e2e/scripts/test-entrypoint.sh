@@ -163,6 +163,41 @@ echo "--- Monitoring Pipeline ---"
 run_test test_monitor_collect_and_query
 run_test test_monitor_cron_with_exec
 
+# ── Secrets CLI ──
+echo ""
+echo "--- Secrets CLI ---"
+run_test test_secrets_set_get
+run_test test_secrets_list
+run_test test_secrets_delete
+
+# ── Secrets from JS ──
+echo ""
+echo "--- Secrets (JS Runtime) ---"
+run_test test_js_secrets_roundtrip
+run_test test_js_secrets_list
+
+# ── Secrets via MCP ──
+echo ""
+echo "--- Secrets (MCP) ---"
+run_test test_mcp_secrets_set
+run_test test_mcp_secrets_get
+run_test test_mcp_secrets_list
+run_test test_mcp_secrets_delete
+
+# ── Capabilities ──
+echo ""
+echo "--- Capabilities ---"
+run_test test_cap_list
+run_test test_cap_enable_disable
+
+# ── Remote Peer Ops ──
+echo ""
+echo "--- Remote Peer Ops ---"
+run_test test_remote_secrets_roundtrip
+run_test test_remote_secrets_list
+run_test test_remote_cap_status
+run_test test_remote_cron_list
+
 # ── Results ──
 echo ""
 echo "========================================="
