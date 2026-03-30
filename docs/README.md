@@ -1,0 +1,34 @@
+# hop Documentation
+
+## Product Documentation (`docs/product/`)
+
+What hop does — user-facing behavior, CLI commands, JS APIs.
+
+| Document | Description |
+|----------|-------------|
+| [overview.md](product/overview.md) | Vision, why hop exists, core user flows, architecture diagram |
+| [cli-reference.md](product/cli-reference.md) | Every CLI command with flags and examples |
+| [capabilities.md](product/capabilities.md) | `hop cap` — built-in automation (health, log-search, security-baseline) |
+| [orchestration.md](product/orchestration.md) | Secrets store, HTTP binding, OAuth proxy, email monitoring |
+| [js-api.md](product/js-api.md) | Complete `hop.*` JS runtime reference (all bindings) |
+| [datastore.md](product/datastore.md) | KV, time-series, cron scheduling, secrets, retention |
+| [fleet.md](product/fleet.md) | Fleet management, roles, aggregate invites |
+| [transfer.md](product/transfer.md) | `hop cp`, `hop sync`, delta transfer, compression |
+| [security.md](product/security.md) | Sandbox system, auth, invites, privilege separation |
+| [mcp.md](product/mcp.md) | MCP server, tools, skills library, AI agent integration |
+| [sessions.md](product/sessions.md) | Shell sessions, persistence, reconnection, connection agent |
+
+## Technical Documentation (`docs/technical/`)
+
+How hop works — protocols, algorithms, internal architecture.
+
+| Document | Description |
+|----------|-------------|
+| [architecture.md](technical/architecture.md) | Crate layout, module map, dependency flow |
+| [protocol.md](technical/protocol.md) | Wire protocol (ALPN V1/V2/V3), message types, admin protocol |
+| [crypto.md](technical/crypto.md) | Ed25519 identity, Argon2 auth, ChaCha20-Poly1305 secrets |
+| [datastore.md](technical/datastore.md) | redb tables, IPC protocol, DsRequest/DsResponse, retention |
+| [sandbox.md](technical/sandbox.md) | Validator, broker, macOS Seatbelt, Linux Landlock, policy composition |
+| [transfer.md](technical/transfer.md) | Delta algorithm, negotiation, privilege-separated helper |
+| [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |
+| [networking.md](technical/networking.md) | iroh endpoint, relay, netmon, agent/mux IPC, reconnection |
