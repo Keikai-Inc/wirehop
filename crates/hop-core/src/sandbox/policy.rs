@@ -101,6 +101,17 @@ impl SandboxPolicy {
         }
     }
 
+    /// Preset: connect access. Read-only but network-enabled (for API integrations).
+    pub fn preset_connect() -> Self {
+        Self {
+            read_only: true,
+            no_network: false,
+            allowed_paths: Vec::new(),
+            allowed_commands: Vec::new(),
+            denied_commands: default_denied_commands(),
+        }
+    }
+
     /// Preset: deploy access. Write-enabled, network-enabled, scoped to cwd.
     pub fn preset_deploy() -> Self {
         // Scope to current working directory — caller should resolve this.
@@ -118,6 +129,7 @@ impl SandboxPolicy {
         match name {
             "monitor" => Some(Self::preset_monitor()),
             "audit" => Some(Self::preset_audit()),
+            "connect" => Some(Self::preset_connect()),
             "deploy" => Some(Self::preset_deploy()),
             _ => None,
         }

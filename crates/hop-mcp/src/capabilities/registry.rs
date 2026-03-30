@@ -45,5 +45,20 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
             category: "security",
             params: &[],
         },
+        CapabilityDefinition {
+            id: "email-monitor",
+            name: "Email Monitor",
+            description: "Daily Gmail triage and morning briefing. Fetches unread emails, \
+                classifies by urgency (URGENT/ACTION/FYI) using Claude, sends a briefing \
+                email, and marks FYI messages as read. Urgent and action-required emails \
+                stay unread. Requires secrets: google_client_id, google_client_secret, \
+                gmail_refresh_token, ANTHROPIC_API_KEY.",
+            tier: PermissionTier::Connect,
+            trigger: TriggerMode::Both { default_schedule: "0 0 7 * * *" },
+            data_pattern: DataPattern::Push,
+            script: include_str!("scripts/email_monitor.js"),
+            category: "automation",
+            params: &[],
+        },
     ]
 }

@@ -25,6 +25,8 @@ pub enum PermissionTier {
     Observe,
     /// Read-only, no network, full filesystem read.
     Audit,
+    /// Read-only, network allowed (API integrations).
+    Connect,
     /// Write + network, deny destructive.
     Operate,
 }
@@ -35,6 +37,7 @@ impl PermissionTier {
         match self {
             PermissionTier::Observe => SandboxPolicy::preset_monitor(),
             PermissionTier::Audit => SandboxPolicy::preset_audit(),
+            PermissionTier::Connect => SandboxPolicy::preset_connect(),
             PermissionTier::Operate => SandboxPolicy::preset_deploy(),
         }
     }
@@ -43,6 +46,7 @@ impl PermissionTier {
         match self {
             PermissionTier::Observe => "monitor",
             PermissionTier::Audit => "audit",
+            PermissionTier::Connect => "connect",
             PermissionTier::Operate => "deploy",
         }
     }
