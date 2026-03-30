@@ -213,6 +213,19 @@ fn dispatch_request(ds: &Datastore, req: DsRequest) -> Result<DsResponse> {
             ds.cron_update_last_run(&id, ts, next_run)?;
             DsResponse::Ok
         }
+        DsRequest::SecretsGet { name } => {
+            DsResponse::SecretValue(ds.secrets_get(&name)?)
+        }
+        DsRequest::SecretsSet { name, value } => {
+            ds.secrets_set(&name, &value)?;
+            DsResponse::Ok
+        }
+        DsRequest::SecretsDelete { name } => {
+            DsResponse::Bool(ds.secrets_delete(&name)?)
+        }
+        DsRequest::SecretsList => {
+            DsResponse::SecretNames(ds.secrets_list()?)
+        }
     })
 }
 

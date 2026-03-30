@@ -58,6 +58,17 @@ pub struct CronJob {
     pub sandbox: Option<SandboxPolicy>,
 }
 
+/// An encrypted secret stored in the secrets table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedSecret {
+    /// ChaCha20-Poly1305 ciphertext (plaintext + 16-byte auth tag).
+    pub ciphertext: Vec<u8>,
+    /// 12-byte random nonce used for this encryption.
+    pub nonce: [u8; 12],
+    /// Unix timestamp in milliseconds when the secret was last updated.
+    pub updated_at: u64,
+}
+
 /// Query parameters for time-series range queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeSeriesQuery {

@@ -13,3 +13,6 @@ pub const CRON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cron"
 
 /// Metadata: key → bincode-encoded value (schema version, retention policies, etc.).
 pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// Encrypted secrets: secret_name → bincode-encoded SealedSecret.
+pub const SECRETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");

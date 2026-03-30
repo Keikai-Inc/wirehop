@@ -778,6 +778,55 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    // __hop_secrets_get(name) → value string or "null"
+    {
+        let ds = ds.clone();
+        globals.set("__hop_secrets_get",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String| -> rquickjs::Result<String> {
+                match ds.secrets_get(&name) {
+                    Ok(Some(value)) => Ok(String::from_utf8_lossy(&value).to_string()),
+                    Ok(None) => Ok("null".to_string()),
+                    Err(e) => Err(js_err(format!("hop.secrets.get failed: {e}"))),
+                }
+            }).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_secrets_set(name, value) → void
+    {
+        let ds = ds.clone();
+        globals.set("__hop_secrets_set",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String, value: String| -> rquickjs::Result<()> {
+                ds.secrets_set(&name, value.as_bytes())
+                    .map_err(|e| js_err(format!("hop.secrets.set failed: {e}")))
+            }).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_secrets_delete(name) → boolean
+    {
+        let ds = ds.clone();
+        globals.set("__hop_secrets_delete",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String| -> rquickjs::Result<bool> {
+                ds.secrets_delete(&name)
+                    .map_err(|e| js_err(format!("hop.secrets.delete failed: {e}")))
+            }).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // __hop_secrets_list() → JSON array of names
+    {
+        let ds = ds.clone();
+        globals.set("__hop_secrets_list",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>| -> rquickjs::Result<String> {
+                match ds.secrets_list() {
+                    Ok(names) => Ok(serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())),
+                    Err(e) => Err(js_err(format!("hop.secrets.list failed: {e}"))),
+                }
+            }).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     Ok(())
 }
 
@@ -832,6 +881,21 @@ fn install_datastore_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
                 return JSON.parse(__hop_cron_list());
             }
         };
+        hop.secrets = {
+            get: function(name) {
+                var r = __hop_secrets_get(name);
+                return r === "null" ? null : r;
+            },
+            set: function(name, value) {
+                __hop_secrets_set(name, String(value));
+            },
+            delete: function(name) {
+                return __hop_secrets_delete(name);
+            },
+            list: function() {
+                return JSON.parse(__hop_secrets_list());
+            }
+        };
     "#;
 
     ctx.eval::<(), _>(js_code)
@@ -856,6 +920,12 @@ fn install_datastore_stubs(ctx: &Ctx<'_>) -> Result<()> {
         };
         hop.cron = {
             list: function() { throw new Error("hop.cron.* requires a datastore (run in host mode)"); }
+        };
+        hop.secrets = {
+            get: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); },
+            set: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); },
+            delete: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); },
+            list: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); }
         };
     "#;
 

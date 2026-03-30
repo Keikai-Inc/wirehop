@@ -22,6 +22,10 @@ pub enum DsRequest {
     CronFindByCatalogId { catalog_id: String },
     CronGetDue { now_ms: u64 },
     CronUpdateLastRun { id: String, ts: u64, next_run: u64 },
+    SecretsGet { name: String },
+    SecretsSet { name: String, value: Vec<u8> },
+    SecretsDelete { name: String },
+    SecretsList,
 }
 
 /// Response from the daemon's datastore to a client.
@@ -36,4 +40,6 @@ pub enum DsResponse {
     TsLatest(Option<(u64, MetricPoint)>),
     CronJob(Box<Option<CronJob>>),
     CronJobs(Vec<CronJob>),
+    SecretValue(Option<Vec<u8>>),
+    SecretNames(Vec<String>),
 }

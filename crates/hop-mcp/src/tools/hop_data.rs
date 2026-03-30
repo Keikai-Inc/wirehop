@@ -23,18 +23,19 @@ struct DataArgs {
     end: Option<u64>,
     tags: Option<BTreeMap<String, String>>,
     limit: Option<usize>,
+    name: Option<String>,
 }
 
 pub fn tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "hop_data".into(),
-        description: "Store and query data in hop's embedded datastore. Supports key-value storage (namespaced) and time-series metrics. Data persists across restarts.".into(),
+        description: "Store and query data in hop's embedded datastore. Supports key-value storage (namespaced), time-series metrics, and encrypted secrets. Data persists across restarts.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["kv_get", "kv_set", "kv_delete", "kv_list", "ts_insert", "ts_query", "ts_latest"],
+                    "enum": ["kv_get", "kv_set", "kv_delete", "kv_list", "ts_insert", "ts_query", "ts_latest", "secrets_get", "secrets_set", "secrets_delete", "secrets_list"],
                     "description": "The datastore operation to perform"
                 },
                 "namespace": {
@@ -76,6 +77,10 @@ pub fn tool_definition() -> ToolDefinition {
                 "limit": {
                     "type": "integer",
                     "description": "Max results for ts_query"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Secret name (required for secrets_get, secrets_set, secrets_delete)"
                 }
             },
             "required": ["action"]
@@ -97,6 +102,10 @@ pub fn call(datastore: &Datastore, args: Value) -> ToolCallResult {
         "ts_insert" => ts_insert(datastore, &args),
         "ts_query" => ts_query(datastore, &args),
         "ts_latest" => ts_latest(datastore, &args),
+        "secrets_get" => secrets_get(datastore, &args),
+        "secrets_set" => secrets_set(datastore, &args),
+        "secrets_delete" => secrets_delete(datastore, &args),
+        "secrets_list" => secrets_list(datastore),
         other => ToolCallResult::error(format!("Unknown action: {other}")),
     }
 }
@@ -274,6 +283,55 @@ fn ts_latest(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
         ),
         Ok(None) => ToolCallResult::text("null"),
         Err(e) => ToolCallResult::error(format!("ts_latest failed: {e}")),
+    }
+}
+
+fn secrets_get(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
+    let name = match args.name.as_deref() {
+        Some(n) => n,
+        None => return ToolCallResult::error("name is required for secrets_get"),
+    };
+    match ds.secrets_get(name) {
+        Ok(Some(value)) => {
+            let text = String::from_utf8_lossy(&value);
+            ToolCallResult::text(text.to_string())
+        }
+        Ok(None) => ToolCallResult::text("null"),
+        Err(e) => ToolCallResult::error(format!("secrets_get failed: {e}")),
+    }
+}
+
+fn secrets_set(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
+    let name = match args.name.as_deref() {
+        Some(n) => n,
+        None => return ToolCallResult::error("name is required for secrets_set"),
+    };
+    let value = match &args.value {
+        Some(Value::String(s)) => s.as_bytes().to_vec(),
+        Some(v) => serde_json::to_vec(v).unwrap_or_default(),
+        None => return ToolCallResult::error("value is required for secrets_set"),
+    };
+    match ds.secrets_set(name, &value) {
+        Ok(()) => ToolCallResult::text(json!({"ok": true}).to_string()),
+        Err(e) => ToolCallResult::error(format!("secrets_set failed: {e}")),
+    }
+}
+
+fn secrets_delete(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
+    let name = match args.name.as_deref() {
+        Some(n) => n,
+        None => return ToolCallResult::error("name is required for secrets_delete"),
+    };
+    match ds.secrets_delete(name) {
+        Ok(deleted) => ToolCallResult::text(json!({"deleted": deleted}).to_string()),
+        Err(e) => ToolCallResult::error(format!("secrets_delete failed: {e}")),
+    }
+}
+
+fn secrets_list(ds: &Datastore) -> ToolCallResult {
+    match ds.secrets_list() {
+        Ok(names) => ToolCallResult::text(serde_json::to_string_pretty(&names).unwrap_or_default()),
+        Err(e) => ToolCallResult::error(format!("secrets_list failed: {e}")),
     }
 }
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, TsAction};
+use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, SecretsAction, TsAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
@@ -160,6 +160,10 @@ async fn main() -> Result<()> {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             cmd_kv(&config_dir, action)
         }
+        Command::Secrets { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_secrets(&config_dir, action)
+        }
         Command::Ts { action } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             cmd_ts(&config_dir, action)
@@ -227,6 +231,7 @@ type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
     let public_key = secret_key.public();
+    let secrets_key = hop_core::datastore::derive_secrets_key(&secret_key.to_bytes());
     let endpoint = net::create_host_endpoint(secret_key).await?;
 
     let relay_url = net::host_relay_url(&endpoint);
@@ -413,7 +418,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 
     // Open datastore once; share with socket listener, cron scheduler, and admin handler
     let ds_path = config_dir.join("datastore.redb");
-    let datastore = hop_core::datastore::Datastore::open(&ds_path)?;
+    let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)?;
 
     // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
     let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
@@ -2501,6 +2506,63 @@ fn cmd_kv(config_dir: &std::path::Path, action: KvAction) -> Result<()> {
             };
             ds.kv_set(ns, &key, &entry)?;
             println!("OK");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_secrets(config_dir: &std::path::Path, action: SecretsAction) -> Result<()> {
+    let ds = hop_core::datastore::Datastore::connect(config_dir)
+        .context("Failed to connect to daemon — is `hop host` running?")?;
+
+    match action {
+        SecretsAction::Get { name } => {
+            match ds.secrets_get(&name)? {
+                Some(value) => {
+                    let text = String::from_utf8_lossy(&value);
+                    println!("{text}");
+                }
+                None => {
+                    println!("(not found)");
+                }
+            }
+        }
+        SecretsAction::Set { name, value } => {
+            let value = match value {
+                Some(v) => v,
+                None => {
+                    use std::io::{IsTerminal, Read};
+                    if std::io::stdin().is_terminal() {
+                        eprint!("Enter secret value: ");
+                        let mut buf = String::new();
+                        std::io::stdin().read_line(&mut buf)?;
+                        buf.trim_end().to_string()
+                    } else {
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf.trim_end().to_string()
+                    }
+                }
+            };
+            ds.secrets_set(&name, value.as_bytes())?;
+            println!("OK");
+        }
+        SecretsAction::List => {
+            let names = ds.secrets_list()?;
+            if names.is_empty() {
+                println!("No secrets stored.");
+            } else {
+                for name in &names {
+                    println!("  {name}");
+                }
+            }
+        }
+        SecretsAction::Delete { name } => {
+            if ds.secrets_delete(&name)? {
+                println!("Deleted.");
+            } else {
+                println!("(not found)");
+            }
         }
     }
     Ok(())

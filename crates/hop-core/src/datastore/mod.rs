@@ -8,6 +8,7 @@ pub mod cron;
 pub mod kv;
 pub mod protocol;
 pub mod retention;
+pub mod secrets;
 pub mod socket;
 pub mod tables;
 pub mod timeseries;
@@ -27,8 +28,22 @@ pub struct Datastore {
 }
 
 pub(crate) enum DatastoreInner {
-    Local(redb::Database),
+    Local {
+        db: redb::Database,
+        secrets_key: Option<[u8; 32]>,
+    },
     Remote(socket::DaemonConnection),
+}
+
+/// Derive the AEAD encryption key for secrets from an Ed25519 secret key.
+///
+/// Uses SHA-256 with a domain separator to prevent cross-protocol key reuse.
+pub fn derive_secrets_key(identity_key: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"hop-secrets-v1");
+    hasher.update(identity_key);
+    hasher.finalize().into()
 }
 
 /// Dispatch a request to the daemon socket and extract the expected response variant.
@@ -57,6 +72,17 @@ pub(crate) use remote_dispatch;
 impl Datastore {
     /// Open (or create) a datastore at the given file path (Local mode).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    /// Open (or create) a datastore with an encryption key for secrets.
+    ///
+    /// The key should be derived via [`derive_secrets_key`] from the Ed25519 identity.
+    pub fn open_with_secrets(path: &Path, secrets_key: [u8; 32]) -> Result<Self> {
+        Self::open_inner(path, Some(secrets_key))
+    }
+
+    fn open_inner(path: &Path, secrets_key: Option<[u8; 32]>) -> Result<Self> {
         let db = redb::Database::create(path)
             .with_context(|| format!("Failed to open datastore at {}", path.display()))?;
 
@@ -83,7 +109,7 @@ impl Datastore {
         }
 
         Ok(Self {
-            inner: Arc::new(DatastoreInner::Local(db)),
+            inner: Arc::new(DatastoreInner::Local { db, secrets_key }),
         })
     }
 
@@ -102,8 +128,26 @@ impl Datastore {
     /// methods return early via `remote_dispatch!`).
     fn local_db(&self) -> &redb::Database {
         match self.inner.as_ref() {
-            DatastoreInner::Local(db) => db,
+            DatastoreInner::Local { db, .. } => db,
             DatastoreInner::Remote(_) => unreachable!("local_db() called on Remote datastore"),
+        }
+    }
+
+    /// Get the secrets encryption key (Local mode only).
+    fn secrets_key(&self) -> Result<&[u8; 32]> {
+        match self.inner.as_ref() {
+            DatastoreInner::Local {
+                secrets_key: Some(key),
+                ..
+            } => Ok(key),
+            DatastoreInner::Local {
+                secrets_key: None, ..
+            } => {
+                Err(anyhow::anyhow!(
+                    "Secrets key not configured — open with open_with_secrets()"
+                ))
+            }
+            DatastoreInner::Remote(_) => unreachable!("secrets_key() called on Remote datastore"),
         }
     }
 }

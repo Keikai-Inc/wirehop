@@ -221,6 +221,12 @@ pub enum Command {
         action: KvAction,
     },
 
+    /// Manage encrypted secrets in the daemon datastore
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+
     /// Query time-series data from the daemon datastore
     Ts {
         #[command(subcommand)]
@@ -552,6 +558,29 @@ pub enum KvAction {
         key: String,
         /// Value
         value: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretsAction {
+    /// Get a secret's value
+    Get {
+        /// Secret name
+        name: String,
+    },
+    /// Set a secret (reads from stdin if value omitted)
+    Set {
+        /// Secret name
+        name: String,
+        /// Secret value (omit to enter interactively)
+        value: Option<String>,
+    },
+    /// List all secret names
+    List,
+    /// Delete a secret
+    Delete {
+        /// Secret name
+        name: String,
     },
 }
 
