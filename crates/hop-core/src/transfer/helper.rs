@@ -153,7 +153,13 @@ pub async fn run_transfer_helper(
             let base_dir = if dest.is_file() { dest.parent().unwrap_or(dest) } else { dest };
 
             super::sender::send_files(&mut stdout, base_dir, &entries, &progress, &params).await?;
-            let _errors = super::receiver::read_acks_until_done(&mut stdin, None).await?;
+            // Read one ack per entry sent (files + dirs + symlinks)
+            let ack_count = entries.len();
+            for _ in 0..ack_count {
+                let _ack: crate::proto::TransferMsg = crate::proto::read_message(&mut stdin).await?;
+            }
+            // Signal end of transfer — client reads until Done
+            crate::proto::write_message(&mut stdout, &crate::proto::TransferMsg::Done).await?;
         }
         "sync-receive" => {
             // Sync receive: read file list request, send our listing, receive plan, receive files

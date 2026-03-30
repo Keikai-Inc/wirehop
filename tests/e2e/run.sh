@@ -40,7 +40,7 @@ docker compose down -v 2>/dev/null || true
 
 # 4. Build Docker image + run tests
 echo "Building Docker image..."
-docker compose build
+DOCKER_BUILDKIT=0 docker compose build
 
 echo "Starting test containers..."
 echo ""
