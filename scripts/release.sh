@@ -125,6 +125,8 @@ if [[ "${SITE_ONLY}" == true ]]; then
     --content-type "text/html"
   aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
     --content-type "text/html"
+  aws s3 cp "${PROJECT_ROOT}/site/orchestration.html" "s3://${BUCKET}/orchestration.html" \
+    --content-type "text/html"
   aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
     --content-type "text/css"
   aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
@@ -142,7 +144,7 @@ if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
-    --paths "/" "/index.html" "/fleet.html" "/shared.css" "/shared.js" \
+    --paths "/" "/index.html" "/fleet.html" "/orchestration.html" "/shared.css" "/shared.js" \
       "/favicon.ico" "/favicon-32x32.png" \
       "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" \
     --output text --query 'Invalidation.Id'
@@ -291,6 +293,8 @@ aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
   --content-type "text/html"
 aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
   --content-type "text/html"
+aws s3 cp "${PROJECT_ROOT}/site/orchestration.html" "s3://${BUCKET}/orchestration.html" \
+  --content-type "text/html"
 aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
   --content-type "text/css"
 aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
@@ -324,7 +328,7 @@ git -C "${PROJECT_ROOT}" push --tags
 echo "==> Invalidating CloudFront cache"
 aws cloudfront create-invalidation \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
-  --paths "/" "/index.html" "/fleet.html" "/shared.css" "/shared.js" \
+  --paths "/" "/index.html" "/fleet.html" "/orchestration.html" "/shared.css" "/shared.js" \
     "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
     "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" \
     "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*" \

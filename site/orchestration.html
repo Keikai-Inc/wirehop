@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hop — Personal Cloud Automation</title>
+  <meta name="description" content="Turn any machine into an always-on automation backend. Schedule cron jobs, store encrypted credentials, call external APIs, and let AI manage it all.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    /* --- Orchestration page overrides ---------------------------------------- */
+
+    .steps-4 { grid-template-columns: repeat(4, 1fr); }
+
+    /* --- Capability cards ---------------------------------------------------- */
+
+    .cap-card {
+      position: relative;
+    }
+
+    .cap-card .cap-schedule {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--color-text-tertiary);
+      margin-top: 0.75rem;
+      padding: 0.25rem 0.625rem;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--color-border);
+      border-radius: 0.375rem;
+    }
+
+    /* --- Secrets grid (reuses daemon-grid pattern) --------------------------- */
+
+    .secrets-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+
+    .secrets-grid > * { min-width: 0; }
+
+    .secrets-info h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .secrets-info p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+      margin-bottom: 1.5rem;
+    }
+
+    .secrets-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .secrets-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .secrets-list li::before {
+      content: "\2713";
+      color: var(--color-accent-green);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 0.1rem;
+    }
+
+    /* --- Orchestration responsive -------------------------------------------- */
+
+    @media (max-width: 768px) {
+      .steps-4 { grid-template-columns: 1fr; }
+      .secrets-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Personal Cloud Automation</div>
+    <h1>Automate anything,<br><span class="gradient">from anywhere</span></h1>
+    <p>Turn any machine into an always-on automation backend. Schedule cron jobs, store encrypted credentials, call external APIs, and let AI manage it all — through a single binary.</p>
+    <div class="hero-actions">
+      <a href="#setup" class="btn btn-primary">Get Started</a>
+      <a href="#capabilities" class="btn btn-ghost">See Capabilities</a>
+    </div>
+  </div>
+
+  <!-- The Story -->
+  <section id="story">
+    <div class="container">
+      <div class="section-header">
+        <h2>Morning briefing in 60 seconds</h2>
+        <p>From zero to AI-powered email triage in three commands.</p>
+      </div>
+
+      <div class="steps">
+        <div class="step">
+          <h3>Store credentials</h3>
+          <p>Encrypt your API key on the remote host. ChaCha20-Poly1305 at rest, accessible from CLI, JS runtime, and MCP.</p>
+          <div style="margin-top: 0.75rem;"><code>hop RexMundi secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
+        </div>
+        <div class="step">
+          <h3>Enable the capability</h3>
+          <p>One command registers the cron schedule, wires up the script, and starts the automation.</p>
+          <div style="margin-top: 0.75rem;"><code>hop cap enable email-monitor</code></div>
+        </div>
+        <div class="step">
+          <h3>Wake up to a briefing</h3>
+          <p>Every morning: AI triages your inbox, sends a summary, and marks routine messages as read.</p>
+        </div>
+      </div>
+
+      <div style="margin-top: 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">email-monitor capability (condensed)</span>
+          </div>
+          <div class="code-body">
+<span class="comment">// Runs daily at 7 AM via hop cron</span>
+<span class="cmd">var</span> key = hop.secrets.get(<span class="flag">"ANTHROPIC_API_KEY"</span>);
+<span class="cmd">var</span> gmail = hop.secrets.get(<span class="flag">"GMAIL_TOKEN"</span>);
+
+<span class="comment">// Fetch unread messages</span>
+<span class="cmd">var</span> msgs = hop.http.get(<span class="flag">"https://gmail.googleapis.com/gmail/v1/users/me/messages"</span>, {
+    bearer: gmail, params: { q: <span class="flag">"is:unread"</span> }
+});
+
+<span class="comment">// Ask Claude to triage</span>
+<span class="cmd">var</span> briefing = hop.http.post(<span class="flag">"https://api.anthropic.com/v1/messages"</span>, {
+    bearer: key,
+    json: { model: <span class="flag">"claude-sonnet-4-20250514"</span>, messages: [
+        { role: <span class="flag">"user"</span>, content: <span class="flag">"Triage these emails: "</span> + JSON.stringify(msgs) }
+    ]}
+});
+
+<span class="comment">// Store the result</span>
+hop.kv.set(<span class="flag">"briefings"</span>, <span class="cmd">new</span> Date().toISOString().slice(<span class="url">0</span>, <span class="url">10</span>), briefing);
+hop.log(<span class="flag">"Briefing stored for "</span> + <span class="cmd">new</span> Date().toISOString().slice(<span class="url">0</span>, <span class="url">10</span>));
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Capabilities -->
+  <section id="capabilities">
+    <div class="container">
+      <div class="section-header">
+        <h2>Built-in capabilities</h2>
+        <p>Self-contained automation units. Enable with one command, disable with another.</p>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card card-green cap-card">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          </div>
+          <h3>Health Monitor</h3>
+          <p>CPU, memory, disk, and uptime. Stores metrics in the local datastore and alerts on thresholds.</p>
+          <span class="cap-schedule">Every 5 min</span>
+        </div>
+
+        <div class="card card-teal cap-card">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </div>
+          <h3>Log Search</h3>
+          <p>Search logs across your fleet. Grep through syslog, journald, and application logs from one command.</p>
+          <span class="cap-schedule">On-demand</span>
+        </div>
+
+        <div class="card card-red cap-card">
+          <div class="card-icon card-icon-red">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <h3>Security Baseline</h3>
+          <p>Audit SUID binaries, open ports, auth logs, and SSH key hygiene. Flags drift from a known-good baseline.</p>
+          <span class="cap-schedule">Daily 3 AM</span>
+        </div>
+
+        <div class="card card-amber cap-card">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          </div>
+          <h3>Email Monitor</h3>
+          <p>Gmail triage powered by Claude. Summarizes unread mail, marks routine as read, and stores a daily briefing.</p>
+          <span class="cap-schedule">Daily 7 AM</span>
+        </div>
+      </div>
+
+      <div style="margin-top: 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — Managing capabilities</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># List all available capabilities</span>
+<span class="prompt">$</span> <span class="cmd">hop cap list</span>
+<span class="output">  health-monitor     CPU, memory, disk, uptime        every 5m</span>
+<span class="output">  log-search         Search logs across fleet          on-demand</span>
+<span class="output">  security-baseline  SUID, ports, auth, SSH keys       daily 3 AM</span>
+<span class="output">  email-monitor      Gmail triage + AI briefing        daily 7 AM</span>
+
+<span class="comment"># Enable a capability</span>
+<span class="prompt">$</span> <span class="cmd">hop cap enable</span> <span class="flag">health</span>
+<span class="output">Enabled: health-monitor (every 5m)</span>
+
+<span class="comment"># Check status</span>
+<span class="prompt">$</span> <span class="cmd">hop cap status</span>
+<span class="output">  health-monitor     enabled    last run: 2m ago     OK</span>
+<span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span>
+
+<span class="comment"># Run a capability manually</span>
+<span class="prompt">$</span> <span class="cmd">hop cap run</span> <span class="flag">email-monitor</span>
+<span class="output">Running email-monitor... done (briefing stored)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Secrets & HTTP -->
+  <section id="secrets">
+    <div class="container">
+      <div class="section-header">
+        <h2>Encrypted secrets and native HTTP</h2>
+        <p>Store credentials safely. Call any API directly from automation scripts.</p>
+      </div>
+
+      <div class="secrets-grid">
+        <div class="secrets-info">
+          <h3>Secrets that stay secret</h3>
+          <p>API keys, OAuth tokens, and credentials are encrypted at rest with ChaCha20-Poly1305, keyed from your Ed25519 identity. Access them from the CLI, JS runtime, or MCP — never exposed in plaintext on disk.</p>
+          <h3>Native HTTP client</h3>
+          <p>Call any REST API directly from JS scripts. Bearer token auth, JSON request/response, and full header control — no curl, no external dependencies.</p>
+          <ul class="secrets-list">
+            <li><strong>ChaCha20-Poly1305</strong> encryption at rest</li>
+            <li><strong>CLI + JS + MCP</strong> access to secrets</li>
+            <li><strong>fetch-like API</strong> for HTTP requests</li>
+            <li><strong>Bearer tokens</strong> injected from secrets store</li>
+            <li><strong>JSON</strong> request and response handling</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">Terminal — Secrets + HTTP</span>
+            </div>
+            <div class="code-body">
+<span class="prompt">$</span> <span class="cmd">hop secrets set</span> <span class="flag">API_KEY</span> sk-ant-...
+<span class="output">OK</span>
+
+<span class="comment">// In a cron job:</span>
+<span class="cmd">var</span> key = hop.secrets.get(<span class="flag">"API_KEY"</span>);
+<span class="cmd">var</span> resp = hop.http.post(<span class="flag">"https://api.example.com"</span>, {
+    bearer: key,
+    json: { query: <span class="flag">"hello"</span> }
+});
+hop.log(resp.status);  <span class="comment">// 200</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Remote Management -->
+  <section id="remote">
+    <div class="container">
+      <div class="section-header">
+        <h2>Manage from anywhere</h2>
+        <p>Every command works on remote hosts. The host name always comes first.</p>
+      </div>
+
+      <div style="max-width: 48rem; margin: 0 auto;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — Remote management from your laptop</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># From your laptop to your cloud server</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> secrets set <span class="flag">API_KEY</span> value
+<span class="output">OK</span>
+
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cap enable <span class="flag">email-monitor</span>
+<span class="output">Enabled: email-monitor (daily 7 AM)</span>
+
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cap status
+<span class="output">  health-monitor     enabled    last run: 2m ago     OK</span>
+<span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span>
+
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> kv get <span class="flag">briefings</span> 2026-03-30
+<span class="output">  3 urgent, 12 routine, 5 archived</span>
+<span class="output">  Urgent: AWS bill spike, deploy approval, security alert...</span>
+
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cron list
+<span class="output">  health-monitor      */5 * * * *     enabled</span>
+<span class="output">  security-baseline   0 3 * * *       enabled</span>
+<span class="output">  email-monitor       0 7 * * *       enabled</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Setup -->
+  <section id="setup" style="padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Get started</h2>
+        <p>Four steps from bare metal to automated cloud.</p>
+      </div>
+
+      <div class="steps steps-4">
+        <div class="step">
+          <h3>Install hop on your server</h3>
+          <p>One command installs hop as a persistent daemon that starts at boot.</p>
+          <div style="margin-top: 0.75rem;"><code>curl -fsSL https://hop.keik.ai/install.sh | bash</code></div>
+        </div>
+        <div class="step">
+          <h3>Connect from your laptop</h3>
+          <p>Redeem the invite token to save the server as a known host.</p>
+          <div style="margin-top: 0.75rem;"><code>hop connect &lt;invite-token&gt;</code></div>
+        </div>
+        <div class="step">
+          <h3>Store credentials</h3>
+          <p>Encrypt your API keys on the remote host. They never leave the machine in plaintext.</p>
+          <div style="margin-top: 0.75rem;"><code>hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
+        </div>
+        <div class="step">
+          <h3>Enable automation</h3>
+          <p>Turn on a capability and it runs on schedule, unattended.</p>
+          <div style="margin-top: 0.75rem;"><code>hop myserver cap enable email-monitor</code></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to automate?</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Automation features are built into hop. Install the daemon, store your credentials, and enable a capability.</p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="index.html#install" class="btn btn-primary">Install hop</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer id="site-footer"></footer>
+
+  <script src="shared.js"></script>
+
+</body>
+</html>

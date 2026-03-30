@@ -6,6 +6,7 @@
     { label: 'Daemon',       href: '#daemon',       cross: 'index.html#daemon' },
     { label: 'AI',           href: '#ai',           cross: 'index.html#ai' },
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
+    { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
   ];
 
   var path = location.pathname;
@@ -18,6 +19,7 @@
       var url = (onIndex || !link.href.startsWith('#')) ? link.href : link.cross;
       var cls = '';
       if (!onIndex && link.href === 'fleet.html' && path.indexOf('fleet') !== -1) cls = ' class="active"';
+      if (!onIndex && link.href === 'orchestration.html' && path.indexOf('orchestration') !== -1) cls = ' class="active"';
       return '<li><a href="' + url + '"' + cls + '>' + link.label + '</a></li>';
     }).join('');
 

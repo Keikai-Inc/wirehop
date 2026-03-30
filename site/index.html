@@ -313,6 +313,30 @@
           <p>Manage dozens to thousands of machines with role-based access, tagging, and aggregate invites. <a href="fleet.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">Learn more &rarr;</a></p>
         </div>
 
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <h3>Encrypted Secrets</h3>
+          <p>Store API keys and OAuth tokens encrypted at rest. ChaCha20-Poly1305 with keys derived from your Ed25519 identity. Access from CLI, JS runtime, or MCP.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <h3>Built-in Automation</h3>
+          <p>Schedule cron jobs, enable capabilities like health monitoring and email briefings. <code>hop cap enable email-monitor</code> runs daily AI-powered email triage.</p>
+        </div>
+
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </div>
+          <h3>API Integration</h3>
+          <p>Call any HTTP API directly from JS scripts. <code>hop.http()</code> with bearer tokens, JSON bodies, and sandbox-aware networking. No curl needed.</p>
+        </div>
+
         <div class="card card-green">
           <div class="card-icon card-icon-green">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -377,6 +401,21 @@
           <div class="comparison-cell comparison-label">AI integration</div>
           <div class="comparison-cell hop-col">Built-in MCP server</div>
           <div class="comparison-cell comparison-other">None (external tools only)</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Built-in automation</div>
+          <div class="comparison-cell hop-col">Cron + capabilities</div>
+          <div class="comparison-cell comparison-other">External tools (crontab, Ansible)</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Encrypted secrets</div>
+          <div class="comparison-cell hop-col">Built-in (AES-256)</div>
+          <div class="comparison-cell comparison-other">Vault, external KMS</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Remote management</div>
+          <div class="comparison-cell hop-col">hop myhost secrets/cap</div>
+          <div class="comparison-cell comparison-other">SSH + separate tools</div>
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Kernel sandboxing</div>
@@ -481,7 +520,7 @@
             <div>
               <div style="font-size: 0.8rem; color: var(--color-text-tertiary); margin-bottom: 0.375rem;">Install specific version</div>
               <div class="install-cmd" onclick="copyCmd('install-version', 'copy-install-version')">
-                <code><span class="prompt">$</span> curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.2.5</code>
+                <code><span class="prompt">$</span> curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.4.4</code>
                 <button class="copy-btn" title="Copy to clipboard" id="copy-install-version">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                 </button>
@@ -593,8 +632,8 @@
           <h3>Model Context Protocol</h3>
           <p>Expose fleet management to AI agents through the standard MCP protocol. Claude Code, Cursor, and other compatible tools can orchestrate your infrastructure through natural language.</p>
           <ul class="daemon-features">
-            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_exec</code> runs JavaScript with fleet bindings (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fleet.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fs.push()</code>)</li>
-            <li><strong style="color: var(--color-text);">Built-in Skills Library</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_skills</code> provides 80+ searchable skills across 12 categories (fleet, security, monitoring, and more)</li>
+            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_exec</code> runs JavaScript with fleet bindings (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fleet.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.http()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.secrets.get()</code>)</li>
+            <li><strong style="color: var(--color-text);">Built-in Skills Library</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_skills</code> provides 90+ searchable skills across 14 categories (fleet, security, monitoring, and more)</li>
             <li><strong style="color: var(--color-text);">Works with Claude Code, Cursor, etc.</strong> &mdash; Standard MCP protocol, plug into any compatible AI tool</li>
             <li><strong style="color: var(--color-text);">Safe by Design</strong> &mdash; Memory limits, timeouts, no shell escape&mdash;agents operate within defined boundaries</li>
             <li><strong style="color: var(--color-text);">Sandbox Presets</strong> &mdash; Restrict AI agents to read-only monitoring, auditing, or scoped deploys with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--preset monitor|audit|deploy</code>. Clients can self-restrict for defense-in-depth</li>
@@ -642,6 +681,19 @@
     </div>
   </section>
 
+  <!-- Automation teaser -->
+  <section id="automation-teaser" style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;">
+        <div style="max-width: 36rem;">
+          <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Automate your infrastructure with AI</h2>
+          <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">Schedule cron jobs, monitor email, call external APIs — all from a single binary. Set up once, runs forever.</p>
+        </div>
+        <a href="orchestration.html" class="btn btn-primary" style="flex-shrink: 0;">Automation & Orchestration &rarr;</a>
+      </div>
+    </div>
+  </section>
+
   <!-- Footer -->
   <footer id="site-footer"></footer>
 
@@ -649,7 +701,7 @@
   <script>
     var cmds = {
       'install-latest':  'curl -fsSL https://hop.keik.ai/install.sh | bash',
-      'install-version': 'curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.2.5',
+      'install-version': 'curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.4.4',
       'install-dir':     'curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin',
       'daemon-install':  'curl -fsSL https://hop.keik.ai/install-daemon.sh | bash',
     };
