@@ -122,30 +122,36 @@ pub fn validate_username(username: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// All SUDO_USER tests in one function to avoid parallel env var races.
+    /// Env vars are process-global mutable state — parallel tests that
+    /// set/remove the same var will interfere with each other.
     #[test]
-    fn sudo_user_filters_empty_and_root() {
+    fn sudo_user_and_default_creator() {
         // SAFETY: test-only env manipulation
         unsafe {
+            // Unset → sudo_user returns None
+            std::env::remove_var("SUDO_USER");
+            assert_eq!(sudo_user(), None);
+
+            // Empty → None
             std::env::set_var("SUDO_USER", "");
             assert_eq!(sudo_user(), None);
 
+            // Root → None (filtered)
             std::env::set_var("SUDO_USER", "root");
             assert_eq!(sudo_user(), None);
 
+            // Valid user → Some
             std::env::set_var("SUDO_USER", "alice");
             assert_eq!(sudo_user(), Some("alice".into()));
 
-            std::env::remove_var("SUDO_USER");
-        }
-    }
+            // default_creator_username prefers SUDO_USER
+            std::env::set_var("SUDO_USER", "bob");
+            assert_eq!(default_creator_username(), Some("bob".into()));
 
-    #[test]
-    fn sudo_user_unset() {
-        // SAFETY: test-only env manipulation
-        unsafe {
+            // Cleanup
             std::env::remove_var("SUDO_USER");
         }
-        assert_eq!(sudo_user(), None);
     }
 
     #[test]
@@ -155,19 +161,6 @@ mod tests {
             assert!(!name.is_empty());
             assert_ne!(name, "root");
             assert_ne!(name, "nobody");
-        }
-    }
-
-    #[test]
-    fn default_creator_username_prefers_sudo_user() {
-        // SAFETY: test-only env manipulation
-        unsafe {
-            std::env::set_var("SUDO_USER", "bob");
-        }
-        let result = default_creator_username();
-        assert_eq!(result, Some("bob".into()));
-        unsafe {
-            std::env::remove_var("SUDO_USER");
         }
     }
 }
