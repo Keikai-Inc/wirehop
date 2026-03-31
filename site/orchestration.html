@@ -151,17 +151,26 @@
     bearer: gmail, params: { q: <span class="flag">"is:unread"</span> }
 });
 
-<span class="comment">// Ask Claude to triage</span>
-<span class="cmd">var</span> briefing = hop.http.post(<span class="flag">"https://api.anthropic.com/v1/messages"</span>, {
-    bearer: key,
+<span class="comment">// Claude classifies each as URGENT / ACTION / FYI</span>
+<span class="cmd">var</span> triage = hop.http.post(<span class="flag">"https://api.anthropic.com/v1/messages"</span>, {
+    headers: { <span class="flag">"x-api-key"</span>: key, <span class="flag">"anthropic-version"</span>: <span class="flag">"2023-06-01"</span> },
     json: { model: <span class="flag">"claude-sonnet-4-20250514"</span>, messages: [
-        { role: <span class="flag">"user"</span>, content: <span class="flag">"Triage these emails: "</span> + JSON.stringify(msgs) }
+        { role: <span class="flag">"user"</span>, content: <span class="flag">"Classify as URGENT/ACTION/FYI: "</span> + JSON.stringify(msgs) }
     ]}
 });
 
-<span class="comment">// Store the result</span>
-hop.kv.set(<span class="flag">"briefings"</span>, <span class="cmd">new</span> Date().toISOString().slice(<span class="url">0</span>, <span class="url">10</span>), briefing);
-hop.log(<span class="flag">"Briefing stored for "</span> + <span class="cmd">new</span> Date().toISOString().slice(<span class="url">0</span>, <span class="url">10</span>));
+<span class="comment">// Send briefing email to your inbox</span>
+hop.http.post(<span class="flag">"https://gmail.googleapis.com/.../messages/send"</span>, {
+    bearer: gmail, json: { raw: base64url(summary) }
+});
+
+<span class="comment">// Mark FYI messages as read (urgent + action stay unread)</span>
+hop.http.post(<span class="flag">"https://gmail.googleapis.com/.../messages/batchModify"</span>, {
+    bearer: gmail, json: { ids: fyiIds, removeLabelIds: [<span class="flag">"UNREAD"</span>] }
+});
+
+<span class="comment">// Archive briefing for later retrieval</span>
+hop.kv.set(<span class="flag">"briefings"</span>, today, { summary: summary, urgent: urgent.length });
           </div>
         </div>
       </div>
@@ -241,7 +250,7 @@ hop.log(<span class="flag">"Briefing stored for "</span> + <span class="cmd">new
 
 <span class="comment"># Run a capability manually</span>
 <span class="prompt">$</span> <span class="cmd">hop cap run</span> <span class="flag">email-monitor</span>
-<span class="output">Running email-monitor... done (briefing stored)</span>
+<span class="output">Briefing sent. 23 emails: 2 urgent, 5 action, 16 marked as read.</span>
           </div>
         </div>
       </div>
