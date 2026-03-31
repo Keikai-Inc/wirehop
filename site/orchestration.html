@@ -120,7 +120,7 @@
         <div class="step">
           <h3>Store credentials</h3>
           <p>Encrypt your API key on the remote host. ChaCha20-Poly1305 at rest, accessible from CLI, JS runtime, and MCP.</p>
-          <div style="margin-top: 0.75rem;"><code>hop RexMundi secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
+          <div style="margin-top: 0.75rem;"><code>hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
         </div>
         <div class="step">
           <h3>Enable the capability</h3>
@@ -315,21 +315,21 @@ hop.log(resp.status);  <span class="comment">// 200</span>
           </div>
           <div class="code-body">
 <span class="comment"># From your laptop to your cloud server</span>
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> secrets set <span class="flag">API_KEY</span> value
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> secrets set <span class="flag">API_KEY</span> value
 <span class="output">OK</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cap enable <span class="flag">email-monitor</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap enable <span class="flag">email-monitor</span>
 <span class="output">Enabled: email-monitor (daily 7 AM)</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cap status
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap status
 <span class="output">  health-monitor     enabled    last run: 2m ago     OK</span>
 <span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> kv get <span class="flag">briefings</span> 2026-03-30
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> kv get <span class="flag">briefings</span> 2026-03-30
 <span class="output">  3 urgent, 12 routine, 5 archived</span>
 <span class="output">  Urgent: AWS bill spike, deploy approval, security alert...</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">RexMundi</span> cron list
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron list
 <span class="output">  health-monitor      */5 * * * *     enabled</span>
 <span class="output">  security-baseline   0 3 * * *       enabled</span>
 <span class="output">  email-monitor       0 7 * * *       enabled</span>
