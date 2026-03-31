@@ -2177,9 +2177,11 @@ async fn cmd_auth(provider: &str, target: Option<&str>, config_dir: &std::path::
         }
         println!("  \u{2713} {} authenticated.", provider);
     } else if let Some(apikey) = oauth::api_key_provider(provider) {
-        let (name, value) = oauth::run_api_key_flow(apikey)?;
-        store_auth_secret(target, config_dir, &name, value.as_bytes()).await?;
-        println!("  \u{2713} {} API key stored.", provider);
+        let secrets = oauth::run_api_key_flow(apikey)?;
+        for (name, value) in &secrets {
+            store_auth_secret(target, config_dir, name, value.as_bytes()).await?;
+        }
+        println!("  \u{2713} {} authenticated.", provider);
     } else {
         anyhow::bail!("Unknown auth provider: {provider}. Available: gmail, anthropic");
     }

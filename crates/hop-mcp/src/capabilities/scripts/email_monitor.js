@@ -132,41 +132,57 @@ for (var i = 0; i < emails.length; i++) {
         + "Preview: " + emails[i].snippet + "\n---\n";
 }
 
+// ── Claude Inference Helper ────────────────────────────────────────
+// Supports three methods: API key, OAuth token, or Claude CLI fallback.
+
 var apiKey = hop.secrets.get("ANTHROPIC_API_KEY");
-if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY not set. Run: hop cap setup email-monitor");
-}
+var anthropicMethod = hop.secrets.get("anthropic_method") || "api_key";
 
-// Detect token type: OAuth tokens start with "sk-ant-oat", API keys with "sk-ant-api"
-var anthropicHeaders = { "anthropic-version": "2023-06-01", "content-type": "application/json" };
-if (apiKey.indexOf("sk-ant-oat") === 0) {
-    anthropicHeaders["Authorization"] = "Bearer " + apiKey;
-} else {
-    anthropicHeaders["x-api-key"] = apiKey;
-}
+function callClaude(prompt) {
+    // Method 1 & 2: API call (api_key or claude_oauth)
+    if (apiKey) {
+        var headers = { "anthropic-version": "2023-06-01", "content-type": "application/json" };
+        if (apiKey.indexOf("sk-ant-oat") === 0) {
+            headers["Authorization"] = "Bearer " + apiKey;
+        } else {
+            headers["x-api-key"] = apiKey;
+        }
 
-var triageResp = hop.http.post("https://api.anthropic.com/v1/messages", {
-    headers: anthropicHeaders,
-    json: {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2048,
-        messages: [{
-            role: "user",
-            content: "Classify each email as URGENT, ACTION, or FYI.\n\n"
-                + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss)\n"
-                + "ACTION = needs a response but not urgent (e.g., review request, question, meeting follow-up)\n"
-                + "FYI = informational only (e.g., newsletter, notification, automated alert, marketing)\n\n"
-                + "Return ONLY a JSON array like: [{\"index\": 0, \"class\": \"FYI\"}, ...]\n"
-                + "No other text. One entry per email.\n\n" + triageInput
-        }]
+        var resp = hop.http.post("https://api.anthropic.com/v1/messages", {
+            headers: headers,
+            json: {
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 2048,
+                messages: [{ role: "user", content: prompt }]
+            }
+        });
+
+        if (resp.status === 200) {
+            return resp.json().content[0].text;
+        }
+
+        // If API rejected the token, try Claude CLI fallback
+        hop.log("API call failed (" + resp.status + "), trying Claude CLI fallback...");
     }
-});
 
-if (triageResp.status !== 200) {
-    throw new Error("Claude triage failed (" + triageResp.status + "): " + triageResp.body);
+    // Method 3: Claude CLI (works with Claude Code's own auth)
+    var cliResult = hop.local("claude -p " + JSON.stringify(prompt) + " --output-format text 2>/dev/null");
+    if (cliResult.exit_code === 0 && cliResult.stdout.trim()) {
+        return cliResult.stdout.trim();
+    }
+
+    throw new Error("Claude inference failed. No working auth method. Run: hop cap setup email-monitor");
 }
 
-var triageText = triageResp.json().content[0].text.trim();
+var triageText = callClaude(
+    "Classify each email as URGENT, ACTION, or FYI.\n\n"
+    + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss)\n"
+    + "ACTION = needs a response but not urgent (e.g., review request, question, meeting follow-up)\n"
+    + "FYI = informational only (e.g., newsletter, notification, automated alert, marketing)\n\n"
+    + "Return ONLY a JSON array like: [{\"index\": 0, \"class\": \"FYI\"}, ...]\n"
+    + "No other text. One entry per email.\n\n" + triageInput
+);
+
 // Extract JSON array from response (handle markdown code fences)
 var jsonMatch = triageText.match(/\[[\s\S]*\]/);
 var triage = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
@@ -212,27 +228,13 @@ if (fyi.length > 0) {
     }
 }
 
-var summaryResp = hop.http.post("https://api.anthropic.com/v1/messages", {
-    headers: anthropicHeaders,
-    json: {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2048,
-        messages: [{
-            role: "user",
-            content: "Write a concise morning email briefing from this classified inbox.\n"
-                + "Group by priority (URGENT first, then ACTION, then FYI).\n"
-                + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
-                + "For FYI: just list briefly (these will be marked as read).\n"
-                + "Keep it scannable — bullet points, no fluff.\n\n" + summaryInput
-        }]
-    }
-});
-
-if (summaryResp.status !== 200) {
-    throw new Error("Claude summary failed (" + summaryResp.status + "): " + summaryResp.body);
-}
-
-var summary = summaryResp.json().content[0].text;
+var summary = callClaude(
+    "Write a concise morning email briefing from this classified inbox.\n"
+    + "Group by priority (URGENT first, then ACTION, then FYI).\n"
+    + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
+    + "For FYI: just list briefly (these will be marked as read).\n"
+    + "Keep it scannable — bullet points, no fluff.\n\n" + summaryInput
+);
 
 // ── Send Briefing Email ───────────────────────────────────────────
 

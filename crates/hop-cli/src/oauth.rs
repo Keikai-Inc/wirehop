@@ -160,22 +160,31 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
 
 // ── API Key Flow ──────────────────────────────────────────────────
 
-/// Run the API key flow for a provider. For Anthropic, checks for existing
-/// Claude Code credentials first and offers to reuse them.
-/// Returns (secret_name, secret_value).
-pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<(String, String)> {
-    // Check for existing Claude Code credentials
-    if provider.name == "anthropic" && let Some(token) = detect_claude_credentials() {
-        eprintln!("  Found existing Claude Code credentials.");
-        eprint!("  Use Claude Code login? [Y/n]: ");
-        std::io::stderr().flush()?;
+/// Run the Anthropic auth flow. Returns a list of (secret_name, value) pairs.
+///
+/// Priority:
+/// 1. Detect local Claude Code credentials and copy them
+/// 2. Prompt for an API key from console.anthropic.com
+pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String)>> {
+    if provider.name == "anthropic" {
+        // Check for existing Claude Code credentials
+        if let Some(creds) = detect_claude_credentials() {
+            eprintln!("  Found Claude Code credentials (expires {}).", creds.expires_display);
+            eprint!("  Use Claude Code login? [Y/n]: ");
+            std::io::stderr().flush()?;
 
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim().to_lowercase();
 
-        if answer.is_empty() || answer == "y" || answer == "yes" {
-            return Ok((provider.secret_name.to_string(), token));
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                return Ok(vec![
+                    ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
+                    ("anthropic_refresh_token".to_string(), creds.refresh_token),
+                    ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
+                    ("anthropic_method".to_string(), "claude_oauth".to_string()),
+                ]);
+            }
         }
     }
 
@@ -197,19 +206,30 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<(String, String)> {
         anyhow::bail!("No API key provided");
     }
 
-    Ok((provider.secret_name.to_string(), key))
+    Ok(vec![
+        (provider.secret_name.to_string(), key),
+        ("anthropic_method".to_string(), "api_key".to_string()),
+    ])
+}
+
+struct ClaudeCredentials {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+    expires_display: String,
 }
 
 /// Check for existing Claude Code OAuth credentials at ~/.claude/.credentials.json.
-/// Returns the access token if found and not expired.
-fn detect_claude_credentials() -> Option<String> {
+/// Returns the full credential set if found and not expired.
+fn detect_claude_credentials() -> Option<ClaudeCredentials> {
     let home = std::env::var("HOME").ok()?;
     let path = std::path::PathBuf::from(home).join(".claude/.credentials.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&data).ok()?;
 
     let oauth = json.get("claudeAiOauth")?;
-    let token = oauth.get("accessToken")?.as_str()?;
+    let access_token = oauth.get("accessToken")?.as_str()?.to_string();
+    let refresh_token = oauth.get("refreshToken")?.as_str().unwrap_or("").to_string();
     let expires_at = oauth.get("expiresAt")?.as_u64()?;
 
     // Check if token is still valid (with 5 min buffer)
@@ -222,7 +242,19 @@ fn detect_claude_credentials() -> Option<String> {
         return None; // expired
     }
 
-    Some(token.to_string())
+    let remaining_hours = (expires_at - now_ms) / 3_600_000;
+    let expires_display = if remaining_hours > 24 {
+        format!("in {} days", remaining_hours / 24)
+    } else {
+        format!("in {} hours", remaining_hours)
+    };
+
+    Some(ClaudeCredentials {
+        access_token,
+        refresh_token,
+        expires_at,
+        expires_display,
+    })
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────
