@@ -47,7 +47,7 @@ static GMAIL: OAuthProvider = OAuthProvider {
     name: "gmail",
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
     token_url: "https://oauth2.googleapis.com/token",
-    // gcloud CLI's public client credentials (embedded in gcloud binary, considered public)
+    // hop's registered Desktop app OAuth client (hop-keik-ai project)
     client_id: "REDACTED.apps.googleusercontent.com",
     client_secret: "REDACTED",
     scopes: &[
