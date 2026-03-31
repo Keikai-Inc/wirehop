@@ -133,23 +133,21 @@ for (var i = 0; i < emails.length; i++) {
 }
 
 // ── Claude Inference Helper ────────────────────────────────────────
-// Supports three methods: API key, OAuth token, or Claude CLI fallback.
+// Two methods: API key (direct HTTP) or Claude CLI (uses Claude Code's own auth).
+// The method is chosen during `hop cap setup` and stored in secrets.
 
 var apiKey = hop.secrets.get("ANTHROPIC_API_KEY");
 var anthropicMethod = hop.secrets.get("anthropic_method") || "api_key";
 
 function callClaude(prompt) {
-    // Method 1 & 2: API call (api_key or claude_oauth)
-    if (apiKey) {
-        var headers = { "anthropic-version": "2023-06-01", "content-type": "application/json" };
-        if (apiKey.indexOf("sk-ant-oat") === 0) {
-            headers["Authorization"] = "Bearer " + apiKey;
-        } else {
-            headers["x-api-key"] = apiKey;
-        }
-
+    // API key method: direct HTTP call
+    if (anthropicMethod === "api_key" && apiKey) {
         var resp = hop.http.post("https://api.anthropic.com/v1/messages", {
-            headers: headers,
+            headers: {
+                "x-api-key": apiKey,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
             json: {
                 model: "claude-sonnet-4-20250514",
                 max_tokens: 2048,
@@ -160,18 +158,19 @@ function callClaude(prompt) {
         if (resp.status === 200) {
             return resp.json().content[0].text;
         }
-
-        // If API rejected the token, try Claude CLI fallback
-        hop.log("API call failed (" + resp.status + "), trying Claude CLI fallback...");
+        throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
     }
 
-    // Method 3: Claude CLI (works with Claude Code's own auth)
+    // Claude CLI method: uses Claude Code's own OAuth auth
     var cliResult = hop.local("claude -p " + JSON.stringify(prompt) + " --output-format text 2>/dev/null");
     if (cliResult.exit_code === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
     }
 
-    throw new Error("Claude inference failed. No working auth method. Run: hop cap setup email-monitor");
+    if (!apiKey && anthropicMethod !== "claude_oauth") {
+        throw new Error("No Anthropic credentials configured. Run: hop cap setup email-monitor");
+    }
+    throw new Error("Claude CLI failed (exit " + cliResult.exit_code + "). Is claude installed? stderr: " + cliResult.stderr);
 }
 
 var triageText = callClaude(
