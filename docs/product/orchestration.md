@@ -8,9 +8,10 @@ hop's cron system, JS runtime, fleet management, and MCP integration make it a p
 +-------------------------------------------------------------------+
 |  YOUR LAPTOP (client)                                             |
 |                                                                   |
-|  hop secrets set ANTHROPIC_API_KEY sk-ant-...                     |
-|  hop cron create --name "Morning Briefing" --file briefing.js     |
-|  hop mcp   (AI agent creates/manages cron jobs)                   |
+|  hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...            |
+|  hop myserver cap enable email-monitor                            |
+|  hop myserver cap status                                          |
+|  hop mcp   (AI agent creates/manages jobs remotely)               |
 +-------------------------------------------------------------------+
           | QUIC (P2P, encrypted)
           v
@@ -20,10 +21,26 @@ hop's cron system, JS runtime, fleet management, and MCP integration make it a p
 |  hop host (systemd/launchd daemon)                                |
 |  +-- Secrets Store (encrypted KV, per-service credentials)        |
 |  +-- Cron Scheduler (JS jobs with hop.* + hop.http() + secrets)   |
+|  +-- Capabilities (health, security-baseline, email-monitor)      |
 |  +-- MCP Server (AI agents create/manage jobs remotely)           |
 |  +-- Fleet (optional: fan out to other machines)                  |
 +-------------------------------------------------------------------+
 ```
+
+## Remote Management
+
+Any authenticated peer can manage secrets, capabilities, KV, and cron on remote hosts. The host name always comes first:
+
+```bash
+hop myserver secrets set API_KEY value       # store secret on myserver
+hop myserver secrets list                    # list secret names on myserver
+hop myserver cap enable email-monitor        # enable capability on myserver
+hop myserver cap status                      # check enabled capabilities
+hop myserver kv get briefings 2026-03-30     # read KV data
+hop myserver cron list                       # list cron jobs
+```
+
+No Creator role required — any peer with `hop connect` access can use these. Secrets travel over the encrypted QUIC connection and never appear in shell history or process listings.
 
 ## Shipped Features
 
@@ -40,6 +57,10 @@ hop secrets set DB_PASSWORD            # reads from stdin
 hop secrets get ANTHROPIC_API_KEY
 hop secrets list
 hop secrets delete ANTHROPIC_API_KEY
+
+# Remote (from laptop to cloud server)
+hop myserver secrets set API_KEY value
+hop myserver secrets get API_KEY
 ```
 
 #### JS Runtime
@@ -115,29 +136,79 @@ hop.http.post("https://api.example.com", {
 - Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD
 - DNS resolution happens on the daemon (daemon's network is the egress point)
 
-## Planned Features
+### 3. Email Monitor Capability (v0.4.4)
 
-### 3. OAuth Proxy Flow (`hop auth`) (Planned)
+A built-in capability that performs daily AI-powered email triage. See [capabilities.md](capabilities.md) for the full setup guide.
 
-Initiates OAuth on the client machine (where there is a browser) and stores resulting tokens on the remote daemon.
+#### What It Does
+
+Every morning at 7 AM (configurable):
+
+1. **Refreshes Gmail token** — inline OAuth refresh using stored refresh_token
+2. **Fetches unread emails** — up to 50 messages via Gmail API
+3. **Claude triage** — classifies each email as:
+   - **URGENT** — time-sensitive, needs immediate response (stays unread)
+   - **ACTION** — needs a response but not urgent (stays unread)
+   - **FYI** — informational, newsletters, notifications (marked as read)
+4. **Sends briefing email** — structured summary grouped by priority, delivered to your inbox
+5. **Marks FYI as read** — only routine messages. Urgent and action-required stay unread in your inbox
+6. **Archives briefing** — stored in KV datastore for later retrieval
+
+#### Enable It
 
 ```bash
-hop auth gmail --host MyCloud
-# -> Opens browser locally for OAuth consent
-# -> Tokens sent to cloud daemon via QUIC
-# -> Stored encrypted in daemon's secrets store
+# From your laptop
+hop myserver secrets set google_client_id YOUR_CLIENT_ID
+hop myserver secrets set google_client_secret YOUR_CLIENT_SECRET
+hop myserver secrets set gmail_refresh_token YOUR_REFRESH_TOKEN
+hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...
+hop myserver cap enable email-monitor
 
-hop auth github --host MyCloud
-hop auth slack --host MyCloud --scopes channels:read,chat:write
-hop auth custom --auth-url ... --token-url ... --client-id ...
-hop auth revoke gmail --host MyCloud
+# Test immediately
+hop myserver cap run email-monitor
+
+# Check status
+hop myserver cap status
+
+# Retrieve past briefings
+hop myserver kv get briefings 2026-03-30
 ```
 
-**Planned service registry:** Gmail/Google, GitHub, Slack, custom OAuth providers.
+#### Token Lifecycle
 
-**Token lifecycle:** Automatic refresh, expiry alerts, revocation.
+The script handles token refresh automatically:
+- Checks access token expiry before each run (5-minute buffer)
+- Refreshes via Google's token endpoint using the stored refresh token
+- Stores new access token and expiry back in secrets
+- Retries on 401 (force refresh if token expired mid-run)
+- Refresh tokens don't expire — runs indefinitely without re-authentication
 
-### 4. `hop.ai()` Convenience Binding (Planned)
+### 4. Remote Peer Operations (v0.4.4)
+
+Any authenticated peer can manage secrets, KV, cron, and capabilities on remote hosts over the encrypted QUIC connection. Uses the `PeerRequest`/`PeerResponse` protocol — no Creator role required.
+
+```bash
+hop myserver secrets set/get/list/delete    # manage secrets
+hop myserver cap list/enable/disable/status  # manage capabilities
+hop myserver kv get/set/list                 # read/write KV
+hop myserver cron list/get                   # inspect cron jobs
+```
+
+## Planned Features
+
+### 5. OAuth Proxy Flow (`hop auth`) (Planned)
+
+Initiates OAuth on the client machine (where there is a browser) and stores resulting tokens on the remote daemon. hop ships with its own registered Google OAuth app — users don't need to create their own Google Cloud project.
+
+```bash
+hop myserver auth gmail
+# → Opens browser locally for Google OAuth consent
+# → Tokens sent to myserver via QUIC
+# → Stored encrypted in daemon's secrets store
+# → "Authenticated with Gmail on myserver."
+```
+
+### 6. `hop.ai()` Convenience Binding (Planned)
 
 Syntactic sugar over `hop.http()` + `hop.secrets.get()` for LLM calls.
 
@@ -150,82 +221,14 @@ var result = hop.ai({
 });
 ```
 
-### 5. Token Auto-Refresh Daemon (Planned)
-
-Background refresh of OAuth tokens. Today, token refresh is handled inline by cron jobs (see email monitoring example below).
-
-## Email Monitoring Example
-
-This is a complete, working example using shipped features (secrets + hop.http). No planned features required.
-
-### Setup
+### 7. Interactive Setup Wizard (Planned)
 
 ```bash
-# 1. Connect to your cloud daemon
-hop connect <creator-invite>
-
-# 2. Store Google OAuth credentials (from Google Cloud Console)
-hop secrets set google_client_id YOUR_CLIENT_ID
-hop secrets set google_client_secret YOUR_CLIENT_SECRET
-
-# 3. Perform OAuth manually, then store tokens
-#    (Phase 3 will automate this with: hop auth gmail --host cloud)
-hop secrets set gmail_refresh_token REFRESH_TOKEN
-hop secrets set gmail_access_token ACCESS_TOKEN
-hop secrets set gmail_token_expiry 0
-
-# 4. Store Anthropic API key
-hop secrets set ANTHROPIC_API_KEY sk-ant-your-key-here
-
-# 5. Install the cron job
-hop cron create \
-  --name "Gmail Morning Briefing" \
-  --schedule "0 0 7 * * *" \
-  --file gmail-briefing.js
-```
-
-### Cron Job Script (gmail-briefing.js)
-
-The script performs these steps every morning:
-
-1. **Token refresh** -- checks expiry, refreshes via Google OAuth if needed, stores new token back in secrets
-2. **Fetch unread emails** -- Gmail API list + metadata fetch (up to 30 messages)
-3. **Summarize with Claude** -- sends email summaries to Anthropic API
-4. **Send briefing email** -- composes and sends via Gmail API
-5. **Mark as read** -- batch-modifies all fetched messages
-6. **Store briefing** -- saves to KV datastore for later retrieval
-
-Key patterns used:
-
-```javascript
-// Token refresh (inline, no separate daemon needed)
-var resp = hop.http.post("https://oauth2.googleapis.com/token", {
-    json: {
-        client_id: hop.secrets.get("google_client_id"),
-        client_secret: hop.secrets.get("google_client_secret"),
-        refresh_token: hop.secrets.get("gmail_refresh_token"),
-        grant_type: "refresh_token"
-    }
-});
-hop.secrets.set("gmail_access_token", resp.json().access_token);
-
-// Bearer auth for API calls
-var messages = hop.http.get(
-    "https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread",
-    { bearer: token }
-);
-
-// LLM call via hop.http
-var summary = hop.http.post("https://api.anthropic.com/v1/messages", {
-    headers: {
-        "x-api-key": hop.secrets.get("ANTHROPIC_API_KEY"),
-        "anthropic-version": "2023-06-01"
-    },
-    json: { model: "claude-sonnet-4-20250514", max_tokens: 2048, messages: [...] }
-});
-
-// Persist results
-hop.kv.set("briefings", today, { date: today, summary: summary });
+hop myserver cap setup email-monitor
+# → Opens browser for Gmail auth (via hop auth)
+# → Prompts for Anthropic API key
+# → Enables the capability
+# → "Email monitor active on myserver. Next briefing: 7:00 AM UTC"
 ```
 
 ## Implementation Status
@@ -234,8 +237,10 @@ hop.kv.set("briefings", today, { date: today, summary: summary });
 |---|---|---|---|
 | 1 | Encrypted secrets store | **Shipped** (v0.4.3) | ChaCha20-Poly1305, CLI + JS + MCP |
 | 2 | Native `hop.http()` in JS | **Shipped** (v0.4.3) | reqwest::blocking, sandbox-aware |
-| 3 | OAuth proxy flow (`hop auth`) | Planned | Browser-based OAuth from client to remote daemon |
-| 4 | `hop.ai()` convenience binding | Planned | Sugar over hop.http + hop.secrets for LLM calls |
-| 5 | Token auto-refresh daemon | Planned | Background refresh; today handled inline by cron jobs |
+| 3 | Email monitor capability | **Shipped** (v0.4.4) | AI triage, briefing, selective mark-as-read |
+| 4 | Remote peer operations | **Shipped** (v0.4.4) | `hop myhost secrets/cap/kv/cron` over QUIC |
+| 5 | OAuth proxy (`hop auth`) | Planned | Embedded Google OAuth app, browser flow |
+| 6 | `hop.ai()` convenience | Planned | Sugar over hop.http + hop.secrets |
+| 7 | Interactive setup wizard | Planned | `hop myhost cap setup email-monitor` |
 
-*Last updated: v0.4.3*
+*Last updated: v0.4.4*
