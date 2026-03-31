@@ -632,11 +632,11 @@
           <h3>Model Context Protocol</h3>
           <p>Expose fleet management to AI agents through the standard MCP protocol. Claude Code, Cursor, and other compatible tools can orchestrate your infrastructure through natural language.</p>
           <ul class="daemon-features">
-            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_exec</code> runs JavaScript with fleet bindings (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.fleet.exec()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.http()</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop.secrets.get()</code>)</li>
-            <li><strong style="color: var(--color-text);">Built-in Skills Library</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop_skills</code> provides 90+ searchable skills across 14 categories (fleet, security, monitoring, and more)</li>
-            <li><strong style="color: var(--color-text);">Works with Claude Code, Cursor, etc.</strong> &mdash; Standard MCP protocol, plug into any compatible AI tool</li>
-            <li><strong style="color: var(--color-text);">Safe by Design</strong> &mdash; Memory limits, timeouts, no shell escape&mdash;agents operate within defined boundaries</li>
-            <li><strong style="color: var(--color-text);">Sandbox Presets</strong> &mdash; Restrict AI agents to read-only monitoring, auditing, or scoped deploys with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--preset monitor|audit|deploy</code>. Clients can self-restrict for defense-in-depth</li>
+            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong> — execute JavaScript with full fleet bindings: remote exec, HTTP requests, secrets, metrics, and more</li>
+            <li><strong style="color: var(--color-text);">90+ Built-in Skills</strong> — searchable library across 14 categories that agents use to discover fleet, security, monitoring, and deployment patterns</li>
+            <li><strong style="color: var(--color-text);">Claude Code, Cursor, etc.</strong> — standard MCP protocol, plug into any compatible AI tool</li>
+            <li><strong style="color: var(--color-text);">Safe by Design</strong> — memory limits, execution timeouts, no shell escape. Agents operate within defined boundaries</li>
+            <li><strong style="color: var(--color-text);">Sandbox Presets</strong> — restrict agents to read-only monitoring, auditing, or scoped deploys. Clients can self-restrict for defense-in-depth</li>
           </ul>
         </div>
 
