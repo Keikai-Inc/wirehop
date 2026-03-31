@@ -233,6 +233,12 @@ pub enum Command {
         action: TsAction,
     },
 
+    /// Authenticate with a service (gmail, anthropic)
+    Auth {
+        /// Service name (gmail, anthropic)
+        provider: String,
+    },
+
     /// Start MCP server (Model Context Protocol) for AI agent integration
     Mcp,
 
@@ -641,6 +647,14 @@ pub enum CapAction {
         /// Fleet target tag (required)
         #[arg(long)]
         targets: String,
+    },
+    /// Interactive setup: authenticate and enable a capability
+    Setup {
+        /// Capability ID (e.g. email-monitor)
+        id: String,
+        /// Override the default schedule (cron expression)
+        #[arg(long)]
+        schedule: Option<String>,
     },
 }
 

@@ -15,6 +15,7 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
             script: include_str!("scripts/health.js"),
             category: "monitor",
             params: &[],
+            auth_requirements: &[],
         },
         CapabilityDefinition {
             id: "log-search",
@@ -33,6 +34,7 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
                     default: None,
                 },
             ],
+            auth_requirements: &[],
         },
         CapabilityDefinition {
             id: "security-baseline",
@@ -44,6 +46,7 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
             script: include_str!("scripts/security_baseline.js"),
             category: "security",
             params: &[],
+            auth_requirements: &[],
         },
         CapabilityDefinition {
             id: "email-monitor",
@@ -51,14 +54,17 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
             description: "Daily Gmail triage and morning briefing. Fetches unread emails, \
                 classifies by urgency (URGENT/ACTION/FYI) using Claude, sends a briefing \
                 email, and marks FYI messages as read. Urgent and action-required emails \
-                stay unread. Requires secrets: google_client_id, google_client_secret, \
-                gmail_refresh_token, ANTHROPIC_API_KEY.",
+                stay unread.",
             tier: PermissionTier::Connect,
             trigger: TriggerMode::Both { default_schedule: "0 0 7 * * *" },
             data_pattern: DataPattern::Push,
             script: include_str!("scripts/email_monitor.js"),
             category: "automation",
             params: &[],
+            auth_requirements: &[
+                AuthRequirement { provider: "gmail", description: "Gmail" },
+                AuthRequirement { provider: "anthropic", description: "Anthropic" },
+            ],
         },
     ]
 }

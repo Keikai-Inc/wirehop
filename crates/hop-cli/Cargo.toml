@@ -26,6 +26,9 @@ libc.workspace = true
 users.workspace = true
 cron.workspace = true
 rand.workspace = true
+sha2.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

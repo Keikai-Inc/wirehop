@@ -68,6 +68,14 @@ pub struct ParamDef {
     pub default: Option<&'static str>,
 }
 
+/// An authentication requirement for a capability's setup flow.
+pub struct AuthRequirement {
+    /// Provider name (matches `hop auth <provider>`): "gmail", "anthropic", etc.
+    pub provider: &'static str,
+    /// Human-readable description shown during setup.
+    pub description: &'static str,
+}
+
 /// A built-in capability definition.
 pub struct CapabilityDefinition {
     pub id: &'static str,
@@ -79,6 +87,9 @@ pub struct CapabilityDefinition {
     pub script: &'static str,
     pub category: &'static str,
     pub params: &'static [ParamDef],
+    /// Auth providers needed before the capability can run.
+    /// Used by `hop cap setup` to guide the user through authentication.
+    pub auth_requirements: &'static [AuthRequirement],
 }
 
 impl CapabilityDefinition {

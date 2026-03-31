@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod itemize;
+mod oauth;
 mod mux;
 mod progress_ui;
 mod reconnect;
@@ -168,6 +169,10 @@ async fn main() -> Result<()> {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             cmd_ts(&config_dir, action)
         }
+        Command::Auth { provider } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_auth(&provider, None, &config_dir).await
+        }
         Command::Mcp => {
             // MCP server: all output goes to stdout (JSON-RPC), logs to stderr only
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -211,9 +216,24 @@ async fn main() -> Result<()> {
             // Check for remote subcommand: hop <host> secrets/cap/kv/cron ...
             if args.len() >= 2 {
                 match args[1].as_str() {
-                    "secrets" | "cap" | "kv" | "cron" => {
+                    "secrets" | "kv" | "cron" => {
                         let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
                         let _secret_key = config::load_or_generate_identity(&config_dir)?;
+                        return cmd_remote_peer_op(&args[0], &args[1..], &config_dir).await
+                    }
+                    "auth" => {
+                        let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+                        let provider = args.get(2).context("usage: hop <host> auth <provider>")?;
+                        return cmd_auth(provider, Some(&args[0]), &config_dir).await
+                    }
+                    "cap" => {
+                        let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+                        let _secret_key = config::load_or_generate_identity(&config_dir)?;
+                        // Check for "cap setup" which needs special handling (auth flows)
+                        if args.get(2).map(|s| s.as_str()) == Some("setup") {
+                            let cap_id = args.get(3).context("usage: hop <host> cap setup <id>")?;
+                            return cmd_cap_setup(cap_id, None, Some(&args[0]), &config_dir).await
+                        }
                         return cmd_remote_peer_op(&args[0], &args[1..], &config_dir).await
                     }
                     _ => {}
@@ -2147,6 +2167,163 @@ async fn cmd_fleet(
     }
 }
 
+/// Run `hop auth <provider>` — authenticate with a service and store credentials.
+/// If `target` is Some, stores secrets on the remote host. If None, stores locally.
+async fn cmd_auth(provider: &str, target: Option<&str>, config_dir: &std::path::Path) -> Result<()> {
+    if let Some(oauth) = oauth::oauth_provider(provider) {
+        let secrets = oauth::run_oauth_flow(oauth)?;
+        for (name, value) in &secrets {
+            store_auth_secret(target, config_dir, name, value.as_bytes()).await?;
+        }
+        println!("  \u{2713} {} authenticated.", provider);
+    } else if let Some(apikey) = oauth::api_key_provider(provider) {
+        let (name, value) = oauth::run_api_key_flow(apikey)?;
+        store_auth_secret(target, config_dir, &name, value.as_bytes()).await?;
+        println!("  \u{2713} {} API key stored.", provider);
+    } else {
+        anyhow::bail!("Unknown auth provider: {provider}. Available: gmail, anthropic");
+    }
+    Ok(())
+}
+
+/// Store a secret locally or on a remote host.
+async fn store_auth_secret(target: Option<&str>, config_dir: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
+    if let Some(host) = target {
+        // Remote: send via PeerRequest over QUIC
+        let request = hop_core::proto::PeerRequest::SecretsSet {
+            name: name.to_string(),
+            value: value.to_vec(),
+        };
+        let (_resolved, _send, mut recv) = mux::connect_to_host(
+            config_dir,
+            host,
+            None,
+            &hop_core::proto::ClientMessage::RequestPeerOp(request),
+        ).await?;
+        let response: hop_core::proto::HostMessage = hop_core::proto::read_message(&mut recv).await?;
+        match response {
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Ok) => Ok(()),
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Error(e)) => {
+                anyhow::bail!("Failed to store secret on {host}: {e}")
+            }
+            _ => anyhow::bail!("Unexpected response from {host}"),
+        }
+    } else {
+        // Local: store via daemon Unix socket
+        let ds = hop_core::datastore::Datastore::connect(config_dir)
+            .context("Failed to connect to daemon — is `hop host` running?")?;
+        ds.secrets_set(name, value)?;
+        Ok(())
+    }
+}
+
+/// Run `hop cap setup <id>` — guided auth + enable.
+async fn cmd_cap_setup(id: &str, schedule: Option<&str>, target: Option<&str>, config_dir: &std::path::Path) -> Result<()> {
+    use hop_mcp::capabilities::CapabilityDefinition;
+
+    let cap = CapabilityDefinition::find(id)
+        .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'. Run `hop cap list` to see available capabilities."))?;
+
+    println!("{} Setup", cap.name);
+    println!("{}", "\u{2500}".repeat(cap.name.len() + 6));
+
+    let reqs = cap.auth_requirements;
+    if reqs.is_empty() {
+        println!("\nNo authentication required.");
+    } else {
+        for (i, req) in reqs.iter().enumerate() {
+            println!("\n[{}/{}] {}", i + 1, reqs.len(), req.description);
+            cmd_auth(req.provider, target, config_dir).await?;
+        }
+    }
+
+    // Enable the capability
+    if !cap.is_schedulable() {
+        println!("\n\u{2713} {} is on-demand only — run with `hop cap run {id}`.", cap.name);
+        return Ok(());
+    }
+
+    let schedule = schedule
+        .map(String::from)
+        .or_else(|| cap.default_schedule().map(String::from))
+        .ok_or_else(|| anyhow::anyhow!("No schedule provided and capability has no default"))?;
+
+    println!("\nEnabling {} (schedule: {})...", cap.id, schedule);
+
+    if let Some(host) = target {
+        // Remote enable — use PeerRequest
+        // For now, enable via hop exec since CapEnable needs the script
+        // which only exists in the binary (hop-mcp), not on the wire protocol.
+        // The remote host has the same binary, so `hop cap enable` works locally there.
+        let request = hop_core::proto::PeerRequest::CapEnable {
+            id: id.to_string(),
+            schedule: Some(schedule),
+            targets: None,
+        };
+        let (_resolved, _send, mut recv) = mux::connect_to_host(
+            config_dir,
+            host,
+            None,
+            &hop_core::proto::ClientMessage::RequestPeerOp(request),
+        ).await?;
+        let response: hop_core::proto::HostMessage = hop_core::proto::read_message(&mut recv).await?;
+        match response {
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::CapEnabled { job_id }) => {
+                println!("\u{2713} {} active (job {job_id}).", cap.name);
+            }
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Error(e)) => {
+                // Remote cap enable not yet supported — tell user to run locally
+                eprintln!("Note: {e}");
+                eprintln!("Run on the remote host: hop cap enable {id}");
+            }
+            _ => {
+                anyhow::bail!("Unexpected response");
+            }
+        }
+    } else {
+        // Local enable — same as cmd_cap CapAction::Enable
+        let sched: cron::Schedule = schedule.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid cron expression '{schedule}': {e}"))?;
+
+        let ds = hop_core::datastore::Datastore::connect(config_dir)
+            .context("Failed to connect to daemon — is `hop host` running?")?;
+
+        let catalog_id = cap.catalog_id();
+        if let Ok(Some(existing)) = ds.cron_find_by_catalog_id(&catalog_id) {
+            println!("\u{2713} {} already enabled (job {}).", cap.id, existing.id);
+            return Ok(());
+        }
+
+        let now = unix_now_ms();
+        let next_run = hop_mcp::cron::next_occurrence_ms(&sched, now);
+        let job_id = format!("{:08x}", rand::random::<u32>());
+
+        let job = hop_core::datastore::types::CronJob {
+            id: job_id.clone(),
+            name: format!("cap:{}", id),
+            schedule,
+            script: cap.script.to_string(),
+            enabled: true,
+            last_run: None,
+            next_run,
+            created_at: now,
+            tags: vec![format!("cap:{}", id)],
+            targets: None,
+            catalog_id: Some(catalog_id),
+            sandbox: Some(cap.tier.to_sandbox()),
+        };
+        ds.cron_add(&job)?;
+        println!("\u{2713} {} active (job {}).", cap.name, job_id);
+    }
+
+    if let Some(host) = target {
+        println!("\nRun `hop {host} cap run {id}` to test now.");
+    } else {
+        println!("\nRun `hop cap run {id}` to test now.");
+    }
+    Ok(())
+}
+
 async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> {
     use hop_mcp::capabilities::{CapabilityDefinition, registry::builtin_capabilities};
 
@@ -2363,6 +2540,9 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 }
                 Err(e) => anyhow::bail!("Fleet exec failed: {e}"),
             }
+        }
+        CapAction::Setup { id, schedule } => {
+            return cmd_cap_setup(&id, schedule.as_deref(), None, config_dir).await;
         }
     }
     Ok(())
