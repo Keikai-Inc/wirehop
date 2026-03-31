@@ -134,15 +134,19 @@ for (var i = 0; i < emails.length; i++) {
 
 var apiKey = hop.secrets.get("ANTHROPIC_API_KEY");
 if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY not set. Run: hop secrets set ANTHROPIC_API_KEY <key>");
+    throw new Error("ANTHROPIC_API_KEY not set. Run: hop cap setup email-monitor");
+}
+
+// Detect token type: OAuth tokens start with "sk-ant-oat", API keys with "sk-ant-api"
+var anthropicHeaders = { "anthropic-version": "2023-06-01", "content-type": "application/json" };
+if (apiKey.indexOf("sk-ant-oat") === 0) {
+    anthropicHeaders["Authorization"] = "Bearer " + apiKey;
+} else {
+    anthropicHeaders["x-api-key"] = apiKey;
 }
 
 var triageResp = hop.http.post("https://api.anthropic.com/v1/messages", {
-    headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    },
+    headers: anthropicHeaders,
     json: {
         model: "claude-sonnet-4-20250514",
         max_tokens: 2048,
@@ -209,11 +213,7 @@ if (fyi.length > 0) {
 }
 
 var summaryResp = hop.http.post("https://api.anthropic.com/v1/messages", {
-    headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    },
+    headers: anthropicHeaders,
     json: {
         model: "claude-sonnet-4-20250514",
         max_tokens: 2048,

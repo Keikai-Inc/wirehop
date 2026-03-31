@@ -160,17 +160,32 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
 
 // ── API Key Flow ──────────────────────────────────────────────────
 
-/// Run the API key prompt flow for a provider.
+/// Run the API key flow for a provider. For Anthropic, checks for existing
+/// Claude Code credentials first and offers to reuse them.
 /// Returns (secret_name, secret_value).
 pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<(String, String)> {
-    // Open console page in browser
+    // Check for existing Claude Code credentials
+    if provider.name == "anthropic" && let Some(token) = detect_claude_credentials() {
+        eprintln!("  Found existing Claude Code credentials.");
+        eprint!("  Use Claude Code login? [Y/n]: ");
+        std::io::stderr().flush()?;
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+
+        if answer.is_empty() || answer == "y" || answer == "yes" {
+            return Ok((provider.secret_name.to_string(), token));
+        }
+    }
+
+    // Fall back to manual key entry
     eprintln!(
         "  Opening {} to create an API key...",
         provider.console_url
     );
     let _ = open_browser(provider.console_url);
 
-    // Prompt for key
     eprint!("  {}: ", provider.prompt);
     std::io::stderr().flush()?;
 
@@ -183,6 +198,31 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<(String, String)> {
     }
 
     Ok((provider.secret_name.to_string(), key))
+}
+
+/// Check for existing Claude Code OAuth credentials at ~/.claude/.credentials.json.
+/// Returns the access token if found and not expired.
+fn detect_claude_credentials() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(home).join(".claude/.credentials.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+
+    let oauth = json.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?;
+    let expires_at = oauth.get("expiresAt")?.as_u64()?;
+
+    // Check if token is still valid (with 5 min buffer)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+
+    if now_ms > expires_at.saturating_sub(300_000) {
+        return None; // expired
+    }
+
+    Some(token.to_string())
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────
