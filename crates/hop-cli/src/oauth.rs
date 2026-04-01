@@ -383,34 +383,35 @@ fn detect_claude_credentials_file() -> Option<ClaudeCredentials> {
 }
 
 fn detect_claude_credentials_cli() -> Option<ClaudeCredentials> {
-    // Check if claude is installed and logged in (via user's shell for nvm/brew PATH)
-    let status = shell_command("claude auth status").output().ok()?;
-
-    if !status.status.success() {
-        return None;
-    }
-
-    let status_json: serde_json::Value =
-        serde_json::from_slice(&status.stdout).ok()?;
-
-    if !status_json.get("loggedIn")?.as_bool()? {
-        return None;
-    }
-
-    // Claude is logged in but credentials are in the keychain.
-    // On macOS, try reading from Electron's safeStorage via the credentials file
-    // that Claude Code maintains. If that doesn't work, we can't extract tokens
-    // programmatically — fall back to asking the user.
+    // On macOS, npm-installed Claude Code stores credentials in the Keychain
+    // under service "Claude Code-credentials". Try reading it directly.
     #[cfg(target_os = "macos")]
     {
-        // Try the Electron safeStorage credentials file one more time
-        // (it may have been created since our first check)
-        if let Some(creds) = detect_claude_credentials_file() {
+        if let Some(creds) = detect_claude_credentials_keychain() {
             return Some(creds);
         }
     }
 
     None
+}
+
+/// Read Claude Code credentials from macOS Keychain.
+/// npm-installed Claude Code uses service name "Claude Code-credentials".
+#[cfg(target_os = "macos")]
+fn detect_claude_credentials_keychain() -> Option<ClaudeCredentials> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
+    let oauth = json.get("claudeAiOauth")?;
+    parse_claude_oauth(oauth)
 }
 
 fn parse_claude_oauth(oauth: &serde_json::Value) -> Option<ClaudeCredentials> {
