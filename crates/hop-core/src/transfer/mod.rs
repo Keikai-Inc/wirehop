@@ -467,6 +467,9 @@ pub async fn client_push_copy(
     let start = Instant::now();
     let mut summary = TransferSummary::default();
 
+    // Collect all entries to send (walk directories upfront).
+    let mut all_sends: Vec<(PathBuf, Vec<FileEntry>)> = Vec::new();
+
     for (i, local_path) in local_paths.iter().enumerate() {
         let (base_dir, entries) = if local_path.is_file() {
             let metadata = std::fs::metadata(local_path)?;
@@ -497,12 +500,8 @@ pub async fn client_push_copy(
         } else if local_path.is_dir() {
             let is_contents_only = contents_only.get(i).copied().unwrap_or(false);
             if is_contents_only {
-                // Trailing slash (rsync convention): send contents only,
-                // paths relative to the directory itself.
                 (local_path.clone(), listing::walk_directory(local_path)?)
             } else {
-                // No trailing slash: include the directory name in all paths
-                // so the receiver creates the directory under the destination.
                 let dir_name = local_path
                     .file_name()
                     .unwrap_or_default()
@@ -519,21 +518,65 @@ pub async fn client_push_copy(
             bail!("path does not exist: {}", local_path.display());
         };
 
-        let bytes = sender::send_files(send, &base_dir, &entries, progress, params).await?;
-        summary.bytes_transferred += bytes;
         summary.files_transferred += entries.iter().filter(|e| !e.is_dir).count() as u64;
         summary.dirs_created += entries.iter().filter(|e| e.is_dir).count() as u64;
+        all_sends.push((base_dir, entries));
     }
 
-    // Send Done immediately after all files
+    // Send files in batches and drain acks between batches. Without draining
+    // acks during send, large transfers deadlock: the host writes acks to its
+    // stdout pipe, the pipe fills (64KB), the helper blocks, can't read more
+    // data from stdin, QUIC flow control back-pressures the client → deadlock.
+    const BATCH_SIZE: usize = 100;
+
+    for (base_dir, entries) in &all_sends {
+        for batch in entries.chunks(BATCH_SIZE) {
+            let bytes = sender::send_files(send, base_dir, batch, progress, params).await?;
+            summary.bytes_transferred += bytes;
+
+            // Drain any pending acks (non-blocking) to prevent back-pressure
+            drain_pending_acks(recv, progress, &mut summary.errors).await;
+        }
+    }
+
+    // Send Done
     proto::write_message(send, &TransferMsg::Done).await?;
 
-    // Read all acks + host's Done in one pass (no count needed)
+    // Read remaining acks + host's Done
     let errors = receiver::read_acks_until_done(recv, Some(progress)).await?;
-    summary.errors = errors;
+    summary.errors.extend(errors);
 
     summary.elapsed = start.elapsed();
     Ok(summary)
+}
+
+/// Drain any pending ack messages without blocking.
+///
+/// Reads acks that are immediately available. Returns when no more data
+/// is ready (the read would block). This prevents the recv buffer from
+/// filling up during large sends, which would cause QUIC back-pressure deadlock.
+async fn drain_pending_acks(
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    progress: &dyn ProgressReporter,
+    errors: &mut Vec<String>,
+) {
+    use std::time::Duration;
+    // Try to read acks with a very short timeout — just drain what's buffered
+    loop {
+        match tokio::time::timeout(Duration::from_millis(1), proto::read_message::<TransferMsg>(recv)).await {
+            Ok(Ok(TransferMsg::FileAck { path, success, error })) => {
+                if success {
+                    progress.file_confirmed(&path);
+                } else {
+                    errors.push(format!("{}: {}", path, error.unwrap_or_else(|| "unknown error".into())));
+                }
+            }
+            Ok(Ok(TransferMsg::Done)) => break, // host sent Done early
+            Ok(Ok(_)) => {} // ignore other messages
+            Ok(Err(_)) => break, // read error
+            Err(_) => break, // timeout — no more pending acks
+        }
+    }
 }
 
 /// Client-side: pull files from the remote host (copy pull).
