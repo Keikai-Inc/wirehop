@@ -693,11 +693,16 @@ async fn dispatch_session(
         }
         Some(ClientMessage::RequestPeerOp(request)) => {
             tracing::info!("Peer op from {}: {:?}", peer_id, request);
-            let response = hop_core::peer_ops::handle_peer_request(
-                request,
-                config_dir,
-                &datastore,
-            );
+            // Handle CapEnable/CapRun here (needs hop-mcp for capability definitions)
+            let response = match request {
+                hop_core::proto::PeerRequest::CapEnable { ref id, ref schedule, ref targets } => {
+                    handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref())
+                }
+                hop_core::proto::PeerRequest::CapRun { ref id, ref targets, ref params } => {
+                    handle_remote_cap_run(&datastore, id, targets.as_deref(), params)
+                }
+                _ => hop_core::peer_ops::handle_peer_request(request, config_dir, &datastore),
+            };
             proto::write_message(&mut send, &proto::HostMessage::PeerResponse(response)).await?;
         }
         Some(ClientMessage::RequestAdmin(request)) => {
@@ -3140,6 +3145,95 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn handle_remote_cap_enable(
+    datastore: &hop_core::datastore::Datastore,
+    id: &str,
+    schedule: Option<&str>,
+    targets: Option<&str>,
+) -> hop_core::proto::PeerResponse {
+    use hop_mcp::capabilities::CapabilityDefinition;
+
+    let Some(cap) = CapabilityDefinition::find(id) else {
+        return hop_core::proto::PeerResponse::Error(format!("Unknown capability: {id}"));
+    };
+    if !cap.is_schedulable() {
+        return hop_core::proto::PeerResponse::Error(format!("'{id}' is on-demand only"));
+    }
+
+    let schedule = schedule
+        .map(String::from)
+        .or_else(|| cap.default_schedule().map(String::from))
+        .unwrap_or_default();
+
+    let Ok(sched) = schedule.parse::<cron::Schedule>() else {
+        return hop_core::proto::PeerResponse::Error(format!("Invalid schedule: {schedule}"));
+    };
+
+    let catalog_id = cap.catalog_id();
+    if let Ok(Some(existing)) = datastore.cron_find_by_catalog_id(&catalog_id) {
+        return hop_core::proto::PeerResponse::CapEnabled { job_id: existing.id };
+    }
+
+    let now = unix_now_ms();
+    let next_run = hop_mcp::cron::next_occurrence_ms(&sched, now);
+    let job_id = format!("{:08x}", rand::random::<u32>());
+
+    let job = hop_core::datastore::types::CronJob {
+        id: job_id.clone(),
+        name: format!("cap:{id}"),
+        schedule,
+        script: cap.script.to_string(),
+        enabled: true,
+        last_run: None,
+        next_run,
+        created_at: now,
+        tags: vec![format!("cap:{id}")],
+        targets: targets.map(String::from),
+        catalog_id: Some(catalog_id),
+        sandbox: Some(cap.tier.to_sandbox()),
+    };
+
+    match datastore.cron_add(&job) {
+        Ok(()) => hop_core::proto::PeerResponse::CapEnabled { job_id },
+        Err(e) => hop_core::proto::PeerResponse::Error(format!("Failed to enable: {e}")),
+    }
+}
+
+fn handle_remote_cap_run(
+    datastore: &hop_core::datastore::Datastore,
+    id: &str,
+    targets: Option<&str>,
+    _params: &[(String, String)],
+) -> hop_core::proto::PeerResponse {
+    use hop_mcp::capabilities::CapabilityDefinition;
+
+    let Some(cap) = CapabilityDefinition::find(id) else {
+        return hop_core::proto::PeerResponse::Error(format!("Unknown capability: {id}"));
+    };
+
+    let now = unix_now_ms();
+    let job_id = format!("{:08x}", rand::random::<u32>());
+    let job = hop_core::datastore::types::CronJob {
+        id: job_id.clone(),
+        name: format!("cap:run:{id}"),
+        schedule: "0 0 0 1 1 * 2099".to_string(),
+        script: cap.script.to_string(),
+        enabled: true,
+        last_run: None,
+        next_run: 0,
+        created_at: now,
+        tags: vec![],
+        targets: targets.map(String::from),
+        catalog_id: Some(format!("cap:run:{id}")),
+        sandbox: Some(cap.tier.to_sandbox()),
+    };
+
+    match datastore.cron_add(&job) {
+        Ok(()) => hop_core::proto::PeerResponse::CapTriggered { job_id },
+        Err(e) => hop_core::proto::PeerResponse::Error(format!("Failed to trigger: {e}")),
+    }
 }
 
 fn unix_now_ms() -> u64 {
