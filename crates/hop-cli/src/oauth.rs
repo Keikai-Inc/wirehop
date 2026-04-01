@@ -193,18 +193,30 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             eprintln!("  Claude Code is logged in. Running setup-token to export credentials...");
             eprintln!();
 
-            let status = shell_command_interactive("claude setup-token")
-                .stdout(std::process::Stdio::inherit())
+            let output = shell_command_interactive("claude setup-token")
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
-                .status();
+                .output();
 
-            if let Ok(s) = status && s.success() {
-                // setup-token should have written to .credentials.json — try again
+            if let Ok(out) = output && out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+
+                // Try 1: check if setup-token wrote to .credentials.json
                 if let Some(creds) = detect_claude_credentials_file() {
                     return Ok(vec![
                         ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
                         ("anthropic_refresh_token".to_string(), creds.refresh_token),
                         ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
+                        ("anthropic_method".to_string(), "claude_oauth".to_string()),
+                    ]);
+                }
+
+                // Try 2: parse the token from stdout (setup-token prints it)
+                // Look for "sk-ant-oat01-" in the output
+                if let Some(token) = extract_token_from_output(&stdout) {
+                    eprintln!("  Token captured from setup-token output.");
+                    return Ok(vec![
+                        ("ANTHROPIC_API_KEY".to_string(), token),
                         ("anthropic_method".to_string(), "claude_oauth".to_string()),
                     ]);
                 }
@@ -239,6 +251,31 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 }
 
 /// Check if the `claude` CLI binary is available via the user's shell.
+/// Extract an OAuth token (sk-ant-oat01-...) from setup-token's stdout.
+/// The output contains ASCII art and text; the token is on its own line.
+fn extract_token_from_output(output: &str) -> Option<String> {
+    // Token lines may be split across multiple lines (line wrapping).
+    // Collect all text, then find the token pattern.
+    let clean: String = output
+        .lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Find sk-ant-oat01- and capture until whitespace or non-token char
+    if let Some(start) = clean.find("sk-ant-oat01-") {
+        let token_chars: String = clean[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if token_chars.len() > 20 {
+            return Some(token_chars);
+        }
+    }
+
+    None
+}
+
 /// Minimum Claude Code version that supports `claude auth status`.
 const MIN_CLAUDE_VERSION: (u32, u32) = (2, 1); // 2.1.x+
 
