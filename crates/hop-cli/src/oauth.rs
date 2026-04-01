@@ -187,15 +187,11 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             }
         }
 
-        // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
-        // Run `claude setup-token` to create an extractable long-lived token.
-        let claude_logged_in = is_claude_logged_in();
-        if !claude_logged_in {
-            eprintln!("  (Claude Code not detected or not logged in)");
-        }
-        if claude_logged_in {
-            eprintln!("  Claude Code is logged in but credentials are in the system keychain.");
-            eprintln!("  Running `claude setup-token` to create an extractable token...");
+        // Try 2: Claude CLI is installed — run setup-token to create extractable credentials.
+        // Skip `claude auth status` (it hangs with null stdin on some versions).
+        // Just check if the binary exists and let setup-token handle auth.
+        if has_claude_cli() {
+            eprintln!("  Claude Code detected. Running setup-token to export credentials...");
             eprintln!();
 
             let status = shell_command_interactive("claude setup-token")
@@ -243,35 +239,13 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
     ])
 }
 
-/// Check if Claude Code is logged in (without extracting tokens).
-/// Uses the user's shell to find `claude` (handles nvm, brew, etc.).
-fn is_claude_logged_in() -> bool {
-    let output = match shell_command("claude auth status").output() {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::debug!("claude auth status failed to run: {e}");
-            return false;
-        }
-    };
-    if !output.status.success() {
-        tracing::debug!("claude auth status exited with: {}", output.status);
-        return false;
-    }
-    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::debug!("claude auth status output not JSON: {e}");
-            // stdout might contain shell profile noise — try to find JSON in it
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(start) = stdout.find('{')
-                && let Ok(j) = serde_json::from_str::<serde_json::Value>(&stdout[start..])
-            {
-                return j.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-            }
-            return false;
-        }
-    };
-    json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
+/// Check if the `claude` CLI binary is available via the user's shell.
+fn has_claude_cli() -> bool {
+    shell_command("which claude")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Run a command through the user's login shell so PATH includes
