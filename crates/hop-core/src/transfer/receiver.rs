@@ -177,13 +177,22 @@ async fn receive_file_data(
 
 /// Read acks until a Done message is received, without knowing the count up front.
 /// Returns collected error strings. Used for pipelined ack reading.
+/// Timeout for reading individual ack messages. If the host doesn't respond
+/// within this time, the transfer is considered failed (connection likely dead).
+const ACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn read_acks_until_done(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<String>> {
     let mut errors = Vec::new();
     loop {
-        let msg: TransferMsg = proto::read_message(recv).await?;
+        let msg: TransferMsg = tokio::time::timeout(
+            ACK_READ_TIMEOUT,
+            proto::read_message(recv),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Transfer timed out waiting for host (no response in {}s). Connection may have dropped.", ACK_READ_TIMEOUT.as_secs()))??;
         match msg {
             TransferMsg::FileAck {
                 path,
@@ -221,7 +230,12 @@ pub async fn read_acks(
 ) -> Result<Vec<String>> {
     let mut errors = Vec::new();
     for _ in 0..expected_count {
-        let msg: TransferMsg = proto::read_message(recv).await?;
+        let msg: TransferMsg = tokio::time::timeout(
+            ACK_READ_TIMEOUT,
+            proto::read_message(recv),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Transfer timed out waiting for host acknowledgment"))??;
         match msg {
             TransferMsg::FileAck {
                 path,

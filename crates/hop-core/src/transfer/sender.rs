@@ -21,6 +21,10 @@ use super::progress::ProgressReporter;
 /// - Regular files: send `FileHeader`, then `FileData` chunks, then `FileEnd`
 ///
 /// The caller is responsible for reading `FileAck` responses (see receiver).
+/// Timeout for write operations. If the connection is dead, writes
+/// will eventually fail when buffers fill, but this caps the wait.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn send_files(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     base_dir: &Path,
@@ -126,7 +130,12 @@ pub async fn send_files(
             }
         }
 
-        proto::write_message(send, &TransferMsg::FileEnd).await?;
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            proto::write_message(send, &TransferMsg::FileEnd),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Write timed out sending {} — connection may have dropped", entry.path))??;
         progress.file_done(&entry.path);
     }
 
