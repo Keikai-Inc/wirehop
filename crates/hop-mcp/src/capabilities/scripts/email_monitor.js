@@ -132,19 +132,65 @@ for (var i = 0; i < emails.length; i++) {
         + "Preview: " + emails[i].snippet + "\n---\n";
 }
 
-// ── Claude Inference Helper ────────────────────────────────────────
-// Two methods: API key (direct HTTP) or Claude CLI (uses Claude Code's own auth).
-// The method is chosen during `hop cap setup` and stored in secrets.
+// ── Claude Inference ──────────────────────────────────────────────
+// Two methods, both with automatic token refresh:
+//   api_key:      direct HTTP with x-api-key header
+//   claude_oauth: OAuth token via ANTHROPIC_API_KEY env + claude CLI
 
-var apiKey = hop.secrets.get("ANTHROPIC_API_KEY");
 var anthropicMethod = hop.secrets.get("anthropic_method") || "api_key";
 
+function getAnthropicToken() {
+    var token = hop.secrets.get("ANTHROPIC_API_KEY");
+    if (!token) {
+        throw new Error("ANTHROPIC_API_KEY not set. Run: hop cap setup email-monitor");
+    }
+
+    // API keys (sk-ant-api...) don't expire
+    if (anthropicMethod === "api_key") {
+        return token;
+    }
+
+    // OAuth tokens (sk-ant-oat...) expire — check and refresh
+    var expiry = parseInt(hop.secrets.get("anthropic_token_expiry") || "0");
+    if (Date.now() > expiry - 300000) {
+        hop.log("Refreshing Anthropic OAuth token...");
+        var refreshToken = hop.secrets.get("anthropic_refresh_token");
+        if (!refreshToken) {
+            throw new Error("anthropic_refresh_token not set. Run: hop cap setup email-monitor");
+        }
+
+        var resp = hop.http.post("https://console.anthropic.com/v1/oauth/token", {
+            json: {
+                grant_type: "refresh_token",
+                refresh_token: refreshToken,
+                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+            }
+        });
+
+        if (resp.status !== 200) {
+            throw new Error("Anthropic token refresh failed (" + resp.status + "): " + resp.body);
+        }
+
+        var data = resp.json();
+        token = data.access_token;
+        hop.secrets.set("ANTHROPIC_API_KEY", token);
+        if (data.expires_in) {
+            hop.secrets.set("anthropic_token_expiry", String(Date.now() + data.expires_in * 1000));
+        }
+        hop.log("Anthropic token refreshed.");
+    }
+
+    return token;
+}
+
 function callClaude(prompt) {
-    // API key method: direct HTTP call
-    if (anthropicMethod === "api_key" && apiKey) {
+    var token = getAnthropicToken();
+
+    if (anthropicMethod === "api_key") {
+        // Direct API call with x-api-key
         var resp = hop.http.post("https://api.anthropic.com/v1/messages", {
             headers: {
-                "x-api-key": apiKey,
+                "x-api-key": token,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json"
             },
@@ -161,16 +207,13 @@ function callClaude(prompt) {
         throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
     }
 
-    // Claude CLI method: uses Claude Code's own OAuth auth
-    var cliResult = hop.local("claude -p " + JSON.stringify(prompt) + " --output-format text 2>/dev/null");
+    // Claude CLI with OAuth token passed via env var
+    var escaped = token.replace(/'/g, "'\\''");
+    var cliResult = hop.local("ANTHROPIC_API_KEY='" + escaped + "' claude -p " + JSON.stringify(prompt) + " --bare --output-format text 2>/dev/null");
     if (cliResult.exit_code === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
     }
-
-    if (!apiKey && anthropicMethod !== "claude_oauth") {
-        throw new Error("No Anthropic credentials configured. Run: hop cap setup email-monitor");
-    }
-    throw new Error("Claude CLI failed (exit " + cliResult.exit_code + "). Is claude installed? stderr: " + cliResult.stderr);
+    throw new Error("Claude CLI failed (exit " + cliResult.exit_code + "): " + cliResult.stderr);
 }
 
 var triageText = callClaude(
