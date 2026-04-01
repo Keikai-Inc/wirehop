@@ -198,8 +198,7 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             eprintln!("  Running `claude setup-token` to create an extractable token...");
             eprintln!();
 
-            let status = shell_command("claude setup-token")
-                .stdin(std::process::Stdio::inherit())
+            let status = shell_command_interactive("claude setup-token")
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .status();
@@ -277,7 +276,18 @@ fn is_claude_logged_in() -> bool {
 
 /// Run a command through the user's login shell so PATH includes
 /// nvm, brew, cargo, and other shell-initialized tools.
+/// Stdin is set to null to prevent interactive TUI launches.
 fn shell_command(cmd: &str) -> std::process::Command {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut command = std::process::Command::new(&shell);
+    command.args(["-lc", cmd]);
+    // Prevent interactive mode — force non-TTY stdin
+    command.stdin(std::process::Stdio::null());
+    command
+}
+
+/// Like shell_command but inherits stdin (for interactive commands like setup-token).
+fn shell_command_interactive(cmd: &str) -> std::process::Command {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut command = std::process::Command::new(&shell);
     command.args(["-lc", cmd]);
