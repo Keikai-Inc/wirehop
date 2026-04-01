@@ -167,7 +167,7 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
 /// 2. Prompt for an API key from console.anthropic.com
 pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String)>> {
     if provider.name == "anthropic" {
-        // Check for existing Claude Code credentials
+        // Try 1: Extract credentials from file/keychain
         if let Some(creds) = detect_claude_credentials() {
             eprintln!("  Found Claude Code credentials (expires {}).", creds.expires_display);
             eprint!("  Use Claude Code login? [Y/n]: ");
@@ -182,6 +182,27 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
                     ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
                     ("anthropic_refresh_token".to_string(), creds.refresh_token),
                     ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
+                    ("anthropic_method".to_string(), "claude_oauth".to_string()),
+                ]);
+            }
+        }
+
+        // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
+        // Offer to configure the remote to use claude CLI directly.
+        if is_claude_logged_in() {
+            eprintln!("  Claude Code is logged in (credentials in system keychain).");
+            eprintln!("  Options:");
+            eprintln!("    [1] Use Claude CLI on remote host (requires claude installed there)");
+            eprintln!("    [2] Enter an API key from console.anthropic.com");
+            eprint!("  Choice [1/2]: ");
+            std::io::stderr().flush()?;
+
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim();
+
+            if answer.is_empty() || answer == "1" {
+                return Ok(vec![
                     ("anthropic_method".to_string(), "claude_oauth".to_string()),
                 ]);
             }
@@ -210,6 +231,23 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
         (provider.secret_name.to_string(), key),
         ("anthropic_method".to_string(), "api_key".to_string()),
     ])
+}
+
+/// Check if Claude Code is logged in (without extracting tokens).
+fn is_claude_logged_in() -> bool {
+    let Ok(output) = std::process::Command::new("claude")
+        .args(["auth", "status"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 struct ClaudeCredentials {
