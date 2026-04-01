@@ -187,11 +187,10 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             }
         }
 
-        // Try 2: Claude CLI is installed — run setup-token to create extractable credentials.
-        // Skip `claude auth status` (it hangs with null stdin on some versions).
-        // Just check if the binary exists and let setup-token handle auth.
-        if has_claude_cli() {
-            eprintln!("  Claude Code detected. Running setup-token to export credentials...");
+        // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
+        // Run `claude setup-token` to create an extractable long-lived token.
+        if is_claude_logged_in() {
+            eprintln!("  Claude Code is logged in. Running setup-token to export credentials...");
             eprintln!();
 
             let status = shell_command_interactive("claude setup-token")
@@ -240,12 +239,56 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 }
 
 /// Check if the `claude` CLI binary is available via the user's shell.
-fn has_claude_cli() -> bool {
-    shell_command("which claude")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// Minimum Claude Code version that supports `claude auth status`.
+const MIN_CLAUDE_VERSION: (u32, u32) = (2, 1); // 2.1.x+
+
+/// Check if Claude Code is installed, recent enough, and logged in.
+/// Returns true only if `claude auth status` reports loggedIn: true.
+fn is_claude_logged_in() -> bool {
+    // Check version first — old versions don't have `auth status`
+    let version_output = match shell_command("claude --version").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let version_str = String::from_utf8_lossy(&version_output.stdout);
+    if !check_claude_version(&version_str) {
+        // Extract version for the error message
+        let ver = version_str.trim().lines().next().unwrap_or("unknown");
+        eprintln!("  Claude Code {ver} is too old (need >= {}.{}.x).", MIN_CLAUDE_VERSION.0, MIN_CLAUDE_VERSION.1);
+        eprintln!("  Update with: npm install -g @anthropic-ai/claude-code@latest");
+        return false;
+    }
+
+    // Now safe to call auth status
+    let output = match shell_command("claude auth status").output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Find JSON in output (may have shell profile noise before it)
+    let json_str = if let Some(start) = stdout.find('{') { &stdout[start..] } else { &stdout };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return false;
+    };
+    json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Check if the claude version string meets the minimum requirement.
+/// Expects format like "2.1.89 (Claude Code)" or similar.
+fn check_claude_version(version_output: &str) -> bool {
+    let line = version_output.trim().lines().next().unwrap_or("");
+    // Extract version numbers from "2.1.89 (Claude Code)" or "2.1.89"
+    let version_part = line.split_whitespace().next().unwrap_or("");
+    let parts: Vec<&str> = version_part.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let Ok(major) = parts[0].parse::<u32>() else { return false };
+    let Ok(minor) = parts[1].parse::<u32>() else { return false };
+    (major, minor) >= MIN_CLAUDE_VERSION
 }
 
 /// Run a command through the user's login shell so PATH includes
