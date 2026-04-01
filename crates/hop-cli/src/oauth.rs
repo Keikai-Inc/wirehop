@@ -189,7 +189,11 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 
         // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
         // Run `claude setup-token` to create an extractable long-lived token.
-        if is_claude_logged_in() {
+        let claude_logged_in = is_claude_logged_in();
+        if !claude_logged_in {
+            eprintln!("  (Claude Code not detected or not logged in)");
+        }
+        if claude_logged_in {
             eprintln!("  Claude Code is logged in but credentials are in the system keychain.");
             eprintln!("  Running `claude setup-token` to create an extractable token...");
             eprintln!();
@@ -243,14 +247,30 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 /// Check if Claude Code is logged in (without extracting tokens).
 /// Uses the user's shell to find `claude` (handles nvm, brew, etc.).
 fn is_claude_logged_in() -> bool {
-    let Ok(output) = shell_command("claude auth status").output() else {
-        return false;
+    let output = match shell_command("claude auth status").output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!("claude auth status failed to run: {e}");
+            return false;
+        }
     };
     if !output.status.success() {
+        tracing::debug!("claude auth status exited with: {}", output.status);
         return false;
     }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return false;
+    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::debug!("claude auth status output not JSON: {e}");
+            // stdout might contain shell profile noise — try to find JSON in it
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(start) = stdout.find('{')
+                && let Ok(j) = serde_json::from_str::<serde_json::Value>(&stdout[start..])
+            {
+                return j.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+            }
+            return false;
+        }
     };
     json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
 }
