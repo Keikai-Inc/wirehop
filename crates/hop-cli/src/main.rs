@@ -2893,12 +2893,26 @@ fn parse_remote_cap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
     let action = args.first().map(|s| s.as_str()).unwrap_or("");
     match action {
         "status" => Ok(PeerRequest::CapStatus),
+        "enable" => {
+            let id = args.get(1).context("usage: hop <host> cap enable <id>")?;
+            let schedule = args.iter().position(|a| a == "--schedule")
+                .and_then(|i| args.get(i + 1)).cloned();
+            let targets = args.iter().position(|a| a == "--targets")
+                .and_then(|i| args.get(i + 1)).cloned();
+            Ok(PeerRequest::CapEnable { id: id.clone(), schedule, targets })
+        }
         "disable" => {
             let id = args.get(1).context("usage: hop <host> cap disable <id>")?;
             Ok(PeerRequest::CapDisable { id: id.clone() })
         }
+        "run" => {
+            let id = args.get(1).context("usage: hop <host> cap run <id>")?;
+            let targets = args.iter().position(|a| a == "--targets")
+                .and_then(|i| args.get(i + 1)).cloned();
+            Ok(PeerRequest::CapRun { id: id.clone(), targets, params: vec![] })
+        }
         "list" => Ok(PeerRequest::CapList),
-        _ => anyhow::bail!("usage: hop <host> cap [status|disable|list] ..."),
+        _ => anyhow::bail!("usage: hop <host> cap [list|enable|disable|status|run] ..."),
     }
 }
 
