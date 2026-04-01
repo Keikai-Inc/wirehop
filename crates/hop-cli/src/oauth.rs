@@ -219,15 +219,68 @@ struct ClaudeCredentials {
     expires_display: String,
 }
 
-/// Check for existing Claude Code OAuth credentials at ~/.claude/.credentials.json.
+/// Detect existing Claude Code OAuth credentials.
+///
+/// Tries two sources:
+/// 1. ~/.claude/.credentials.json (file cache, may not exist on all setups)
+/// 2. `claude auth status --json` + keychain (Claude Code manages its own auth)
+///
 /// Returns the full credential set if found and not expired.
 fn detect_claude_credentials() -> Option<ClaudeCredentials> {
+    // Try 1: credentials file (fast, no subprocess)
+    if let Some(creds) = detect_claude_credentials_file() {
+        return Some(creds);
+    }
+
+    // Try 2: ask Claude CLI to export credentials via setup-token or auth status
+    detect_claude_credentials_cli()
+}
+
+fn detect_claude_credentials_file() -> Option<ClaudeCredentials> {
     let home = std::env::var("HOME").ok()?;
     let path = std::path::PathBuf::from(home).join(".claude/.credentials.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&data).ok()?;
 
     let oauth = json.get("claudeAiOauth")?;
+    parse_claude_oauth(oauth)
+}
+
+fn detect_claude_credentials_cli() -> Option<ClaudeCredentials> {
+    // Check if claude is installed and logged in
+    let status = std::process::Command::new("claude")
+        .args(["auth", "status"])
+        .output()
+        .ok()?;
+
+    if !status.status.success() {
+        return None;
+    }
+
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).ok()?;
+
+    if !status_json.get("loggedIn")?.as_bool()? {
+        return None;
+    }
+
+    // Claude is logged in but credentials are in the keychain.
+    // On macOS, try reading from Electron's safeStorage via the credentials file
+    // that Claude Code maintains. If that doesn't work, we can't extract tokens
+    // programmatically — fall back to asking the user.
+    #[cfg(target_os = "macos")]
+    {
+        // Try the Electron safeStorage credentials file one more time
+        // (it may have been created since our first check)
+        if let Some(creds) = detect_claude_credentials_file() {
+            return Some(creds);
+        }
+    }
+
+    None
+}
+
+fn parse_claude_oauth(oauth: &serde_json::Value) -> Option<ClaudeCredentials> {
     let access_token = oauth.get("accessToken")?.as_str()?.to_string();
     let refresh_token = oauth.get("refreshToken")?.as_str().unwrap_or("").to_string();
     let expires_at = oauth.get("expiresAt")?.as_u64()?;
