@@ -194,8 +194,7 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             eprintln!("  Running `claude setup-token` to create an extractable token...");
             eprintln!();
 
-            let status = std::process::Command::new("claude")
-                .arg("setup-token")
+            let status = shell_command("claude setup-token")
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
@@ -242,11 +241,9 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 }
 
 /// Check if Claude Code is logged in (without extracting tokens).
+/// Uses the user's shell to find `claude` (handles nvm, brew, etc.).
 fn is_claude_logged_in() -> bool {
-    let Ok(output) = std::process::Command::new("claude")
-        .args(["auth", "status"])
-        .output()
-    else {
+    let Ok(output) = shell_command("claude auth status").output() else {
         return false;
     };
     if !output.status.success() {
@@ -256,6 +253,15 @@ fn is_claude_logged_in() -> bool {
         return false;
     };
     json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Run a command through the user's login shell so PATH includes
+/// nvm, brew, cargo, and other shell-initialized tools.
+fn shell_command(cmd: &str) -> std::process::Command {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut command = std::process::Command::new(&shell);
+    command.args(["-lc", cmd]);
+    command
 }
 
 struct ClaudeCredentials {
@@ -293,11 +299,8 @@ fn detect_claude_credentials_file() -> Option<ClaudeCredentials> {
 }
 
 fn detect_claude_credentials_cli() -> Option<ClaudeCredentials> {
-    // Check if claude is installed and logged in
-    let status = std::process::Command::new("claude")
-        .args(["auth", "status"])
-        .output()
-        .ok()?;
+    // Check if claude is installed and logged in (via user's shell for nvm/brew PATH)
+    let status = shell_command("claude auth status").output().ok()?;
 
     if !status.status.success() {
         return None;
