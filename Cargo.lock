@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.5.7"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.5.7"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mcp"
-version = "0.5.7"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2078,8 +2078,6 @@ dependencies = [
 [[package]]
 name = "iroh-quinn"
 version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034ed21f34c657a123d39525d948c885aacba59508805e4dd67d71f022e7151b"
 dependencies = [
  "bytes",
  "cfg_aliases 0.2.1",
@@ -2088,7 +2086,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

@@ -66,6 +66,12 @@ cron = "0.13"
 # Testing
 tempfile = "3"
 
+# Patch iroh-quinn to fix panic on drained connections under heavy stream load.
+# See vendor/iroh-quinn/src/connection.rs:287 — replaces unreachable!() with
+# graceful LocallyClosed fallback. Filed upstream: quinn-rs/quinn.
+[patch.crates-io]
+iroh-quinn = { path = "vendor/iroh-quinn" }
+
 [profile.release]
 lto = true
 codegen-units = 1
