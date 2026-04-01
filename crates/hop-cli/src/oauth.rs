@@ -188,24 +188,32 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
         }
 
         // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
-        // Offer to configure the remote to use claude CLI directly.
+        // Run `claude setup-token` to create an extractable long-lived token.
         if is_claude_logged_in() {
-            eprintln!("  Claude Code is logged in (credentials in system keychain).");
-            eprintln!("  Options:");
-            eprintln!("    [1] Use Claude CLI on remote host (requires claude installed there)");
-            eprintln!("    [2] Enter an API key from console.anthropic.com");
-            eprint!("  Choice [1/2]: ");
-            std::io::stderr().flush()?;
+            eprintln!("  Claude Code is logged in but credentials are in the system keychain.");
+            eprintln!("  Running `claude setup-token` to create an extractable token...");
+            eprintln!();
 
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            let answer = answer.trim();
+            let status = std::process::Command::new("claude")
+                .arg("setup-token")
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status();
 
-            if answer.is_empty() || answer == "1" {
-                return Ok(vec![
-                    ("anthropic_method".to_string(), "claude_oauth".to_string()),
-                ]);
+            if let Ok(s) = status && s.success() {
+                // setup-token should have written to .credentials.json — try again
+                if let Some(creds) = detect_claude_credentials_file() {
+                    return Ok(vec![
+                        ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
+                        ("anthropic_refresh_token".to_string(), creds.refresh_token),
+                        ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
+                        ("anthropic_method".to_string(), "claude_oauth".to_string()),
+                    ]);
+                }
             }
+
+            eprintln!("  Could not extract credentials. Falling back to API key.");
         }
     }
 
