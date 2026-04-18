@@ -651,13 +651,22 @@ async fn send_ack(
     .await
 }
 
+/// True if `path` contains a `..` path component (not just the substring).
+/// `Path::new("foo..bar").components()` yields a single Normal component,
+/// so filenames containing literal `..` characters are accepted.
+fn has_parent_dir_component(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Validate a symlink target is safe: no absolute paths, no `..` traversal.
 /// Only relative targets that stay within the destination are allowed.
 fn validate_symlink_target(target: &str) -> Result<()> {
-    if target.starts_with('/') {
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
         bail!("symlink with absolute target rejected: {target}");
     }
-    if target.contains("..") {
+    if has_parent_dir_component(target_path) {
         bail!("symlink with traversal target rejected: {target}");
     }
     Ok(())
@@ -666,8 +675,8 @@ fn validate_symlink_target(target: &str) -> Result<()> {
 /// Join `base / relative` and validate the result stays within `base`
 /// to prevent path traversal attacks.
 fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
-    // Reject obvious traversal attempts
-    if relative.contains("..") {
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute() || has_parent_dir_component(rel_path) {
         bail!("path traversal rejected: {relative}");
     }
 
@@ -704,10 +713,71 @@ fn tmp_name(path: &Path) -> PathBuf {
     path.with_file_name(format!(".hop-tmp-{file_name}"))
 }
 
+fn set_metadata(path: &Path, mode: u32, mtime: u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Strip setuid (04000), setgid (02000), and sticky (01000) bits.
+        let safe_mode = mode & 0o0777;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
+
+        if mtime > 0 {
+            let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
+            let _ = filetime::set_file_mtime(path, ft);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, mtime);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::TransferMsg;
+
+    #[test]
+    fn safe_join_accepts_filenames_with_consecutive_dots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        for name in [
+            "2020 Partnership TF7012 (THOMAS FAMILY HOLDING COMPANY LLC) K1 (STANTON ....pdf",
+            "foo..bar.txt",
+            "..pdf",
+            "report...final.docx",
+            "a/b/c..d.txt",
+        ] {
+            safe_join(&base, name).unwrap_or_else(|e| panic!("rejected {name:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_real_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        for name in ["..", "../etc/passwd", "a/../b", "foo/../../bar", "/etc/passwd"] {
+            assert!(
+                safe_join(&base, name).is_err(),
+                "should reject traversal: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_symlink_target_accepts_dots_in_names() {
+        validate_symlink_target("foo..bar").unwrap();
+        validate_symlink_target("dir/file...ext").unwrap();
+    }
+
+    #[test]
+    fn validate_symlink_target_rejects_traversal() {
+        assert!(validate_symlink_target("..").is_err());
+        assert!(validate_symlink_target("../escape").is_err());
+        assert!(validate_symlink_target("a/../b").is_err());
+        assert!(validate_symlink_target("/absolute").is_err());
+    }
 
     /// Reproduce the sender/receiver zstd roundtrip to verify data integrity.
     #[tokio::test]
@@ -785,26 +855,10 @@ mod tests {
         // Verify
         let output = std::fs::read(dst_dir.join("test.txt")).unwrap();
         assert_eq!(output.len(), original.len(), "Size mismatch");
-        assert_eq!(output, original, "Content mismatch - got all zeros: {}", output.iter().all(|&b| b == 0));
-    }
-}
-
-fn set_metadata(path: &Path, mode: u32, mtime: u64) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Strip setuid (04000), setgid (02000), and sticky (01000) bits.
-        let safe_mode = mode & 0o0777;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
-
-        if mtime > 0 {
-            let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
-            let _ = filetime::set_file_mtime(path, ft);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode, mtime);
+        assert!(
+            output == original,
+            "Content mismatch - got all zeros: {}",
+            output.iter().all(|&b| b == 0),
+        );
     }
 }
