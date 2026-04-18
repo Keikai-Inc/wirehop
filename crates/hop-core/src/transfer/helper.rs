@@ -9,11 +9,23 @@
 //! The child runs the same transfer functions, just as a different user.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use super::negotiation::NegotiatedParams;
 use super::progress::SilentProgress;
+
+/// Maximum time the proxy will tolerate zero progress in BOTH directions
+/// before killing the child. Prevents orphaned helpers when iroh-quinn
+/// fails to surface a dead connection as an error.
+const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Maximum time the child helper will wait for parent IPC activity before
+/// self-exiting. Insurance against parent-side bugs that leave us orphaned.
+const HELPER_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Spawn a privilege-separated helper and proxy the QUIC stream through it.
 ///
@@ -29,8 +41,6 @@ pub async fn proxy_via_helper(
     params: &NegotiatedParams,
     mode: &str,
 ) -> Result<()> {
-    use tokio::io;
-
     let (uid, gid) = lookup_uid_gid(username)?;
 
     let exe = std::env::current_exe().context("cannot determine hop executable path")?;
@@ -60,7 +70,10 @@ pub async fn proxy_via_helper(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .uid(uid)
-        .gid(gid);
+        .gid(gid)
+        // If the parent future is dropped (cancellation, panic, connection
+        // torn down), ensure the child is SIGKILLed instead of orphaned.
+        .kill_on_drop(true);
     unsafe {
         cmd.pre_exec(move || {
             // initgroups sets supplementary groups (staff, admin, etc.)
@@ -72,27 +85,42 @@ pub async fn proxy_via_helper(
         });
     }
     let mut child = cmd.spawn().context("failed to spawn transfer helper")?;
+    let child_pid = child.id();
 
-    let mut child_stdin = child.stdin.take().context("no child stdin")?;
-    let mut child_stdout = child.stdout.take().context("no child stdout")?;
+    let child_stdin = child.stdin.take().context("no child stdin")?;
+    let child_stdout = child.stdout.take().context("no child stdout")?;
 
-    let proxy_in = async {
-        io::copy(quic_recv, &mut child_stdin).await?;
-        drop(child_stdin);
-        Ok::<_, anyhow::Error>(())
+    // Monotonic counter bumped on every successful read or write in either
+    // direction. The watchdog reads it to detect a stuck proxy.
+    let activity = Arc::new(AtomicU64::new(0));
+
+    let proxy_in = copy_with_activity("recv→child", quic_recv, child_stdin, Arc::clone(&activity));
+    let proxy_out = copy_with_activity("child→send", child_stdout, quic_send, Arc::clone(&activity));
+
+    let proxies = async move {
+        let (in_result, out_result) = tokio::join!(proxy_in, proxy_out);
+        if let Err(e) = in_result {
+            tracing::debug!("proxy_in ended: {e:#}");
+        }
+        if let Err(e) = out_result {
+            tracing::debug!("proxy_out ended: {e:#}");
+        }
     };
-    let proxy_out = async {
-        io::copy(&mut child_stdout, quic_send).await?;
-        Ok::<_, anyhow::Error>(())
-    };
 
-    let (in_result, out_result) = tokio::join!(proxy_in, proxy_out);
+    let watchdog = idle_watchdog(Arc::clone(&activity), PROXY_IDLE_TIMEOUT);
 
-    if let Err(e) = in_result {
-        tracing::debug!("proxy_in ended: {e:#}");
-    }
-    if let Err(e) = out_result {
-        tracing::debug!("proxy_out ended: {e:#}");
+    // Whichever completes first wins. If watchdog fires, dropping `child`
+    // (which owns kill_on_drop) terminates the helper.
+    tokio::select! {
+        _ = proxies => {}
+        _ = watchdog => {
+            tracing::warn!(
+                "transfer helper (pid={child_pid:?}) idle > {}s; killing",
+                PROXY_IDLE_TIMEOUT.as_secs()
+            );
+            let _ = child.kill().await;
+            bail!("transfer helper idle timeout");
+        }
     }
 
     let status = child.wait().await.context("failed to wait for transfer helper")?;
@@ -101,6 +129,82 @@ pub async fn proxy_via_helper(
     }
 
     Ok(())
+}
+
+/// `tokio::io::copy` equivalent that bumps `activity` on every successful
+/// read/write. Used to feed the idle watchdog.
+#[cfg(unix)]
+async fn copy_with_activity<R, W>(
+    label: &'static str,
+    mut reader: R,
+    mut writer: W,
+    activity: Arc<AtomicU64>,
+) -> Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            writer.flush().await.ok();
+            tracing::trace!("{label}: EOF after {total} bytes");
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+        activity.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Watchdog future. Resolves (returns) once `activity` has been idle
+/// for `timeout`. Polls at `timeout / 4` granularity, clamped to [50ms, 60s]
+/// so it stays responsive for short test timeouts without burning CPU
+/// on the 10-minute production timeout.
+#[cfg(unix)]
+async fn idle_watchdog(activity: Arc<AtomicU64>, timeout: Duration) {
+    let mut last_seen = activity.load(Ordering::Relaxed);
+    let mut last_change = Instant::now();
+    let tick = (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(60));
+    loop {
+        tokio::time::sleep(tick).await;
+        let current = activity.load(Ordering::Relaxed);
+        if current != last_seen {
+            last_seen = current;
+            last_change = Instant::now();
+            continue;
+        }
+        if last_change.elapsed() >= timeout {
+            return;
+        }
+    }
+}
+
+/// AsyncRead wrapper that bumps a shared counter on every non-empty read.
+/// Used by the child helper's idle watchdog to detect a dead parent.
+struct ActivityStdin {
+    inner: tokio::io::Stdin,
+    activity: Arc<AtomicU64>,
+}
+
+impl tokio::io::AsyncRead for ActivityStdin {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &res
+            && buf.filled().len() > before
+        {
+            self.activity.fetch_add(1, Ordering::Relaxed);
+        }
+        res
+    }
 }
 
 /// Entry point for the `__transfer-helper` child process.
@@ -112,9 +216,28 @@ pub async fn run_transfer_helper(
     dest: &Path,
     params: NegotiatedParams,
 ) -> Result<()> {
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let activity = Arc::new(AtomicU64::new(0));
+    let stdin_inner = ActivityStdin {
+        inner: tokio::io::stdin(),
+        activity: Arc::clone(&activity),
+    };
+    let mut stdin = tokio::io::BufReader::new(stdin_inner);
     let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
     let progress = SilentProgress;
+
+    // Background task: if stdin has been idle for > HELPER_IDLE_TIMEOUT,
+    // self-terminate. Guards against orphaning when the parent daemon has
+    // a bug that leaves us with nothing to read.
+    let watchdog_activity = Arc::clone(&activity);
+    tokio::spawn(async move {
+        idle_watchdog(watchdog_activity, HELPER_IDLE_TIMEOUT).await;
+        eprintln!(
+            "hop transfer helper: stdin idle > {}s, self-exiting to avoid orphan",
+            HELPER_IDLE_TIMEOUT.as_secs()
+        );
+        // Hard exit; the parent will observe EOF on our stdout and clean up.
+        std::process::exit(2);
+    });
 
     match mode {
         "receive" => {
@@ -322,4 +445,39 @@ pub fn lookup_uid_gid(username: &str) -> Result<(u32, u32)> {
     let user = users::get_user_by_name(username)
         .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
     Ok((user.uid(), user.primary_group_id()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn watchdog_fires_when_idle() {
+        let activity = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        // Use a 200ms timeout and a 60ms tick floor. We must wait at least
+        // one full `timeout` of silence after the first tick.
+        let watchdog = idle_watchdog(Arc::clone(&activity), Duration::from_millis(200));
+        tokio::time::timeout(Duration::from_secs(5), watchdog)
+            .await
+            .expect("watchdog should have fired");
+        assert!(start.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn watchdog_does_not_fire_while_active() {
+        let activity = Arc::new(AtomicU64::new(0));
+        let bump = Arc::clone(&activity);
+        let bumper = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                bump.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let watchdog = idle_watchdog(Arc::clone(&activity), Duration::from_millis(500));
+        // Should timeout (watchdog doesn't fire) while bumper is active.
+        let res = tokio::time::timeout(Duration::from_millis(400), watchdog).await;
+        assert!(res.is_err(), "watchdog must not fire while activity present");
+        bumper.abort();
+    }
 }

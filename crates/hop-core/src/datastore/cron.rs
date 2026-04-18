@@ -1,5 +1,8 @@
 //! Cron job CRUD operations on the embedded datastore.
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::Result;
 #[allow(unused_imports)]
 use redb::ReadableTable;
@@ -9,6 +12,13 @@ use super::remote_dispatch;
 use super::tables::CRON_TABLE;
 use super::types::CronJob;
 use super::Datastore;
+
+/// Keys we have already warned about decoding (one warn per daemon lifetime
+/// per key). Prevents log spam when the scheduler polls every 15s.
+fn warned_corrupt_keys() -> &'static Mutex<HashSet<String>> {
+    static W: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 impl Datastore {
     /// Add a cron job. Overwrites if the ID already exists.
@@ -47,7 +57,9 @@ impl Datastore {
         Ok(existed)
     }
 
-    /// List all cron jobs.
+    /// List all cron jobs. Undecodable entries (e.g. from schema-breaking
+    /// changes to `CronJob`) are skipped with a one-time warning per key,
+    /// so a single bad record can't poison the whole scheduler.
     pub fn cron_list(&self) -> Result<Vec<CronJob>> {
         remote_dispatch!(self,
             DsRequest::CronList,
@@ -62,13 +74,72 @@ impl Datastore {
 
         let mut jobs = Vec::new();
         for item in table.iter()? {
-            let (_, val_guard) = item?;
+            let (key_guard, val_guard) = item?;
+            let key = key_guard.value();
             let bytes = val_guard.value();
-            let (job, _): (CronJob, _) =
-                bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
-            jobs.push(job);
+            match bincode::serde::decode_from_slice::<CronJob, _>(
+                bytes,
+                bincode::config::standard(),
+            ) {
+                Ok((job, _)) => jobs.push(job),
+                Err(e) => {
+                    let mut warned = warned_corrupt_keys().lock().unwrap();
+                    if warned.insert(key.to_string()) {
+                        tracing::warn!(
+                            "Corrupt cron entry '{key}' skipped: {e}. \
+                             Remove it with `hop cron remove {key}` or call \
+                             `Datastore::cron_purge_corrupt`.",
+                        );
+                    }
+                }
+            }
         }
         Ok(jobs)
+    }
+
+    /// Delete all cron entries that fail to decode with the current schema.
+    /// Returns the keys that were purged. Intended as a manual repair path
+    /// after schema-breaking changes to `CronJob`.
+    pub fn cron_purge_corrupt(&self) -> Result<Vec<String>> {
+        remote_dispatch!(self,
+            DsRequest::CronPurgeCorrupt,
+            DsResponse::StringList(keys) => keys
+        );
+        let mut corrupt: Vec<String> = Vec::new();
+        {
+            let txn = self.local_db().begin_read()?;
+            let table = match txn.open_table(CRON_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
+            for item in table.iter()? {
+                let (key_guard, val_guard) = item?;
+                let key = key_guard.value().to_string();
+                let bytes = val_guard.value();
+                if bincode::serde::decode_from_slice::<CronJob, _>(
+                    bytes,
+                    bincode::config::standard(),
+                )
+                .is_err()
+                {
+                    corrupt.push(key);
+                }
+            }
+        }
+        if !corrupt.is_empty() {
+            let txn = self.local_db().begin_write()?;
+            {
+                let mut table = txn.open_table(CRON_TABLE)?;
+                for key in &corrupt {
+                    table.remove(key.as_str())?;
+                }
+            }
+            txn.commit()?;
+            // Reset the warn-set so future corruption surfaces a fresh warning.
+            warned_corrupt_keys().lock().unwrap().clear();
+        }
+        Ok(corrupt)
     }
 
     /// Get a cron job by ID.
@@ -235,6 +306,64 @@ mod tests {
 
         let not_found = ds.cron_find_by_catalog_id("nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn cron_list_skips_corrupt_entries_and_returns_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+
+        ds.cron_add(&make_job("good1", "0 * * * * *", true, 1000))
+            .unwrap();
+        ds.cron_add(&make_job("good2", "0 * * * * *", true, 2000))
+            .unwrap();
+
+        // Inject a corrupt (truncated) entry directly into the table.
+        {
+            let txn = ds.local_db().begin_write().unwrap();
+            {
+                let mut table = txn.open_table(CRON_TABLE).unwrap();
+                table.insert("corrupt", &b"\x00\x01\x02"[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let jobs = ds.cron_list().unwrap();
+        let ids: Vec<_> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(jobs.len(), 2, "corrupt entry should be skipped, got {ids:?}");
+        assert!(ids.contains(&"good1"));
+        assert!(ids.contains(&"good2"));
+
+        let due = ds.cron_get_due(5000).unwrap();
+        assert_eq!(due.len(), 2, "cron_get_due must also tolerate corruption");
+    }
+
+    #[test]
+    fn cron_purge_corrupt_removes_bad_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+
+        ds.cron_add(&make_job("keep", "0 * * * * *", true, 1000))
+            .unwrap();
+
+        {
+            let txn = ds.local_db().begin_write().unwrap();
+            {
+                let mut table = txn.open_table(CRON_TABLE).unwrap();
+                table.insert("bad1", &b"\xff\xff"[..]).unwrap();
+                table.insert("bad2", &b"\x01"[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let purged = ds.cron_purge_corrupt().unwrap();
+        assert_eq!(purged.len(), 2);
+        assert!(purged.contains(&"bad1".to_string()));
+        assert!(purged.contains(&"bad2".to_string()));
+
+        let jobs = ds.cron_list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "keep");
     }
 
     #[test]

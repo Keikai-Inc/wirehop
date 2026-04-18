@@ -712,7 +712,7 @@ mod tests {
         let loaded = RolesStore::load(dir.path()).unwrap();
         assert_eq!(loaded.roles.len(), 2);
         assert_eq!(loaded.roles[0].name, "developer");
-        assert_eq!(loaded.roles[1].sudo, true);
+        assert!(loaded.roles[1].sudo);
         assert_eq!(loaded.roles[1].groups, vec!["docker"]);
     }
 

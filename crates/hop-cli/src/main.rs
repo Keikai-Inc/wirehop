@@ -485,9 +485,27 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         let config_dir = config_dir.to_path_buf();
                         let registry = registry.clone();
                         let ds = datastore.clone();
+                        // Double-spawn: the inner task's JoinHandle lets us
+                        // observe panics explicitly (via JoinError::is_panic)
+                        // and log which connection died, instead of just
+                        // letting tokio's default panic hook print to stderr
+                        // and losing the context.
                         tokio::spawn(async move {
-                            if let Err(e) = handle_incoming(inc, &config_dir, registry, ds).await {
-                                tracing::error!("Connection error: {e:#}");
+                            let inner = tokio::spawn(async move {
+                                handle_incoming(inc, &config_dir, registry, ds).await
+                            });
+                            match inner.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => tracing::error!("Connection error: {e:#}"),
+                                Err(je) if je.is_panic() => {
+                                    tracing::error!(
+                                        "Connection handler panicked (tokio caught the \
+                                         unwind; worker thread is safe): {je}"
+                                    );
+                                }
+                                Err(je) => {
+                                    tracing::error!("Connection task cancelled: {je}");
+                                }
                             }
                         });
                     }
@@ -522,6 +540,20 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     Ok(())
 }
 
+/// RAII guard that calls `Connection::close` on drop. Ensures the explicit
+/// close runs even if `handle_incoming_inner` panics — dropping an iroh
+/// connection without a prior close can trigger the iroh-quinn
+/// "drained connections always have an error" path.
+struct ConnCloseGuard<'a> {
+    conn: &'a iroh::endpoint::Connection,
+}
+
+impl Drop for ConnCloseGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"done");
+    }
+}
+
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
@@ -531,12 +563,8 @@ async fn handle_incoming(
     tracing::debug!("Awaiting QUIC handshake...");
     let conn: iroh::endpoint::Connection = incoming.await?;
     tracing::debug!("QUIC handshake complete from {}", conn.remote_id().fmt_short());
-    let result = handle_incoming_inner(&conn, config_dir, registry, datastore).await;
-    // Always close the connection explicitly before dropping it.
-    // Dropping without close triggers an iroh-quinn panic:
-    // "drained connections always have an error"
-    conn.close(0u32.into(), b"done");
-    result
+    let _close_guard = ConnCloseGuard { conn: &conn };
+    handle_incoming_inner(&conn, config_dir, registry, datastore).await
 }
 
 async fn handle_incoming_inner(

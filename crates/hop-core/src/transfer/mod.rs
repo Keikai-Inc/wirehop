@@ -1138,7 +1138,7 @@ mod tests {
         std::fs::write(src.join("sub").join("b.txt"), b"bbb").unwrap();
 
         let paths = push_roundtrip(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &[false], // no trailing slash — include dir name
             &dst,
         ).await;
@@ -1161,7 +1161,7 @@ mod tests {
         std::fs::write(src.join("sub").join("b.txt"), b"bbb").unwrap();
 
         let paths = push_roundtrip(
-            &[src.clone()],
+            std::slice::from_ref(&src),
             &[true], // trailing slash — contents only, no dir name prefix
             &dst,
         ).await;
@@ -1185,7 +1185,7 @@ mod tests {
         std::fs::write(src.join("src/components/app.rs"), b"struct App;").unwrap();
 
         // Without trailing slash
-        let paths = push_roundtrip(&[src.clone()], &[false], &dst).await;
+        let paths = push_roundtrip(std::slice::from_ref(&src), &[false], &dst).await;
         assert!(paths.contains(&"project/README.md".to_string()));
         assert!(paths.contains(&"project/src/main.rs".to_string()));
         assert!(paths.contains(&"project/src/components/app.rs".to_string()));

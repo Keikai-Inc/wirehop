@@ -213,6 +213,9 @@ fn dispatch_request(ds: &Datastore, req: DsRequest) -> Result<DsResponse> {
             ds.cron_update_last_run(&id, ts, next_run)?;
             DsResponse::Ok
         }
+        DsRequest::CronPurgeCorrupt => {
+            DsResponse::StringList(ds.cron_purge_corrupt()?)
+        }
         DsRequest::SecretsGet { name } => {
             DsResponse::SecretValue(ds.secrets_get(&name)?)
         }

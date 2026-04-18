@@ -22,6 +22,7 @@ pub enum DsRequest {
     CronFindByCatalogId { catalog_id: String },
     CronGetDue { now_ms: u64 },
     CronUpdateLastRun { id: String, ts: u64, next_run: u64 },
+    CronPurgeCorrupt,
     SecretsGet { name: String },
     SecretsSet { name: String, value: Vec<u8> },
     SecretsDelete { name: String },
@@ -42,4 +43,5 @@ pub enum DsResponse {
     CronJobs(Vec<CronJob>),
     SecretValue(Option<Vec<u8>>),
     SecretNames(Vec<String>),
+    StringList(Vec<String>),
 }
