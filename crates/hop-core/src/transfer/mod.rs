@@ -98,59 +98,80 @@ pub async fn host_transfer_session(
         NegotiatedParams::legacy()
     };
 
+    // On unix running as root with a bound username, file I/O for the
+    // transfer is delegated to a privilege-separated helper process so
+    // it runs under the target user's kernel-enforced permissions. The
+    // arm bodies below intentionally do NOT early-return on the helper
+    // path: we want helper errors to flow through the shared
+    // TransferMsg::Error write below so the client sees a real message
+    // instead of just a closed stream.
     let result = match (&request.mode, &request.direction) {
         (TransferMode::Copy { .. }, TransferDirection::Push) => {
             // Client pushes files to us — we receive.
-            // When running as root with a bound username, use a privilege-separated
-            // helper process so file I/O runs as the target user (kernel-enforced).
             #[cfg(unix)]
-            if crate::unix_user::is_running_as_root()
+            let arm_result = if crate::unix_user::is_running_as_root()
                 && let Some(user) = username
             {
-                return helper::proxy_via_helper(
+                helper::proxy_via_helper(
                     &mut send, &mut recv, &base_path, user, &params, "receive",
-                ).await;
-            }
-            host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await
+                ).await
+            } else {
+                host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await
+            };
+            #[cfg(not(unix))]
+            let arm_result = host_receive_files(&conn, &mut send, &mut recv, &base_path, &progress, &params).await;
+            arm_result
         }
         (TransferMode::Copy { .. }, TransferDirection::Pull) => {
             // Client pulls files from us — we send.
             let recursive = matches!(request.mode, TransferMode::Copy { recursive: true });
             #[cfg(unix)]
-            if crate::unix_user::is_running_as_root()
+            let arm_result = if crate::unix_user::is_running_as_root()
                 && let Some(user) = username
             {
                 let send_mode = if recursive { "send-recursive" } else { "send" };
-                return helper::proxy_via_helper(
+                helper::proxy_via_helper(
                     &mut send, &mut recv, &base_path, user, &params, send_mode,
-                ).await;
-            }
-            host_send_files(&mut send, &mut recv, &base_path, &request, &progress, &params).await
+                ).await
+            } else {
+                host_send_files(&mut send, &mut recv, &base_path, &request, &progress, &params).await
+            };
+            #[cfg(not(unix))]
+            let arm_result = host_send_files(&mut send, &mut recv, &base_path, &request, &progress, &params).await;
+            arm_result
         }
         (TransferMode::Sync, TransferDirection::Push) => {
             // Client sync-pushes to us.
             #[cfg(unix)]
-            if crate::unix_user::is_running_as_root()
+            let arm_result = if crate::unix_user::is_running_as_root()
                 && let Some(user) = username
             {
-                return helper::proxy_via_helper(
+                helper::proxy_via_helper(
                     &mut send, &mut recv, &base_path, user, &params, "sync-receive",
-                ).await;
-            }
-            host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await
+                ).await
+            } else {
+                host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await
+            };
+            #[cfg(not(unix))]
+            let arm_result = host_sync_receive(&conn, &mut send, &mut recv, &base_path, &request, &progress, &params).await;
+            arm_result
         }
         (TransferMode::Sync, TransferDirection::Pull) => {
             // Client sync-pulls from us.
             #[cfg(unix)]
-            if crate::unix_user::is_running_as_root()
+            let arm_result = if crate::unix_user::is_running_as_root()
                 && let Some(user) = username
             {
                 let mode = if request.delete_extraneous { "sync-send-delete" } else { "sync-send" };
-                return helper::proxy_via_helper(
+                helper::proxy_via_helper(
                     &mut send, &mut recv, &base_path, user, &params, mode,
-                ).await;
-            }
-            host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await
+                ).await
+            } else {
+                host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await
+            };
+            #[cfg(not(unix))]
+            let arm_result = host_sync_send(&mut send, &mut recv, &base_path, &request, &progress, &params).await;
+            arm_result
         }
     };
 

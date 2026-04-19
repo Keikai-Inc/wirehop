@@ -210,11 +210,12 @@ pub async fn proxy_via_helper(
 
 Spawns a child process running as the target user:
 
-1. Look up UID/GID for the username
-2. Build command: `hop __transfer-helper --mode <mode> --dest <path> [--compression zstd:level] --chunk-size <size>`
-3. Spawn with `.uid(uid).gid(gid)` and `pre_exec` hook for `initgroups()`
-4. Bidirectional proxy: `quic_recv -> child stdin`, `child stdout -> quic_send`
-5. Wait for child exit; fail if non-zero
+1. Build command: `hop __transfer-helper --mode <mode> --dest <path> [--compression zstd:level] --chunk-size <size>`
+2. Spawn as the target user:
+   - **macOS**: wrap in `/usr/bin/login -fpq <user> <hop-exe> <args>`. `login` sets up a full user session (fresh audit session id via `setaudit_addr`, `setlogin`, PAM) before exec'ing hop. A bare `setuid` from launchd's root audit session is not sufficient — macOS denies filesystem access to user-owned files without a proper user audit session, even when POSIX permissions would allow it. `-q` suppresses the "Last login" banner that would otherwise corrupt stdout IPC framing.
+   - **Linux**: spawn directly with `.uid(uid).gid(gid)` and a `pre_exec` hook that calls `initgroups()` for supplementary groups. Linux has no audit-session axis, so this is sufficient.
+3. Bidirectional proxy: `quic_recv -> child stdin`, `child stdout -> quic_send`. Uses `select!` so that the session tears down as soon as the helper's stdout closes, rather than waiting on `quic_recv` (which would stall for the full watchdog timeout when the helper exits early).
+4. Wait for child exit; fail if non-zero
 
 ### Helper Modes
 

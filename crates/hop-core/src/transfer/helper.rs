@@ -41,11 +41,9 @@ pub async fn proxy_via_helper(
     params: &NegotiatedParams,
     mode: &str,
 ) -> Result<()> {
-    let (uid, gid) = lookup_uid_gid(username)?;
-
     let exe = std::env::current_exe().context("cannot determine hop executable path")?;
 
-    let mut args = vec![
+    let mut helper_args = vec![
         "__transfer-helper".to_string(),
         "--mode".to_string(),
         mode.to_string(),
@@ -55,35 +53,53 @@ pub async fn proxy_via_helper(
     if let Some(ref comp) = params.compression {
         match comp {
             super::negotiation::Compression::Zstd { level } => {
-                args.push("--compression".to_string());
-                args.push(format!("zstd:{level}"));
+                helper_args.push("--compression".to_string());
+                helper_args.push(format!("zstd:{level}"));
             }
         }
     }
-    args.push("--chunk-size".to_string());
-    args.push(params.max_chunk_size.to_string());
+    helper_args.push("--chunk-size".to_string());
+    helper_args.push(params.max_chunk_size.to_string());
 
-    let username_for_pre_exec = username.to_string();
-    let mut cmd = tokio::process::Command::new(&exe);
-    cmd.args(&args)
-        .stdin(std::process::Stdio::piped())
+    // On macOS, route through `login -fpq` so the child gets a real user
+    // session (fresh audit session id, setlogin, PAM setup). A bare setuid
+    // from launchd's root audit session leaves filesystem access blocked
+    // on user-owned files — the same reason `hop on <host>` uses `login -fp`
+    // to spawn shells. `-q` suppresses the "Last login" banner so it doesn't
+    // corrupt our stdout IPC framing.
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("/usr/bin/login");
+        c.arg("-fpq").arg(username).arg(&exe).args(&helper_args);
+        c
+    };
+
+    // Linux has no audit-session axis, so uid/gid drop + initgroups is
+    // sufficient.
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let (uid, gid) = lookup_uid_gid(username)?;
+        let username_for_pre_exec = username.to_string();
+        let mut c = tokio::process::Command::new(&exe);
+        c.args(&helper_args).uid(uid).gid(gid);
+        unsafe {
+            c.pre_exec(move || {
+                let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                libc::initgroups(c_name.as_ptr(), gid as _);
+                Ok(())
+            });
+        }
+        c
+    };
+
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .uid(uid)
-        .gid(gid)
         // If the parent future is dropped (cancellation, panic, connection
         // torn down), ensure the child is SIGKILLed instead of orphaned.
         .kill_on_drop(true);
-    unsafe {
-        cmd.pre_exec(move || {
-            // initgroups sets supplementary groups (staff, admin, etc.)
-            let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            // nix::unistd::initgroups is not available on macOS, use libc directly
-            libc::initgroups(c_name.as_ptr(), gid as _);
-            Ok(())
-        });
-    }
+
     let mut child = cmd.spawn().context("failed to spawn transfer helper")?;
     let child_pid = child.id();
 
@@ -96,24 +112,37 @@ pub async fn proxy_via_helper(
 
     let proxy_in = copy_with_activity("recv→child", quic_recv, child_stdin, Arc::clone(&activity));
     let proxy_out = copy_with_activity("child→send", child_stdout, quic_send, Arc::clone(&activity));
-
-    let proxies = async move {
-        let (in_result, out_result) = tokio::join!(proxy_in, proxy_out);
-        if let Err(e) = in_result {
-            tracing::debug!("proxy_in ended: {e:#}");
-        }
-        if let Err(e) = out_result {
-            tracing::debug!("proxy_out ended: {e:#}");
-        }
-    };
-
     let watchdog = idle_watchdog(Arc::clone(&activity), PROXY_IDLE_TIMEOUT);
 
-    // Whichever completes first wins. If watchdog fires, dropping `child`
-    // (which owns kill_on_drop) terminates the helper.
+    tokio::pin!(proxy_in);
+    tokio::pin!(proxy_out);
+    tokio::pin!(watchdog);
+
+    // proxy_out finishing is the definitive "session is over" signal:
+    // the helper has closed its stdout, so whatever it was going to say
+    // has already been forwarded and there is nothing left to proxy. Do
+    // not wait on proxy_in in that case — if the helper bailed early the
+    // client is usually parked waiting to *receive* data and will never
+    // send anything to unblock proxy_in, so a `join!` here would stall
+    // for the full 10-minute watchdog timeout before tearing down.
     tokio::select! {
-        _ = proxies => {}
-        _ = watchdog => {
+        r = &mut proxy_out => {
+            if let Err(e) = r {
+                tracing::debug!("proxy_out ended: {e:#}");
+            }
+        }
+        r = &mut proxy_in => {
+            if let Err(e) = r {
+                tracing::debug!("proxy_in ended: {e:#}");
+            }
+            // Client side hung up. Give the helper a short grace period
+            // to deliver any final output before we tear down.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                &mut proxy_out,
+            ).await;
+        }
+        _ = &mut watchdog => {
             tracing::warn!(
                 "transfer helper (pid={child_pid:?}) idle > {}s; killing",
                 PROXY_IDLE_TIMEOUT.as_secs()
@@ -247,8 +276,14 @@ pub async fn run_transfer_helper(
         "send" | "send-recursive" => {
             let recursive = mode == "send-recursive";
 
-            let entries = if dest.is_file() {
-                let metadata = std::fs::metadata(dest)?;
+            // Explicit metadata() so the caller sees the real errno
+            // (ENOENT vs EACCES vs EPERM) instead of the misleading
+            // "source path does not exist" that `is_file()`/`is_dir()`
+            // would produce by swallowing every error into `false`.
+            let metadata = std::fs::metadata(dest)
+                .with_context(|| format!("cannot access source path: {}", dest.display()))?;
+
+            let entries = if metadata.is_file() {
                 let file_name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
                 vec![crate::proto::FileEntry {
                     path: file_name,
@@ -264,16 +299,16 @@ pub async fn run_transfer_helper(
                     symlink_target: None,
                     content_hash: None,
                 }]
-            } else if dest.is_dir() {
+            } else if metadata.is_dir() {
                 if !recursive {
                     bail!("source is a directory; use -r for recursive copy");
                 }
                 super::listing::walk_directory(dest)?
             } else {
-                bail!("source path does not exist: {}", dest.display());
+                bail!("source is not a regular file or directory: {}", dest.display());
             };
 
-            let base_dir = if dest.is_file() { dest.parent().unwrap_or(dest) } else { dest };
+            let base_dir = if metadata.is_file() { dest.parent().unwrap_or(dest) } else { dest };
 
             super::sender::send_files(&mut stdout, base_dir, &entries, &progress, &params).await?;
             // Read one ack per entry sent (files + dirs + symlinks)
@@ -353,11 +388,15 @@ pub async fn run_transfer_helper(
                 other => bail!("expected FileList, got: {other:?}"),
             };
 
-            // 2. Walk source and compute plan
-            let (source_entries, base_dir) = if dest.is_dir() {
+            // 2. Walk source and compute plan. Explicit metadata() so the
+            // caller sees the real errno rather than the misleading
+            // "source path does not exist" that comes from
+            // is_file()/is_dir() swallowing every error into false.
+            let metadata = std::fs::metadata(dest)
+                .with_context(|| format!("cannot access source path: {}", dest.display()))?;
+            let (source_entries, base_dir) = if metadata.is_dir() {
                 (super::listing::walk_directory(dest)?, dest.to_path_buf())
-            } else if dest.is_file() {
-                let metadata = std::fs::metadata(dest)?;
+            } else if metadata.is_file() {
                 let file_name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let entry = FileEntry {
                     path: file_name,
@@ -375,7 +414,7 @@ pub async fn run_transfer_helper(
                 };
                 (vec![entry], dest.parent().unwrap_or(dest).to_path_buf())
             } else {
-                bail!("source path does not exist: {}", dest.display());
+                bail!("source is not a regular file or directory: {}", dest.display());
             };
 
             let plan = super::listing::compute_sync_plan(&source_entries, &client_entries, delete_extraneous);
