@@ -618,7 +618,9 @@ fn install_http_binding(ctx: &Ctx<'_>, sandbox: Option<&SandboxPolicy>) -> Resul
             } else if (options.body !== undefined) {
                 body = options.body;
             }
-            var r = JSON.parse(__hop_http(url, method, JSON.stringify(headers), body));
+            var r = (body !== null)
+                ? JSON.parse(__hop_http(url, method, JSON.stringify(headers), body))
+                : JSON.parse(__hop_http(url, method, JSON.stringify(headers)));
             r.json = function() { return JSON.parse(r.body); };
             return r;
         };
