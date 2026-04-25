@@ -207,13 +207,15 @@ function callClaude(prompt) {
         throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
     }
 
-    // Claude CLI with OAuth token passed via env var
-    var escaped = token.replace(/'/g, "'\\''");
-    var cliResult = hop.local("ANTHROPIC_API_KEY='" + escaped + "' claude -p " + JSON.stringify(prompt) + " --bare --output-format text 2>/dev/null");
-    if (cliResult.exit_code === 0 && cliResult.stdout.trim()) {
+    // Claude CLI with OAuth token passed via env var.
+    // Prompt must be in single quotes so sandbox validator treats < > as literal.
+    var tokenEscaped = token.replace(/'/g, "'\\''");
+    var promptEscaped = prompt.replace(/'/g, "'\\''");
+    var cliResult = hop.local("ANTHROPIC_API_KEY='" + tokenEscaped + "' claude -p '" + promptEscaped + "' --bare --output-format text");
+    if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
     }
-    throw new Error("Claude CLI failed (exit " + cliResult.exit_code + "): " + cliResult.stderr);
+    throw new Error("Claude CLI failed (exit " + cliResult.exitCode + "): " + cliResult.stderr);
 }
 
 var triageText = callClaude(
