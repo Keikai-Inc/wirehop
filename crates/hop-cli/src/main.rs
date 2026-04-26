@@ -2346,7 +2346,7 @@ async fn cmd_cap_setup(id: &str, schedule: Option<&str>, target: Option<&str>, c
             targets: None,
             catalog_id: Some(catalog_id),
             sandbox: Some(cap.tier.to_sandbox()),
-            run_as_user: hop_core::unix_user::default_creator_username(),
+            run_as_user: hop_core::unix_user::current_username(),
         };
         ds.cron_add(&job)?;
         println!("\u{2713} {} active (job {}).", cap.name, job_id);
@@ -2424,7 +2424,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 targets,
                 catalog_id: Some(catalog_id),
                 sandbox: Some(cap.tier.to_sandbox()),
-                run_as_user: hop_core::unix_user::default_creator_username(),
+                run_as_user: hop_core::unix_user::current_username(),
             };
             ds.cron_add(&job)?;
             println!("Enabled capability '{}' (job {}, sandbox: {})", id, job_id, cap.tier.name());
@@ -2518,7 +2518,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                     targets: Some(tag.clone()),
                     catalog_id: Some(catalog_id),
                     sandbox: Some(cap.tier.to_sandbox()),
-                    run_as_user: hop_core::unix_user::default_creator_username(),
+                    run_as_user: hop_core::unix_user::current_username(),
                 };
                 ds.cron_add(&job)?;
                 println!("Triggered capability '{}' on targets '{}' (job {}, will run on next scheduler tick ~15s)", id, tag, job_id);
@@ -2542,7 +2542,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 targets: None,
                 catalog_id: Some(format!("cap:run:{}", id)),
                 sandbox: Some(cap.tier.to_sandbox()),
-                run_as_user: hop_core::unix_user::default_creator_username(),
+                run_as_user: hop_core::unix_user::current_username(),
             };
             ds.cron_add(&job)?;
             println!("Triggered capability '{}' locally (job {}, will run on next scheduler tick ~15s)", id, job_id);
@@ -2651,7 +2651,7 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                 targets,
                 catalog_id: None,
                 sandbox: None,
-                run_as_user: hop_core::unix_user::default_creator_username(),
+                run_as_user: hop_core::unix_user::current_username(),
             };
             ds.cron_add(&job)?;
             println!("Created cron job: {id}");

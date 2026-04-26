@@ -44,12 +44,29 @@ pub fn sudo_user() -> Option<String> {
         .filter(|u| !u.is_empty() && u != "root")
 }
 
-/// Returns the first regular user (UID >= 1000) with a valid login shell
-/// by parsing `/etc/passwd`.
+/// Returns the first regular user (UID >= 500 on macOS, >= 1000 on Linux)
+/// with a valid login shell.
 ///
-/// "Valid" means the shell is not `/usr/sbin/nologin`, `/bin/false`, or
-/// `/sbin/nologin`.
+/// On Linux, parses `/etc/passwd`. On macOS, uses `dscl` since local
+/// accounts are stored in Directory Services, not `/etc/passwd`.
 pub fn first_regular_user() -> Option<String> {
+    // Try /etc/passwd first (works on Linux, partial on macOS)
+    if let Some(user) = first_regular_user_from_passwd() {
+        return Some(user);
+    }
+
+    // macOS: use dscl to list local users
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(user) = first_regular_user_from_dscl() {
+            return Some(user);
+        }
+    }
+
+    None
+}
+
+fn first_regular_user_from_passwd() -> Option<String> {
     let content = std::fs::read_to_string("/etc/passwd").ok()?;
     for line in content.lines() {
         let fields: Vec<&str> = line.split(':').collect();
@@ -62,7 +79,7 @@ pub fn first_regular_user() -> Option<String> {
             Err(_) => continue,
         };
         let shell = fields[6];
-        if uid >= 1000
+        if uid >= 500
             && !username.is_empty()
             && username != "nobody"
             && !shell.ends_with("/nologin")
@@ -74,10 +91,33 @@ pub fn first_regular_user() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn first_regular_user_from_dscl() -> Option<String> {
+    let output = std::process::Command::new("dscl")
+        .args([".", "-list", "/Users"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in stdout.lines() {
+        let name = name.trim();
+        // Skip system users (start with _) and root
+        if name.is_empty() || name.starts_with('_') || name == "root"
+            || name == "nobody" || name == "daemon" || name == "Guest"
+        {
+            continue;
+        }
+        // Verify user has a home dir (real user, not a service account)
+        if std::path::Path::new(&format!("/Users/{name}")).is_dir() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 /// Picks a username for the creator invite when running as root.
 ///
 /// Tries `SUDO_USER` first, then falls back to the first regular user
-/// in `/etc/passwd`.
+/// on the system.
 pub fn default_creator_username() -> Option<String> {
     sudo_user().or_else(first_regular_user)
 }
