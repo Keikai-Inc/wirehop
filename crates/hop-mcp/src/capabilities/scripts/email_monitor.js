@@ -211,11 +211,22 @@ function callClaude(prompt) {
     // Prompt must be in single quotes so sandbox validator treats < > as literal.
     var tokenEscaped = token.replace(/'/g, "'\\''");
     var promptEscaped = prompt.replace(/'/g, "'\\''");
-    // Daemon runs as root, so ~/.local won't find the user's claude install.
-    // Search common install locations.
+    // Resolve claude binary path. `which` may fail if ~/.local/bin isn't in
+    // the daemon's PATH, and shell globs/variables are blocked by the sandbox
+    // validator. Use hop.local("id -un") to get the current user (after
+    // privilege drop) and construct the path directly.
     var claudeBin = hop.local("which claude").stdout.trim();
     if (!claudeBin) {
-        claudeBin = hop.local("ls /Users/*/.local/bin/claude /home/*/.local/bin/claude").stdout.trim().split("\n")[0] || "claude";
+        var currentUser = hop.local("id -un").stdout.trim();
+        if (currentUser) {
+            var homedir = (currentUser === "root") ? "/var/root" : "/Users/" + currentUser;
+            var candidate = homedir + "/.local/bin/claude";
+            var test = hop.local("test -x '" + candidate + "' && echo ok");
+            if (test.stdout.trim() === "ok") {
+                claudeBin = candidate;
+            }
+        }
+        if (!claudeBin) claudeBin = "claude";
     }
     var cliResult = hop.local("ANTHROPIC_API_KEY='" + tokenEscaped + "' '" + claudeBin + "' -p '" + promptEscaped + "' --bare --output-format text");
     if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
