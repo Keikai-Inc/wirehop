@@ -2685,6 +2685,28 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
             ds.cron_add(&job)?;
             println!("Triggered cron job: {id} (will run on next scheduler tick, ~15s)");
         }
+        CronAction::Errors { id } => {
+            if let Some(id) = id {
+                match ds.kv_get("cron_errors", &id)? {
+                    Some(entry) => {
+                        let text = String::from_utf8_lossy(&entry.value);
+                        println!("{text}");
+                    }
+                    None => println!("No errors recorded for job {id}."),
+                }
+            } else {
+                let entries = ds.kv_list("cron_errors", "")?;
+                if entries.is_empty() {
+                    println!("No cron errors recorded.");
+                } else {
+                    for (key, entry) in &entries {
+                        let text = String::from_utf8_lossy(&entry.value);
+                        let truncated = if text.len() > 120 { format!("{}...", &text[..117]) } else { text.to_string() };
+                        println!("  {key}: {truncated}");
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

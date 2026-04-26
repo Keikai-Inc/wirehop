@@ -541,6 +541,11 @@ pub enum CronAction {
         /// Job ID
         id: String,
     },
+    /// Show the last error from a cron job
+    Errors {
+        /// Job ID (optional — shows all errors if omitted)
+        id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -110,7 +110,19 @@ async fn run_due_jobs(
                 id: job_id,
             };
             if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
-                tracing::error!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
+                let msg = format!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
+                tracing::error!("{msg}");
+                eprintln!("[hop.cron] ERROR: {msg}");
+                // Store error in KV for retrieval via `hop cron errors`
+                let _ = ds.kv_set(
+                    "cron_errors",
+                    &job.id,
+                    &hop_core::datastore::types::KvEntry {
+                        value: msg.as_bytes().to_vec(),
+                        content_type: "text/plain".to_string(),
+                        updated_at: crate::cron::now_ms(),
+                    },
+                );
             }
         });
     }
@@ -161,12 +173,26 @@ async fn execute_cron_job(
     };
 
     match &result {
-        Ok(output) => tracing::info!(
-            "Cron job '{}' completed: {}",
-            job.name,
-            truncate(output, 200)
-        ),
-        Err(e) => tracing::error!("Cron job '{}' script error: {e:#}", job.name),
+        Ok(output) => {
+            let msg = truncate(output, 200);
+            tracing::info!("Cron job '{}' completed: {msg}", job.name);
+            eprintln!("[hop.cron] {} completed: {msg}", job.name);
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!("Cron job '{}' script error: {msg}", job.name);
+            eprintln!("[hop.cron] ERROR: {} script error: {msg}", job.name);
+            // Store error in KV
+            let _ = datastore.kv_set(
+                "cron_errors",
+                &job.id,
+                &hop_core::datastore::types::KvEntry {
+                    value: msg.as_bytes().to_vec(),
+                    content_type: "text/plain".to_string(),
+                    updated_at: now_ms(),
+                },
+            );
+        }
     }
 
     Ok(())
