@@ -167,6 +167,9 @@ pub fn install_hop_bindings(
         install_datastore_stubs(ctx)?;
     }
 
+    // Install hop.claude() binding — AI inference via Claude CLI
+    install_claude_binding(ctx, datastore, sandbox, run_as_user)?;
+
     remove_dangerous_globals(ctx)?;
 
     Ok(())
@@ -875,6 +878,267 @@ fn install_http_binding(ctx: &Ctx<'_>, sandbox: Option<&SandboxPolicy>) -> Resul
     .map_err(|e| anyhow::anyhow!("Failed to install hop.http wrapper: {e}"))?;
 
     Ok(())
+}
+
+/// Install `hop.claude(prompt)` binding for AI inference via Claude CLI.
+///
+/// Handles credential management (token refresh), binary resolution (with
+/// auto-download), and direct subprocess invocation (no shell quoting).
+fn install_claude_binding(
+    ctx: &Ctx<'_>,
+    datastore: Option<&Datastore>,
+    sandbox: Option<&SandboxPolicy>,
+    run_as_user: Option<&str>,
+) -> Result<()> {
+    if sandbox.is_some_and(|s| s.no_network) {
+        ctx.eval::<(), _>(
+            r#"hop.claude = function() { throw new Error("hop.claude: network access denied by sandbox policy"); };"#,
+        ).map_err(|e| anyhow::anyhow!("Failed to install hop.claude stub: {e}"))?;
+        return Ok(());
+    }
+
+    let ds = datastore.cloned();
+    let username = run_as_user.map(String::from);
+    let globals = ctx.globals();
+
+    globals.set("__hop_claude",
+        Function::new(ctx.clone(), move |_ctx: Ctx<'_>, prompt: String, max_turns: rquickjs::function::Opt<u32>| -> rquickjs::Result<String> {
+            let max_turns = max_turns.0.unwrap_or(1);
+
+            // Get token from secrets (with refresh if needed)
+            let token = match &ds {
+                Some(ds) => claude_get_token(ds)
+                    .map_err(|e| js_err(format!("hop.claude: {e}")))?,
+                None => return Err(js_err("hop.claude: no datastore available (requires daemon mode)".into())),
+            };
+
+            // Resolve claude binary
+            let claude_bin = claude_resolve_binary(username.as_deref())
+                .map_err(|e| js_err(format!("hop.claude: {e}")))?;
+
+            // Spawn claude directly — no shell, no quoting
+            claude_invoke(&claude_bin, &token, &prompt, max_turns, username.as_deref())
+                .map_err(|e| js_err(format!("hop.claude: {e}")))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    ctx.eval::<(), _>(r#"
+        hop.claude = function(prompt, options) {
+            options = options || {};
+            var maxTurns = options.maxTurns || 1;
+            return __hop_claude(prompt, maxTurns);
+        };
+    "#)
+    .map_err(|e| anyhow::anyhow!("Failed to install hop.claude wrapper: {e}"))?;
+
+    Ok(())
+}
+
+/// Get a valid Anthropic token from the datastore, refreshing if expired.
+fn claude_get_token(ds: &Datastore) -> Result<String> {
+    let token_bytes = ds.secrets_get("ANTHROPIC_API_KEY")?
+        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials. Run: hop auth anthropic"))?;
+    let token = String::from_utf8(token_bytes)?;
+
+    let method = ds.secrets_get("anthropic_method")?
+        .map(|v| String::from_utf8_lossy(&v).to_string())
+        .unwrap_or_else(|| "api_key".to_string());
+
+    // API keys don't expire
+    if method != "claude_oauth" {
+        return Ok(token);
+    }
+
+    // Check OAuth token expiry (5 min buffer)
+    let expiry: u64 = ds.secrets_get("anthropic_token_expiry")?
+        .and_then(|v| String::from_utf8(v).ok()?.parse().ok())
+        .unwrap_or(0);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    if now_ms < expiry.saturating_sub(300_000) {
+        return Ok(token);
+    }
+
+    // Refresh
+    tracing::info!("hop.claude: refreshing Anthropic OAuth token");
+    let refresh_bytes = ds.secrets_get("anthropic_refresh_token")?
+        .ok_or_else(|| anyhow::anyhow!("anthropic_refresh_token not set. Re-run: hop auth anthropic"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": String::from_utf8(refresh_bytes)?,
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    });
+    let resp = client
+        .post("https://console.anthropic.com/v1/oauth/token")
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("token refresh failed ({status}): {body}. Re-run: hop auth anthropic");
+    }
+
+    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    let new_token = data["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("token refresh response missing access_token"))?
+        .to_string();
+
+    ds.secrets_set("ANTHROPIC_API_KEY", new_token.as_bytes())?;
+    if let Some(expires_in) = data["expires_in"].as_u64() {
+        ds.secrets_set(
+            "anthropic_token_expiry",
+            {
+                let new_expiry = now_ms + expires_in * 1000;
+                new_expiry.to_string()
+            }.as_bytes(),
+        )?;
+    }
+    tracing::info!("hop.claude: token refreshed");
+    Ok(new_token)
+}
+
+/// Resolve the claude CLI binary path.
+fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
+    // 1. Try user's login shell (handles nvm, brew, .local/bin)
+    let shell = username
+        .map(hop_core::unix_user::user_login_shell)
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+
+    let rc_source = hop_core::sandbox::with_rc_source("which claude", &shell);
+    let which = std::process::Command::new(&shell)
+        .args(["-lc", &rc_source])
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    if let Ok(out) = which
+        && out.status.success()
+    {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+
+    // 2. Check common locations
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    #[cfg(target_os = "macos")]
+    let user_home = username
+        .map(|u| format!("/Users/{u}"))
+        .unwrap_or_else(|| home.clone());
+    #[cfg(not(target_os = "macos"))]
+    let user_home = username
+        .map(|u| format!("/home/{u}"))
+        .unwrap_or_else(|| home.clone());
+
+    for dir in [&user_home, &home] {
+        let candidate = std::path::PathBuf::from(dir).join(".local/bin/claude");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // 3. Auto-download
+    tracing::info!("hop.claude: claude CLI not found, downloading...");
+    let hop_bin_dir = std::path::PathBuf::from(&user_home).join(".hop/bin");
+    let dest = hop_bin_dir.join("claude");
+    if dest.exists() {
+        return Ok(dest);
+    }
+
+    let _ = std::fs::create_dir_all(&hop_bin_dir);
+    let install_result = std::process::Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "curl -fsSL https://claude.ai/install.sh | INSTALL_DIR={} bash",
+                hop_bin_dir.display()
+            ),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output();
+
+    match install_result {
+        Ok(out) if dest.exists() => Ok(dest),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("claude download failed: {stderr}")
+        }
+        Err(e) => anyhow::bail!("claude download failed: {e}"),
+    }
+}
+
+/// Invoke claude CLI directly as a subprocess — no shell, no quoting.
+fn claude_invoke(
+    claude_bin: &std::path::Path,
+    token: &str,
+    prompt: &str,
+    max_turns: u32,
+    username: Option<&str>,
+) -> Result<String> {
+    let mut cmd = std::process::Command::new(claude_bin);
+    cmd.args([
+        "-p", "-",
+        "--bare",
+        "--output-format", "text",
+        "--max-turns", &max_turns.to_string(),
+    ])
+    .env("ANTHROPIC_API_KEY", token)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    // Drop privileges if running as root with a target user
+    #[cfg(unix)]
+    if let Some(user) = username
+        && hop_core::unix_user::is_running_as_root()
+        && let Ok((uid, gid)) = hop_core::transfer::helper::lookup_uid_gid(user)
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.uid(uid);
+        cmd.gid(gid);
+        // Set HOME for claude to find its config
+        #[cfg(target_os = "macos")]
+        cmd.env("HOME", format!("/Users/{user}"));
+        #[cfg(not(target_os = "macos"))]
+        cmd.env("HOME", format!("/home/{user}"));
+    }
+
+    let mut child = cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn claude: {e}"))?;
+
+    // Write prompt to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| anyhow::anyhow!("claude process error: {e}"))?;
+
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("claude returned empty response. stderr: {stderr}");
+        }
+        Ok(text)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("claude failed (exit {}): {}", output.status, stderr)
+    }
 }
 
 /// Install stub bindings (no backend available, e.g. cron jobs).

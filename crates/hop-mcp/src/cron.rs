@@ -150,8 +150,9 @@ async fn execute_cron_job(
 
     // Timeout must exceed the 60s exec timeout in LocalBackend so that
     // hop.exec() can fire its own timeout error instead of the JS runtime
-    // killing the script silently.
-    let js_timeout = Duration::from_secs(120);
+    // killing the script silently. Set to 5 minutes for AI-powered jobs
+    // that may invoke hop.claude() (each Claude call can take 30-60s).
+    let js_timeout = Duration::from_secs(300);
 
     let result = if let Some(be) = backend {
         runtime.execute(&script, be, Some(js_timeout)).await

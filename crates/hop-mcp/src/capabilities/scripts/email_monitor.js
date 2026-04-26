@@ -132,96 +132,11 @@ for (var i = 0; i < emails.length; i++) {
         + "Preview: " + emails[i].snippet + "\n---\n";
 }
 
-// ── Claude Inference ──────────────────────────────────────────────
-// Two methods, both with automatic token refresh:
-//   api_key:      direct HTTP with x-api-key header
-//   claude_oauth: OAuth token via ANTHROPIC_API_KEY env + claude CLI
+// ── Claude Inference via hop.claude() ─────────────────────────────
+// hop.claude() handles everything: credential management, token refresh,
+// binary resolution, and direct subprocess invocation. Zero config needed.
 
-var anthropicMethod = hop.secrets.get("anthropic_method") || "api_key";
-
-function getAnthropicToken() {
-    var token = hop.secrets.get("ANTHROPIC_API_KEY");
-    if (!token) {
-        throw new Error("ANTHROPIC_API_KEY not set. Run: hop cap setup email-monitor");
-    }
-
-    // API keys (sk-ant-api...) don't expire
-    if (anthropicMethod === "api_key") {
-        return token;
-    }
-
-    // OAuth tokens (sk-ant-oat...) expire — check and refresh
-    var expiry = parseInt(hop.secrets.get("anthropic_token_expiry") || "0");
-    if (Date.now() > expiry - 300000) {
-        hop.log("Refreshing Anthropic OAuth token...");
-        var refreshToken = hop.secrets.get("anthropic_refresh_token");
-        if (!refreshToken) {
-            throw new Error("anthropic_refresh_token not set. Run: hop cap setup email-monitor");
-        }
-
-        var resp = hop.http.post("https://console.anthropic.com/v1/oauth/token", {
-            json: {
-                grant_type: "refresh_token",
-                refresh_token: refreshToken,
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-            }
-        });
-
-        if (resp.status !== 200) {
-            throw new Error("Anthropic token refresh failed (" + resp.status + "): " + resp.body);
-        }
-
-        var data = resp.json();
-        token = data.access_token;
-        hop.secrets.set("ANTHROPIC_API_KEY", token);
-        if (data.expires_in) {
-            hop.secrets.set("anthropic_token_expiry", String(Date.now() + data.expires_in * 1000));
-        }
-        hop.log("Anthropic token refreshed.");
-    }
-
-    return token;
-}
-
-function callClaude(prompt) {
-    var token = getAnthropicToken();
-
-    if (anthropicMethod === "api_key") {
-        // Direct API call with x-api-key
-        var resp = hop.http.post("https://api.anthropic.com/v1/messages", {
-            headers: {
-                "x-api-key": token,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json: {
-                model: "claude-sonnet-4-20250514",
-                max_tokens: 2048,
-                messages: [{ role: "user", content: prompt }]
-            }
-        });
-
-        if (resp.status === 200) {
-            return resp.json().content[0].text;
-        }
-        throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
-    }
-
-    // Claude CLI via hop.script() — pipes everything through stdin, no quoting issues.
-    var cliResult = hop.script(
-        "export ANTHROPIC_API_KEY=" + JSON.stringify(token) + "\n"
-        + "claude -p - --bare --output-format text <<'HOP_PROMPT_EOF'\n"
-        + prompt + "\n"
-        + "HOP_PROMPT_EOF"
-    );
-
-    if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
-        return cliResult.stdout.trim();
-    }
-    throw new Error("Claude CLI failed (exit " + cliResult.exitCode + "): " + cliResult.stderr);
-}
-
-var triageText = callClaude(
+var triageText = hop.claude(
     "Classify each email as URGENT, ACTION, or FYI.\n\n"
     + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss)\n"
     + "ACTION = needs a response but not urgent (e.g., review request, question, meeting follow-up)\n"
@@ -275,7 +190,7 @@ if (fyi.length > 0) {
     }
 }
 
-var summary = callClaude(
+var summary = hop.claude(
     "Write a concise morning email briefing from this classified inbox.\n"
     + "Group by priority (URGENT first, then ACTION, then FYI).\n"
     + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
