@@ -165,6 +165,7 @@ for (var i = 0; i < emails.length; i++) {
 }
 
 hop.log("Triage: " + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI");
+hop.log("Building summary...");
 
 // ── Summarize with Claude ─────────────────────────────────────────
 
@@ -190,13 +191,21 @@ if (fyi.length > 0) {
     }
 }
 
-var summary = hop.claude(
-    "Write a concise morning email briefing from this classified inbox.\n"
-    + "Group by priority (URGENT first, then ACTION, then FYI).\n"
-    + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
-    + "For FYI: just list briefly (these will be marked as read).\n"
-    + "Keep it scannable — bullet points, no fluff.\n\n" + summaryInput
-);
+hop.log("Calling Claude for summary (" + summaryInput.length + " chars)...");
+var summary;
+try {
+    summary = hop.claude(
+        "Write a concise morning email briefing from this classified inbox.\n"
+        + "Group by priority (URGENT first, then ACTION, then FYI).\n"
+        + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
+        + "For FYI: just list briefly (these will be marked as read).\n"
+        + "Keep it scannable — bullet points, no fluff.\n\n" + summaryInput
+    );
+    hop.log("Summary received (" + summary.length + " chars)");
+} catch (e) {
+    hop.log("ERROR: Summary call failed: " + e.message);
+    throw e;
+}
 
 // ── Send Briefing Email ───────────────────────────────────────────
 
