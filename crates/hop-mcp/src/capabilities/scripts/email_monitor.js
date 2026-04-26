@@ -78,9 +78,18 @@ function base64url(str) {
     var bytes = [];
     for (var i = 0; i < str.length; i++) {
         var c = str.charCodeAt(i);
+        // Handle surrogate pairs (emoji and other 4-byte UTF-8)
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+            var lo = str.charCodeAt(i + 1);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                c = ((c - 0xD800) << 10) + (lo - 0xDC00) + 0x10000;
+                i++;
+            }
+        }
         if (c < 128) bytes.push(c);
         else if (c < 2048) { bytes.push(192 | (c >> 6)); bytes.push(128 | (c & 63)); }
-        else { bytes.push(224 | (c >> 12)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+        else if (c < 65536) { bytes.push(224 | (c >> 12)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+        else { bytes.push(240 | (c >> 18)); bytes.push(128 | ((c >> 12) & 63)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
     }
     var b64 = "";
     for (var i = 0; i < bytes.length; i += 3) {
@@ -205,8 +214,11 @@ try {
         + "Group by priority: URGENT first (red), then ACTION (orange), then FYI (gray).\n"
         + "For URGENT/ACTION: include sender, subject as a clickable link to the email, and a brief note on why it matters.\n"
         + "For FYI: list briefly with clickable subject links (these will be marked as read).\n"
-        + "Use a clean, minimal style with inline CSS. No markdown. Keep it scannable.\n"
-        + "Each email has a Link: URL — use it as the href for the subject.\n\n" + summaryInput
+        + "Use a clean, minimal style with inline CSS. No markdown. No emoji. Keep it scannable.\n"
+        + "Use text labels like [URGENT], [ACTION], [FYI] instead of emoji.\n"
+        + "Each email has a Link: URL — use it as the href for the subject.\n"
+        + "Output ONLY the HTML. No explanation, no markdown, no commentary before or after.\n\n"
+        + summaryInput
     );
     hop.log("Summary received (" + summary.length + " chars)");
 } catch (e) {
@@ -222,8 +234,17 @@ var subject = "Morning Briefing -- " + today
 
 // userEmail already fetched earlier for links
 
-// Strip markdown code fences if Claude wrapped the HTML in them
-var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```$/i, "").trim();
+// Strip markdown code fences and any trailing commentary
+var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```[\s\S]*$/i, "").trim();
+// If Claude added text after the closing </html> tag, strip it
+var htmlEnd = htmlBody.lastIndexOf("</html>");
+if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</body>");
+if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</div>");
+if (htmlEnd !== -1) {
+    // Keep the closing tag + a few chars for the tag itself
+    var tagEnd = htmlBody.indexOf(">", htmlEnd);
+    if (tagEnd !== -1) htmlBody = htmlBody.substring(0, tagEnd + 1);
+}
 
 var emailContent = "To: " + userEmail + "\r\nSubject: " + subject
     + "\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n\r\n" + htmlBody;
