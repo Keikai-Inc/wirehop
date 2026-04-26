@@ -88,7 +88,7 @@ fn build_exec_command(
             command
                 .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                 .arg(&profile)
-                .args([&user_shell, "-lc", cmd])
+                .args([&user_shell, "-lic", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -138,7 +138,7 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
         {
             let mut command = tokio::process::Command::new("login");
             command
-                .args(["-fpq", user, &user_shell, "-lc", cmd])
+                .args(["-fpq", user, &user_shell, "-lic", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -169,7 +169,7 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut command = tokio::process::Command::new(&shell);
         command
-            .args(["-lc", cmd])
+            .args(["-lic", cmd])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

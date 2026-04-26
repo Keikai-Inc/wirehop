@@ -506,7 +506,7 @@ fn run_local_command_sync(
                 std::process::Command::new("login")
                     .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                     .arg(&profile)
-                    .args([&user_shell, "-lc", command])
+                    .args([&user_shell, "-lic", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
@@ -527,7 +527,7 @@ fn run_local_command_sync(
             {
                 let _ = user;
                 std::process::Command::new(&user_shell)
-                    .args(["-lc", command])
+                    .args(["-lic", command])
                     .output()
             }
         }
@@ -537,7 +537,7 @@ fn run_local_command_sync(
             #[cfg(target_os = "macos")]
             {
                 std::process::Command::new("login")
-                    .args(["-fpq", user, &user_shell, "-lc", command])
+                    .args(["-fpq", user, &user_shell, "-lic", command])
                     .output()
             }
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -550,7 +550,7 @@ fn run_local_command_sync(
             {
                 let _ = user;
                 std::process::Command::new(&user_shell)
-                    .args(["-lc", command])
+                    .args(["-lic", command])
                     .output()
             }
         }
@@ -562,14 +562,14 @@ fn run_local_command_sync(
             {
                 let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
                 std::process::Command::new("/usr/bin/sandbox-exec")
-                    .args(["-p", &profile, &user_shell, "-lc", command])
+                    .args(["-p", &profile, &user_shell, "-lic", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
             {
                 let policy_clone = policy.clone();
                 let mut cmd = std::process::Command::new(&user_shell);
-                cmd.args(["-lc", command]);
+                cmd.args(["-lic", command]);
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
@@ -582,7 +582,7 @@ fn run_local_command_sync(
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 std::process::Command::new(&user_shell)
-                    .args(["-lc", command])
+                    .args(["-lic", command])
                     .output()
             }
         }
@@ -590,7 +590,7 @@ fn run_local_command_sync(
         // No sandbox, no username, not root: plain execution
         (false, None) => {
             std::process::Command::new(&user_shell)
-                .args(["-lc", command])
+                .args(["-lic", command])
                 .output()
         }
     };
