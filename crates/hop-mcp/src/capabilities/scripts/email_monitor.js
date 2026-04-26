@@ -213,7 +213,7 @@ var today = new Date().toISOString().split("T")[0];
 var subject = "Morning Briefing -- " + today
     + " (" + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI)";
 
-var emailContent = "From: me\r\nTo: me\r\nSubject: " + subject
+var emailContent = "Subject: " + subject
     + "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + summary;
 
 gmailPost("/messages/send", { raw: base64url(emailContent) });
