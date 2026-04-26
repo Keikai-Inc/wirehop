@@ -24,9 +24,15 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(backend: BoxedBackend) -> Self {
+        let mut js_runtime = JsRuntime::new();
+        // When the daemon runs as root, set the default user for hop.local()
+        // so MCP tool invocations drop privileges instead of running as root.
+        if let Some(user) = hop_core::unix_user::default_creator_username() {
+            js_runtime.set_run_as_user(user);
+        }
         Self {
             skill_store: SkillStore::new(),
-            js_runtime: JsRuntime::new(),
+            js_runtime,
             backend,
             datastore: None,
         }
