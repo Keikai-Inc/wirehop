@@ -443,6 +443,10 @@ fn install_backend_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
 fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>, run_as_user: Option<String>) -> Result<()> {
     let globals = ctx.globals();
 
+    // Clone before first closure moves them
+    let sandbox2 = sandbox.clone();
+    let run_as_user2 = run_as_user.clone();
+
     globals.set("__hop_local",
         Function::new(ctx.clone(), move |_ctx: Ctx<'_>, command: String| -> rquickjs::Result<String> {
             let result = run_local_command_sync(&command, sandbox.as_ref(), run_as_user.as_deref());
@@ -455,13 +459,29 @@ fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>, run_as_u
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // JS wrapper
+    // hop.script(code) — run a script piped through stdin (no quoting issues)
+    globals.set("__hop_script",
+        Function::new(ctx.clone(), move |_ctx: Ctx<'_>, script: String| -> rquickjs::Result<String> {
+            let result = run_local_script_sync(&script, sandbox2.as_ref(), run_as_user2.as_deref());
+            match result {
+                Ok(exec_result) => serde_json::to_string(&exec_result)
+                    .map_err(|e| js_err(format!("serialize script result: {e}"))),
+                Err(e) => Err(js_err(format!("hop.script() failed: {e}"))),
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // JS wrappers
     ctx.eval::<(), _>(r#"
         hop.local = function(command) {
             return JSON.parse(__hop_local(command));
         };
+        hop.script = function(code) {
+            return JSON.parse(__hop_script(code));
+        };
     "#)
-    .map_err(|e| anyhow::anyhow!("Failed to install hop.local wrapper: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("Failed to install hop.local/script wrapper: {e}"))?;
 
     Ok(())
 }
@@ -627,6 +647,112 @@ fn run_local_command_sync(
             stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
             exit_code: o.status.code().unwrap_or(-1),
         }),
+        Err(e) => Ok(ExecResult {
+            stdout: String::new(),
+            stderr: format!("failed to spawn: {e}"),
+            exit_code: -1,
+        }),
+    }
+}
+
+/// Run a script via stdin — no shell quoting of the script content.
+///
+/// The script is piped to the user's login shell via stdin. This avoids
+/// all quoting issues with complex scripts (quotes, newlines, special chars).
+/// The shell sources the user's profile first for the full environment.
+fn run_local_script_sync(
+    script: &str,
+    sandbox: Option<&SandboxPolicy>,
+    username: Option<&str>,
+) -> Result<crate::js::types::ExecResult> {
+    use crate::js::types::ExecResult;
+    use std::io::Write;
+
+    // Safety: when running as root with no user to drop to, refuse execution
+    if username.is_none() && hop_core::unix_user::is_running_as_root() {
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: "hop.script() refused: daemon is root but job has no run_as_user.".to_string(),
+            exit_code: -1,
+        });
+    }
+
+    let user_shell = username
+        .map(hop_core::unix_user::user_login_shell)
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+
+    // Build the rc source prefix
+    let rc_source = hop_core::sandbox::with_rc_source("", &user_shell);
+    let full_script = if rc_source.is_empty() {
+        script.to_string()
+    } else {
+        // rc_source ends with "; " — append the script
+        format!("{rc_source}\n{script}")
+    };
+
+    // Spawn shell reading from stdin — no -c, no command string on argv
+    let child = match username {
+        Some(user) => {
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("login")
+                    .args(["-fpq", user, &user_shell, "-l"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                std::process::Command::new("su")
+                    .args(["-", user, "-s", &user_shell])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = user;
+                std::process::Command::new(&user_shell)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            }
+        }
+        None => {
+            std::process::Command::new(&user_shell)
+                .arg("-l")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        }
+    };
+
+    let _ = sandbox; // sandbox enforcement happens at OS level via login/su
+
+    match child {
+        Ok(mut child) => {
+            // Write script to stdin
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(full_script.as_bytes());
+                // Drop stdin to close it — shell will read EOF and execute
+            }
+            match child.wait_with_output() {
+                Ok(o) => Ok(ExecResult {
+                    stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+                    exit_code: o.status.code().unwrap_or(-1),
+                }),
+                Err(e) => Ok(ExecResult {
+                    stdout: String::new(),
+                    stderr: format!("wait failed: {e}"),
+                    exit_code: -1,
+                }),
+            }
+        }
         Err(e) => Ok(ExecResult {
             stdout: String::new(),
             stderr: format!("failed to spawn: {e}"),

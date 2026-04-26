@@ -207,24 +207,13 @@ function callClaude(prompt) {
         throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
     }
 
-    // Claude CLI via temp file — avoids shell quoting issues with complex prompts.
-    // Write prompt directly from JS (no shell interpretation of content).
-    var tmpFile = "/tmp/hop-claude-prompt-" + Date.now() + ".txt";
-    hop.writeFile(tmpFile, prompt);
-
-    // Resolve claude binary path
-    var whichResult = hop.local("which claude").stdout.trim();
-    var claudeBin = (whichResult && whichResult.indexOf("/") === 0) ? whichResult : "claude";
-
-    // Run claude with prompt from file, token via env var
-    var tokenEscaped = token.replace(/'/g, "'\\''");
-    var cliResult = hop.local(
-        "ANTHROPIC_API_KEY='" + tokenEscaped + "' "
-        + claudeBin + " -p - --bare --output-format text < " + tmpFile
+    // Claude CLI via hop.script() — pipes everything through stdin, no quoting issues.
+    var cliResult = hop.script(
+        "export ANTHROPIC_API_KEY=" + JSON.stringify(token) + "\n"
+        + "claude -p - --bare --output-format text <<'HOP_PROMPT_EOF'\n"
+        + prompt + "\n"
+        + "HOP_PROMPT_EOF"
     );
-
-    // Clean up temp file
-    hop.local("rm -f " + tmpFile);
 
     if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
