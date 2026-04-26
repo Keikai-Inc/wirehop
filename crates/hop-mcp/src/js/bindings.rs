@@ -1132,9 +1132,9 @@ fn claude_invoke(
         // stdin is dropped here, closing the pipe so claude knows input is done
     }
 
-    // Wait with timeout (120s per call). Read stdout/stderr in threads
+    // Wait with timeout (240s per call). Read stdout/stderr in threads
     // so we can enforce a deadline without blocking forever.
-    let timeout = std::time::Duration::from_secs(120);
+    let timeout = std::time::Duration::from_secs(240);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
