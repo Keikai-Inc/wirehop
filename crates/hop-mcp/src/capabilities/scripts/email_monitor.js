@@ -211,8 +211,8 @@ function callClaude(prompt) {
     // Prompt must be in single quotes so sandbox validator treats < > as literal.
     var tokenEscaped = token.replace(/'/g, "'\\''");
     var promptEscaped = prompt.replace(/'/g, "'\\''");
-    var claudeBin = hop.local("which claude").stdout.trim() || (hop.local("test -x $HOME/.local/bin/claude").exitCode === 0 ? "$HOME/.local/bin/claude" : "claude");
-    var cliResult = hop.local("ANTHROPIC_API_KEY='" + tokenEscaped + "' " + claudeBin + " -p '" + promptEscaped + "' --bare --output-format text");
+    var claudeBin = hop.local("PATH=\"$HOME/.local/bin:$PATH\" which claude").stdout.trim() || "claude";
+    var cliResult = hop.local("ANTHROPIC_API_KEY='" + tokenEscaped + "' '" + claudeBin + "' -p '" + promptEscaped + "' --bare --output-format text");
     if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
     }
