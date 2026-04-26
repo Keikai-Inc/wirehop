@@ -64,10 +64,11 @@ function gmailPost(path, body) {
         "https://gmail.googleapis.com/gmail/v1/users/me" + path,
         { bearer: token, json: body }
     );
-    if (resp.status !== 200) {
+    if (resp.status >= 300) {
         throw new Error("Gmail POST " + path + " failed (" + resp.status + "): " + resp.body);
     }
-    return resp.json();
+    // 204 No Content (e.g. batchModify) has no body
+    return resp.status === 204 ? {} : resp.json();
 }
 
 // ── Base64url Encoding ────────────────────────────────────────────
