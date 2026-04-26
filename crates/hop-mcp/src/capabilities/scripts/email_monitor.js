@@ -215,7 +215,8 @@ function callClaude(prompt) {
     // the daemon's PATH, and shell globs/variables are blocked by the sandbox
     // validator. Use hop.local("id -un") to get the current user (after
     // privilege drop) and construct the path directly.
-    var claudeBin = hop.local("which claude").stdout.trim();
+    var whichResult = hop.local("which claude").stdout.trim();
+    var claudeBin = (whichResult && whichResult.startsWith("/")) ? whichResult : "";
     if (!claudeBin) {
         var currentUser = hop.local("id -un").stdout.trim();
         if (currentUser) {
