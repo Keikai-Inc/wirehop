@@ -104,6 +104,28 @@ pub fn install_hop_bindings(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // hop.writeFile(path, content) — write a string to a file (for temp files, prompts, etc.)
+    hop.set(
+        "writeFile",
+        Function::new(ctx.clone(), |_ctx: Ctx<'_>, path: String, content: String| -> rquickjs::Result<()> {
+            std::fs::write(&path, content.as_bytes())
+                .map_err(|e| js_err(format!("hop.writeFile({path}) failed: {e}")))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // hop.readFile(path) — read a file as a string
+    hop.set(
+        "readFile",
+        Function::new(ctx.clone(), |_ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+            std::fs::read_to_string(&path)
+                .map_err(|e| js_err(format!("hop.readFile({path}) failed: {e}")))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     if let Some((ref _b, ref _h)) = backend {
         // Set hop.id with the real backend before globals assignment
         let b = Arc::clone(_b);

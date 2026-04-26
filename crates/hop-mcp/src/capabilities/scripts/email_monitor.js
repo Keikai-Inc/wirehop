@@ -208,9 +208,9 @@ function callClaude(prompt) {
     }
 
     // Claude CLI via temp file — avoids shell quoting issues with complex prompts.
-    // Write prompt to a temp file, pipe it to claude via stdin.
+    // Write prompt directly from JS (no shell interpretation of content).
     var tmpFile = "/tmp/hop-claude-prompt-" + Date.now() + ".txt";
-    hop.local("cat > " + tmpFile + " << 'HOP_PROMPT_EOF'\n" + prompt + "\nHOP_PROMPT_EOF");
+    hop.writeFile(tmpFile, prompt);
 
     // Resolve claude binary path
     var whichResult = hop.local("which claude").stdout.trim();
