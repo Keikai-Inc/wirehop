@@ -1010,29 +1010,9 @@ fn claude_get_token(ds: &Datastore) -> Result<String> {
     Ok(new_token)
 }
 
-/// Resolve the claude CLI binary path.
+/// Resolve the claude CLI binary path by checking known locations directly.
+/// Avoids shell invocation (which can hang in daemon contexts).
 fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
-    // 1. Try user's login shell (handles nvm, brew, .local/bin)
-    let shell = username
-        .map(hop_core::unix_user::user_login_shell)
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
-
-    let rc_source = hop_core::sandbox::with_rc_source("which claude", &shell);
-    let which = std::process::Command::new(&shell)
-        .args(["-lc", &rc_source])
-        .stdin(std::process::Stdio::null())
-        .output();
-
-    if let Ok(out) = which
-        && out.status.success()
-    {
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return Ok(std::path::PathBuf::from(path));
-        }
-    }
-
-    // 2. Check common locations
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     #[cfg(target_os = "macos")]
     let user_home = username
@@ -1043,11 +1023,37 @@ fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
         .map(|u| format!("/home/{u}"))
         .unwrap_or_else(|| home.clone());
 
-    for dir in [&user_home, &home] {
-        let candidate = std::path::PathBuf::from(dir).join(".local/bin/claude");
-        if candidate.exists() {
-            return Ok(candidate);
+    // Check known installation locations
+    let search_dirs = [&user_home, &home];
+    let known_paths = [
+        ".local/bin/claude",
+        ".hop/bin/claude",
+        ".nvm/versions/node/*/bin/claude", // nvm-installed (glob not supported, check below)
+    ];
+
+    for dir in &search_dirs {
+        for rel in &known_paths[..2] {
+            let candidate = std::path::PathBuf::from(dir).join(rel);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
         }
+        // Check nvm directories (glob manually)
+        let nvm_dir = std::path::PathBuf::from(dir).join(".nvm/versions/node");
+        if nvm_dir.is_dir() && let Ok(entries) = std::fs::read_dir(&nvm_dir) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("bin/claude");
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    // Also check /usr/local/bin
+    let usr_local = std::path::PathBuf::from("/usr/local/bin/claude");
+    if usr_local.exists() {
+        return Ok(usr_local);
     }
 
     // 3. Auto-download
