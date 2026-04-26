@@ -65,6 +65,7 @@ pub fn install_hop_bindings(
     datastore: Option<&Datastore>,
     backend: Option<(Arc<dyn OrchestratorBackend>, Handle)>,
     sandbox: Option<&SandboxPolicy>,
+    run_as_user: Option<&str>,
 ) -> Result<()> {
     let globals = ctx.globals();
 
@@ -131,7 +132,7 @@ pub fn install_hop_bindings(
     }
 
     // Install hop.local() binding — runs commands on the local machine with sandbox
-    install_local_binding(ctx, sandbox.cloned())?;
+    install_local_binding(ctx, sandbox.cloned(), run_as_user.map(String::from))?;
 
     // Install hop.http() binding — makes HTTP requests from JS
     install_http_binding(ctx, sandbox)?;
@@ -417,12 +418,12 @@ fn install_backend_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
 /// When a sandbox policy is set, commands are run through `spawn_sandboxed_command`.
 /// When no sandbox is set, commands are run unsandboxed via `/bin/sh -c`.
 /// Returns `{ stdout, stderr, exit_code }` — same shape as `hop.exec()`.
-fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>) -> Result<()> {
+fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>, run_as_user: Option<String>) -> Result<()> {
     let globals = ctx.globals();
 
     globals.set("__hop_local",
         Function::new(ctx.clone(), move |_ctx: Ctx<'_>, command: String| -> rquickjs::Result<String> {
-            let result = run_local_command_sync(&command, sandbox.as_ref());
+            let result = run_local_command_sync(&command, sandbox.as_ref(), run_as_user.as_deref());
             match result {
                 Ok(exec_result) => serde_json::to_string(&exec_result)
                     .map_err(|e| js_err(format!("serialize local result: {e}"))),
@@ -444,12 +445,33 @@ fn install_local_binding(ctx: &Ctx<'_>, sandbox: Option<SandboxPolicy>) -> Resul
 }
 
 /// Run a command locally using std::process::Command (synchronous, for the JS thread).
-/// If sandbox is provided, validates the command first and applies OS-level sandboxing.
+///
+/// When `username` is set and the daemon is root, drops privileges via
+/// `login -fp <user>` (macOS) or `su - <user> -c` (Linux) — the same
+/// mechanism used by peer sessions in `sandbox/mod.rs`.
+///
+/// Security: refuses to execute if the daemon is root and no username is set,
+/// preventing cron jobs from accidentally running commands as root.
 fn run_local_command_sync(
     command: &str,
     sandbox: Option<&SandboxPolicy>,
+    username: Option<&str>,
 ) -> Result<crate::js::types::ExecResult> {
     use crate::js::types::ExecResult;
+
+    // Safety: when running as root with no user to drop to, refuse execution
+    if username.is_none() && hop_core::unix_user::is_running_as_root() {
+        tracing::warn!(
+            "hop.local() refused: daemon is root but job has no run_as_user — command: {command}"
+        );
+        return Ok(ExecResult {
+            stdout: String::new(),
+            stderr: "hop.local() refused: daemon is root but job has no run_as_user. \
+                     Re-create the job to set a user automatically."
+                .to_string(),
+            exit_code: -1,
+        });
+    }
 
     // Validate command against sandbox policy
     if let Some(policy) = sandbox
@@ -463,9 +485,73 @@ fn run_local_command_sync(
         });
     }
 
-    // Build the command — apply OS-level sandbox if policy is restricted
-    let output = if let Some(policy) = sandbox {
-        if policy.is_restricted() {
+    let restricted = sandbox.is_some_and(|p| p.is_restricted());
+
+    // Build the command with privilege dropping and optional sandboxing.
+    // Mirrors the patterns in sandbox/mod.rs build_exec_command() and
+    // build_unsandboxed_exec(), using std::process::Command (sync).
+    let output = match (restricted, username) {
+        // Sandboxed + username: drop privileges then sandbox
+        (true, Some(user)) => {
+            let policy = sandbox.unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
+                std::process::Command::new("login")
+                    .args(["-fp", user, "/usr/bin/sandbox-exec", "-p"])
+                    .arg(&profile)
+                    .args(["/bin/sh", "-c", command])
+                    .output()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let policy_clone = policy.clone();
+                let mut cmd = std::process::Command::new("su");
+                cmd.args(["-", user, "-c", command]);
+                unsafe {
+                    use std::os::unix::process::CommandExt;
+                    cmd.pre_exec(move || {
+                        hop_core::sandbox::linux::apply_sandbox(&policy_clone);
+                        Ok(())
+                    });
+                }
+                cmd.output()
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = user;
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .output()
+            }
+        }
+
+        // Unsandboxed + username: drop privileges only
+        (false, Some(user)) => {
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("login")
+                    .args(["-fp", user, "/bin/sh", "-c", command])
+                    .output()
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                std::process::Command::new("su")
+                    .args(["-", user, "-c", command])
+                    .output()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = user;
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", command])
+                    .output()
+            }
+        }
+
+        // Sandboxed + no username: sandbox only (not root, or legacy fallback)
+        (true, None) => {
+            let policy = sandbox.unwrap();
             #[cfg(target_os = "macos")]
             {
                 let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
@@ -475,11 +561,11 @@ fn run_local_command_sync(
             }
             #[cfg(target_os = "linux")]
             {
-                // On Linux, apply Landlock in a forked child
                 let policy_clone = policy.clone();
                 let mut cmd = std::process::Command::new("/bin/sh");
                 cmd.args(["-c", command]);
                 unsafe {
+                    use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
                         hop_core::sandbox::linux::apply_sandbox(&policy_clone);
                         Ok(())
@@ -493,15 +579,14 @@ fn run_local_command_sync(
                     .args(["-c", command])
                     .output()
             }
-        } else {
+        }
+
+        // No sandbox, no username, not root: plain execution
+        (false, None) => {
             std::process::Command::new("/bin/sh")
                 .args(["-c", command])
                 .output()
         }
-    } else {
-        std::process::Command::new("/bin/sh")
-            .args(["-c", command])
-            .output()
     };
 
     match output {

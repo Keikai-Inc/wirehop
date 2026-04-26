@@ -36,6 +36,7 @@ pub struct JsRuntime {
     limits: SandboxLimits,
     datastore: Option<Datastore>,
     sandbox: Option<SandboxPolicy>,
+    run_as_user: Option<String>,
 }
 
 impl Default for JsRuntime {
@@ -50,6 +51,7 @@ impl JsRuntime {
             limits: SandboxLimits::default(),
             datastore: None,
             sandbox: None,
+            run_as_user: None,
         }
     }
 
@@ -58,6 +60,7 @@ impl JsRuntime {
             limits,
             datastore: None,
             sandbox: None,
+            run_as_user: None,
         }
     }
 
@@ -69,6 +72,12 @@ impl JsRuntime {
     /// Set the sandbox policy for hop.exec/fleet.exec/local bindings.
     pub fn set_sandbox(&mut self, sandbox: SandboxPolicy) {
         self.sandbox = Some(sandbox);
+    }
+
+    /// Set the Unix user for privilege dropping in `hop.local()` calls.
+    /// When set and the daemon is root, commands run as this user.
+    pub fn set_run_as_user(&mut self, username: String) {
+        self.run_as_user = Some(username);
     }
 
     /// Execute JS code in a fresh sandbox with hop.* bindings.
@@ -89,6 +98,7 @@ impl JsRuntime {
         let max_stack_size = self.limits.max_stack_size;
         let datastore = self.datastore.clone();
         let sandbox = self.sandbox.clone();
+        let run_as_user = self.run_as_user.clone();
         let backend = Arc::clone(backend);
         let handle = Handle::current();
 
@@ -104,6 +114,7 @@ impl JsRuntime {
                 datastore.as_ref(),
                 Some((backend, handle)),
                 sandbox.as_ref(),
+                run_as_user.as_deref(),
             );
             let _ = tx.send(result);
         });
@@ -121,12 +132,13 @@ impl JsRuntime {
         let max_stack_size = self.limits.max_stack_size;
         let datastore = self.datastore.clone();
         let sandbox = self.sandbox.clone();
+        let run_as_user = self.run_as_user.clone();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         std::thread::spawn(move || {
             let result =
-                execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref(), None, sandbox.as_ref());
+                execute_js_sync(&code, memory_limit, max_stack_size, timeout, datastore.as_ref(), None, sandbox.as_ref(), run_as_user.as_deref());
             let _ = tx.send(result);
         });
 
@@ -143,6 +155,7 @@ fn execute_js_sync(
     datastore: Option<&Datastore>,
     backend: Option<(Arc<dyn crate::backend::OrchestratorBackend>, Handle)>,
     sandbox: Option<&SandboxPolicy>,
+    run_as_user: Option<&str>,
 ) -> Result<String> {
     let rt = QjsRuntime::new().context("Failed to create QuickJS runtime")?;
     rt.set_memory_limit(memory_limit);
@@ -160,7 +173,7 @@ fn execute_js_sync(
     // called inside ctx.with() — ctx.with() holds the runtime Mutex and
     // runtime methods also need it, causing a deadlock.
     let result = ctx.with(|ctx| -> Result<String> {
-        bindings::install_hop_bindings(&ctx, datastore, backend, sandbox)?;
+        bindings::install_hop_bindings(&ctx, datastore, backend, sandbox, run_as_user)?;
 
         let wrapped = format!("(function() {{\n{code}\n}})()");
 
@@ -274,43 +287,43 @@ mod tests {
 
     #[test]
     fn execute_js_sync_math() {
-        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("return 2 + 2", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert_eq!(result, "4");
     }
 
     #[test]
     fn execute_js_sync_string() {
-        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("return 'hello'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn execute_js_sync_object() {
-        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("return {a: 1, b: 'two'}", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert!(result.contains("\"a\": 1"));
     }
 
     #[test]
     fn execute_js_sync_log() {
-        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("hop.log('test'); return 'ok'", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert_eq!(result, "ok");
     }
 
     #[test]
     fn execute_js_sync_error() {
-        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None);
+        let result = execute_js_sync("return {{{", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn execute_js_sync_no_return() {
-        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("let x = 42;", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert_eq!(result, "undefined");
     }
 
     #[test]
     fn execute_js_sync_array() {
-        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None).unwrap();
+        let result = execute_js_sync("return [1, 2, 3]", 64 * 1024 * 1024, 1024 * 1024, Duration::from_secs(5), None, None, None, None).unwrap();
         assert!(result.contains("["));
         assert!(result.contains("1"));
     }

@@ -724,10 +724,10 @@ async fn dispatch_session(
             // Handle CapEnable/CapRun here (needs hop-mcp for capability definitions)
             let response = match request {
                 hop_core::proto::PeerRequest::CapEnable { ref id, ref schedule, ref targets } => {
-                    handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref())
+                    handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref(), username)
                 }
                 hop_core::proto::PeerRequest::CapRun { ref id, ref targets, ref params } => {
-                    handle_remote_cap_run(&datastore, id, targets.as_deref(), params)
+                    handle_remote_cap_run(&datastore, id, targets.as_deref(), params, username)
                 }
                 _ => hop_core::peer_ops::handle_peer_request(request, config_dir, &datastore),
             };
@@ -2346,6 +2346,7 @@ async fn cmd_cap_setup(id: &str, schedule: Option<&str>, target: Option<&str>, c
             targets: None,
             catalog_id: Some(catalog_id),
             sandbox: Some(cap.tier.to_sandbox()),
+            run_as_user: hop_core::unix_user::default_creator_username(),
         };
         ds.cron_add(&job)?;
         println!("\u{2713} {} active (job {}).", cap.name, job_id);
@@ -2423,6 +2424,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 targets,
                 catalog_id: Some(catalog_id),
                 sandbox: Some(cap.tier.to_sandbox()),
+                run_as_user: hop_core::unix_user::default_creator_username(),
             };
             ds.cron_add(&job)?;
             println!("Enabled capability '{}' (job {}, sandbox: {})", id, job_id, cap.tier.name());
@@ -2516,6 +2518,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                     targets: Some(tag.clone()),
                     catalog_id: Some(catalog_id),
                     sandbox: Some(cap.tier.to_sandbox()),
+                    run_as_user: hop_core::unix_user::default_creator_username(),
                 };
                 ds.cron_add(&job)?;
                 println!("Triggered capability '{}' on targets '{}' (job {}, will run on next scheduler tick ~15s)", id, tag, job_id);
@@ -2539,6 +2542,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 targets: None,
                 catalog_id: Some(format!("cap:run:{}", id)),
                 sandbox: Some(cap.tier.to_sandbox()),
+                run_as_user: hop_core::unix_user::default_creator_username(),
             };
             ds.cron_add(&job)?;
             println!("Triggered capability '{}' locally (job {}, will run on next scheduler tick ~15s)", id, job_id);
@@ -2647,6 +2651,7 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                 targets,
                 catalog_id: None,
                 sandbox: None,
+                run_as_user: hop_core::unix_user::default_creator_username(),
             };
             ds.cron_add(&job)?;
             println!("Created cron job: {id}");
@@ -3194,6 +3199,7 @@ fn handle_remote_cap_enable(
     id: &str,
     schedule: Option<&str>,
     targets: Option<&str>,
+    username: Option<&str>,
 ) -> hop_core::proto::PeerResponse {
     use hop_mcp::capabilities::CapabilityDefinition;
 
@@ -3235,6 +3241,7 @@ fn handle_remote_cap_enable(
         targets: targets.map(String::from),
         catalog_id: Some(catalog_id),
         sandbox: Some(cap.tier.to_sandbox()),
+        run_as_user: username.map(String::from),
     };
 
     match datastore.cron_add(&job) {
@@ -3248,6 +3255,7 @@ fn handle_remote_cap_run(
     id: &str,
     targets: Option<&str>,
     _params: &[(String, String)],
+    username: Option<&str>,
 ) -> hop_core::proto::PeerResponse {
     use hop_mcp::capabilities::CapabilityDefinition;
 
@@ -3270,6 +3278,7 @@ fn handle_remote_cap_run(
         targets: targets.map(String::from),
         catalog_id: Some(format!("cap:run:{id}")),
         sandbox: Some(cap.tier.to_sandbox()),
+        run_as_user: username.map(String::from),
     };
 
     match datastore.cron_add(&job) {

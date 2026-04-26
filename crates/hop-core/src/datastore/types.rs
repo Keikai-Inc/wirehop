@@ -56,6 +56,12 @@ pub struct CronJob {
     /// this policy to `hop.exec()`, `hop.fleet.exec()`, and `hop.local()` calls.
     #[serde(default)]
     pub sandbox: Option<SandboxPolicy>,
+    /// Unix username this job runs as. Stamped automatically by the system
+    /// at creation time — never user-settable. When the daemon runs as root
+    /// and this is `Some`, `hop.local()` drops privileges to this user via
+    /// `login -fp` (macOS) or `su -` (Linux).
+    #[serde(default)]
+    pub run_as_user: Option<String>,
 }
 
 /// An encrypted secret stored in the secrets table.

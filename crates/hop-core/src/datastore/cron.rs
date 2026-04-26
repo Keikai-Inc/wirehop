@@ -236,6 +236,7 @@ mod tests {
             targets: None,
             catalog_id: None,
             sandbox: None,
+            run_as_user: None,
         }
     }
 

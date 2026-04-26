@@ -361,6 +361,7 @@ mod tests {
             targets: None,
             catalog_id: Some("test-cat".into()),
             sandbox: None,
+            run_as_user: None,
         };
 
         // Add

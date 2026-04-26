@@ -134,6 +134,11 @@ async fn execute_cron_job(
         runtime.set_sandbox(sandbox.clone());
     }
 
+    // Set user for privilege dropping in hop.local()
+    if let Some(ref user) = job.run_as_user {
+        runtime.set_run_as_user(user.clone());
+    }
+
     // Build the script, optionally prepending hop.targets injection
     let script = if let (Some(tag), Some(be)) = (&job.targets, backend) {
         let hosts = be.list_hosts(Some(tag)).await.unwrap_or_default();
@@ -217,6 +222,7 @@ mod tests {
             targets: None,
             catalog_id: None,
             sandbox: None,
+            run_as_user: None,
         }
     }
 

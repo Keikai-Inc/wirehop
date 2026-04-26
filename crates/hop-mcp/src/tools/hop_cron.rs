@@ -143,6 +143,7 @@ fn cron_create(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         targets: args.targets.clone(),
         catalog_id: args.catalog_id.clone(),
         sandbox,
+        run_as_user: hop_core::unix_user::default_creator_username(),
     };
 
     match ds.cron_add(&job) {
@@ -228,6 +229,7 @@ fn cron_ensure(ds: &Datastore, args: &CronArgs) -> ToolCallResult {
         targets: args.targets.clone(),
         catalog_id: Some(catalog_id.to_string()),
         sandbox,
+        run_as_user: hop_core::unix_user::default_creator_username(),
     };
 
     match ds.cron_add(&job) {
