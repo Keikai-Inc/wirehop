@@ -170,24 +170,25 @@ hop.log("Building summary...");
 // ── Summarize with Claude ─────────────────────────────────────────
 
 var summaryInput = "";
+var GMAIL_BASE = "https://mail.google.com/mail/u/0/#inbox/";
 if (urgent.length > 0) {
     summaryInput += "URGENT (" + urgent.length + "):\n";
     for (var i = 0; i < urgent.length; i++) {
-        summaryInput += "- From: " + urgent[i].from + " | Subject: " + urgent[i].subject + " | " + urgent[i].snippet + "\n";
+        summaryInput += "- From: " + urgent[i].from + " | Subject: " + urgent[i].subject + " | " + urgent[i].snippet + " | Link: " + GMAIL_BASE + urgent[i].id + "\n";
     }
     summaryInput += "\n";
 }
 if (action.length > 0) {
     summaryInput += "ACTION NEEDED (" + action.length + "):\n";
     for (var i = 0; i < action.length; i++) {
-        summaryInput += "- From: " + action[i].from + " | Subject: " + action[i].subject + " | " + action[i].snippet + "\n";
+        summaryInput += "- From: " + action[i].from + " | Subject: " + action[i].subject + " | " + action[i].snippet + " | Link: " + GMAIL_BASE + action[i].id + "\n";
     }
     summaryInput += "\n";
 }
 if (fyi.length > 0) {
     summaryInput += "FYI / READ (" + fyi.length + "):\n";
     for (var i = 0; i < fyi.length; i++) {
-        summaryInput += "- From: " + fyi[i].from + " | Subject: " + fyi[i].subject + "\n";
+        summaryInput += "- From: " + fyi[i].from + " | Subject: " + fyi[i].subject + " | Link: " + GMAIL_BASE + fyi[i].id + "\n";
     }
 }
 
@@ -195,11 +196,12 @@ hop.log("Calling Claude for summary (" + summaryInput.length + " chars)...");
 var summary;
 try {
     summary = hop.claude(
-        "Write a concise morning email briefing from this classified inbox.\n"
-        + "Group by priority (URGENT first, then ACTION, then FYI).\n"
-        + "For URGENT/ACTION: include sender, subject, and why it matters.\n"
-        + "For FYI: just list briefly (these will be marked as read).\n"
-        + "Keep it scannable — bullet points, no fluff.\n\n" + summaryInput
+        "Write a concise morning email briefing as clean HTML (for Gmail rendering).\n"
+        + "Group by priority: URGENT first (red), then ACTION (orange), then FYI (gray).\n"
+        + "For URGENT/ACTION: include sender, subject as a clickable link to the email, and a brief note on why it matters.\n"
+        + "For FYI: list briefly with clickable subject links (these will be marked as read).\n"
+        + "Use a clean, minimal style with inline CSS. No markdown. Keep it scannable.\n"
+        + "Each email has a Link: URL — use it as the href for the subject.\n\n" + summaryInput
     );
     hop.log("Summary received (" + summary.length + " chars)");
 } catch (e) {
@@ -217,8 +219,11 @@ var subject = "Morning Briefing -- " + today
 var profile = gmailGet("/profile");
 var userEmail = profile.emailAddress;
 
+// Strip markdown code fences if Claude wrapped the HTML in them
+var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```$/i, "").trim();
+
 var emailContent = "To: " + userEmail + "\r\nSubject: " + subject
-    + "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + summary;
+    + "\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n\r\n" + htmlBody;
 
 gmailPost("/messages/send", { raw: base64url(emailContent) });
 hop.log("Briefing email sent: " + subject);
