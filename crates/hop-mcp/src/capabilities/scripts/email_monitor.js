@@ -147,10 +147,11 @@ for (var i = 0; i < emails.length; i++) {
 // binary resolution, and direct subprocess invocation. Zero config needed.
 
 var triageText = hop.claude(
-    "Classify each email as URGENT, ACTION, or FYI.\n\n"
-    + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss)\n"
+    "Classify each email as URGENT, ACTION, FYI, or JUNK.\n\n"
+    + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss, 2FA codes)\n"
     + "ACTION = needs a response but not urgent (e.g., review request, question, meeting follow-up)\n"
-    + "FYI = informational only (e.g., newsletter, notification, automated alert, marketing)\n\n"
+    + "FYI = informational but worth knowing about (e.g., useful newsletters, project updates, shipping notifications)\n"
+    + "JUNK = marketing, spam, promotions, cold outreach, automated notifications with no value, unsubscribe-worthy\n\n"
     + "Return ONLY a JSON array like: [{\"index\": 0, \"class\": \"FYI\"}, ...]\n"
     + "No other text. One entry per email.\n\n" + triageInput
 );
@@ -165,16 +166,17 @@ for (var i = 0; i < triage.length; i++) {
     classMap[triage[i].index] = triage[i]["class"];
 }
 
-var urgent = [], action = [], fyi = [];
+var urgent = [], action = [], fyi = [], junk = [];
 for (var i = 0; i < emails.length; i++) {
     var cls = classMap[i] || "FYI";
     emails[i].classification = cls;
     if (cls === "URGENT") urgent.push(emails[i]);
     else if (cls === "ACTION") action.push(emails[i]);
+    else if (cls === "JUNK") junk.push(emails[i]);
     else fyi.push(emails[i]);
 }
 
-hop.log("Triage: " + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI");
+hop.log("Triage: " + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI, " + junk.length + " junk");
 hop.log("Building summary...");
 
 // ── Summarize with Claude ─────────────────────────────────────────
@@ -200,9 +202,16 @@ if (action.length > 0) {
     summaryInput += "\n";
 }
 if (fyi.length > 0) {
-    summaryInput += "FYI / READ (" + fyi.length + "):\n";
+    summaryInput += "FYI / MARKED READ (" + fyi.length + "):\n";
     for (var i = 0; i < fyi.length; i++) {
         summaryInput += "- From: " + fyi[i].from + " | Subject: " + fyi[i].subject + " | Link: " + GMAIL_BASE + fyi[i].id + "\n";
+    }
+    summaryInput += "\n";
+}
+if (junk.length > 0) {
+    summaryInput += "JUNK / ARCHIVED (" + junk.length + "):\n";
+    for (var i = 0; i < junk.length; i++) {
+        summaryInput += "- From: " + junk[i].from + " | Subject: " + junk[i].subject + "\n";
     }
 }
 
@@ -230,7 +239,7 @@ try {
 
 var today = new Date().toISOString().split("T")[0];
 var subject = "Morning Briefing -- " + today
-    + " (" + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI)";
+    + " (" + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI, " + junk.length + " archived)";
 
 // userEmail already fetched earlier for links
 
@@ -266,7 +275,21 @@ if (fyi.length > 0) {
     hop.log("Marked " + fyiIds.length + " FYI messages as read.");
 }
 
-// ── Archive Briefing ──────────────────────────────────────────────
+// ── Archive Junk (remove from inbox) ─────────────────────────────
+
+if (junk.length > 0) {
+    var junkIds = [];
+    for (var i = 0; i < junk.length; i++) {
+        junkIds.push(junk[i].id);
+    }
+    gmailPost("/messages/batchModify", {
+        ids: junkIds,
+        removeLabelIds: ["UNREAD", "INBOX"]
+    });
+    hop.log("Archived " + junkIds.length + " junk messages.");
+}
+
+// ── Store Briefing ───────────────────────────────────────────────
 
 hop.kv.set("briefings", today, {
     date: today,
@@ -274,6 +297,7 @@ hop.kv.set("briefings", today, {
     urgent: urgent.length,
     action: action.length,
     fyi: fyi.length,
+    junk: junk.length,
     summary: summary,
     classifications: emails.map(function(e) {
         return { from: e.from, subject: e.subject, classification: e.classification };
@@ -282,4 +306,4 @@ hop.kv.set("briefings", today, {
 
 return "Briefing sent. " + emails.length + " emails: "
     + urgent.length + " urgent, " + action.length + " action, "
-    + fyi.length + " marked as read.";
+    + fyi.length + " read, " + junk.length + " archived.";
