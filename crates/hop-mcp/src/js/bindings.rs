@@ -487,9 +487,15 @@ fn run_local_command_sync(
 
     let restricted = sandbox.is_some_and(|p| p.is_restricted());
 
+    // Resolve the user's login shell. Use their actual shell (zsh, bash, etc.)
+    // in login mode (-lc) so the profile is sourced and PATH includes nvm/brew/etc.
+    // This matches what `hop exec` does — the agent tests commands in the same
+    // environment the cron job will use.
+    let user_shell = username
+        .map(|u| hop_core::unix_user::user_login_shell(u))
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+
     // Build the command with privilege dropping and optional sandboxing.
-    // Mirrors the patterns in sandbox/mod.rs build_exec_command() and
-    // build_unsandboxed_exec(), using std::process::Command (sync).
     let output = match (restricted, username) {
         // Sandboxed + username: drop privileges then sandbox
         (true, Some(user)) => {
@@ -500,14 +506,14 @@ fn run_local_command_sync(
                 std::process::Command::new("login")
                     .args(["-fp", user, "/usr/bin/sandbox-exec", "-p"])
                     .arg(&profile)
-                    .args(["/bin/sh", "-c", command])
+                    .args([&user_shell, "-lc", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
             {
                 let policy_clone = policy.clone();
                 let mut cmd = std::process::Command::new("su");
-                cmd.args(["-", user, "-c", command]);
+                cmd.args(["-", user, "-s", &user_shell, "-c", command]);
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
@@ -520,8 +526,8 @@ fn run_local_command_sync(
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = user;
-                std::process::Command::new("/bin/sh")
-                    .args(["-c", command])
+                std::process::Command::new(&user_shell)
+                    .args(["-lc", command])
                     .output()
             }
         }
@@ -531,20 +537,20 @@ fn run_local_command_sync(
             #[cfg(target_os = "macos")]
             {
                 std::process::Command::new("login")
-                    .args(["-fp", user, "/bin/sh", "-c", command])
+                    .args(["-fp", user, &user_shell, "-lc", command])
                     .output()
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             {
                 std::process::Command::new("su")
-                    .args(["-", user, "-c", command])
+                    .args(["-", user, "-s", &user_shell, "-c", command])
                     .output()
             }
             #[cfg(not(unix))]
             {
                 let _ = user;
-                std::process::Command::new("/bin/sh")
-                    .args(["-c", command])
+                std::process::Command::new(&user_shell)
+                    .args(["-lc", command])
                     .output()
             }
         }
@@ -556,14 +562,14 @@ fn run_local_command_sync(
             {
                 let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
                 std::process::Command::new("/usr/bin/sandbox-exec")
-                    .args(["-p", &profile, "/bin/sh", "-c", command])
+                    .args(["-p", &profile, &user_shell, "-lc", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
             {
                 let policy_clone = policy.clone();
-                let mut cmd = std::process::Command::new("/bin/sh");
-                cmd.args(["-c", command]);
+                let mut cmd = std::process::Command::new(&user_shell);
+                cmd.args(["-lc", command]);
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
@@ -575,16 +581,16 @@ fn run_local_command_sync(
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
-                std::process::Command::new("/bin/sh")
-                    .args(["-c", command])
+                std::process::Command::new(&user_shell)
+                    .args(["-lc", command])
                     .output()
             }
         }
 
         // No sandbox, no username, not root: plain execution
         (false, None) => {
-            std::process::Command::new("/bin/sh")
-                .args(["-c", command])
+            std::process::Command::new(&user_shell)
+                .args(["-lc", command])
                 .output()
         }
     };
