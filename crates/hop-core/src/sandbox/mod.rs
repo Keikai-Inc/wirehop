@@ -83,12 +83,13 @@ fn build_exec_command(
             // Run login first to switch users, then sandbox-exec inside:
             // login -fpq <user> /usr/bin/sandbox-exec -p <profile> <shell> -lc <cmd>
             let user_shell = crate::unix_user::user_login_shell(user);
+            let wrapped = with_rc_source(cmd, &user_shell);
             let profile = macos::generate_sbpl_profile(policy);
             let mut command = tokio::process::Command::new("login");
             command
                 .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                 .arg(&profile)
-                .args([&user_shell, "-lic", cmd])
+                .args([&user_shell, "-lc", &wrapped])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -127,6 +128,23 @@ fn build_exec_command(
     }
 }
 
+/// Wrap a command to source the user's shell rc file first.
+///
+/// Login shells (`-l`) source `.zprofile`/`.bash_profile` but NOT `.zshrc`/`.bashrc`
+/// (those are for interactive shells). Many users put PATH additions in `.zshrc`.
+/// We source it explicitly (with stderr suppressed to avoid prompt tool noise like
+/// starship warnings) before running the actual command.
+pub fn with_rc_source(cmd: &str, shell: &str) -> String {
+    let rc_file = if shell.ends_with("/zsh") {
+        "~/.zshrc"
+    } else if shell.ends_with("/bash") {
+        "~/.bashrc"
+    } else {
+        return cmd.to_string(); // no rc file to source for other shells
+    };
+    format!(". {rc_file} 2>/dev/null; {cmd}")
+}
+
 /// Build an unsandboxed exec command using the user's login shell.
 ///
 /// Uses the user's shell from passwd (zsh, bash, etc.) with `-lc` flag
@@ -134,11 +152,12 @@ fn build_exec_command(
 fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::Command {
     if let Some(user) = username {
         let user_shell = crate::unix_user::user_login_shell(user);
+        let wrapped = with_rc_source(cmd, &user_shell);
         #[cfg(target_os = "macos")]
         {
             let mut command = tokio::process::Command::new("login");
             command
-                .args(["-fpq", user, &user_shell, "-lic", cmd])
+                .args(["-fpq", user, &user_shell, "-lc", &wrapped])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -148,7 +167,7 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
         {
             let mut command = tokio::process::Command::new("su");
             command
-                .args(["-", user, "-s", &user_shell, "-c", cmd])
+                .args(["-", user, "-s", &user_shell, "-c", &wrapped])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -169,7 +188,7 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut command = tokio::process::Command::new(&shell);
         command
-            .args(["-lic", cmd])
+            .args(["-lc", cmd])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

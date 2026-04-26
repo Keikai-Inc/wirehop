@@ -495,6 +495,10 @@ fn run_local_command_sync(
         .map(hop_core::unix_user::user_login_shell)
         .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
+    // Wrap command to source the user's rc file (e.g. .zshrc) for full PATH.
+    let wrapped = hop_core::sandbox::with_rc_source(command, &user_shell);
+    let command = wrapped.as_str();
+
     // Build the command with privilege dropping and optional sandboxing.
     let output = match (restricted, username) {
         // Sandboxed + username: drop privileges then sandbox
@@ -506,7 +510,7 @@ fn run_local_command_sync(
                 std::process::Command::new("login")
                     .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                     .arg(&profile)
-                    .args([&user_shell, "-lic", command])
+                    .args([&user_shell, "-lc", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
@@ -527,7 +531,7 @@ fn run_local_command_sync(
             {
                 let _ = user;
                 std::process::Command::new(&user_shell)
-                    .args(["-lic", command])
+                    .args(["-lc", command])
                     .output()
             }
         }
@@ -537,7 +541,7 @@ fn run_local_command_sync(
             #[cfg(target_os = "macos")]
             {
                 std::process::Command::new("login")
-                    .args(["-fpq", user, &user_shell, "-lic", command])
+                    .args(["-fpq", user, &user_shell, "-lc", command])
                     .output()
             }
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -550,7 +554,7 @@ fn run_local_command_sync(
             {
                 let _ = user;
                 std::process::Command::new(&user_shell)
-                    .args(["-lic", command])
+                    .args(["-lc", command])
                     .output()
             }
         }
@@ -562,14 +566,14 @@ fn run_local_command_sync(
             {
                 let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
                 std::process::Command::new("/usr/bin/sandbox-exec")
-                    .args(["-p", &profile, &user_shell, "-lic", command])
+                    .args(["-p", &profile, &user_shell, "-lc", command])
                     .output()
             }
             #[cfg(target_os = "linux")]
             {
                 let policy_clone = policy.clone();
                 let mut cmd = std::process::Command::new(&user_shell);
-                cmd.args(["-lic", command]);
+                cmd.args(["-lc", command]);
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
@@ -582,7 +586,7 @@ fn run_local_command_sync(
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 std::process::Command::new(&user_shell)
-                    .args(["-lic", command])
+                    .args(["-lc", command])
                     .output()
             }
         }
@@ -590,7 +594,7 @@ fn run_local_command_sync(
         // No sandbox, no username, not root: plain execution
         (false, None) => {
             std::process::Command::new(&user_shell)
-                .args(["-lic", command])
+                .args(["-lc", command])
                 .output()
         }
     };
