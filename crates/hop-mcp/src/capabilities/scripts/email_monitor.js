@@ -95,7 +95,7 @@ function base64url(str) {
 
 // ── Fetch Unread Emails ───────────────────────────────────────────
 
-var listResp = gmailGet("/messages?q=is:unread&maxResults=50");
+var listResp = gmailGet("/messages?q=is:unread+newer_than:2d&maxResults=50");
 var messageIds = listResp.messages || [];
 
 if (messageIds.length === 0) {
@@ -169,8 +169,12 @@ hop.log("Building summary...");
 
 // ── Summarize with Claude ─────────────────────────────────────────
 
+// Get user email for links (fetch early so it's available for summary)
+var profile = gmailGet("/profile");
+var userEmail = profile.emailAddress;
+var GMAIL_BASE = "https://mail.google.com/mail/u/?authuser=" + userEmail.replace("@", "%40") + "#inbox/";
+
 var summaryInput = "";
-var GMAIL_BASE = "https://mail.google.com/mail/u/0/#inbox/";
 if (urgent.length > 0) {
     summaryInput += "URGENT (" + urgent.length + "):\n";
     for (var i = 0; i < urgent.length; i++) {
@@ -215,9 +219,7 @@ var today = new Date().toISOString().split("T")[0];
 var subject = "Morning Briefing -- " + today
     + " (" + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI)";
 
-// Get the user's email address for the To: header
-var profile = gmailGet("/profile");
-var userEmail = profile.emailAddress;
+// userEmail already fetched earlier for links
 
 // Strip markdown code fences if Claude wrapped the HTML in them
 var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```$/i, "").trim();
