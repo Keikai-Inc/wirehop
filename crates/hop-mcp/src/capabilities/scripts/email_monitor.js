@@ -207,29 +207,25 @@ function callClaude(prompt) {
         throw new Error("Anthropic API error (" + resp.status + "): " + resp.body);
     }
 
-    // Claude CLI with OAuth token passed via env var.
-    // Prompt must be in single quotes so sandbox validator treats < > as literal.
-    var tokenEscaped = token.replace(/'/g, "'\\''");
-    var promptEscaped = prompt.replace(/'/g, "'\\''");
-    // Resolve claude binary path. `which` may fail if ~/.local/bin isn't in
-    // the daemon's PATH, and shell globs/variables are blocked by the sandbox
-    // validator. Use hop.local("id -un") to get the current user (after
-    // privilege drop) and construct the path directly.
+    // Claude CLI via temp file — avoids shell quoting issues with complex prompts.
+    // Write prompt to a temp file, pipe it to claude via stdin.
+    var tmpFile = "/tmp/hop-claude-prompt-" + Date.now() + ".txt";
+    hop.local("cat > " + tmpFile + " << 'HOP_PROMPT_EOF'\n" + prompt + "\nHOP_PROMPT_EOF");
+
+    // Resolve claude binary path
     var whichResult = hop.local("which claude").stdout.trim();
-    var claudeBin = (whichResult && whichResult.startsWith("/")) ? whichResult : "";
-    if (!claudeBin) {
-        var currentUser = hop.local("id -un").stdout.trim();
-        if (currentUser) {
-            var homedir = (currentUser === "root") ? "/var/root" : "/Users/" + currentUser;
-            var candidate = homedir + "/.local/bin/claude";
-            var test = hop.local("test -x '" + candidate + "' && echo ok");
-            if (test.stdout.trim() === "ok") {
-                claudeBin = candidate;
-            }
-        }
-        if (!claudeBin) claudeBin = "claude";
-    }
-    var cliResult = hop.local("ANTHROPIC_API_KEY='" + tokenEscaped + "' '" + claudeBin + "' -p '" + promptEscaped + "' --bare --output-format text");
+    var claudeBin = (whichResult && whichResult.indexOf("/") === 0) ? whichResult : "claude";
+
+    // Run claude with prompt from file, token via env var
+    var tokenEscaped = token.replace(/'/g, "'\\''");
+    var cliResult = hop.local(
+        "ANTHROPIC_API_KEY='" + tokenEscaped + "' "
+        + claudeBin + " -p - --bare --output-format text < " + tmpFile
+    );
+
+    // Clean up temp file
+    hop.local("rm -f " + tmpFile);
+
     if (cliResult.exitCode === 0 && cliResult.stdout.trim()) {
         return cliResult.stdout.trim();
     }
