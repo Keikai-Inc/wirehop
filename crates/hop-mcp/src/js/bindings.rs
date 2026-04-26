@@ -504,7 +504,7 @@ fn run_local_command_sync(
             {
                 let profile = hop_core::sandbox::macos::generate_sbpl_profile(policy);
                 std::process::Command::new("login")
-                    .args(["-fp", user, "/usr/bin/sandbox-exec", "-p"])
+                    .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                     .arg(&profile)
                     .args([&user_shell, "-lc", command])
                     .output()
@@ -537,7 +537,7 @@ fn run_local_command_sync(
             #[cfg(target_os = "macos")]
             {
                 std::process::Command::new("login")
-                    .args(["-fp", user, &user_shell, "-lc", command])
+                    .args(["-fpq", user, &user_shell, "-lc", command])
                     .output()
             }
             #[cfg(all(unix, not(target_os = "macos")))]
