@@ -1129,10 +1129,57 @@ fn claude_invoke(
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(prompt.as_bytes());
+        // stdin is dropped here, closing the pipe so claude knows input is done
     }
 
-    let output = child.wait_with_output()
-        .map_err(|e| anyhow::anyhow!("claude process error: {e}"))?;
+    // Wait with timeout (120s per call). Read stdout/stderr in threads
+    // so we can enforce a deadline without blocking forever.
+    let timeout = std::time::Duration::from_secs(120);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stdout {
+            use std::io::Read;
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr {
+            use std::io::Read;
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    // Wait for the process with a deadline
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    anyhow::bail!("claude timed out after {}s", timeout.as_secs());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => anyhow::bail!("claude wait error: {e}"),
+        }
+    }
+
+    let status = child.wait()?;
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+    let output = std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    };
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
