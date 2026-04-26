@@ -81,13 +81,14 @@ fn build_exec_command(
         if let Some(user) = username {
             // login is setuid — sandbox-exec cannot exec it.
             // Run login first to switch users, then sandbox-exec inside:
-            // login -fp <user> /usr/bin/sandbox-exec -p <profile> /bin/sh -c <cmd>
+            // login -fpq <user> /usr/bin/sandbox-exec -p <profile> <shell> -lc <cmd>
+            let user_shell = crate::unix_user::user_login_shell(user);
             let profile = macos::generate_sbpl_profile(policy);
             let mut command = tokio::process::Command::new("login");
             command
-                .args(["-fp", user, "/usr/bin/sandbox-exec", "-p"])
+                .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
                 .arg(&profile)
-                .args(["/bin/sh", "-c", cmd])
+                .args([&user_shell, "-lc", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -126,14 +127,18 @@ fn build_exec_command(
     }
 }
 
-/// Build an unsandboxed exec command (existing behavior).
+/// Build an unsandboxed exec command using the user's login shell.
+///
+/// Uses the user's shell from passwd (zsh, bash, etc.) with `-lc` flag
+/// so the profile is sourced — matching the interactive `hop connect` environment.
 fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::Command {
     if let Some(user) = username {
+        let user_shell = crate::unix_user::user_login_shell(user);
         #[cfg(target_os = "macos")]
         {
             let mut command = tokio::process::Command::new("login");
             command
-                .args(["-fp", user, "/bin/sh", "-c", cmd])
+                .args(["-fpq", user, &user_shell, "-lc", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -143,7 +148,7 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
         {
             let mut command = tokio::process::Command::new("su");
             command
-                .args(["-", user, "-c", cmd])
+                .args(["-", user, "-s", &user_shell, "-c", cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -161,9 +166,10 @@ fn build_unsandboxed_exec(cmd: &str, username: Option<&str>) -> tokio::process::
             command
         }
     } else {
-        let mut command = tokio::process::Command::new("/bin/sh");
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut command = tokio::process::Command::new(&shell);
         command
-            .args(["-c", cmd])
+            .args(["-lc", cmd])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

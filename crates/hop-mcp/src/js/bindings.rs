@@ -492,7 +492,7 @@ fn run_local_command_sync(
     // This matches what `hop exec` does — the agent tests commands in the same
     // environment the cron job will use.
     let user_shell = username
-        .map(|u| hop_core::unix_user::user_login_shell(u))
+        .map(hop_core::unix_user::user_login_shell)
         .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
     // Build the command with privilege dropping and optional sandboxing.
