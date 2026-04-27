@@ -216,18 +216,18 @@ fn dispatch_request(ds: &Datastore, req: DsRequest) -> Result<DsResponse> {
         DsRequest::CronPurgeCorrupt => {
             DsResponse::StringList(ds.cron_purge_corrupt()?)
         }
-        DsRequest::SecretsGet { name } => {
-            DsResponse::SecretValue(ds.secrets_get(&name)?)
+        DsRequest::SecretsGet { username, name } => {
+            DsResponse::SecretValue(ds.secrets_get(&username, &name)?)
         }
-        DsRequest::SecretsSet { name, value } => {
-            ds.secrets_set(&name, &value)?;
+        DsRequest::SecretsSet { username, name, value } => {
+            ds.secrets_set(&username, &name, &value)?;
             DsResponse::Ok
         }
-        DsRequest::SecretsDelete { name } => {
-            DsResponse::Bool(ds.secrets_delete(&name)?)
+        DsRequest::SecretsDelete { username, name } => {
+            DsResponse::Bool(ds.secrets_delete(&username, &name)?)
         }
-        DsRequest::SecretsList => {
-            DsResponse::SecretNames(ds.secrets_list()?)
+        DsRequest::SecretsList { username } => {
+            DsResponse::SecretNames(ds.secrets_list(&username)?)
         }
     })
 }

@@ -452,6 +452,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     let ds_path = config_dir.join("datastore.redb");
     let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)?;
 
+    // Migrate legacy unscoped secrets to user-scoped table
+    let migration_user = hop_core::unix_user::default_creator_username()
+        .unwrap_or_else(|| "default".to_string());
+    if let Err(e) = datastore.migrate_secrets_if_needed(&migration_user) {
+        tracing::warn!("Secret migration failed: {e}");
+    }
+
     // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
     let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
 
@@ -729,7 +736,10 @@ async fn dispatch_session(
                 hop_core::proto::PeerRequest::CapRun { ref id, ref targets, ref params } => {
                     handle_remote_cap_run(&datastore, id, targets.as_deref(), params, username)
                 }
-                _ => hop_core::peer_ops::handle_peer_request(request, config_dir, &datastore),
+                _ => {
+                    let peer_user = username.unwrap_or("default");
+                    hop_core::peer_ops::handle_peer_request(request, config_dir, &datastore, peer_user)
+                }
             };
             proto::write_message(&mut send, &proto::HostMessage::PeerResponse(response)).await?;
         }
@@ -2247,7 +2257,9 @@ async fn store_auth_secret(target: Option<&str>, config_dir: &std::path::Path, n
         // Local: store via daemon Unix socket
         let ds = hop_core::datastore::Datastore::connect(config_dir)
             .context("Failed to connect to daemon — is `hop host` running?")?;
-        ds.secrets_set(name, value)?;
+        let user = hop_core::unix_user::current_username()
+            .unwrap_or_else(|| "default".to_string());
+        ds.secrets_set(&user, name, value)?;
         Ok(())
     }
 }
@@ -2777,10 +2789,12 @@ fn cmd_kv(config_dir: &std::path::Path, action: KvAction) -> Result<()> {
 fn cmd_secrets(config_dir: &std::path::Path, action: SecretsAction) -> Result<()> {
     let ds = hop_core::datastore::Datastore::connect(config_dir)
         .context("Failed to connect to daemon — is `hop host` running?")?;
+    let user = hop_core::unix_user::current_username()
+        .unwrap_or_else(|| "default".to_string());
 
     match action {
         SecretsAction::Get { name } => {
-            match ds.secrets_get(&name)? {
+            match ds.secrets_get(&user, &name)? {
                 Some(value) => {
                     let text = String::from_utf8_lossy(&value);
                     println!("{text}");
@@ -2807,11 +2821,11 @@ fn cmd_secrets(config_dir: &std::path::Path, action: SecretsAction) -> Result<()
                     }
                 }
             };
-            ds.secrets_set(&name, value.as_bytes())?;
+            ds.secrets_set(&user, &name, value.as_bytes())?;
             println!("OK");
         }
         SecretsAction::List => {
-            let names = ds.secrets_list()?;
+            let names = ds.secrets_list(&user)?;
             if names.is_empty() {
                 println!("No secrets stored.");
             } else {
@@ -2821,7 +2835,7 @@ fn cmd_secrets(config_dir: &std::path::Path, action: SecretsAction) -> Result<()
             }
         }
         SecretsAction::Delete { name } => {
-            if ds.secrets_delete(&name)? {
+            if ds.secrets_delete(&user, &name)? {
                 println!("Deleted.");
             } else {
                 println!("(not found)");

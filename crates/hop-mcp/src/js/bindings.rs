@@ -161,7 +161,7 @@ pub fn install_hop_bindings(
 
     // Install datastore bindings via JS wrapper
     if let Some(ds) = datastore {
-        install_datastore_raw(ctx, ds)?;
+        install_datastore_raw(ctx, ds, run_as_user)?;
         install_datastore_js_wrappers(ctx)?;
     } else {
         install_datastore_stubs(ctx)?;
@@ -906,8 +906,9 @@ fn install_claude_binding(
             let max_turns = max_turns.0.unwrap_or(1);
 
             // Get token from secrets (with refresh if needed)
+            let user = username.as_deref().unwrap_or("default");
             let token = match &ds {
-                Some(ds) => claude_get_token(ds)
+                Some(ds) => claude_get_token(ds, user)
                     .map_err(|e| js_err(format!("hop.claude: {e}")))?,
                 None => return Err(js_err("hop.claude: no datastore available (requires daemon mode)".into())),
             };
@@ -940,15 +941,15 @@ fn install_claude_binding(
 /// Sources (in order):
 /// 1. Local ~/.claude/.credentials.json (if Claude Code is installed on this machine)
 /// 2. hop secrets store (long-lived setup-token or API key from `hop auth anthropic`)
-fn claude_get_token(ds: &Datastore) -> Result<String> {
+fn claude_get_token(ds: &Datastore, username: &str) -> Result<String> {
     // Try 1: local credentials file (if Claude Code is installed and logged in)
     if let Some(token) = read_local_claude_token() {
         return Ok(token);
     }
 
     // Try 2: stored token (setup-token is valid for 1 year, API keys don't expire)
-    let token_bytes = ds.secrets_get("ANTHROPIC_API_KEY")?
-        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials. Run: hop auth anthropic"))?;
+    let token_bytes = ds.secrets_get(username, "ANTHROPIC_API_KEY")?
+        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials for {username}. Run: hop auth anthropic"))?;
     Ok(String::from_utf8(token_bytes)?)
 }
 
@@ -1248,7 +1249,8 @@ fn install_stub_bindings<'js>(ctx: &Ctx<'js>, hop: &Object<'js>) -> Result<()> {
 }
 
 /// Install raw __hop_kv_* and __hop_ts_* functions that return JSON strings.
-fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
+fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore, run_as_user: Option<&str>) -> Result<()> {
+    let secrets_user = run_as_user.unwrap_or("default").to_string();
     let globals = ctx.globals();
 
     // __hop_kv_get(ns, key) → JSON string or "null"
@@ -1429,9 +1431,10 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
     // __hop_secrets_get(name) → value string or "null"
     {
         let ds = ds.clone();
+        let user = secrets_user.clone();
         globals.set("__hop_secrets_get",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String| -> rquickjs::Result<String> {
-                match ds.secrets_get(&name) {
+                match ds.secrets_get(&user, &name) {
                     Ok(Some(value)) => Ok(String::from_utf8_lossy(&value).to_string()),
                     Ok(None) => Ok("null".to_string()),
                     Err(e) => Err(js_err(format!("hop.secrets.get failed: {e}"))),
@@ -1443,9 +1446,10 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
     // __hop_secrets_set(name, value) → void
     {
         let ds = ds.clone();
+        let user = secrets_user.clone();
         globals.set("__hop_secrets_set",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String, value: String| -> rquickjs::Result<()> {
-                ds.secrets_set(&name, value.as_bytes())
+                ds.secrets_set(&user, &name, value.as_bytes())
                     .map_err(|e| js_err(format!("hop.secrets.set failed: {e}")))
             }).map_err(|e| anyhow::anyhow!("{e}"))?,
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1454,9 +1458,10 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
     // __hop_secrets_delete(name) → boolean
     {
         let ds = ds.clone();
+        let user = secrets_user.clone();
         globals.set("__hop_secrets_delete",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>, name: String| -> rquickjs::Result<bool> {
-                ds.secrets_delete(&name)
+                ds.secrets_delete(&user, &name)
                     .map_err(|e| js_err(format!("hop.secrets.delete failed: {e}")))
             }).map_err(|e| anyhow::anyhow!("{e}"))?,
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1465,9 +1470,10 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore) -> Result<()> {
     // __hop_secrets_list() → JSON array of names
     {
         let ds = ds.clone();
+        let user = secrets_user.clone();
         globals.set("__hop_secrets_list",
             Function::new(ctx.clone(), move |_ctx: Ctx<'_>| -> rquickjs::Result<String> {
-                match ds.secrets_list() {
+                match ds.secrets_list(&user) {
                     Ok(names) => Ok(serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())),
                     Err(e) => Err(js_err(format!("hop.secrets.list failed: {e}"))),
                 }

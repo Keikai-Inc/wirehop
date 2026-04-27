@@ -1,4 +1,5 @@
 //! OAuth and API key authentication flows for `hop auth`.
+#![allow(dead_code)] // Legacy credential detection functions kept for reference
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -252,11 +253,10 @@ fn extract_token_from_output(output: &str) -> Option<String> {
     None
 }
 
-/// Minimum Claude Code version that supports `claude auth status`.
-const MIN_CLAUDE_VERSION: (u32, u32) = (2, 1); // 2.1.x+
+// ── Legacy Functions (kept for reference, may be cleaned up later) ──
 
-/// Check if Claude Code is installed, recent enough, and logged in.
-/// Returns true only if `claude auth status` reports loggedIn: true.
+const MIN_CLAUDE_VERSION: (u32, u32) = (2, 1);
+
 fn is_claude_logged_in() -> bool {
     // Check version first — old versions don't have `auth status`
     let version_output = match shell_command("claude --version").output() {

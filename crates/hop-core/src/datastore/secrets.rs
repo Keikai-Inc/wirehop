@@ -1,4 +1,7 @@
 //! Encrypted secrets operations on the embedded datastore.
+//!
+//! Secrets are scoped per-user: each user can only access their own secrets.
+//! The key is `(username, secret_name)` in the redb table.
 
 use anyhow::Result;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -7,19 +10,19 @@ use redb::ReadableTable;
 
 use super::protocol::{DsRequest, DsResponse};
 use super::remote_dispatch;
-use super::tables::SECRETS_TABLE;
+use super::tables::{SECRETS_TABLE, SECRETS_V2_TABLE};
 use super::types::SealedSecret;
 use super::Datastore;
 
 impl Datastore {
-    /// Get a decrypted secret by name. Returns the plaintext value.
-    pub fn secrets_get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    /// Get a decrypted secret by name, scoped to a user.
+    pub fn secrets_get(&self, username: &str, name: &str) -> Result<Option<Vec<u8>>> {
         remote_dispatch!(
             self,
-            DsRequest::SecretsGet { name: name.into() },
+            DsRequest::SecretsGet { username: username.into(), name: name.into() },
             DsResponse::SecretValue(v) => v
         );
-        let Some(sealed) = self.secrets_get_sealed(name)? else {
+        let Some(sealed) = self.secrets_get_sealed(username, name)? else {
             return Ok(None);
         };
         let key = self.secrets_key()?;
@@ -27,11 +30,12 @@ impl Datastore {
         Ok(Some(plaintext))
     }
 
-    /// Set (encrypt and store) a secret.
-    pub fn secrets_set(&self, name: &str, value: &[u8]) -> Result<()> {
+    /// Set (encrypt and store) a secret, scoped to a user.
+    pub fn secrets_set(&self, username: &str, name: &str, value: &[u8]) -> Result<()> {
         remote_dispatch!(
             self,
             DsRequest::SecretsSet {
+                username: username.into(),
                 name: name.into(),
                 value: value.to_vec(),
             },
@@ -42,55 +46,117 @@ impl Datastore {
         let bytes = bincode::serde::encode_to_vec(&sealed, bincode::config::standard())?;
         let txn = self.local_db().begin_write()?;
         {
-            let mut table = txn.open_table(SECRETS_TABLE)?;
-            table.insert(name, bytes.as_slice())?;
+            let mut table = txn.open_table(SECRETS_V2_TABLE)?;
+            table.insert((username, name), bytes.as_slice())?;
         }
         txn.commit()?;
         Ok(())
     }
 
     /// Delete a secret. Returns true if the name existed.
-    pub fn secrets_delete(&self, name: &str) -> Result<bool> {
+    pub fn secrets_delete(&self, username: &str, name: &str) -> Result<bool> {
         remote_dispatch!(
             self,
-            DsRequest::SecretsDelete { name: name.into() },
+            DsRequest::SecretsDelete { username: username.into(), name: name.into() },
             DsResponse::Bool(b) => b
         );
         let txn = self.local_db().begin_write()?;
         let existed = {
-            let mut table = txn.open_table(SECRETS_TABLE)?;
-            table.remove(name)?.is_some()
+            let mut table = txn.open_table(SECRETS_V2_TABLE)?;
+            table.remove((username, name))?.is_some()
         };
         txn.commit()?;
         Ok(existed)
     }
 
-    /// List secret names (not values).
-    pub fn secrets_list(&self) -> Result<Vec<String>> {
-        remote_dispatch!(self, DsRequest::SecretsList, DsResponse::SecretNames(names) => names);
+    /// List secret names (not values) for a user.
+    pub fn secrets_list(&self, username: &str) -> Result<Vec<String>> {
+        remote_dispatch!(
+            self,
+            DsRequest::SecretsList { username: username.into() },
+            DsResponse::SecretNames(names) => names
+        );
         let txn = self.local_db().begin_read()?;
-        let table = match txn.open_table(SECRETS_TABLE) {
+        let table = match txn.open_table(SECRETS_V2_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
         let mut names = Vec::new();
+        // Scan for entries with matching username prefix
         for item in table.iter()? {
             let (key_guard, _) = item?;
-            names.push(key_guard.value().to_string());
+            let (user, name) = key_guard.value();
+            if user == username {
+                names.push(name.to_string());
+            }
         }
         Ok(names)
     }
 
-    /// Internal: read the raw SealedSecret from redb (no decryption).
-    fn secrets_get_sealed(&self, name: &str) -> Result<Option<SealedSecret>> {
+    /// Migrate secrets from the old unscoped table to the new user-scoped table.
+    /// Called once on startup. Assigns all existing secrets to `default_user`.
+    pub fn migrate_secrets_if_needed(&self, default_user: &str) -> Result<()> {
         let txn = self.local_db().begin_read()?;
-        let table = match txn.open_table(SECRETS_TABLE) {
+        let old_table = match txn.open_table(SECRETS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()), // nothing to migrate
+            Err(e) => return Err(e.into()),
+        };
+
+        // Check if old table has any entries
+        let entries: Vec<(String, Vec<u8>)> = old_table
+            .iter()?
+            .filter_map(|item| {
+                let (k, v) = item.ok()?;
+                Some((k.value().to_string(), v.value().to_vec()))
+            })
+            .collect();
+        drop(old_table);
+        drop(txn);
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Migrating {} secrets from legacy table to user-scoped table (user: {default_user})",
+            entries.len()
+        );
+
+        let txn = self.local_db().begin_write()?;
+        {
+            let mut new_table = txn.open_table(SECRETS_V2_TABLE)?;
+            for (name, encrypted_bytes) in &entries {
+                // Copy the raw encrypted bytes — no need to decrypt/re-encrypt
+                new_table.insert((default_user, name.as_str()), encrypted_bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+
+        // Delete old table entries
+        let txn = self.local_db().begin_write()?;
+        {
+            let mut old_table = txn.open_table(SECRETS_TABLE)?;
+            for (name, _) in &entries {
+                old_table.remove(name.as_str())?;
+            }
+        }
+        txn.commit()?;
+
+        tracing::info!("Secret migration complete");
+        Ok(())
+    }
+
+    /// Internal: read the raw SealedSecret from redb (no decryption).
+    fn secrets_get_sealed(&self, username: &str, name: &str) -> Result<Option<SealedSecret>> {
+        let txn = self.local_db().begin_read()?;
+        let table = match txn.open_table(SECRETS_V2_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        match table.get(name)? {
+        match table.get((username, name))? {
             Some(guard) => {
                 let bytes = guard.value();
                 let (sealed, _): (SealedSecret, _) =
@@ -143,9 +209,28 @@ mod tests {
         let ds =
             Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
 
-        ds.secrets_set("API_KEY", b"sk-test-123").unwrap();
-        let val = ds.secrets_get("API_KEY").unwrap();
+        ds.secrets_set("alice", "API_KEY", b"sk-test-123").unwrap();
+        let val = ds.secrets_get("alice", "API_KEY").unwrap();
         assert_eq!(val, Some(b"sk-test-123".to_vec()));
+    }
+
+    #[test]
+    fn user_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds =
+            Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
+
+        ds.secrets_set("alice", "KEY", b"alice-secret").unwrap();
+        ds.secrets_set("bob", "KEY", b"bob-secret").unwrap();
+
+        // Each user sees only their own
+        assert_eq!(ds.secrets_get("alice", "KEY").unwrap(), Some(b"alice-secret".to_vec()));
+        assert_eq!(ds.secrets_get("bob", "KEY").unwrap(), Some(b"bob-secret".to_vec()));
+
+        // Alice can't see Bob's secrets
+        let alice_list = ds.secrets_list("alice").unwrap();
+        assert_eq!(alice_list, vec!["KEY".to_string()]);
+        assert!(!alice_list.iter().any(|n| n.contains("bob")));
     }
 
     #[test]
@@ -154,7 +239,7 @@ mod tests {
         let ds =
             Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
 
-        assert_eq!(ds.secrets_get("NOPE").unwrap(), None);
+        assert_eq!(ds.secrets_get("alice", "NOPE").unwrap(), None);
     }
 
     #[test]
@@ -163,10 +248,10 @@ mod tests {
         let ds =
             Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
 
-        ds.secrets_set("B_KEY", b"val-b").unwrap();
-        ds.secrets_set("A_KEY", b"val-a").unwrap();
+        ds.secrets_set("alice", "B_KEY", b"val-b").unwrap();
+        ds.secrets_set("alice", "A_KEY", b"val-a").unwrap();
 
-        let names = ds.secrets_list().unwrap();
+        let names = ds.secrets_list("alice").unwrap();
         assert_eq!(names, vec!["A_KEY".to_string(), "B_KEY".to_string()]);
     }
 
@@ -176,10 +261,10 @@ mod tests {
         let ds =
             Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
 
-        ds.secrets_set("KEY", b"val").unwrap();
-        assert!(ds.secrets_delete("KEY").unwrap());
-        assert!(!ds.secrets_delete("KEY").unwrap());
-        assert_eq!(ds.secrets_get("KEY").unwrap(), None);
+        ds.secrets_set("alice", "KEY", b"val").unwrap();
+        assert!(ds.secrets_delete("alice", "KEY").unwrap());
+        assert!(!ds.secrets_delete("alice", "KEY").unwrap());
+        assert_eq!(ds.secrets_get("alice", "KEY").unwrap(), None);
     }
 
     #[test]
@@ -187,15 +272,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.redb");
 
-        // Store with one key
         let ds1 = Datastore::open_with_secrets(&db_path, test_key()).unwrap();
-        ds1.secrets_set("SECRET", b"hidden").unwrap();
+        ds1.secrets_set("alice", "SECRET", b"hidden").unwrap();
         drop(ds1);
 
-        // Try to read with a different key
         let wrong_key = super::super::derive_secrets_key(&[99u8; 32]);
         let ds2 = Datastore::open_with_secrets(&db_path, wrong_key).unwrap();
-        let result = ds2.secrets_get("SECRET");
+        let result = ds2.secrets_get("alice", "SECRET");
         assert!(result.is_err());
     }
 
@@ -205,8 +288,8 @@ mod tests {
         let ds =
             Datastore::open_with_secrets(&dir.path().join("test.redb"), test_key()).unwrap();
 
-        ds.secrets_set("KEY", b"old").unwrap();
-        ds.secrets_set("KEY", b"new").unwrap();
-        assert_eq!(ds.secrets_get("KEY").unwrap(), Some(b"new".to_vec()));
+        ds.secrets_set("alice", "KEY", b"old").unwrap();
+        ds.secrets_set("alice", "KEY", b"new").unwrap();
+        assert_eq!(ds.secrets_get("alice", "KEY").unwrap(), Some(b"new".to_vec()));
     }
 }

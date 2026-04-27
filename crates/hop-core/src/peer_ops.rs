@@ -18,23 +18,24 @@ pub fn handle_peer_request(
     request: PeerRequest,
     _config_dir: &Path,
     datastore: &Datastore,
+    username: &str,
 ) -> PeerResponse {
     match request {
-        // --- Secrets ---
-        PeerRequest::SecretsGet { name } => match datastore.secrets_get(&name) {
+        // --- Secrets (scoped to peer's username) ---
+        PeerRequest::SecretsGet { name } => match datastore.secrets_get(username, &name) {
             Ok(value) => PeerResponse::SecretValue(value),
             Err(e) => PeerResponse::Error(format!("secrets_get: {e}")),
         },
-        PeerRequest::SecretsSet { name, value } => match datastore.secrets_set(&name, &value) {
+        PeerRequest::SecretsSet { name, value } => match datastore.secrets_set(username, &name, &value) {
             Ok(()) => PeerResponse::Ok,
             Err(e) => PeerResponse::Error(format!("secrets_set: {e}")),
         },
-        PeerRequest::SecretsDelete { name } => match datastore.secrets_delete(&name) {
+        PeerRequest::SecretsDelete { name } => match datastore.secrets_delete(username, &name) {
             Ok(true) => PeerResponse::Ok,
             Ok(false) => PeerResponse::Error("secret not found".into()),
             Err(e) => PeerResponse::Error(format!("secrets_delete: {e}")),
         },
-        PeerRequest::SecretsList => match datastore.secrets_list() {
+        PeerRequest::SecretsList => match datastore.secrets_list(username) {
             Ok(names) => PeerResponse::SecretNames(names),
             Err(e) => PeerResponse::Error(format!("secrets_list: {e}")),
         },

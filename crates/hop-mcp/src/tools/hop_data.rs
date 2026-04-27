@@ -286,12 +286,18 @@ fn ts_latest(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
     }
 }
 
+fn default_secrets_user() -> String {
+    hop_core::unix_user::current_username()
+        .unwrap_or_else(|| "default".to_string())
+}
+
 fn secrets_get(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
     let name = match args.name.as_deref() {
         Some(n) => n,
         None => return ToolCallResult::error("name is required for secrets_get"),
     };
-    match ds.secrets_get(name) {
+    let user = default_secrets_user();
+    match ds.secrets_get(&user, name) {
         Ok(Some(value)) => {
             let text = String::from_utf8_lossy(&value);
             ToolCallResult::text(text.to_string())
@@ -311,7 +317,8 @@ fn secrets_set(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
         Some(v) => serde_json::to_vec(v).unwrap_or_default(),
         None => return ToolCallResult::error("value is required for secrets_set"),
     };
-    match ds.secrets_set(name, &value) {
+    let user = default_secrets_user();
+    match ds.secrets_set(&user, name, &value) {
         Ok(()) => ToolCallResult::text(json!({"ok": true}).to_string()),
         Err(e) => ToolCallResult::error(format!("secrets_set failed: {e}")),
     }
@@ -322,14 +329,16 @@ fn secrets_delete(ds: &Datastore, args: &DataArgs) -> ToolCallResult {
         Some(n) => n,
         None => return ToolCallResult::error("name is required for secrets_delete"),
     };
-    match ds.secrets_delete(name) {
+    let user = default_secrets_user();
+    match ds.secrets_delete(&user, name) {
         Ok(deleted) => ToolCallResult::text(json!({"deleted": deleted}).to_string()),
         Err(e) => ToolCallResult::error(format!("secrets_delete failed: {e}")),
     }
 }
 
 fn secrets_list(ds: &Datastore) -> ToolCallResult {
-    match ds.secrets_list() {
+    let user = default_secrets_user();
+    match ds.secrets_list(&user) {
         Ok(names) => ToolCallResult::text(serde_json::to_string_pretty(&names).unwrap_or_default()),
         Err(e) => ToolCallResult::error(format!("secrets_list failed: {e}")),
     }

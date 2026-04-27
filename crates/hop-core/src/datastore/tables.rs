@@ -14,5 +14,9 @@ pub const CRON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cron"
 /// Metadata: key → bincode-encoded value (schema version, retention policies, etc.).
 pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
-/// Encrypted secrets: secret_name → bincode-encoded SealedSecret.
+/// Encrypted secrets (legacy, unscoped): secret_name → bincode-encoded SealedSecret.
+/// Migrated to SECRETS_V2_TABLE on first access.
 pub const SECRETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
+
+/// Encrypted secrets (user-scoped): (username, secret_name) → bincode-encoded SealedSecret.
+pub const SECRETS_V2_TABLE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("secrets_v2");

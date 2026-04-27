@@ -23,10 +23,10 @@ pub enum DsRequest {
     CronGetDue { now_ms: u64 },
     CronUpdateLastRun { id: String, ts: u64, next_run: u64 },
     CronPurgeCorrupt,
-    SecretsGet { name: String },
-    SecretsSet { name: String, value: Vec<u8> },
-    SecretsDelete { name: String },
-    SecretsList,
+    SecretsGet { username: String, name: String },
+    SecretsSet { username: String, name: String, value: Vec<u8> },
+    SecretsDelete { username: String, name: String },
+    SecretsList { username: String },
 }
 
 /// Response from the daemon's datastore to a client.
