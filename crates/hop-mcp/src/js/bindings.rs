@@ -1066,8 +1066,10 @@ fn claude_invoke(
         "-p", "-",
         "--output-format", "text",
         "--max-turns", &max_turns.to_string(),
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools", "",
     ])
-    .env("ANTHROPIC_API_KEY", token)
     .env("CLAUDE_CODE_OAUTH_TOKEN", token)
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
