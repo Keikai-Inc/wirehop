@@ -1064,11 +1064,11 @@ fn claude_invoke(
     let mut cmd = std::process::Command::new(claude_bin);
     cmd.args([
         "-p", "-",
-        "--bare",
         "--output-format", "text",
         "--max-turns", &max_turns.to_string(),
     ])
     .env("ANTHROPIC_API_KEY", token)
+    .env("CLAUDE_CODE_OAUTH_TOKEN", token)
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
