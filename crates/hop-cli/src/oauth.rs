@@ -163,34 +163,13 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
 /// Run the Anthropic auth flow. Returns a list of (secret_name, value) pairs.
 ///
 /// Priority:
-/// 1. Detect local Claude Code credentials and copy them
-/// 2. Prompt for an API key from console.anthropic.com
+/// 1. Run `claude setup-token` to create a long-lived token (1 year, stable)
+/// 2. Fall back to manual API key entry
 pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String)>> {
     if provider.name == "anthropic" {
-        // Try 1: Extract credentials from file/keychain
-        if let Some(creds) = detect_claude_credentials() {
-            eprintln!("  Found Claude Code credentials (expires {}).", creds.expires_display);
-            eprint!("  Use Claude Code login? [Y/n]: ");
-            std::io::stderr().flush()?;
-
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            let answer = answer.trim().to_lowercase();
-
-            if answer.is_empty() || answer == "y" || answer == "yes" {
-                return Ok(vec![
-                    ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
-                    ("anthropic_refresh_token".to_string(), creds.refresh_token),
-                    ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
-                    ("anthropic_method".to_string(), "claude_oauth".to_string()),
-                ]);
-            }
-        }
-
-        // Try 2: Claude is logged in but tokens are in Keychain (can't extract).
-        // Run `claude setup-token` to create an extractable long-lived token.
-        if is_claude_logged_in() {
-            eprintln!("  Claude Code is logged in. Running setup-token to export credentials...");
+        // Try: run setup-token for a long-lived token (1 year, no refresh needed)
+        if has_claude_cli() {
+            eprintln!("  Creating a long-lived Claude token (valid for 1 year)...");
             eprintln!();
 
             let output = shell_command_interactive("claude setup-token")
@@ -201,28 +180,17 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
             if let Ok(out) = output && out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
 
-                // Try 1: check if setup-token wrote to .credentials.json
-                if let Some(creds) = detect_claude_credentials_file() {
-                    return Ok(vec![
-                        ("ANTHROPIC_API_KEY".to_string(), creds.access_token),
-                        ("anthropic_refresh_token".to_string(), creds.refresh_token),
-                        ("anthropic_token_expiry".to_string(), creds.expires_at.to_string()),
-                        ("anthropic_method".to_string(), "claude_oauth".to_string()),
-                    ]);
-                }
-
-                // Try 2: parse the token from stdout (setup-token prints it)
-                // Look for "sk-ant-oat01-" in the output
                 if let Some(token) = extract_token_from_output(&stdout) {
-                    eprintln!("  Token captured from setup-token output.");
+                    eprintln!();
+                    eprintln!("  Long-lived token created (valid for 1 year).");
                     return Ok(vec![
                         ("ANTHROPIC_API_KEY".to_string(), token),
-                        ("anthropic_method".to_string(), "claude_oauth".to_string()),
+                        ("anthropic_method".to_string(), "setup_token".to_string()),
                     ]);
                 }
             }
 
-            eprintln!("  Could not extract credentials. Falling back to API key.");
+            eprintln!("  Could not create setup token. Falling back to API key.");
         }
     }
 
@@ -251,6 +219,14 @@ pub fn run_api_key_flow(provider: &ApiKeyProvider) -> Result<Vec<(String, String
 }
 
 /// Check if the `claude` CLI binary is available via the user's shell.
+fn has_claude_cli() -> bool {
+    shell_command("which claude")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Extract an OAuth token (sk-ant-oat01-...) from setup-token's stdout.
 /// The output contains ASCII art and text; the token is on its own line.
 fn extract_token_from_output(output: &str) -> Option<String> {

@@ -935,79 +935,46 @@ fn install_claude_binding(
     Ok(())
 }
 
-/// Get a valid Anthropic token from the datastore, refreshing if expired.
+/// Get a valid Anthropic token.
+///
+/// Sources (in order):
+/// 1. Local ~/.claude/.credentials.json (if Claude Code is installed on this machine)
+/// 2. hop secrets store (long-lived setup-token or API key from `hop auth anthropic`)
 fn claude_get_token(ds: &Datastore) -> Result<String> {
-    let token_bytes = ds.secrets_get("ANTHROPIC_API_KEY")?
-        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials. Run: hop auth anthropic"))?;
-    let token = String::from_utf8(token_bytes)?;
-
-    let method = ds.secrets_get("anthropic_method")?
-        .map(|v| String::from_utf8_lossy(&v).to_string())
-        .unwrap_or_else(|| "api_key".to_string());
-
-    // API keys don't expire
-    if method != "claude_oauth" {
+    // Try 1: local credentials file (if Claude Code is installed and logged in)
+    if let Some(token) = read_local_claude_token() {
         return Ok(token);
     }
 
-    // Check OAuth token expiry (5 min buffer)
-    let expiry: u64 = ds.secrets_get("anthropic_token_expiry")?
-        .and_then(|v| String::from_utf8(v).ok()?.parse().ok())
-        .unwrap_or(0);
+    // Try 2: stored token (setup-token is valid for 1 year, API keys don't expire)
+    let token_bytes = ds.secrets_get("ANTHROPIC_API_KEY")?
+        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials. Run: hop auth anthropic"))?;
+    Ok(String::from_utf8(token_bytes)?)
+}
+
+/// Read a valid token from the local ~/.claude/.credentials.json file.
+/// Claude Code auto-refreshes this file, so it's always the freshest source.
+/// Returns None if the file doesn't exist, can't be parsed, or token is expired.
+fn read_local_claude_token() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(&home).join(".claude/.credentials.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let oauth = json.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?.to_string();
+    let expires_at = oauth.get("expiresAt")?.as_u64()?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .ok()?
         .as_millis() as u64;
 
-    if now_ms < expiry.saturating_sub(300_000) {
-        return Ok(token);
+    // Valid with 5 min buffer
+    if now_ms < expires_at.saturating_sub(300_000) {
+        Some(token)
+    } else {
+        None
     }
-
-    // Refresh
-    tracing::info!("hop.claude: refreshing Anthropic OAuth token");
-    let refresh_bytes = ds.secrets_get("anthropic_refresh_token")?
-        .ok_or_else(|| anyhow::anyhow!("anthropic_refresh_token not set. Re-run: hop auth anthropic"))?;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": String::from_utf8(refresh_bytes)?,
-        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    });
-    let resp = client
-        .post("https://console.anthropic.com/v1/oauth/token")
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("token refresh failed ({status}): {body}. Re-run: hop auth anthropic");
-    }
-
-    let data: serde_json::Value = serde_json::from_str(&resp.text()?)?;
-    let new_token = data["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("token refresh response missing access_token"))?
-        .to_string();
-
-    ds.secrets_set("ANTHROPIC_API_KEY", new_token.as_bytes())?;
-    if let Some(expires_in) = data["expires_in"].as_u64() {
-        ds.secrets_set(
-            "anthropic_token_expiry",
-            {
-                let new_expiry = now_ms + expires_in * 1000;
-                new_expiry.to_string()
-            }.as_bytes(),
-        )?;
-    }
-    tracing::info!("hop.claude: token refreshed");
-    Ok(new_token)
 }
 
 /// Resolve the claude CLI binary path by checking known locations directly.
