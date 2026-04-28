@@ -111,6 +111,22 @@ pub fn handle_peer_request(
             targets,
             params,
         } => handle_cap_run(datastore, &id, targets.as_deref(), &params),
+
+        // Extension routing — handled in a separate async dispatcher upstream
+        // of this sync function. If we reach here, the dispatcher above us
+        // didn't intercept; surface a clear error rather than silently
+        // succeeding.
+        PeerRequest::ExtensionList
+        | PeerRequest::ExtensionCall { .. }
+        | PeerRequest::ExtensionStreamOpen { .. }
+        | PeerRequest::ExtensionStreamInput { .. }
+        | PeerRequest::ExtensionStreamClose { .. } => {
+            PeerResponse::Error(
+                "extension request reached sync handler; \
+                 should have been routed via the async extension registry"
+                    .into(),
+            )
+        }
     }
 }
 

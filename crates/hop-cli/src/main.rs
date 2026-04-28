@@ -3088,6 +3088,37 @@ fn display_peer_response(_subcmd: &str, _args: &[String], resp: hop_core::proto:
         PeerResponse::CronJob(None) => {
             println!("(not found)");
         }
+
+        // Extension responses are surfaced by the `hop ext` subcommand
+        // handler, which formats them appropriately. If we hit this path
+        // we got an extension response in a non-extension command — log
+        // it and move on.
+        PeerResponse::ExtensionEntries(entries) => {
+            for e in entries {
+                let avail = if e.available { "active" } else { "unavailable" };
+                println!("  {} ({})  {}", e.ext_id, avail, e.description);
+            }
+        }
+        PeerResponse::ExtensionResult { ok, payload } => {
+            let label = if ok { "ok" } else { "error" };
+            println!("[{label}] {} bytes", payload.len());
+            if !payload.is_empty() {
+                let preview = String::from_utf8_lossy(&payload);
+                println!("{preview}");
+            }
+        }
+        PeerResponse::ExtensionStreamOpened { stream_id } => {
+            println!("(stream {stream_id} opened — use `hop ext` for streaming subscriptions)");
+        }
+        PeerResponse::ExtensionStreamFrame { stream_id, payload } => {
+            println!("(stream {stream_id} frame, {} bytes)", payload.len());
+        }
+        PeerResponse::ExtensionStreamClosed { stream_id, reason } => {
+            match reason {
+                Some(r) => println!("(stream {stream_id} closed: {r})"),
+                None => println!("(stream {stream_id} closed)"),
+            }
+        }
     }
     Ok(())
 }

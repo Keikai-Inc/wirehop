@@ -310,6 +310,29 @@ pub enum PeerRequest {
     KvList { ns: String, prefix: String },
     CronList,
     CronGet { id: String },
+
+    // --- Extension routing ---
+    //
+    // Generic mechanism for hop extensions (companion daemons that register
+    // via ~/.config/hop/extensions/*.toml manifests). Hop core forwards the
+    // payload bytes opaquely; each extension defines its own sub-protocol.
+    /// List installed extensions on this host.
+    ExtensionList,
+
+    /// Send a single request to a registered extension, expect a single response.
+    ExtensionCall { ext_id: String, payload: Vec<u8> },
+
+    /// Open a long-running stream against a registered extension. The
+    /// extension may emit `ExtensionStreamFrame` responses; either side
+    /// may close.
+    ExtensionStreamOpen { ext_id: String, payload: Vec<u8> },
+
+    /// Send input bytes from the peer into an open extension stream
+    /// (e.g., keystrokes for a terminal session subscriber).
+    ExtensionStreamInput { stream_id: u64, payload: Vec<u8> },
+
+    /// Close an open extension stream from the peer side.
+    ExtensionStreamClose { stream_id: u64 },
 }
 
 /// Response to a PeerRequest.
@@ -327,6 +350,33 @@ pub enum PeerResponse {
     CapTriggered { job_id: String },
     CronJobs(Vec<CronJobSummary>),
     CronJob(Option<CronJobSummary>),
+
+    // --- Extension routing ---
+    /// List of registered extensions (response to `ExtensionList`).
+    ExtensionEntries(Vec<ExtensionInfo>),
+
+    /// Single response from an extension to `ExtensionCall`.
+    ExtensionResult { ok: bool, payload: Vec<u8> },
+
+    /// Acknowledges that an extension stream is open. The `stream_id` is
+    /// used for subsequent `ExtensionStreamFrame` / `ExtensionStreamInput`
+    /// / `ExtensionStreamClose` messages.
+    ExtensionStreamOpened { stream_id: u64 },
+
+    /// One frame in an open extension stream (extension → peer).
+    ExtensionStreamFrame { stream_id: u64, payload: Vec<u8> },
+
+    /// The extension closed an open stream (e.g., session ended).
+    ExtensionStreamClosed { stream_id: u64, reason: Option<String> },
+}
+
+/// Summary info for a registered extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionInfo {
+    pub ext_id: String,
+    pub description: String,
+    pub required_role: String,
+    pub available: bool,
 }
 
 /// Summary info for a capability in `hop cap list`.
