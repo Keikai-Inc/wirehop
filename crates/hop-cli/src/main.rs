@@ -2891,6 +2891,7 @@ async fn cmd_remote_peer_op(target: &str, args: &[String], config_dir: &std::pat
         "kv" => parse_remote_kv(sub_args)?,
         "cron" => parse_remote_cron(sub_args)?,
         "cap" => parse_remote_cap(sub_args)?,
+        "ext" => parse_remote_ext(sub_args)?,
         other => anyhow::bail!("unknown remote subcommand: {other}"),
     };
 
@@ -3013,6 +3014,34 @@ fn parse_remote_cap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
         }
         "list" => Ok(PeerRequest::CapList),
         _ => anyhow::bail!("usage: hop <host> cap [list|enable|disable|status|run] ..."),
+    }
+}
+
+fn parse_remote_ext(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "list" => Ok(PeerRequest::ExtensionList),
+        "call" => {
+            let ext_id = args
+                .get(1)
+                .context("usage: hop <host> ext call <ext_id> [--hex <hex>|--text <str>]")?;
+            // Payload is read from --hex or --text. Default: empty payload.
+            let payload = if let Some(i) = args.iter().position(|a| a == "--hex") {
+                let hex = args.get(i + 1).context("--hex requires an argument")?;
+                hex::decode(hex).context("invalid hex payload")?
+            } else if let Some(i) = args.iter().position(|a| a == "--text") {
+                let text = args.get(i + 1).context("--text requires an argument")?;
+                text.as_bytes().to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(PeerRequest::ExtensionCall {
+                ext_id: ext_id.clone(),
+                payload,
+            })
+        }
+        _ => anyhow::bail!("usage: hop <host> ext [list|call <ext_id> [--hex <hex>|--text <str>]]"),
     }
 }
 

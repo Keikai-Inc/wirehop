@@ -22,6 +22,7 @@ ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bincode.workspace = true
+hex.workspace = true
 libc.workspace = true
 users.workspace = true
 cron.workspace = true
