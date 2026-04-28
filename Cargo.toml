@@ -27,6 +27,9 @@ serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
 
+# Extension IPC (typed channels with serde, fd transfer, cross-platform)
+ipc-channel = "0.20"
+
 # Terminal / PTY
 portable-pty = "0.9"
 crossterm = "0.28"

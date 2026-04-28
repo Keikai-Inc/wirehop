@@ -13,6 +13,10 @@
 //! - (forthcoming) `registry` — runtime registry of active extensions,
 //!   ipc-channel rendezvous, SO_PEERCRED checks, request dispatch.
 
+pub mod bootstrap;
 pub mod manifest;
+pub mod registry;
 
+pub use bootstrap::Bootstrap;
 pub use manifest::ExtensionManifest;
+pub use registry::{ExtMessage, ExtensionRegistry, ExtensionStatus};
