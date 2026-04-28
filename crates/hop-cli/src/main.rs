@@ -452,6 +452,14 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     let ds_path = config_dir.join("datastore.redb");
     let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)?;
 
+    // Discover hop extensions installed on this host. The registry only
+    // loads manifests at startup; connections to each extension's IPC
+    // server are established lazily on first use. A missing extensions
+    // directory is normal — it just means no extensions are installed.
+    let ext_manifest_dir = config_dir.join("extensions");
+    let ext_registry = hop_core::extensions::ExtensionRegistry::discover(ext_manifest_dir).await?;
+    let ext_dispatcher = hop_core::extensions::ExtensionDispatcher::new(ext_registry);
+
     // Migrate legacy unscoped secrets to user-scoped table
     let migration_user = hop_core::unix_user::default_creator_username()
         .unwrap_or_else(|| "default".to_string());
@@ -492,6 +500,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         let config_dir = config_dir.to_path_buf();
                         let registry = registry.clone();
                         let ds = datastore.clone();
+                        let ext = ext_dispatcher.clone();
                         // Double-spawn: the inner task's JoinHandle lets us
                         // observe panics explicitly (via JoinError::is_panic)
                         // and log which connection died, instead of just
@@ -499,7 +508,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         // and losing the context.
                         tokio::spawn(async move {
                             let inner = tokio::spawn(async move {
-                                handle_incoming(inc, &config_dir, registry, ds).await
+                                handle_incoming(inc, &config_dir, registry, ds, ext).await
                             });
                             match inner.await {
                                 Ok(Ok(())) => {}
@@ -566,12 +575,13 @@ async fn handle_incoming(
     config_dir: &std::path::Path,
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
+    ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
 ) -> Result<()> {
     tracing::debug!("Awaiting QUIC handshake...");
     let conn: iroh::endpoint::Connection = incoming.await?;
     tracing::debug!("QUIC handshake complete from {}", conn.remote_id().fmt_short());
     let _close_guard = ConnCloseGuard { conn: &conn };
-    handle_incoming_inner(&conn, config_dir, registry, datastore).await
+    handle_incoming_inner(&conn, config_dir, registry, datastore, ext_dispatcher).await
 }
 
 async fn handle_incoming_inner(
@@ -579,6 +589,7 @@ async fn handle_incoming_inner(
     config_dir: &std::path::Path,
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
+    ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
 ) -> Result<()> {
     let remote_id = conn.remote_id();
     let protocol_version = net::negotiated_protocol_version(conn);
@@ -618,8 +629,9 @@ async fn handle_incoming_inner(
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
             let ds = datastore.clone();
+            let ext = ext_dispatcher.clone();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
+                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -637,8 +649,9 @@ async fn handle_incoming_inner(
             let pid = peer_id.clone();
             let cd = config_dir.to_path_buf();
             let ds = datastore.clone();
+            let ext = ext_dispatcher.clone();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
+                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -668,8 +681,9 @@ async fn handle_incoming_inner(
         let pid = peer_id.clone();
         let cd = config_dir.to_path_buf();
         let ds = datastore.clone();
+        let ext = ext_dispatcher.clone();
         tokio::spawn(async move {
-            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds).await {
+            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
                 tracing::error!("Session error: {e:#}");
             }
         });
@@ -692,6 +706,7 @@ async fn dispatch_session(
     config_dir: &std::path::Path,
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
+    ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
@@ -728,13 +743,29 @@ async fn dispatch_session(
         }
         Some(ClientMessage::RequestPeerOp(request)) => {
             tracing::info!("Peer op from {}: {:?}", peer_id, request);
-            // Handle CapEnable/CapRun here (needs hop-mcp for capability definitions)
+            // Three-way routing:
+            //  - CapEnable/CapRun need hop-mcp's capability definitions, handled inline.
+            //  - Extension* variants are async (they wait on an extension daemon's
+            //    response over ipc-channel), routed through the dispatcher.
+            //  - Everything else is a sync peer op, routed via hop-core::peer_ops.
             let response = match request {
                 hop_core::proto::PeerRequest::CapEnable { ref id, ref schedule, ref targets } => {
                     handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref(), username)
                 }
                 hop_core::proto::PeerRequest::CapRun { ref id, ref targets, ref params } => {
                     handle_remote_cap_run(&datastore, id, targets.as_deref(), params, username)
+                }
+                req @ (hop_core::proto::PeerRequest::ExtensionList
+                | hop_core::proto::PeerRequest::ExtensionCall { .. }
+                | hop_core::proto::PeerRequest::ExtensionStreamOpen { .. }
+                | hop_core::proto::PeerRequest::ExtensionStreamInput { .. }
+                | hop_core::proto::PeerRequest::ExtensionStreamClose { .. }) => {
+                    let peer_ctx = hop_core::extensions::PeerContext {
+                        peer_id: peer_id.to_string(),
+                        peer_username: username.map(|s| s.to_string()),
+                        peer_role: format!("{:?}", role).to_lowercase(),
+                    };
+                    ext_dispatcher.dispatch(peer_ctx, req).await
                 }
                 _ => {
                     let peer_user = username.unwrap_or("default");
