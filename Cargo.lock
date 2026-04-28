@@ -1550,6 +1550,7 @@ dependencies = [
  "clap",
  "cron",
  "crossterm",
+ "hex",
  "hop-core",
  "hop-mcp",
  "iroh",
@@ -1602,6 +1603,20 @@ dependencies = [
  "users",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "hop-ext-echo"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hop-core",
+ "ipc-channel",
+ "libc",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

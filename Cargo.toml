@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hop-cli", "crates/hop-core", "crates/hop-mcp"]
+members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/hop-mcp"]
 resolver = "2"
 
 [workspace.package]
