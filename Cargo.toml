@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
+toml = "0.8"
 
 # Terminal / PTY
 portable-pty = "0.9"

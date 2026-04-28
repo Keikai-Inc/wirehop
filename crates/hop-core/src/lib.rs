@@ -3,6 +3,7 @@ pub mod auth;
 pub mod peer_ops;
 pub mod config;
 pub mod datastore;
+pub mod extensions;
 pub mod fleet;
 pub mod invite;
 pub mod net;
