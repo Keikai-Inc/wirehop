@@ -1553,6 +1553,7 @@ dependencies = [
  "hex",
  "hop-core",
  "hop-mcp",
+ "hop-tap-protocol",
  "iroh",
  "libc",
  "rand",
@@ -1637,6 +1638,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hop-tap-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

@@ -2892,6 +2892,7 @@ async fn cmd_remote_peer_op(target: &str, args: &[String], config_dir: &std::pat
         "cron" => parse_remote_cron(sub_args)?,
         "cap" => parse_remote_cap(sub_args)?,
         "ext" => parse_remote_ext(sub_args)?,
+        "tap" => parse_remote_tap(sub_args)?,
         other => anyhow::bail!("unknown remote subcommand: {other}"),
     };
 
@@ -3045,7 +3046,48 @@ fn parse_remote_ext(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
     }
 }
 
-fn display_peer_response(_subcmd: &str, _args: &[String], resp: hop_core::proto::PeerResponse) -> Result<()> {
+/// `hop <host> tap [list|snapshot N]` — typed convenience wrapper
+/// around `ext call tap.terminal`. Encodes a [`hop_tap_protocol::TapRequest`]
+/// as the extension payload; the matching response decode lives in
+/// [`display_peer_response`] keyed on `subcmd == "tap"`.
+///
+/// `tap watch` is **not** wired here yet — it requires the
+/// extension-stream dispatcher (`ExtensionStreamOpen`/`StreamFrame`/
+/// `StreamClosed`) which hop-core marks as "not yet implemented" at
+/// the time of writing. Use the bundled `hop-tap-probe watch` for
+/// live byte streams against a local daemon.
+fn parse_remote_tap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
+    use hop_core::proto::PeerRequest;
+    use hop_tap_protocol::TapRequest;
+
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    let req = match action {
+        "list" => TapRequest::List,
+        "snapshot" => {
+            let pty = args
+                .get(1)
+                .context("usage: hop <host> tap snapshot <pty_index>")?
+                .parse::<i32>()
+                .context("pty_index must be an integer")?;
+            TapRequest::Snapshot { pty_index: pty }
+        }
+        "watch" => anyhow::bail!(
+            "`hop <host> tap watch` requires extension streaming, which the hop \
+             daemon does not yet implement. Use `hop-tap-probe watch --pty N` \
+             on the target host directly until then."
+        ),
+        _ => anyhow::bail!("usage: hop <host> tap [list|snapshot <pty_index>]"),
+    };
+
+    let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
+        .context("encoding TapRequest")?;
+    Ok(PeerRequest::ExtensionCall {
+        ext_id: "tap.terminal".to_string(),
+        payload,
+    })
+}
+
+fn display_peer_response(subcmd: &str, _args: &[String], resp: hop_core::proto::PeerResponse) -> Result<()> {
     use hop_core::proto::PeerResponse;
     match resp {
         PeerResponse::Ok => {
@@ -3160,11 +3202,15 @@ fn display_peer_response(_subcmd: &str, _args: &[String], resp: hop_core::proto:
             }
         }
         PeerResponse::ExtensionResult { ok, payload } => {
-            let label = if ok { "ok" } else { "error" };
-            println!("[{label}] {} bytes", payload.len());
-            if !payload.is_empty() {
-                let preview = String::from_utf8_lossy(&payload);
-                println!("{preview}");
+            if subcmd == "tap" {
+                display_tap_response(ok, &payload)?;
+            } else {
+                let label = if ok { "ok" } else { "error" };
+                println!("[{label}] {} bytes", payload.len());
+                if !payload.is_empty() {
+                    let preview = String::from_utf8_lossy(&payload);
+                    println!("{preview}");
+                }
             }
         }
         PeerResponse::ExtensionStreamOpened { stream_id } => {
@@ -3181,6 +3227,84 @@ fn display_peer_response(_subcmd: &str, _args: &[String], resp: hop_core::proto:
         }
     }
     Ok(())
+}
+
+/// Decode a tap.terminal extension response and pretty-print it.
+/// `ok=false` from the extension surfaces as a warning prefix; the
+/// payload is still expected to be a valid `TapResponse` (typically
+/// `TapResponse::Error(msg)`).
+fn display_tap_response(ok: bool, payload: &[u8]) -> Result<()> {
+    use hop_tap_protocol::TapResponse;
+
+    let (resp, _): (TapResponse, _) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+            .context("decoding TapResponse from tap.terminal payload")?;
+    if !ok {
+        eprintln!("warning: extension returned ok=false");
+    }
+    match resp {
+        TapResponse::SessionList(sessions) => {
+            if sessions.is_empty() {
+                println!("(no active sessions)");
+                return Ok(());
+            }
+            println!("{} active session(s):", sessions.len());
+            for s in sessions {
+                let opener = format_user(&s.opener_username, s.opener_uid);
+                let writer = format_user(&s.last_username, s.last_uid);
+                let identity = if s.opener_uid == s.last_uid && s.opener_pid == s.last_pid {
+                    format!("user={opener:<14} comm={:<10}", s.last_comm)
+                } else if s.opener_uid == s.last_uid {
+                    format!(
+                        "user={opener:<14} comm={:<10} (writer={})",
+                        s.last_comm, s.last_pid
+                    )
+                } else {
+                    format!(
+                        "opener={opener:<14} writer={writer:<14} comm={:<10}",
+                        s.last_comm
+                    )
+                };
+                println!(
+                    "  pty={:>3}  {identity}  out={}b/{}ev  in={}b/{}ev  \
+                     age={}ms idle={}ms",
+                    s.pty_index,
+                    s.output_bytes,
+                    s.output_events,
+                    s.input_bytes,
+                    s.input_events,
+                    s.age_ms,
+                    s.idle_ms,
+                );
+            }
+        }
+        TapResponse::Snapshot {
+            pty_index,
+            rows,
+            cols,
+            contents,
+        } => {
+            println!("snapshot pty={pty_index} ({rows}x{cols})");
+            println!("┌{}┐", "─".repeat(cols as usize));
+            for row in contents {
+                let trimmed = row.trim_end_matches(' ');
+                let padding = (cols as usize).saturating_sub(trimmed.chars().count());
+                println!("│{}{}│", trimmed, " ".repeat(padding));
+            }
+            println!("└{}┘", "─".repeat(cols as usize));
+        }
+        TapResponse::Error(msg) => {
+            anyhow::bail!("tap: {msg}");
+        }
+    }
+    Ok(())
+}
+
+fn format_user(username: &Option<String>, uid: u32) -> String {
+    match username {
+        Some(name) => format!("{}({})", name, uid),
+        None => format!("uid={}", uid),
+    }
 }
 
 fn cmd_ts(config_dir: &std::path::Path, action: TsAction) -> Result<()> {
