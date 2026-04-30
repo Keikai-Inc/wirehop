@@ -43,7 +43,7 @@ already running, hop-tap registers itself as a plugin without touching
 hop's binary or config.
 
 ```bash
-curl -fsSL https://hop-tap.keik.ai/install.sh | bash
+curl -fsSL https://tap.keik.ai/install.sh | bash
 ```
 
 What it does:
@@ -57,7 +57,7 @@ What it does:
   setups).
 - Drops the manifest at `/etc/hop/extensions/tap-terminal.toml`
   (`expected_uid = 0` matches the systemd unit's `User=root`).
-- Installs `hop-tap-d` and `hop-tap-probe` to `/usr/local/bin`.
+- Installs `hop-tap-d` and `tap` to `/usr/local/bin`.
 - Installs `hop-tap.service`, enables and starts it.
 - Restarts hop so the new manifest is picked up.
 
@@ -129,19 +129,25 @@ $ hop myserver tap watch 3
 
 Exits when the captured session ends or you Ctrl-C.
 
-### Local development (`hop-tap-probe`)
+### Local-only access (`tap`)
 
-A bundled probe binary stands in for the hop daemon for local testing.
-Useful for development against a hop-tap-d on your own machine
-without needing a hop network.
+The `tap` CLI bundled with hop-tap-d works **standalone** — connects
+directly to the daemon's local Unix socket
+(`/run/hop-tap/local.sock`); no hop daemon required. Authentication
+is `SO_PEERCRED`: root sees every session, non-root users see only
+sessions whose opener matches their uid. See
+[tap.keik.ai](https://tap.keik.ai) for the canonical landing page.
 
 ```bash
-hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
-> list
-> snapshot 0
-> watch 0
-> exit
+tap list
+tap snapshot 0
+tap watch 0
+tap repl
 ```
+
+The hop integration described above is purely additive — it gives
+peers on the hop network the same operations remotely, gated by
+hop's peer/role identity rather than `SO_PEERCRED`.
 
 ## Security model
 

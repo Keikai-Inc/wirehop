@@ -19,7 +19,7 @@ hop-tap/
 │   ├── hop-tap-ebpf/              # kernel-side; built with vlad's stage1 rustc
 │   ├── hop-tap-protocol/          # wire types (TapRequest, TapResponse, ...)
 │   │                              #   *also depended on by hop-cli*
-│   └── hop-tap-d/                 # userspace daemon + bundled hop-tap-probe
+│   └── hop-tap-d/                 # userspace daemon + bundled tap
 ├── manifests/
 │   └── tap-terminal.toml.example
 ├── install.sh
@@ -663,7 +663,7 @@ inside a privileged Linux container (colima/Docker) and triggering
 synthetic pty traffic via `script(1)`.
 
 End-to-end tests against a real hop daemon happen in the project's
-integration-test scripts (`hop-tap-probe` stands in during local
+integration-test scripts (`tap` stands in during local
 development; the full path uses `hop <host> tap ...`).
 
 ## See also
