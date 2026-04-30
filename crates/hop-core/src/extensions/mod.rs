@@ -19,6 +19,6 @@ pub mod manifest;
 pub mod registry;
 
 pub use bootstrap::Bootstrap;
-pub use dispatcher::{ExtensionDispatcher, PeerContext};
+pub use dispatcher::{ExtensionDispatcher, PeerContext, StreamFrameKind, StreamHandle};
 pub use manifest::ExtensionManifest;
 pub use registry::{ExtMessage, ExtensionRegistry, ExtensionStatus};

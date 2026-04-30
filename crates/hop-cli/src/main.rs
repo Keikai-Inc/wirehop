@@ -743,11 +743,76 @@ async fn dispatch_session(
         }
         Some(ClientMessage::RequestPeerOp(request)) => {
             tracing::info!("Peer op from {}: {:?}", peer_id, request);
-            // Three-way routing:
+            // Four-way routing:
             //  - CapEnable/CapRun need hop-mcp's capability definitions, handled inline.
-            //  - Extension* variants are async (they wait on an extension daemon's
-            //    response over ipc-channel), routed through the dispatcher.
-            //  - Everything else is a sync peer op, routed via hop-core::peer_ops.
+            //  - Extension* (single-response) variants are async (they wait on an
+            //    extension daemon's response over ipc-channel), routed through
+            //    the dispatcher.
+            //  - ExtensionStreamOpen forks: dispatcher returns a StreamHandle;
+            //    we relay each frame as a fresh PeerResponse over the same QUIC
+            //    stream until StreamClosed.
+            //  - Everything else is a sync peer op via hop-core::peer_ops.
+            //
+            // Streaming break-out is handled first because it doesn't fit the
+            // single-PeerResponse shape the other arms produce.
+            if let hop_core::proto::PeerRequest::ExtensionStreamOpen { ext_id, payload } = request {
+                let peer_ctx = hop_core::extensions::PeerContext {
+                    peer_id: peer_id.to_string(),
+                    peer_username: username.map(|s| s.to_string()),
+                    peer_role: format!("{:?}", role).to_lowercase(),
+                };
+                match ext_dispatcher.dispatch_stream_open(peer_ctx, ext_id, payload).await {
+                    Ok(mut handle) => {
+                        // 1. Inform the peer the stream is open.
+                        let stream_id = handle.stream_id;
+                        proto::write_message(
+                            &mut send,
+                            &proto::HostMessage::PeerResponse(
+                                hop_core::proto::PeerResponse::ExtensionStreamOpened { stream_id },
+                            ),
+                        )
+                        .await?;
+                        // 2. Pump frames until close.
+                        while let Some(kind) = handle.frames.recv().await {
+                            let resp = match kind {
+                                hop_core::extensions::StreamFrameKind::Frame(payload) => {
+                                    hop_core::proto::PeerResponse::ExtensionStreamFrame {
+                                        stream_id,
+                                        payload,
+                                    }
+                                }
+                                hop_core::extensions::StreamFrameKind::Closed(reason) => {
+                                    hop_core::proto::PeerResponse::ExtensionStreamClosed {
+                                        stream_id,
+                                        reason,
+                                    }
+                                }
+                            };
+                            let is_close = matches!(
+                                &resp,
+                                hop_core::proto::PeerResponse::ExtensionStreamClosed { .. }
+                            );
+                            proto::write_message(
+                                &mut send,
+                                &proto::HostMessage::PeerResponse(resp),
+                            )
+                            .await?;
+                            if is_close {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err_resp) => {
+                        proto::write_message(
+                            &mut send,
+                            &proto::HostMessage::PeerResponse(err_resp),
+                        )
+                        .await?;
+                    }
+                }
+                return Ok(());
+            }
+
             let response = match request {
                 hop_core::proto::PeerRequest::CapEnable { ref id, ref schedule, ref targets } => {
                     handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref(), username)
@@ -757,7 +822,6 @@ async fn dispatch_session(
                 }
                 req @ (hop_core::proto::PeerRequest::ExtensionList
                 | hop_core::proto::PeerRequest::ExtensionCall { .. }
-                | hop_core::proto::PeerRequest::ExtensionStreamOpen { .. }
                 | hop_core::proto::PeerRequest::ExtensionStreamInput { .. }
                 | hop_core::proto::PeerRequest::ExtensionStreamClose { .. }) => {
                     let peer_ctx = hop_core::extensions::PeerContext {
@@ -2896,6 +2960,13 @@ async fn cmd_remote_peer_op(target: &str, args: &[String], config_dir: &std::pat
         other => anyhow::bail!("unknown remote subcommand: {other}"),
     };
 
+    // Streaming requests (today: just ExtensionStreamOpen) get a
+    // multi-response loop instead of the single-message read.
+    let is_streaming = matches!(
+        request,
+        hop_core::proto::PeerRequest::ExtensionStreamOpen { .. }
+    );
+
     // Connect and send the request
     let (_resolved, send, mut recv) = mux::connect_to_host(
         config_dir,
@@ -2904,19 +2975,46 @@ async fn cmd_remote_peer_op(target: &str, args: &[String], config_dir: &std::pat
         &hop_core::proto::ClientMessage::RequestPeerOp(request),
     ).await?;
 
-    // Read response
-    let response: HostMessage = hop_core::proto::read_message(&mut recv).await?;
-    drop(send); // close the send side
+    if !is_streaming {
+        let response: HostMessage = hop_core::proto::read_message(&mut recv).await?;
+        drop(send);
+        return match response {
+            HostMessage::PeerResponse(resp) => display_peer_response(subcmd, sub_args, resp),
+            HostMessage::SessionError(msg) => anyhow::bail!("host error: {msg}"),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        };
+    }
 
-    match response {
-        HostMessage::PeerResponse(resp) => display_peer_response(subcmd, sub_args, resp),
-        HostMessage::SessionError(msg) => {
-            anyhow::bail!("host error: {msg}");
-        }
-        other => {
-            anyhow::bail!("unexpected response: {other:?}");
+    // Streaming path: read PeerResponses until ExtensionStreamClosed
+    // or the daemon errors. Each response is rendered immediately so
+    // `tap watch` writes bytes to stdout as they arrive.
+    loop {
+        let response: HostMessage = match hop_core::proto::read_message(&mut recv).await {
+            Ok(m) => m,
+            Err(e) => {
+                // Receiver closed mid-stream — typically the daemon
+                // shut the QUIC stream after writing StreamClosed.
+                tracing::debug!("stream recv ended: {e:#}");
+                break;
+            }
+        };
+        let resp = match response {
+            HostMessage::PeerResponse(resp) => resp,
+            HostMessage::SessionError(msg) => anyhow::bail!("host error: {msg}"),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        };
+        let done = matches!(
+            &resp,
+            hop_core::proto::PeerResponse::ExtensionStreamClosed { .. }
+                | hop_core::proto::PeerResponse::Error(_)
+        );
+        display_peer_response(subcmd, sub_args, resp)?;
+        if done {
+            break;
         }
     }
+    drop(send);
+    Ok(())
 }
 
 fn parse_remote_secrets(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
@@ -3071,11 +3169,23 @@ fn parse_remote_tap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
                 .context("pty_index must be an integer")?;
             TapRequest::Snapshot { pty_index: pty }
         }
-        "watch" => anyhow::bail!(
-            "`hop <host> tap watch` requires extension streaming, which the hop \
-             daemon does not yet implement. Use `hop-tap-probe watch --pty N` \
-             on the target host directly until then."
-        ),
+        "watch" => {
+            use hop_tap_protocol::TapStreamRequest;
+            let pty = args
+                .get(1)
+                .context("usage: hop <host> tap watch <pty_index>")?
+                .parse::<i32>()
+                .context("pty_index must be an integer")?;
+            let payload = bincode::serde::encode_to_vec(
+                &TapStreamRequest::Subscribe { pty_index: pty },
+                bincode::config::standard(),
+            )
+            .context("encoding TapStreamRequest")?;
+            return Ok(PeerRequest::ExtensionStreamOpen {
+                ext_id: "tap.terminal".to_string(),
+                payload,
+            });
+        }
         _ => anyhow::bail!("usage: hop <host> tap [list|snapshot <pty_index>]"),
     };
 
@@ -3214,15 +3324,37 @@ fn display_peer_response(subcmd: &str, _args: &[String], resp: hop_core::proto::
             }
         }
         PeerResponse::ExtensionStreamOpened { stream_id } => {
-            println!("(stream {stream_id} opened — use `hop ext` for streaming subscriptions)");
+            // For `tap`, clear the operator's screen so the replay
+            // bytes start from a clean state. Other subcommands just
+            // get a status line.
+            if subcmd == "tap" {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(b"\x1b[2J\x1b[H").ok();
+                stdout.flush().ok();
+                eprintln!("(stream {stream_id} opened)");
+            } else {
+                println!("(stream {stream_id} opened)");
+            }
         }
         PeerResponse::ExtensionStreamFrame { stream_id, payload } => {
-            println!("(stream {stream_id} frame, {} bytes)", payload.len());
+            if subcmd == "tap" {
+                display_tap_stream_frame(stream_id, &payload)?;
+            } else {
+                println!("(stream {stream_id} frame, {} bytes)", payload.len());
+            }
         }
         PeerResponse::ExtensionStreamClosed { stream_id, reason } => {
-            match reason {
-                Some(r) => println!("(stream {stream_id} closed: {r})"),
-                None => println!("(stream {stream_id} closed)"),
+            // Send to stderr for `tap` so it doesn't interleave with
+            // stdout bytes.
+            let line = match reason {
+                Some(r) => format!("(stream {stream_id} closed: {r})"),
+                None => format!("(stream {stream_id} closed)"),
+            };
+            if subcmd == "tap" {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
             }
         }
     }
@@ -3295,6 +3427,40 @@ fn display_tap_response(ok: bool, payload: &[u8]) -> Result<()> {
         }
         TapResponse::Error(msg) => {
             anyhow::bail!("tap: {msg}");
+        }
+    }
+    Ok(())
+}
+
+/// Decode a TapStreamFrame from an `ExtensionStreamFrame.payload` and
+/// write its byte content to the operator's terminal. The operator's
+/// own terminal interprets the captured escape sequences natively —
+/// no client-side emulator round-trip — so the captured session
+/// renders the way it would for the original user.
+fn display_tap_stream_frame(_stream_id: u64, payload: &[u8]) -> Result<()> {
+    use hop_tap_protocol::TapStreamFrame;
+    use std::io::Write as _;
+
+    let (frame, _): (TapStreamFrame, _) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+            .context("decoding TapStreamFrame")?;
+    let mut stdout = std::io::stdout().lock();
+    match frame {
+        TapStreamFrame::Initial {
+            rows,
+            cols,
+            replay_bytes,
+        } => {
+            eprintln!("(initial frame: {rows}x{cols}, replay={} bytes)", replay_bytes.len());
+            stdout.write_all(&replay_bytes).ok();
+            stdout.flush().ok();
+        }
+        TapStreamFrame::Output(bytes) => {
+            stdout.write_all(&bytes).ok();
+            stdout.flush().ok();
+        }
+        TapStreamFrame::Resize { rows, cols } => {
+            eprintln!("(resize: {rows}x{cols})");
         }
     }
     Ok(())
