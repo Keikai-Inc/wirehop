@@ -7,6 +7,7 @@
     { label: 'AI',           href: '#ai',           cross: 'index.html#ai' },
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
+    { label: 'Tap',          href: 'tap.html',      cross: 'tap.html' },
   ];
 
   var path = location.pathname;
@@ -20,6 +21,7 @@
       var cls = '';
       if (!onIndex && link.href === 'fleet.html' && path.indexOf('fleet') !== -1) cls = ' class="active"';
       if (!onIndex && link.href === 'orchestration.html' && path.indexOf('orchestration') !== -1) cls = ' class="active"';
+      if (!onIndex && link.href === 'tap.html' && path.indexOf('tap') !== -1) cls = ' class="active"';
       return '<li><a href="' + url + '"' + cls + '>' + link.label + '</a></li>';
     }).join('');
 

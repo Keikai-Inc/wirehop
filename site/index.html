@@ -344,6 +344,14 @@
           <h3>Kernel-Level Sandboxing</h3>
           <p>Restrict peers to read-only, no-network, or scoped paths. OS-native enforcement via macOS Seatbelt and Linux Landlock. Use presets (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code>) or custom policies. Clients can self-restrict for defense-in-depth.</p>
         </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3>Terminal Session Audit</h3>
+          <p>eBPF-powered capture of every TTY/PTY session on a Linux host. Live byte streams, current-screen snapshots, and ownership-aware authorization — through hop's existing transport. <a href="tap.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">Learn more &rarr;</a></p>
+        </div>
       </div>
     </div>
   </section>
@@ -690,6 +698,19 @@
           <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">Schedule cron jobs, monitor email, call external APIs — all from a single binary. Set up once, runs forever.</p>
         </div>
         <a href="orchestration.html" class="btn btn-primary" style="flex-shrink: 0;">Automation & Orchestration &rarr;</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tap teaser -->
+  <section id="tap-teaser" style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;">
+        <div style="max-width: 36rem;">
+          <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Audit every terminal session, live</h2>
+          <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">hop-tap captures every TTY/PTY on a Linux host with eBPF. List active sessions with ownership attribution, snapshot current screens, or watch live byte streams — all over hop's authenticated QUIC transport.</p>
+        </div>
+        <a href="tap.html" class="btn btn-primary" style="flex-shrink: 0;">Terminal Audit &rarr;</a>
       </div>
     </div>
   </section>
