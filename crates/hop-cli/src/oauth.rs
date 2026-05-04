@@ -55,6 +55,7 @@ static GMAIL: OAuthProvider = OAuthProvider {
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/calendar.readonly",
     ],
     secrets_map: &[
         ("google_client_id", SecretSource::ClientId),
