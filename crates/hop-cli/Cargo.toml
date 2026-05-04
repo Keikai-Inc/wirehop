@@ -11,12 +11,11 @@ path = "src/main.rs"
 [dependencies]
 hop-core.workspace = true
 hop-mcp.workspace = true
-# Wire types for the `hop <host> tap` verb. Path dependency on the
-# hop-tap workspace — tiny crate (just serde derives), zero
-# transitive cost. The verb is purely additive: if the user
-# doesn't have hop-tap installed on the target, they just get an
+# Wire types for the `hop <host> tap` verb. Tiny crate (just serde
+# derives), zero transitive cost. The verb is purely additive: if the
+# user doesn't have hop-tap installed on the target, they just get an
 # "extension not available" error from the hop daemon.
-hop-tap-protocol = { path = "../../../hop-tap/crates/hop-tap-protocol" }
+hop-tap-protocol = { path = "../../vendor/hop-tap-protocol" }
 iroh.workspace = true
 clap.workspace = true
 tokio.workspace = true
