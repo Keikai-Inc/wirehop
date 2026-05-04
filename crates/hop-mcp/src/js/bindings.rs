@@ -939,18 +939,24 @@ fn install_claude_binding(
 /// Get a valid Anthropic token.
 ///
 /// Sources (in order):
-/// 1. Local ~/.claude/.credentials.json (if Claude Code is installed on this machine)
-/// 2. hop secrets store (long-lived setup-token or API key from `hop auth anthropic`)
+/// 1. hop secrets store (setup-token: stable, 1-year validity)
+/// 2. Local ~/.claude/.credentials.json (fallback if no stored token)
 fn claude_get_token(ds: &Datastore, username: &str) -> Result<String> {
-    // Try 1: local credentials file (if Claude Code is installed and logged in)
+    // Try 1: stored setup-token (stable, 1-year validity, preferred)
+    if let Ok(Some(token_bytes)) = ds.secrets_get(username, "ANTHROPIC_API_KEY") {
+        if let Ok(token) = String::from_utf8(token_bytes) {
+            if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+    }
+
+    // Try 2: local credentials file (if Claude Code is installed and logged in)
     if let Some(token) = read_local_claude_token() {
         return Ok(token);
     }
 
-    // Try 2: stored token (setup-token is valid for 1 year, API keys don't expire)
-    let token_bytes = ds.secrets_get(username, "ANTHROPIC_API_KEY")?
-        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials for {username}. Run: hop auth anthropic"))?;
-    Ok(String::from_utf8(token_bytes)?)
+    anyhow::bail!("no Anthropic credentials for {username}. Run: hop auth anthropic");
 }
 
 /// Read a valid token from the local ~/.claude/.credentials.json file.
