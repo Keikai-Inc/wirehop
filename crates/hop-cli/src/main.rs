@@ -3176,8 +3176,19 @@ fn parse_remote_tap(args: &[String]) -> Result<hop_core::proto::PeerRequest> {
                 .context("usage: hop <host> tap watch <pty_index>")?
                 .parse::<i32>()
                 .context("pty_index must be an integer")?;
+            // hop-tap-d renders the captured pty's grid clipped /
+            // padded to the subscriber's viewport; pass our local
+            // terminal size so the remote daemon paints frames
+            // sized for our window. Fallback to 80x24 if the size
+            // syscall fails (non-tty stdout, e.g. piped output).
+            let (vp_cols, vp_rows) =
+                crossterm::terminal::size().unwrap_or((80, 24));
             let payload = bincode::serde::encode_to_vec(
-                &TapStreamRequest::Subscribe { pty_index: pty },
+                &TapStreamRequest::Subscribe {
+                    pty_index: pty,
+                    viewport_rows: vp_rows,
+                    viewport_cols: vp_cols,
+                },
                 bincode::config::standard(),
             )
             .context("encoding TapStreamRequest")?;
@@ -3425,6 +3436,43 @@ fn display_tap_response(ok: bool, payload: &[u8]) -> Result<()> {
             }
             println!("└{}┘", "─".repeat(cols as usize));
         }
+        // The action-style responses (Inject, Kill, Lock, Quarantine,
+        // AdminMessage, Reply, ResizeSubscription) come from
+        // commands hop-cli currently doesn't expose — only `list`,
+        // `snapshot`, and `watch`. If the daemon ever sends one
+        // anyway (extension-versioning corner case), surface it
+        // briefly rather than panicking.
+        TapResponse::Injected { pty_index, bytes_written } => {
+            println!("injected {bytes_written} byte(s) into pty {pty_index}");
+        }
+        TapResponse::Killed { pty_index, pid, signal } => {
+            println!("killed pty={pty_index} (pid={pid}, signal={signal})");
+        }
+        TapResponse::MessageDelivered { pty_index, bytes_written } => {
+            println!("message delivered to pty={pty_index} ({bytes_written} bytes)");
+        }
+        TapResponse::LockSet { pty_index, locked, pgrp } => {
+            println!(
+                "pty={pty_index} {} (pgrp={pgrp})",
+                if locked { "locked" } else { "unlocked" }
+            );
+        }
+        TapResponse::QuarantineSet { pty_index, quarantined, impostor_pid } => {
+            if quarantined {
+                println!(
+                    "pty={pty_index} quarantined (impostor_pid={})",
+                    impostor_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                );
+            } else {
+                println!("pty={pty_index} released from quarantine");
+            }
+        }
+        TapResponse::SubscriptionResized { stream_id, rows, cols } => {
+            eprintln!("(subscription {stream_id} resized to {cols}x{rows})");
+        }
+        TapResponse::Replied { pty_index, subscribers } => {
+            println!("reply on pty={pty_index} delivered to {subscribers} tapper(s)");
+        }
         TapResponse::Error(msg) => {
             anyhow::bail!("tap: {msg}");
         }
@@ -3461,6 +3509,27 @@ fn display_tap_stream_frame(_stream_id: u64, payload: &[u8]) -> Result<()> {
         }
         TapStreamFrame::Resize { rows, cols } => {
             eprintln!("(resize: {rows}x{cols})");
+        }
+        TapStreamFrame::UserReply { from, message } => {
+            // Captured user replied via `tap reply` on the remote
+            // host. Render as a banner mirroring how local tap
+            // displays it (cyan, reverse-video header).
+            let safe_from: String = from
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(64)
+                .collect();
+            let safe_msg: String = message
+                .chars()
+                .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+                .collect();
+            let _ = write!(
+                stdout,
+                "\r\n\x07\
+                 \x1b[1;36;7m  reply: {safe_from}  \x1b[0m\r\n\
+                 \x1b[1;36m  {safe_msg}\x1b[0m\r\n\r\n",
+            );
+            stdout.flush().ok();
         }
     }
     Ok(())
