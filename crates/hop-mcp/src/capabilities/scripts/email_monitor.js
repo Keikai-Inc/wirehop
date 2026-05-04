@@ -1,8 +1,31 @@
-// Email Monitor — Daily Gmail triage and morning briefing
+// Email Monitor — Time-aware daily planner with SMS notifications
+//
+// Runs every hour. At the configured briefing hour: full email+calendar
+// briefing via email + SMS summary. Other hours: checks for new URGENT
+// emails and upcoming calendar events, sends SMS alerts only if needed.
 //
 // Requires secrets: google_client_id, google_client_secret,
 //   gmail_refresh_token, gmail_access_token, gmail_token_expiry,
 //   ANTHROPIC_API_KEY
+// Optional secrets: sms_phone, sms_carrier, briefing_hour_utc,
+//   quiet_hours_start, quiet_hours_end
+
+// ── Configuration ────────────────────────────────────────────────
+
+var BRIEFING_HOUR = parseInt(hop.secrets.get("briefing_hour_utc") || "14"); // 14 UTC = 7 AM MST
+var QUIET_START = parseInt(hop.secrets.get("quiet_hours_start") || "4");    // 4 UTC = 10 PM MST
+var QUIET_END = parseInt(hop.secrets.get("quiet_hours_end") || "12");       // 12 UTC = 6 AM MST
+
+var GATEWAYS = {
+    "tmobile": "@tmomail.net",
+    "att": "@txt.att.net",
+    "verizon": "@vtext.com",
+    "sprint": "@messaging.sprintpcs.com",
+    "googlefi": "@msg.fi.google.com",
+    "mint": "@tmomail.net",
+    "visible": "@vtext.com",
+    "uscellular": "@email.uscc.net"
+};
 
 // ── Token Management ──────────────────────────────────────────────
 
@@ -14,7 +37,7 @@ function getGmailToken() {
         hop.log("Refreshing Gmail access token...");
         var refreshToken = hop.secrets.get("gmail_refresh_token");
         if (!refreshToken) {
-            throw new Error("gmail_refresh_token not set. Run: hop secrets set gmail_refresh_token <token>");
+            throw new Error("gmail_refresh_token not set. Run: hop cap setup email-monitor");
         }
         var resp = hop.http.post("https://oauth2.googleapis.com/token", {
             json: {
@@ -31,12 +54,11 @@ function getGmailToken() {
         hop.secrets.set("gmail_access_token", data.access_token);
         hop.secrets.set("gmail_token_expiry", String(Date.now() + data.expires_in * 1000));
         accessToken = data.access_token;
-        hop.log("Token refreshed, expires in " + data.expires_in + "s");
     }
     return accessToken;
 }
 
-// ── Gmail API Helpers ─────────────────────────────────────────────
+// ── API Helpers ──────────────────────────────────────────────────
 
 function gmailGet(path) {
     var token = getGmailToken();
@@ -67,18 +89,37 @@ function gmailPost(path, body) {
     if (resp.status >= 300) {
         throw new Error("Gmail POST " + path + " failed (" + resp.status + "): " + resp.body);
     }
-    // 204 No Content (e.g. batchModify) has no body
     return resp.status === 204 ? {} : resp.json();
 }
 
-// ── Base64url Encoding ────────────────────────────────────────────
+function calendarGet(path) {
+    var token = getGmailToken();
+    var resp = hop.http.get(
+        "https://www.googleapis.com/calendar/v3" + path,
+        { bearer: token }
+    );
+    if (resp.status === 401) {
+        hop.secrets.set("gmail_token_expiry", "0");
+        token = getGmailToken();
+        resp = hop.http.get(
+            "https://www.googleapis.com/calendar/v3" + path,
+            { bearer: token }
+        );
+    }
+    if (resp.status !== 200) {
+        hop.log("Calendar API warning (" + resp.status + ")");
+        return { items: [] };
+    }
+    return resp.json();
+}
+
+// ── Base64url Encoding ──────────────────────────────────────────
 
 function base64url(str) {
     var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     var bytes = [];
     for (var i = 0; i < str.length; i++) {
         var c = str.charCodeAt(i);
-        // Handle surrogate pairs (emoji and other 4-byte UTF-8)
         if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
             var lo = str.charCodeAt(i + 1);
             if (lo >= 0xDC00 && lo <= 0xDFFF) {
@@ -103,28 +144,46 @@ function base64url(str) {
     return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-// ── Calendar API Helper ──────────────────────────────────────────
+// ── SMS ─────────────────────────────────────────────────────────
 
-function calendarGet(path) {
-    var token = getGmailToken(); // same OAuth token covers Gmail + Calendar
-    var resp = hop.http.get(
-        "https://www.googleapis.com/calendar/v3" + path,
-        { bearer: token }
-    );
-    if (resp.status === 401) {
-        hop.secrets.set("gmail_token_expiry", "0");
-        token = getGmailToken();
-        resp = hop.http.get(
-            "https://www.googleapis.com/calendar/v3" + path,
-            { bearer: token }
-        );
+function sendSMS(message) {
+    var phone = hop.secrets.get("sms_phone");
+    var carrier = hop.secrets.get("sms_carrier");
+    if (!phone || !carrier) return false;
+
+    var gateway = GATEWAYS[carrier.toLowerCase()];
+    if (!gateway) {
+        // Treat carrier as a custom gateway (e.g., "@custom.gateway.com")
+        gateway = carrier.indexOf("@") === 0 ? carrier : "@" + carrier;
     }
-    if (resp.status !== 200) {
-        hop.log("Calendar API warning (" + resp.status + "): " + resp.body);
-        return { items: [] }; // graceful fallback — don't fail the whole briefing
+
+    var smsAddr = phone + gateway;
+    // Truncate to ~150 chars for SMS
+    if (message.length > 150) message = message.substring(0, 147) + "...";
+
+    var content = "To: " + smsAddr
+        + "\r\nSubject: hop\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + message;
+
+    try {
+        gmailPost("/messages/send", { raw: base64url(content) });
+        hop.log("SMS sent to " + smsAddr);
+        return true;
+    } catch (e) {
+        hop.log("SMS failed: " + e.message);
+        return false;
     }
-    return resp.json();
 }
+
+function isQuietHours() {
+    var hour = new Date().getUTCHours();
+    if (QUIET_START < QUIET_END) {
+        return hour >= QUIET_START && hour < QUIET_END;
+    }
+    // Wraps midnight (e.g., 22-6 = 4 UTC to 12 UTC)
+    return hour >= QUIET_START || hour < QUIET_END;
+}
+
+// ── Calendar Link Builder ───────────────────────────────────────
 
 function makeCalendarLink(title, date, time, durationMin, location) {
     var start = date.replace(/-/g, "") + "T" + (time || "0900").replace(/:/g, "") + "00";
@@ -142,284 +201,346 @@ function makeCalendarLink(title, date, time, durationMin, location) {
     return url;
 }
 
-// ── Fetch Calendar Events ────────────────────────────────────────
+// ── Email Fetching + Triage ─────────────────────────────────────
 
-var now = new Date();
-var todayStr = now.toISOString().split("T")[0];
-var weekEnd = new Date(now.getTime() + 7 * 86400000).toISOString();
+function fetchAndTriageEmails(query, maxFetch) {
+    var listResp = gmailGet("/messages?q=" + encodeURIComponent(query) + "&maxResults=50");
+    var messageIds = listResp.messages || [];
+    if (messageIds.length === 0) return { emails: [], urgent: [], action: [], fyi: [], junk: [] };
 
-var calResp = calendarGet(
-    "/calendars/primary/events"
-    + "?timeMin=" + encodeURIComponent(todayStr + "T00:00:00Z")
-    + "&timeMax=" + encodeURIComponent(weekEnd)
-    + "&singleEvents=true&orderBy=startTime&maxResults=100"
-);
-
-var calEvents = (calResp.items || []).map(function(ev) {
-    var start = ev.start.dateTime || ev.start.date || "";
-    var end = ev.end.dateTime || ev.end.date || "";
-    var isAllDay = !ev.start.dateTime;
-    return {
-        title: ev.summary || "(no title)",
-        start: start,
-        end: end,
-        allDay: isAllDay,
-        location: ev.location || "",
-        meetLink: (ev.conferenceData && ev.conferenceData.entryPoints
-            ? ev.conferenceData.entryPoints.filter(function(e) { return e.entryPointType === "video"; })[0]
-            : null),
-        hangoutLink: ev.hangoutLink || "",
-        htmlLink: ev.htmlLink || "",
-        attendees: (ev.attendees || []).map(function(a) { return a.displayName || a.email; }).join(", ")
-    };
-});
-
-hop.log("Calendar: " + calEvents.length + " events in next 7 days");
-
-// Build calendar input for Claude
-var calendarInput = "";
-if (calEvents.length > 0) {
-    calendarInput += "CALENDAR EVENTS (next 7 days):\n";
-    for (var i = 0; i < calEvents.length; i++) {
-        var ev = calEvents[i];
-        calendarInput += "- " + ev.start + " | " + ev.title;
-        if (ev.location) calendarInput += " | Location: " + ev.location;
-        if (ev.meetLink) calendarInput += " | Meet: " + ev.meetLink.uri;
-        else if (ev.hangoutLink) calendarInput += " | Meet: " + ev.hangoutLink;
-        if (ev.attendees) calendarInput += " | With: " + ev.attendees;
-        calendarInput += "\n";
+    hop.log("Found " + messageIds.length + " messages. Fetching...");
+    var emails = [];
+    for (var i = 0; i < messageIds.length && i < (maxFetch || 30); i++) {
+        var msg = gmailGet("/messages/" + messageIds[i].id
+            + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date");
+        var headers = {};
+        for (var j = 0; j < (msg.payload.headers || []).length; j++) {
+            var h = msg.payload.headers[j];
+            headers[h.name] = h.value;
+        }
+        emails.push({
+            id: msg.id,
+            from: headers["From"] || "(unknown)",
+            subject: headers["Subject"] || "(no subject)",
+            date: headers["Date"] || "",
+            snippet: msg.snippet || ""
+        });
     }
-} else {
-    calendarInput = "CALENDAR: No events in the next 7 days.\n";
+
+    // Triage with Claude
+    var triageInput = "";
+    for (var i = 0; i < emails.length; i++) {
+        triageInput += "[" + i + "] From: " + emails[i].from + "\n"
+            + "Subject: " + emails[i].subject + "\n"
+            + "Preview: " + emails[i].snippet + "\n---\n";
+    }
+
+    var triageText = hop.claude(
+        "Classify each email as URGENT, ACTION, FYI, or JUNK.\n"
+        + "Also extract any calendar-worthy events.\n\n"
+        + "URGENT = time-sensitive, needs immediate response\n"
+        + "ACTION = needs a response but not urgent\n"
+        + "FYI = informational but worth knowing about\n"
+        + "JUNK = marketing, spam, promotions, no value\n\n"
+        + "Return ONLY a JSON array:\n"
+        + "[{\"index\": 0, \"class\": \"FYI\", \"event\": null}, ...]\n"
+        + "event can be: {\"title\": \"...\", \"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM\", \"duration_min\": 60, \"location\": \"...\"} or null.\n"
+        + "No other text.\n\n" + triageInput
+    );
+
+    var jsonMatch = triageText.match(/\[[\s\S]*\]/);
+    var triage = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+
+    var classMap = {}, eventMap = {};
+    for (var i = 0; i < triage.length; i++) {
+        classMap[triage[i].index] = triage[i]["class"];
+        if (triage[i].event) eventMap[triage[i].index] = triage[i].event;
+    }
+
+    var urgent = [], action = [], fyi = [], junk = [];
+    for (var i = 0; i < emails.length; i++) {
+        var cls = classMap[i] || "FYI";
+        emails[i].classification = cls;
+        if (eventMap[i]) {
+            var ev = eventMap[i];
+            emails[i].calendarLink = makeCalendarLink(ev.title, ev.date, ev.time, ev.duration_min, ev.location);
+        }
+        if (cls === "URGENT") urgent.push(emails[i]);
+        else if (cls === "ACTION") action.push(emails[i]);
+        else if (cls === "JUNK") junk.push(emails[i]);
+        else fyi.push(emails[i]);
+    }
+
+    return { emails: emails, urgent: urgent, action: action, fyi: fyi, junk: junk };
 }
 
-// ── Fetch Unread Emails ───────────────────────────────────────────
+// ── Fetch Calendar Events ───────────────────────────────────────
 
-var listResp = gmailGet("/messages?q=is:unread+newer_than:2d&maxResults=50");
-var messageIds = listResp.messages || [];
-
-if (messageIds.length === 0) {
-    hop.log("No unread emails.");
-    return "No unread emails";
-}
-
-hop.log("Found " + messageIds.length + " unread messages. Fetching...");
-
-var emails = [];
-for (var i = 0; i < messageIds.length && i < 30; i++) {
-    var msg = gmailGet("/messages/" + messageIds[i].id
-        + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date");
-    var headers = {};
-    for (var j = 0; j < (msg.payload.headers || []).length; j++) {
-        var h = msg.payload.headers[j];
-        headers[h.name] = h.value;
-    }
-    emails.push({
-        id: msg.id,
-        from: headers["From"] || "(unknown)",
-        subject: headers["Subject"] || "(no subject)",
-        date: headers["Date"] || "",
-        snippet: msg.snippet || ""
+function fetchCalendarEvents(hoursAhead) {
+    var now = new Date();
+    var end = new Date(now.getTime() + hoursAhead * 3600000);
+    var calResp = calendarGet(
+        "/calendars/primary/events"
+        + "?timeMin=" + encodeURIComponent(now.toISOString())
+        + "&timeMax=" + encodeURIComponent(end.toISOString())
+        + "&singleEvents=true&orderBy=startTime&maxResults=100"
+    );
+    return (calResp.items || []).map(function(ev) {
+        return {
+            id: ev.id,
+            title: ev.summary || "(no title)",
+            start: ev.start.dateTime || ev.start.date || "",
+            end: ev.end.dateTime || ev.end.date || "",
+            allDay: !ev.start.dateTime,
+            location: ev.location || "",
+            meetLink: (ev.conferenceData && ev.conferenceData.entryPoints
+                ? (ev.conferenceData.entryPoints.filter(function(e) { return e.entryPointType === "video"; })[0] || {}).uri
+                : null) || ev.hangoutLink || "",
+            htmlLink: ev.htmlLink || "",
+            attendees: (ev.attendees || []).map(function(a) { return a.displayName || a.email; }).join(", ")
+        };
     });
 }
 
-// ── Triage with Claude ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// MAIN: Time-aware dispatch
+// ═══════════════════════════════════════════════════════════════
 
-var triageInput = "";
-for (var i = 0; i < emails.length; i++) {
-    triageInput += "[" + i + "] From: " + emails[i].from + "\n"
-        + "Subject: " + emails[i].subject + "\n"
-        + "Preview: " + emails[i].snippet + "\n---\n";
-}
+var currentHour = new Date().getUTCHours();
+var isBriefingTime = (currentHour === BRIEFING_HOUR);
 
-// ── Claude Inference via hop.claude() ─────────────────────────────
-// hop.claude() handles everything: credential management, token refresh,
-// binary resolution, and direct subprocess invocation. Zero config needed.
+if (isBriefingTime) {
+    // ── FULL MORNING BRIEFING ──────────────────────────────────
 
-var triageText = hop.claude(
-    "Classify each email as URGENT, ACTION, FYI, or JUNK.\n"
-    + "Also extract any calendar-worthy events (meetings, appointments, flights, deadlines).\n\n"
-    + "URGENT = time-sensitive, needs immediate response (e.g., outage, deadline today, direct request from boss, 2FA codes)\n"
-    + "ACTION = needs a response but not urgent (e.g., review request, question, meeting follow-up)\n"
-    + "FYI = informational but worth knowing about (e.g., useful newsletters, project updates, shipping notifications)\n"
-    + "JUNK = marketing, spam, promotions, cold outreach, automated notifications with no value, unsubscribe-worthy\n\n"
-    + "Return ONLY a JSON array. For each email:\n"
-    + "  {\"index\": 0, \"class\": \"FYI\", \"event\": null}\n"
-    + "  or with an event:\n"
-    + "  {\"index\": 1, \"class\": \"ACTION\", \"event\": {\"title\": \"Project Review\", \"date\": \"2026-05-07\", \"time\": \"14:00\", \"duration_min\": 60, \"location\": \"Room 5\"}}\n"
-    + "Set event to null if no calendar event is mentioned. No other text.\n\n" + triageInput
-);
+    var calEvents = fetchCalendarEvents(168); // 7 days
+    hop.log("Calendar: " + calEvents.length + " events in next 7 days");
 
-// Extract JSON array from response (handle markdown code fences)
-var jsonMatch = triageText.match(/\[[\s\S]*\]/);
-var triage = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-
-// Build classification map
-var classMap = {};
-var eventMap = {};
-for (var i = 0; i < triage.length; i++) {
-    classMap[triage[i].index] = triage[i]["class"];
-    if (triage[i].event) eventMap[triage[i].index] = triage[i].event;
-}
-
-var urgent = [], action = [], fyi = [], junk = [];
-for (var i = 0; i < emails.length; i++) {
-    var cls = classMap[i] || "FYI";
-    emails[i].classification = cls;
-    // Attach calendar link if Claude extracted an event
-    if (eventMap[i]) {
-        var ev = eventMap[i];
-        emails[i].calendarLink = makeCalendarLink(ev.title, ev.date, ev.time, ev.duration_min, ev.location);
-        emails[i].eventTitle = ev.title;
+    var result = fetchAndTriageEmails("is:unread newer_than:2d", 30);
+    if (result.emails.length === 0 && calEvents.length === 0) {
+        hop.log("No emails or calendar events.");
+        return "No emails or events";
     }
-    if (cls === "URGENT") urgent.push(emails[i]);
-    else if (cls === "ACTION") action.push(emails[i]);
-    else if (cls === "JUNK") junk.push(emails[i]);
-    else fyi.push(emails[i]);
-}
 
-hop.log("Triage: " + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI, " + junk.length + " junk");
-hop.log("Building summary...");
+    hop.log("Triage: " + result.urgent.length + " urgent, " + result.action.length + " action, "
+        + result.fyi.length + " FYI, " + result.junk.length + " junk");
 
-// ── Summarize with Claude ─────────────────────────────────────────
-
-// Get user email for links (fetch early so it's available for summary)
-var profile = gmailGet("/profile");
-var userEmail = profile.emailAddress;
-var GMAIL_BASE = "https://mail.google.com/mail/u/?authuser=" + userEmail.replace("@", "%40") + "#inbox/";
-
-var summaryInput = "";
-if (urgent.length > 0) {
-    summaryInput += "URGENT (" + urgent.length + "):\n";
-    for (var i = 0; i < urgent.length; i++) {
-        var line = "- From: " + urgent[i].from + " | Subject: " + urgent[i].subject + " | " + urgent[i].snippet + " | Link: " + GMAIL_BASE + urgent[i].id;
-        if (urgent[i].calendarLink) line += " | AddToCal: " + urgent[i].calendarLink;
-        summaryInput += line + "\n";
+    // Build calendar input for Claude
+    var calendarInput = "";
+    if (calEvents.length > 0) {
+        calendarInput += "CALENDAR EVENTS (next 7 days):\n";
+        for (var i = 0; i < calEvents.length; i++) {
+            var ev = calEvents[i];
+            calendarInput += "- " + ev.start + " | " + ev.title;
+            if (ev.location) calendarInput += " | Location: " + ev.location;
+            if (ev.meetLink) calendarInput += " | Meet: " + ev.meetLink;
+            if (ev.attendees) calendarInput += " | With: " + ev.attendees;
+            calendarInput += "\n";
+        }
+    } else {
+        calendarInput = "CALENDAR: No events in the next 7 days.\n";
     }
-    summaryInput += "\n";
-}
-if (action.length > 0) {
-    summaryInput += "ACTION NEEDED (" + action.length + "):\n";
-    for (var i = 0; i < action.length; i++) {
-        var line = "- From: " + action[i].from + " | Subject: " + action[i].subject + " | " + action[i].snippet + " | Link: " + GMAIL_BASE + action[i].id;
-        if (action[i].calendarLink) line += " | AddToCal: " + action[i].calendarLink;
-        summaryInput += line + "\n";
-    }
-    summaryInput += "\n";
-}
-if (fyi.length > 0) {
-    summaryInput += "FYI / MARKED READ (" + fyi.length + "):\n";
-    for (var i = 0; i < fyi.length; i++) {
-        summaryInput += "- From: " + fyi[i].from + " | Subject: " + fyi[i].subject + " | Link: " + GMAIL_BASE + fyi[i].id + "\n";
-    }
-    summaryInput += "\n";
-}
-if (junk.length > 0) {
-    summaryInput += "JUNK / ARCHIVED (" + junk.length + "):\n";
-    for (var i = 0; i < junk.length; i++) {
-        summaryInput += "- From: " + junk[i].from + " | Subject: " + junk[i].subject + "\n";
-    }
-}
 
-hop.log("Calling Claude for summary (" + summaryInput.length + " chars)...");
-var summary;
-try {
-    summary = hop.claude(
-        "Write a morning briefing as clean HTML (for Gmail rendering). Three sections:\n\n"
+    // Build email summary input
+    var profile = gmailGet("/profile");
+    var userEmail = profile.emailAddress;
+    var GMAIL_BASE = "https://mail.google.com/mail/u/?authuser=" + userEmail.replace("@", "%40") + "#inbox/";
+
+    var summaryInput = "";
+    if (result.urgent.length > 0) {
+        summaryInput += "URGENT (" + result.urgent.length + "):\n";
+        for (var i = 0; i < result.urgent.length; i++) {
+            var e = result.urgent[i];
+            var line = "- From: " + e.from + " | Subject: " + e.subject + " | " + e.snippet + " | Link: " + GMAIL_BASE + e.id;
+            if (e.calendarLink) line += " | AddToCal: " + e.calendarLink;
+            summaryInput += line + "\n";
+        }
+        summaryInput += "\n";
+    }
+    if (result.action.length > 0) {
+        summaryInput += "ACTION (" + result.action.length + "):\n";
+        for (var i = 0; i < result.action.length; i++) {
+            var e = result.action[i];
+            var line = "- From: " + e.from + " | Subject: " + e.subject + " | " + e.snippet + " | Link: " + GMAIL_BASE + e.id;
+            if (e.calendarLink) line += " | AddToCal: " + e.calendarLink;
+            summaryInput += line + "\n";
+        }
+        summaryInput += "\n";
+    }
+    if (result.fyi.length > 0) {
+        summaryInput += "FYI / MARKED READ (" + result.fyi.length + "):\n";
+        for (var i = 0; i < result.fyi.length; i++) {
+            summaryInput += "- " + result.fyi[i].from + " | " + result.fyi[i].subject + " | Link: " + GMAIL_BASE + result.fyi[i].id + "\n";
+        }
+        summaryInput += "\n";
+    }
+    if (result.junk.length > 0) {
+        summaryInput += "JUNK / ARCHIVED (" + result.junk.length + "):\n";
+        for (var i = 0; i < result.junk.length; i++) {
+            summaryInput += "- " + result.junk[i].from + " | " + result.junk[i].subject + "\n";
+        }
+    }
+
+    // Claude generates HTML briefing
+    hop.log("Calling Claude for summary...");
+    var summary = hop.claude(
+        "Write a morning briefing as clean HTML (for Gmail).\n\n"
         + "SECTION 1 — TODAY'S SCHEDULE + WEEK AHEAD:\n"
-        + "Show today's calendar events with times, locations, and meet links.\n"
-        + "Add brief prep notes (what to review, what to bring, travel time).\n"
-        + "Then show a day-by-day summary of the rest of the week.\n"
-        + "If no events, say 'No events scheduled.'\n\n"
+        + "Show today's events with times, locations, meet links, prep notes.\n"
+        + "Then day-by-day summary of rest of week.\n\n"
         + "SECTION 2 — EMAIL TRIAGE:\n"
-        + "Group by priority: URGENT (red), ACTION (orange), FYI (gray), JUNK (strikethrough).\n"
-        + "For URGENT/ACTION: include sender, subject as clickable link, and why it matters.\n"
-        + "If an email has an AddToCal: URL, show a clickable 'Add to calendar' link.\n"
-        + "For FYI: list briefly with clickable links (marked as read).\n"
-        + "For JUNK: just show count (archived).\n\n"
-        + "RULES:\n"
-        + "Use clean minimal style with inline CSS. No markdown. No emoji.\n"
-        + "Use text labels [URGENT], [ACTION], [FYI] instead of emoji.\n"
-        + "Each email has a Link: URL — use as href for the subject.\n"
-        + "Output ONLY the HTML. No commentary.\n\n"
-        + calendarInput + "\n"
-        + summaryInput
+        + "URGENT (red), ACTION (orange), FYI (gray). Clickable subject links.\n"
+        + "If AddToCal URL exists, show 'Add to calendar' link.\n"
+        + "JUNK: just count.\n\n"
+        + "RULES: Clean inline CSS. No markdown. No emoji. Text labels only.\n"
+        + "Output ONLY HTML. No commentary.\n\n"
+        + calendarInput + "\n" + summaryInput
     );
     hop.log("Summary received (" + summary.length + " chars)");
-} catch (e) {
-    hop.log("ERROR: Summary call failed: " + e.message);
-    throw e;
-}
 
-// ── Send Briefing Email ───────────────────────────────────────────
-
-var today = new Date().toISOString().split("T")[0];
-var subject = "Morning Briefing -- " + today
-    + " (" + urgent.length + " urgent, " + action.length + " action, " + fyi.length + " FYI, " + junk.length + " archived)";
-
-// userEmail already fetched earlier for links
-
-// Strip markdown code fences and any trailing commentary
-var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```[\s\S]*$/i, "").trim();
-// If Claude added text after the closing </html> tag, strip it
-var htmlEnd = htmlBody.lastIndexOf("</html>");
-if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</body>");
-if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</div>");
-if (htmlEnd !== -1) {
-    // Keep the closing tag + a few chars for the tag itself
-    var tagEnd = htmlBody.indexOf(">", htmlEnd);
-    if (tagEnd !== -1) htmlBody = htmlBody.substring(0, tagEnd + 1);
-}
-
-var emailContent = "To: " + userEmail + "\r\nSubject: " + subject
-    + "\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n\r\n" + htmlBody;
-
-gmailPost("/messages/send", { raw: base64url(emailContent) });
-hop.log("Briefing email sent: " + subject);
-
-// ── Mark FYI as Read ──────────────────────────────────────────────
-
-if (fyi.length > 0) {
-    var fyiIds = [];
-    for (var i = 0; i < fyi.length; i++) {
-        fyiIds.push(fyi[i].id);
+    // Clean HTML
+    var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```[\s\S]*$/i, "").trim();
+    var htmlEnd = htmlBody.lastIndexOf("</html>");
+    if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</body>");
+    if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</div>");
+    if (htmlEnd !== -1) {
+        var tagEnd = htmlBody.indexOf(">", htmlEnd);
+        if (tagEnd !== -1) htmlBody = htmlBody.substring(0, tagEnd + 1);
     }
-    gmailPost("/messages/batchModify", {
-        ids: fyiIds,
-        removeLabelIds: ["UNREAD"]
-    });
-    hop.log("Marked " + fyiIds.length + " FYI messages as read.");
-}
 
-// ── Archive Junk (remove from inbox) ─────────────────────────────
+    // Send email
+    var today = new Date().toISOString().split("T")[0];
+    var subject = "Morning Briefing -- " + today
+        + " (" + result.urgent.length + " urgent, " + result.action.length + " action, "
+        + result.fyi.length + " FYI, " + result.junk.length + " archived)";
 
-if (junk.length > 0) {
-    var junkIds = [];
-    for (var i = 0; i < junk.length; i++) {
-        junkIds.push(junk[i].id);
+    var emailContent = "To: " + userEmail + "\r\nSubject: " + subject
+        + "\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n\r\n" + htmlBody;
+
+    gmailPost("/messages/send", { raw: base64url(emailContent) });
+    hop.log("Briefing email sent: " + subject);
+
+    // Send SMS summary
+    if (!isQuietHours()) {
+        var smsLines = [];
+        smsLines.push("Briefing: " + result.urgent.length + "U " + result.action.length + "A " + result.fyi.length + "F");
+        // Today's events
+        var todayEvents = calEvents.filter(function(e) {
+            return e.start.indexOf(today) === 0 || e.start.indexOf(today) >= 0;
+        });
+        for (var i = 0; i < todayEvents.length && i < 3; i++) {
+            var t = todayEvents[i].start.match(/T(\d{2}):(\d{2})/);
+            var timeStr = t ? (parseInt(t[1]) % 12 || 12) + (parseInt(t[1]) >= 12 ? "PM" : "AM") : "all day";
+            smsLines.push(timeStr + " " + todayEvents[i].title.substring(0, 30));
+        }
+        // Top urgent
+        for (var i = 0; i < result.urgent.length && i < 2; i++) {
+            smsLines.push("[U] " + result.urgent[i].subject.substring(0, 35));
+        }
+        sendSMS(smsLines.join("\n"));
     }
-    gmailPost("/messages/batchModify", {
-        ids: junkIds,
-        removeLabelIds: ["UNREAD", "INBOX"]
+
+    // Mark FYI as read
+    if (result.fyi.length > 0) {
+        var fyiIds = result.fyi.map(function(e) { return e.id; });
+        gmailPost("/messages/batchModify", { ids: fyiIds, removeLabelIds: ["UNREAD"] });
+        hop.log("Marked " + fyiIds.length + " FYI as read.");
+    }
+
+    // Archive junk
+    if (result.junk.length > 0) {
+        var junkIds = result.junk.map(function(e) { return e.id; });
+        gmailPost("/messages/batchModify", { ids: junkIds, removeLabelIds: ["UNREAD", "INBOX"] });
+        hop.log("Archived " + junkIds.length + " junk.");
+    }
+
+    // Save state
+    hop.kv.set("email-monitor", "last_check_time", String(Date.now()));
+    hop.kv.set("email-monitor", "notified_ids", JSON.stringify(
+        result.emails.map(function(e) { return e.id; })
+    ));
+
+    hop.kv.set("briefings", today, {
+        date: today, email_count: result.emails.length,
+        urgent: result.urgent.length, action: result.action.length,
+        fyi: result.fyi.length, junk: result.junk.length
     });
-    hop.log("Archived " + junkIds.length + " junk messages.");
+
+    return "Briefing sent. " + result.emails.length + " emails: "
+        + result.urgent.length + " urgent, " + result.action.length + " action, "
+        + result.fyi.length + " read, " + result.junk.length + " archived.";
+
+} else {
+    // ── HOURLY WATCHDOG ───────────────────────────────────────────
+
+    if (isQuietHours()) {
+        return "Quiet hours — skipping";
+    }
+
+    var alerts = [];
+
+    // Load previously notified IDs
+    var prevIds = [];
+    try {
+        var stored = hop.kv.get("email-monitor", "notified_ids");
+        if (stored) prevIds = JSON.parse(stored);
+    } catch(e) {}
+
+    // Quick check: any new unread emails at all?
+    var listResp = gmailGet("/messages?q=" + encodeURIComponent("is:unread newer_than:1d") + "&maxResults=50");
+    var messageIds = (listResp.messages || []).map(function(m) { return m.id; });
+    var newMessageIds = messageIds.filter(function(id) { return prevIds.indexOf(id) === -1; });
+
+    // Only run Claude triage if there are NEW emails we haven't seen
+    if (newMessageIds.length > 0) {
+        hop.log("Watchdog: " + newMessageIds.length + " new emails, triaging...");
+        var result = fetchAndTriageEmails("is:unread newer_than:1d", 15);
+
+        var newUrgent = result.urgent.filter(function(e) {
+            return prevIds.indexOf(e.id) === -1;
+        });
+
+        // Only alert for URGENT emails
+        for (var i = 0; i < newUrgent.length; i++) {
+            alerts.push("[URGENT] " + newUrgent[i].from.split("<")[0].trim()
+                + ": " + newUrgent[i].subject.substring(0, 40));
+        }
+
+        // Update notified email IDs
+        var allIds = prevIds.concat(result.emails.map(function(e) { return e.id; }));
+        hop.kv.set("email-monitor", "notified_ids", JSON.stringify(allIds));
+    }
+
+    // Check calendar events in next 60 minutes (always, no Claude needed)
+    var upcomingEvents = fetchCalendarEvents(1);
+    var notifiedEvents = [];
+    try {
+        var stored = hop.kv.get("email-monitor", "notified_event_ids");
+        if (stored) notifiedEvents = JSON.parse(stored);
+    } catch(e) {}
+
+    var newEvents = upcomingEvents.filter(function(ev) {
+        return !ev.allDay && notifiedEvents.indexOf(ev.id) === -1;
+    });
+
+    for (var i = 0; i < newEvents.length; i++) {
+        var ev = newEvents[i];
+        var t = ev.start.match(/T(\d{2}):(\d{2})/);
+        var timeStr = t ? (parseInt(t[1]) % 12 || 12) + ":" + t[2] + (parseInt(t[1]) >= 12 ? "PM" : "AM") : "";
+        var line = timeStr + " " + ev.title;
+        if (ev.location) line += " @ " + ev.location.substring(0, 25);
+        alerts.push(line);
+    }
+
+    if (newEvents.length > 0) {
+        var allEventIds = notifiedEvents.concat(newEvents.map(function(e) { return e.id; }));
+        hop.kv.set("email-monitor", "notified_event_ids", JSON.stringify(allEventIds));
+    }
+
+    if (alerts.length > 0) {
+        sendSMS(alerts.join("\n"));
+        hop.log("Watchdog: " + alerts.length + " alerts sent via SMS");
+        return "Watchdog: " + alerts.length + " alerts";
+    }
+
+    return "Watchdog: all clear";
 }
-
-// ── Store Briefing ───────────────────────────────────────────────
-
-hop.kv.set("briefings", today, {
-    date: today,
-    email_count: emails.length,
-    urgent: urgent.length,
-    action: action.length,
-    fyi: fyi.length,
-    junk: junk.length,
-    summary: summary,
-    classifications: emails.map(function(e) {
-        return { from: e.from, subject: e.subject, classification: e.classification };
-    })
-});
-
-return "Briefing sent. " + emails.length + " emails: "
-    + urgent.length + " urgent, " + action.length + " action, "
-    + fyi.length + " read, " + junk.length + " archived.";
