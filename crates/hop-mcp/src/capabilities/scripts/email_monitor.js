@@ -158,8 +158,9 @@ function sendSMS(message) {
     }
 
     var smsAddr = phone + gateway;
-    // Truncate to ~150 chars for SMS
-    if (message.length > 150) message = message.substring(0, 147) + "...";
+    // Email-to-SMS gateways split long messages into multiple texts.
+    // Keep under 300 chars for readability (2 texts max).
+    if (message.length > 300) message = message.substring(0, 297) + "...";
 
     var content = "To: " + smsAddr
         + "\r\nSubject: hop\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + message;
@@ -422,7 +423,7 @@ if (isBriefingTime) {
     // Send SMS summary
     if (!isQuietHours()) {
         var smsLines = [];
-        smsLines.push("Briefing: " + result.urgent.length + "U " + result.action.length + "A " + result.fyi.length + "F");
+        smsLines.push("Morning Briefing: " + result.urgent.length + " urgent, " + result.action.length + " action, " + result.fyi.length + " FYI, " + result.junk.length + " archived");
         // Today's events
         var todayEvents = calEvents.filter(function(e) {
             return e.start.indexOf(today) === 0 || e.start.indexOf(today) >= 0;
@@ -434,7 +435,7 @@ if (isBriefingTime) {
         }
         // Top urgent
         for (var i = 0; i < result.urgent.length && i < 2; i++) {
-            smsLines.push("[U] " + result.urgent[i].subject.substring(0, 35));
+            smsLines.push("[URGENT] " + result.urgent[i].subject.substring(0, 30));
         }
         sendSMS(smsLines.join("\n"));
     }
