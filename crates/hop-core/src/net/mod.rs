@@ -15,18 +15,37 @@ pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 
 /// QUIC transport configuration tuned for resilience on spotty networks.
 ///
+/// **Connection-level:**
 /// - 60s idle timeout: survives WiFi handoffs (5-15s), cellular tower switches
 ///   (10-30s), and brief relay hiccups. Still detects truly dead peers in ~1 min.
-///   (SSH tolerates ~3 min; our 60s is a good balance.)
-/// - 5s keepalive interval: 12 missed probes before death (vs 5 with old 3s/15s).
-///   ~40 bytes/5s is negligible on any link.
+/// - 5s keepalive: 12 missed probes before death. ~40 bytes/5s is negligible.
 /// - 300ms initial RTT estimate for cellular (prevents aggressive retransmission
 ///   before QUIC measures actual RTT).
+///
+/// **Multipath QUIC (draft-ietf-quic-multipath):**
+/// - Up to 13 concurrent paths (WiFi + cellular + relay simultaneously).
+///   Individual path failures don't kill the connection — traffic migrates to
+///   surviving paths automatically. Single biggest resilience improvement.
+/// - Per-path keepalive (5s) and idle timeout (6.5s) ensure dead paths are
+///   detected and replaced quickly without affecting the connection.
+///
+/// **NAT traversal address discovery:**
+/// - Peers exchange observed addresses to help discover their public IP behind
+///   NAT. Improves direct connection establishment and holepunching success.
 fn hop_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
+        // Connection-level timeouts
         .max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("valid idle timeout")))
         .keep_alive_interval(Duration::from_secs(5))
         .initial_rtt(Duration::from_millis(300))
+        // Multipath: use up to 13 paths simultaneously (WiFi, cellular, relay, etc.)
+        .max_concurrent_multipath_paths(13)
+        .default_path_keep_alive_interval(Duration::from_secs(5))
+        .default_path_max_idle_timeout(Duration::from_millis(6500))
+        // NAT traversal: exchange observed addresses for better holepunching
+        .send_observed_address_reports(true)
+        .receive_observed_address_reports(true)
+        .set_max_remote_nat_traversal_addresses(12)
         .build()
 }
 
