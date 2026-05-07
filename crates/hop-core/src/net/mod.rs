@@ -55,8 +55,14 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .context("Failed to bind iroh endpoint")?;
 
     // Wait until connected to relay and address is published to discovery.
-    // Without this, clients cannot find us.
-    endpoint.online().await;
+    // Without this, clients cannot find us. Timeout after 30s to avoid
+    // hanging forever if the relay is unreachable.
+    if tokio::time::timeout(std::time::Duration::from_secs(30), endpoint.online())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Relay did not come online within 30s — host may be unreachable via relay");
+    }
 
     Ok(endpoint)
 }
@@ -126,10 +132,16 @@ pub async fn connect_to_host_with_alpn(
         remote_id.fmt_short(), relay_url.is_some(),
         std::str::from_utf8(alpn).unwrap_or("?"));
 
-    let conn = endpoint
-        .connect(addr, alpn)
-        .await
-        .context("Failed to connect to host")?;
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        endpoint.connect(addr, alpn),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(
+        "Connection timed out after 30s. The host may be offline, behind a strict firewall, \
+         or unable to reach the relay. Check that the host daemon is running and has network access."
+    ))?
+    .context("Failed to connect to host")?;
 
     tracing::info!("Connected to {} ({})", remote_id.fmt_short(),
         std::str::from_utf8(conn.alpn()).unwrap_or("?"));
