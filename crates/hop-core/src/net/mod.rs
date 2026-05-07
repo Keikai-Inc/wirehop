@@ -13,18 +13,19 @@ use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
 /// Hop's own relay server.
 pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 
-/// QUIC transport configuration balancing disconnect detection with lossy-network tolerance.
+/// QUIC transport configuration tuned for resilience on spotty networks.
 ///
-/// - 15s idle timeout: survives 10s cellular stalls while detecting dead peers in half
-///   the time of iroh's 30s default. With 3s keepalives, 5 missed probes = dead.
-/// - 3s keepalive interval: aggressive enough for responsive detection, light enough
-///   for metered links (~40 bytes/3s).
+/// - 60s idle timeout: survives WiFi handoffs (5-15s), cellular tower switches
+///   (10-30s), and brief relay hiccups. Still detects truly dead peers in ~1 min.
+///   (SSH tolerates ~3 min; our 60s is a good balance.)
+/// - 5s keepalive interval: 12 missed probes before death (vs 5 with old 3s/15s).
+///   ~40 bytes/5s is negligible on any link.
 /// - 300ms initial RTT estimate for cellular (prevents aggressive retransmission
 ///   before QUIC measures actual RTT).
 fn hop_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        .max_idle_timeout(Some(Duration::from_secs(15).try_into().expect("valid idle timeout")))
-        .keep_alive_interval(Duration::from_secs(3))
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("valid idle timeout")))
+        .keep_alive_interval(Duration::from_secs(5))
         .initial_rtt(Duration::from_millis(300))
         .build()
 }

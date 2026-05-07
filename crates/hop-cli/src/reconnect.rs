@@ -63,7 +63,7 @@ pub async fn try_quick_reconnect(
         );
         let _ = stdout.flush();
 
-        let connect_result = tokio::time::timeout(remaining.min(Duration::from_secs(5)), async {
+        let connect_result = tokio::time::timeout(remaining.min(Duration::from_secs(15)), async {
             let (mut send, mut recv) = mux::open_agent_stream_pub(
                 config_dir,
                 &resolved.host_id,
@@ -105,7 +105,7 @@ pub async fn try_quick_reconnect(
             }
             _ => {
                 // Brief pause before retrying (100ms catches quick cellular recoveries)
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }

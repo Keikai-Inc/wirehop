@@ -594,10 +594,11 @@ async fn run_attached_loop(
     leftover_msg: Option<ClientMessage>,
     protocol_version: u8,
 ) -> AttachOutcome {
-    /// Heartbeat interval: send an empty Output every 5s so the client knows we're alive.
-    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-    /// Read deadline: if no message arrives from the client within 18s, the connection is dead.
-    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(18);
+    /// Heartbeat interval: send an empty Output so the client knows we're alive.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Read deadline: if no message arrives from the client within this time, treat as dead.
+    /// Must be above QUIC idle timeout (60s) + margin for lossy-network resilience.
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
 
     let compress = protocol_version >= 3;
 
@@ -1039,12 +1040,12 @@ async fn client_shell_loop(
 ) -> Result<SessionOutcome> {
     use crossterm::terminal;
 
-    /// Heartbeat interval: send an empty Input every 5s so the host knows we're alive,
+    /// Heartbeat interval: send an empty Input so the host knows we're alive,
     /// and so our write path detects a dead connection quickly.
-    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-    /// Read deadline: if no message arrives from the host within 18s (QUIC idle timeout
-    /// of 15s + 3s margin), the connection is dead. Heartbeats from the host reset this.
-    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(18);
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Read deadline: if no message arrives from the host within this time, treat as dead.
+    /// Must be above QUIC idle timeout (60s) + margin for lossy-network resilience.
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
 
     // Channel for SIGWINCH resize events (Unix only)
     let (resize_tx, mut resize_rx) = mpsc::channel::<()>(1);

@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use iroh::Endpoint;
 
-/// Poll interval for interface address checks.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Poll interval for interface address checks. 2s catches WiFi/cellular
+/// handoffs quickly enough to trigger path migration before QUIC times out.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Enumerate all non-loopback, non-link-local interface IP addresses.
 #[cfg(unix)]
