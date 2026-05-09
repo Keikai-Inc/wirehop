@@ -946,17 +946,46 @@ fn install_claude_binding(
     Ok(())
 }
 
-/// Get a valid Anthropic token.
+/// Anthropic OAuth token refresh endpoint and client ID.
+const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_CLIENT_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+
+/// Get a valid Anthropic token, refreshing if expired.
 ///
 /// Sources (in order):
-/// 1. hop secrets store (setup-token: stable, 1-year validity)
+/// 1. hop secrets store — checks expiry, refreshes via OAuth if expired
 /// 2. Local ~/.claude/.credentials.json (fallback if no stored token)
 fn claude_get_token(ds: &Datastore, username: &str) -> Result<String> {
-    // Try 1: stored setup-token (stable, 1-year validity, preferred)
+    // Try 1: stored token (check expiry)
     if let Ok(Some(token_bytes)) = ds.secrets_get(username, "ANTHROPIC_API_KEY") {
         if let Ok(token) = String::from_utf8(token_bytes) {
             if !token.is_empty() {
-                return Ok(token);
+                // Check if token is expired
+                let expiry = ds
+                    .secrets_get(username, "anthropic_token_expiry")
+                    .ok()
+                    .flatten()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(u64::MAX); // no expiry stored = assume valid
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                if now_ms < expiry.saturating_sub(300_000) {
+                    // Token still valid (with 5-min buffer)
+                    return Ok(token);
+                }
+
+                // Token expired — try to refresh
+                tracing::info!("Anthropic token expired, attempting refresh");
+                if let Some(refreshed) = refresh_anthropic_token(ds, username) {
+                    return Ok(refreshed);
+                }
+                // Refresh failed — fall through to local credentials
+                tracing::warn!("Anthropic token refresh failed, trying local credentials");
             }
         }
     }
@@ -967,6 +996,79 @@ fn claude_get_token(ds: &Datastore, username: &str) -> Result<String> {
     }
 
     anyhow::bail!("no Anthropic credentials for {username}. Run: hop auth anthropic");
+}
+
+/// Refresh an expired Anthropic OAuth token using the stored refresh token.
+///
+/// On success, updates ANTHROPIC_API_KEY and anthropic_token_expiry in secrets.
+/// Returns the new access token, or None on failure.
+fn refresh_anthropic_token(ds: &Datastore, username: &str) -> Option<String> {
+    let refresh_token = ds
+        .secrets_get(username, "anthropic_refresh_token")
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())?;
+
+    if refresh_token.is_empty() {
+        tracing::warn!("No anthropic_refresh_token stored — cannot refresh");
+        return None;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": ANTHROPIC_CLIENT_ID,
+    });
+
+    let resp = client
+        .post(ANTHROPIC_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        tracing::warn!("Anthropic token refresh failed ({status}): {body}");
+        return None;
+    }
+
+    let resp_text = resp.text().ok()?;
+    let json: serde_json::Value = serde_json::from_str(&resp_text).ok()?;
+    let access_token = json.get("access_token")?.as_str()?.to_string();
+    let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let new_expiry = now_ms + expires_in * 1000;
+
+    // Update stored secrets
+    let _ = ds.secrets_set(username, "ANTHROPIC_API_KEY", access_token.as_bytes());
+    let _ = ds.secrets_set(
+        username,
+        "anthropic_token_expiry",
+        new_expiry.to_string().as_bytes(),
+    );
+
+    // Update refresh token if a new one was issued
+    if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
+        let _ = ds.secrets_set(username, "anthropic_refresh_token", new_refresh.to_string().as_bytes());
+    }
+
+    tracing::info!(
+        "Anthropic token refreshed, expires in {}s",
+        expires_in
+    );
+
+    Some(access_token)
 }
 
 /// Read a valid token from the local ~/.claude/.credentials.json file.
