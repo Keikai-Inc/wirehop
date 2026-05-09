@@ -917,9 +917,19 @@ fn install_claude_binding(
             let claude_bin = claude_resolve_binary(username.as_deref())
                 .map_err(|e| js_err(format!("hop.claude: {e}")))?;
 
-            // Spawn claude directly — no shell, no quoting
-            claude_invoke(&claude_bin, &token, &prompt, max_turns, username.as_deref())
-                .map_err(|e| js_err(format!("hop.claude: {e}")))
+            // Spawn claude directly — no shell, no quoting. Retries transient failures.
+            claude_invoke_with_retry(&claude_bin, &token, &prompt, max_turns, username.as_deref())
+                .map_err(|e| {
+                    let token_hint = if token.len() >= 8 {
+                        format!("{}...{}", &token[..4], &token[token.len()-4..])
+                    } else {
+                        "****".to_string()
+                    };
+                    js_err(format!(
+                        "hop.claude: {e} [binary={}, token={token_hint}]",
+                        claude_bin.display(),
+                    ))
+                })
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?,
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1165,9 +1175,74 @@ fn claude_invoke(
         }
         Ok(text)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude failed (exit {}): {}", output.status, stderr)
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => {
+                let stdout_trunc = if stdout.len() > 500 {
+                    format!("{}...", &stdout[..500])
+                } else {
+                    stdout
+                };
+                format!("stderr: {stderr}; stdout: {stdout_trunc}")
+            }
+            (false, true) => format!("stderr: {stderr}"),
+            (true, false) => {
+                let stdout_trunc = if stdout.len() > 500 {
+                    format!("{}...", &stdout[..500])
+                } else {
+                    stdout
+                };
+                format!("stdout: {stdout_trunc}")
+            }
+            (true, true) => "(no output on stdout or stderr)".to_string(),
+        };
+        anyhow::bail!("claude failed (exit {}): {}", output.status, detail)
     }
+}
+
+/// Retry transient claude CLI failures with short backoff.
+///
+/// Retries up to 2 times (3 attempts total) with 3s/8s delays for transient
+/// failures (non-zero exit with generic output). Does NOT retry permanent
+/// failures: missing binary, timeouts, or missing credentials.
+fn claude_invoke_with_retry(
+    claude_bin: &std::path::Path,
+    token: &str,
+    prompt: &str,
+    max_turns: u32,
+    username: Option<&str>,
+) -> Result<String> {
+    const BACKOFFS: [u64; 2] = [3, 8];
+
+    let mut last_err = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tracing::warn!(
+                "hop.claude: retry {attempt}/2 after {}s backoff",
+                BACKOFFS[(attempt - 1) as usize]
+            );
+            std::thread::sleep(std::time::Duration::from_secs(
+                BACKOFFS[(attempt - 1) as usize],
+            ));
+        }
+        match claude_invoke(claude_bin, token, prompt, max_turns, username) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let msg = format!("{e}");
+                // Don't retry permanent failures
+                if msg.contains("failed to spawn")
+                    || msg.contains("timed out")
+                    || msg.contains("no Anthropic credentials")
+                {
+                    return Err(e);
+                }
+                tracing::warn!("hop.claude attempt {}: {msg}", attempt + 1);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
 }
 
 /// Install stub bindings (no backend available, e.g. cron jobs).

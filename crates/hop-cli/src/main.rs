@@ -2794,28 +2794,83 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
         }
         CronAction::Errors { id } => {
             if let Some(id) = id {
-                match ds.kv_get("cron_errors", &id)? {
-                    Some(entry) => {
-                        let text = String::from_utf8_lossy(&entry.value);
-                        println!("{text}");
-                    }
-                    None => println!("No errors recorded for job {id}."),
-                }
-            } else {
-                let entries = ds.kv_list("cron_errors", "")?;
+                // Show all errors for a specific job (timestamped history)
+                let entries = ds.kv_list("cron_errors", &format!("{id}:"))?;
                 if entries.is_empty() {
-                    println!("No cron errors recorded.");
+                    // Fallback: try exact key (legacy format without timestamp)
+                    match ds.kv_get("cron_errors", &id)? {
+                        Some(entry) => {
+                            let text = String::from_utf8_lossy(&entry.value);
+                            println!("{text}");
+                        }
+                        None => println!("No errors recorded for job {id}."),
+                    }
                 } else {
                     for (key, entry) in &entries {
+                        // Extract timestamp from key format "job_id:0000001234567890"
+                        let ts = key.rsplit(':').next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(entry.updated_at);
+                        let dt = format_epoch_ms(ts);
+                        let text = String::from_utf8_lossy(&entry.value);
+                        println!("[{dt}] {text}");
+                        println!();
+                    }
+                }
+            } else {
+                // List mode: show latest error per job
+                let all = ds.kv_list("cron_errors", "")?;
+                if all.is_empty() {
+                    println!("No cron errors recorded.");
+                } else {
+                    // Group by job_id prefix, show only latest
+                    let mut latest: std::collections::BTreeMap<String, (&str, &hop_core::datastore::types::KvEntry)> =
+                        std::collections::BTreeMap::new();
+                    for (key, entry) in &all {
+                        let job_id = key.rsplit_once(':')
+                            .map(|(prefix, _)| prefix)
+                            .unwrap_or(key);
+                        latest.insert(job_id.to_string(), (key, entry));
+                    }
+                    for (job_id, (_, entry)) in &latest {
                         let text = String::from_utf8_lossy(&entry.value);
                         let truncated = if text.len() > 120 { format!("{}...", &text[..117]) } else { text.to_string() };
-                        println!("  {key}: {truncated}");
+                        let dt = format_epoch_ms(entry.updated_at);
+                        println!("  {job_id} [{dt}]: {truncated}");
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Format epoch milliseconds as a human-readable UTC timestamp.
+fn format_epoch_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Days since 1970-01-01
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+/// Convert days since epoch to (year, month, day). Simple calendar arithmetic.
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn cmd_kv(config_dir: &std::path::Path, action: KvAction) -> Result<()> {

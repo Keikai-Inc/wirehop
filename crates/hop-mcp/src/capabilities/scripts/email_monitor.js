@@ -236,21 +236,28 @@ function fetchAndTriageEmails(query, maxFetch) {
             + "Preview: " + emails[i].snippet + "\n---\n";
     }
 
-    var triageText = hop.claude(
-        "Classify each email as URGENT, ACTION, FYI, or JUNK.\n"
-        + "Also extract any calendar-worthy events.\n\n"
-        + "URGENT = time-sensitive, needs immediate response\n"
-        + "ACTION = needs a response but not urgent\n"
-        + "FYI = informational but worth knowing about\n"
-        + "JUNK = marketing, spam, promotions, no value\n\n"
-        + "Return ONLY a JSON array:\n"
-        + "[{\"index\": 0, \"class\": \"FYI\", \"event\": null}, ...]\n"
-        + "event can be: {\"title\": \"...\", \"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM\", \"duration_min\": 60, \"location\": \"...\"} or null.\n"
-        + "No other text.\n\n" + triageInput
-    );
-
-    var jsonMatch = triageText.match(/\[[\s\S]*\]/);
-    var triage = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    var triage = [];
+    var triageFailed = false;
+    try {
+        var triageText = hop.claude(
+            "Classify each email as URGENT, ACTION, FYI, or JUNK.\n"
+            + "Also extract any calendar-worthy events.\n\n"
+            + "URGENT = time-sensitive, needs immediate response\n"
+            + "ACTION = needs a response but not urgent\n"
+            + "FYI = informational but worth knowing about\n"
+            + "JUNK = marketing, spam, promotions, no value\n\n"
+            + "Return ONLY a JSON array:\n"
+            + "[{\"index\": 0, \"class\": \"FYI\", \"event\": null}, ...]\n"
+            + "event can be: {\"title\": \"...\", \"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM\", \"duration_min\": 60, \"location\": \"...\"} or null.\n"
+            + "No other text.\n\n" + triageInput
+        );
+        var jsonMatch = triageText.match(/\[[\s\S]*\]/);
+        triage = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    } catch(e) {
+        hop.log("WARNING: Claude triage failed (" + e.message + "), classifying all as FYI");
+        triageFailed = true;
+        triage = emails.map(function(_, i) { return { index: i, "class": "FYI", event: null }; });
+    }
 
     var classMap = {}, eventMap = {};
     for (var i = 0; i < triage.length; i++) {
@@ -381,31 +388,44 @@ if (isBriefingTime) {
         }
     }
 
-    // Claude generates HTML briefing
+    // Claude generates HTML briefing (with fallback if AI unavailable)
+    var htmlBody;
     hop.log("Calling Claude for summary...");
-    var summary = hop.claude(
-        "Write a morning briefing as clean HTML (for Gmail).\n\n"
-        + "SECTION 1 — TODAY'S SCHEDULE + WEEK AHEAD:\n"
-        + "Show today's events with times, locations, meet links, prep notes.\n"
-        + "Then day-by-day summary of rest of week.\n\n"
-        + "SECTION 2 — EMAIL TRIAGE:\n"
-        + "URGENT (red), ACTION (orange), FYI (gray). Clickable subject links.\n"
-        + "If AddToCal URL exists, show 'Add to calendar' link.\n"
-        + "JUNK: just count.\n\n"
-        + "RULES: Clean inline CSS. No markdown. No emoji. Text labels only.\n"
-        + "Output ONLY HTML. No commentary.\n\n"
-        + calendarInput + "\n" + summaryInput
-    );
-    hop.log("Summary received (" + summary.length + " chars)");
+    try {
+        var summary = hop.claude(
+            "Write a morning briefing as clean HTML (for Gmail).\n\n"
+            + "SECTION 1 — TODAY'S SCHEDULE + WEEK AHEAD:\n"
+            + "Show today's events with times, locations, meet links, prep notes.\n"
+            + "Then day-by-day summary of rest of week.\n\n"
+            + "SECTION 2 — EMAIL TRIAGE:\n"
+            + "URGENT (red), ACTION (orange), FYI (gray). Clickable subject links.\n"
+            + "If AddToCal URL exists, show 'Add to calendar' link.\n"
+            + "JUNK: just count.\n\n"
+            + "RULES: Clean inline CSS. No markdown. No emoji. Text labels only.\n"
+            + "Output ONLY HTML. No commentary.\n\n"
+            + calendarInput + "\n" + summaryInput
+        );
+        hop.log("Summary received (" + summary.length + " chars)");
 
-    // Clean HTML
-    var htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```[\s\S]*$/i, "").trim();
-    var htmlEnd = htmlBody.lastIndexOf("</html>");
-    if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</body>");
-    if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</div>");
-    if (htmlEnd !== -1) {
-        var tagEnd = htmlBody.indexOf(">", htmlEnd);
-        if (tagEnd !== -1) htmlBody = htmlBody.substring(0, tagEnd + 1);
+        // Clean HTML
+        htmlBody = summary.replace(/^```html?\n?/i, "").replace(/\n?```[\s\S]*$/i, "").trim();
+        var htmlEnd = htmlBody.lastIndexOf("</html>");
+        if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</body>");
+        if (htmlEnd === -1) htmlEnd = htmlBody.lastIndexOf("</div>");
+        if (htmlEnd !== -1) {
+            var tagEnd = htmlBody.indexOf(">", htmlEnd);
+            if (tagEnd !== -1) htmlBody = htmlBody.substring(0, tagEnd + 1);
+        }
+    } catch(e) {
+        hop.log("WARNING: Claude HTML generation failed (" + e.message + "), using plain fallback");
+        var escHtml = function(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); };
+        htmlBody = "<html><body style='font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto;'>"
+            + "<h2 style='color: #333;'>Morning Briefing</h2>"
+            + "<p style='color: #c00; font-size: 13px;'>AI summarization unavailable: " + escHtml(e.message) + "</p>"
+            + (triageFailed ? "<p style='color: #c00; font-size: 13px;'>Email classification also failed -- all shown as FYI.</p>" : "")
+            + "<h3>Calendar</h3><pre style='white-space: pre-wrap; font-size: 13px;'>" + escHtml(calendarInput) + "</pre>"
+            + "<h3>Emails</h3><pre style='white-space: pre-wrap; font-size: 13px;'>" + escHtml(summaryInput) + "</pre>"
+            + "</body></html>";
     }
 
     // Send email
@@ -494,21 +514,32 @@ if (isBriefingTime) {
     // Only run Claude triage if there are NEW emails we haven't seen
     if (newMessageIds.length > 0) {
         hop.log("Watchdog: " + newMessageIds.length + " new emails, triaging...");
-        var result = fetchAndTriageEmails("is:unread newer_than:1d", 15);
+        try {
+            var result = fetchAndTriageEmails("is:unread newer_than:1d", 15);
 
-        var newUrgent = result.urgent.filter(function(e) {
-            return prevIds.indexOf(e.id) === -1;
-        });
+            var newUrgent = result.urgent.filter(function(e) {
+                return prevIds.indexOf(e.id) === -1;
+            });
 
-        // Only alert for URGENT emails
-        for (var i = 0; i < newUrgent.length; i++) {
-            alerts.push("[URGENT] " + newUrgent[i].from.split("<")[0].trim()
-                + ": " + newUrgent[i].subject.substring(0, 40));
+            // Only alert for URGENT emails
+            for (var i = 0; i < newUrgent.length; i++) {
+                alerts.push("[URGENT] " + newUrgent[i].from.split("<")[0].trim()
+                    + ": " + newUrgent[i].subject.substring(0, 40));
+            }
+        } catch(e) {
+            hop.log("Watchdog: email triage failed: " + e.message);
+            // Continue to calendar check below
         }
 
-        // Update notified email IDs
-        var allIds = prevIds.concat(result.emails.map(function(e) { return e.id; }));
-        hop.kv.set("email-monitor", "notified_ids", JSON.stringify(allIds));
+        // Update notified email IDs (only if triage succeeded)
+        if (typeof result !== "undefined" && result.emails) {
+            var allIds = prevIds.concat(result.emails.map(function(e) { return e.id; }));
+            hop.kv.set("email-monitor", "notified_ids", JSON.stringify(allIds));
+        } else {
+            // Mark new IDs as seen even if triage failed, to prevent re-processing
+            var allIds = prevIds.concat(newMessageIds);
+            hop.kv.set("email-monitor", "notified_ids", JSON.stringify(allIds));
+        }
     }
 
     // Check calendar events in next 60 minutes (always, no Claude needed)

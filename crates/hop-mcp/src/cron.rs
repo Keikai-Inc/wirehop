@@ -113,16 +113,8 @@ async fn run_due_jobs(
                 let msg = format!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
                 tracing::error!("{msg}");
                 eprintln!("[hop.cron] ERROR: {msg}");
-                // Store error in KV for retrieval via `hop cron errors`
-                let _ = ds.kv_set(
-                    "cron_errors",
-                    &job.id,
-                    &hop_core::datastore::types::KvEntry {
-                        value: msg.as_bytes().to_vec(),
-                        content_type: "text/plain".to_string(),
-                        updated_at: crate::cron::now_ms(),
-                    },
-                );
+                store_cron_error(&ds, &job.id, &msg);
+                notify_cron_failure(&ds, &job, &msg).await;
             }
         });
     }
@@ -182,16 +174,7 @@ async fn execute_cron_job(
             let msg = format!("{e:#}");
             tracing::error!("Cron job '{}' script error: {msg}", job.name);
             eprintln!("[hop.cron] ERROR: {} script error: {msg}", job.name);
-            // Store error in KV
-            let _ = datastore.kv_set(
-                "cron_errors",
-                &job.id,
-                &hop_core::datastore::types::KvEntry {
-                    value: msg.as_bytes().to_vec(),
-                    content_type: "text/plain".to_string(),
-                    updated_at: now_ms(),
-                },
-            );
+            store_cron_error(datastore, &job.id, &msg);
         }
     }
 
@@ -229,6 +212,144 @@ fn truncate(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+
+/// Store a cron error with timestamp, keeping at most 10 entries per job.
+fn store_cron_error(ds: &Datastore, job_id: &str, msg: &str) {
+    const MAX_ERRORS_PER_JOB: usize = 10;
+
+    let ts = now_ms();
+    let key = format!("{job_id}:{ts:016}");
+    let _ = ds.kv_set(
+        "cron_errors",
+        &key,
+        &hop_core::datastore::types::KvEntry {
+            value: msg.as_bytes().to_vec(),
+            content_type: "text/plain".to_string(),
+            updated_at: ts,
+        },
+    );
+
+    // Prune oldest entries if over the limit
+    if let Ok(entries) = ds.kv_list("cron_errors", &format!("{job_id}:"))
+        && entries.len() > MAX_ERRORS_PER_JOB
+    {
+        for (old_key, _) in entries.iter().take(entries.len() - MAX_ERRORS_PER_JOB) {
+            let _ = ds.kv_delete("cron_errors", old_key);
+        }
+    }
+}
+
+/// Best-effort SMS notification on cron failure.
+///
+/// Sends an SMS via the Gmail API / carrier email gateway, reusing secrets
+/// already configured for the email-monitor capability. Rate-limited to
+/// one SMS per job per hour to prevent spam on recurring failures.
+async fn notify_cron_failure(
+    ds: &Datastore,
+    job: &hop_core::datastore::types::CronJob,
+    msg: &str,
+) {
+    // Check cooldown: at most one SMS per job per hour
+    let cooldown_key = format!("sms_cooldown:{}", job.id);
+    let now = now_ms();
+    if let Ok(Some(entry)) = ds.kv_get("cron_notify", &cooldown_key)
+        && now.saturating_sub(entry.updated_at) < 3_600_000
+    {
+        tracing::debug!("Cron failure SMS skipped (cooldown): {}", job.name);
+        return;
+    }
+
+    // Truncate message for SMS (max ~300 chars)
+    let sms_body = if msg.len() > 280 {
+        format!("[hop] {} failed: {}...", job.name, &msg[..250])
+    } else {
+        format!("[hop] {msg}")
+    };
+
+    let sms_msg_json = serde_json::to_string(&sms_body).unwrap_or_else(|_| "\"cron job failed\"".into());
+    let script = format!(
+        "var __sms_message = {sms_msg_json};\n{SMS_NOTIFY_JS}",
+    );
+
+    let mut runtime = crate::js::JsRuntime::new();
+    runtime.set_datastore(ds.clone());
+    if let Some(ref user) = job.run_as_user {
+        runtime.set_run_as_user(user.clone());
+    }
+
+    match runtime
+        .execute_script(&script, Some(Duration::from_secs(30)))
+        .await
+    {
+        Ok(result) => tracing::info!("Cron failure SMS for '{}': {result}", job.name),
+        Err(e) => tracing::warn!("Cron failure SMS for '{}' failed: {e:#}", job.name),
+    }
+
+    // Update cooldown timestamp
+    let _ = ds.kv_set(
+        "cron_notify",
+        &cooldown_key,
+        &hop_core::datastore::types::KvEntry {
+            value: b"1".to_vec(),
+            content_type: "text/plain".to_string(),
+            updated_at: now,
+        },
+    );
+}
+
+/// Minimal JS to send an SMS via Gmail API + carrier email gateway.
+/// Expects `__sms_message` global to be set before evaluation.
+const SMS_NOTIFY_JS: &str = r#"
+(function() {
+    var GATEWAYS = {
+        "tmobile": "@tmomail.net", "att": "@txt.att.net",
+        "verizon": "@vtext.com", "sprint": "@messaging.sprintpcs.com",
+        "googlefi": "@msg.fi.google.com", "mint": "@tmomail.net",
+        "visible": "@vtext.com", "uscellular": "@email.uscc.net"
+    };
+    var phone = hop.secrets.get("sms_phone");
+    var carrier = hop.secrets.get("sms_carrier");
+    if (!phone || !carrier) return "no sms config";
+    var gateway = GATEWAYS[carrier.toLowerCase()];
+    if (!gateway) gateway = carrier.indexOf("@") === 0 ? carrier : "@" + carrier;
+    var addr = phone + gateway;
+    var msg = __sms_message;
+    if (msg.length > 300) msg = msg.substring(0, 297) + "...";
+
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    function base64url(str) {
+        var bytes = [];
+        for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            if (c < 128) bytes.push(c);
+            else if (c < 2048) { bytes.push(192 | (c >> 6)); bytes.push(128 | (c & 63)); }
+            else if (c < 65536) { bytes.push(224 | (c >> 12)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+            else { bytes.push(240 | (c >> 18)); bytes.push(128 | ((c >> 12) & 63)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+        }
+        var b64 = "";
+        for (var i = 0; i < bytes.length; i += 3) {
+            var b0 = bytes[i], b1 = bytes[i + 1] || 0, b2 = bytes[i + 2] || 0;
+            var n = (b0 << 16) | (b1 << 8) | b2;
+            b64 += chars[(n >> 18) & 63];
+            b64 += chars[(n >> 12) & 63];
+            b64 += (i + 1 < bytes.length) ? chars[(n >> 6) & 63] : "";
+            b64 += (i + 2 < bytes.length) ? chars[n & 63] : "";
+        }
+        return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    var content = "To: " + addr + "\r\nSubject: hop alert\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + msg;
+    var token = hop.secrets.get("gmail_access_token");
+    if (!token) return "no gmail token for SMS";
+    try {
+        hop.http.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            { bearer: token, json: { raw: base64url(content) } });
+        return "sms sent to " + addr;
+    } catch(e) {
+        return "sms failed: " + e.message;
+    }
+})();
+"#;
 
 #[cfg(test)]
 mod tests {
