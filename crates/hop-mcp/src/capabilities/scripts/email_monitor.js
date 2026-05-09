@@ -526,6 +526,20 @@ if (isBriefingTime) {
                 alerts.push("[URGENT] " + newUrgent[i].from.split("<")[0].trim()
                     + ": " + newUrgent[i].subject.substring(0, 40));
             }
+
+            // Archive junk continuously (not just at briefing time)
+            if (result.junk.length > 0) {
+                var junkIds = result.junk.map(function(e) { return e.id; });
+                gmailPost("/messages/batchModify", { ids: junkIds, removeLabelIds: ["UNREAD", "INBOX"] });
+                hop.log("Watchdog: archived " + junkIds.length + " junk");
+            }
+
+            // Mark FYI as read continuously
+            if (result.fyi.length > 0) {
+                var fyiIds = result.fyi.map(function(e) { return e.id; });
+                gmailPost("/messages/batchModify", { ids: fyiIds, removeLabelIds: ["UNREAD"] });
+                hop.log("Watchdog: marked " + fyiIds.length + " FYI as read");
+            }
         } catch(e) {
             hop.log("Watchdog: email triage failed: " + e.message);
             // Continue to calendar check below
