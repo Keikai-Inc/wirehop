@@ -279,7 +279,7 @@ function fetchAndTriageEmails(query, maxFetch) {
         else fyi.push(emails[i]);
     }
 
-    return { emails: emails, urgent: urgent, action: action, fyi: fyi, junk: junk };
+    return { emails: emails, urgent: urgent, action: action, fyi: fyi, junk: junk, triageFailed: triageFailed };
 }
 
 // ── Fetch Calendar Events ───────────────────────────────────────
@@ -422,7 +422,7 @@ if (isBriefingTime) {
         htmlBody = "<html><body style='font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto;'>"
             + "<h2 style='color: #333;'>Morning Briefing</h2>"
             + "<p style='color: #c00; font-size: 13px;'>AI summarization unavailable: " + escHtml(e.message) + "</p>"
-            + (triageFailed ? "<p style='color: #c00; font-size: 13px;'>Email classification also failed -- all shown as FYI.</p>" : "")
+            + (result.triageFailed ? "<p style='color: #c00; font-size: 13px;'>Email classification also failed -- all shown as FYI.</p>" : "")
             + "<h3>Calendar</h3><pre style='white-space: pre-wrap; font-size: 13px;'>" + escHtml(calendarInput) + "</pre>"
             + "<h3>Emails</h3><pre style='white-space: pre-wrap; font-size: 13px;'>" + escHtml(summaryInput) + "</pre>"
             + "</body></html>";
