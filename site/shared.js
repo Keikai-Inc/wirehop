@@ -41,7 +41,7 @@
   if (footerEl) {
     footerEl.innerHTML =
       '<div class="footer-bottom">' +
-        '<p class="footer-copy">&copy; 2026 <a href="https://keikai.ai">Keikai.ai</a> Cybersecurity. All rights reserved.</p>' +
+        '<p class="footer-copy">&copy; 2026 <a href="https://keikai.ai">Keikai, Inc.</a> All rights reserved.</p>' +
         '<p class="footer-tagline">\u201CThe world has changed. Security has to change with it.\u201D</p>' +
       '</div>';
   }
