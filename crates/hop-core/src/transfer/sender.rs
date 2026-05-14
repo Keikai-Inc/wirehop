@@ -380,115 +380,201 @@ pub async fn send_files_with_delta(
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
 ) -> Result<(u64, u64)> {
-    let mut total_bytes = 0u64;
-    let mut bytes_saved = 0u64;
     let mut sizer = ChunkSizer::new(params.max_chunk_size);
     let mut read_buf = vec![0u8; params.max_chunk_size];
 
-    for entry in files {
-        let full_path = base_dir.join(&entry.path);
+    // Drain BlockSignatures from `recv` eagerly into a bounded mpsc.
+    //
+    // The receiver's side of `receive_files_with_delta` pushes one
+    // BlockSignatures message per delta candidate up-front, before any
+    // file data flows back. With the previous lazy `read_message(recv)`
+    // call inline in the file-processing loop, sigs only got consumed
+    // when the main loop reached each delta candidate — which can be
+    // arbitrarily long after the receiver wrote them (a non-delta file
+    // in the middle takes O(file size / disk speed) wall-clock time
+    // during which we're not reading recv at all). Once the receiver's
+    // QUIC stream send buffer fills, the receiver back-pressure-stalls
+    // its own write loop, which the user perceives as an intermittent
+    // freeze with progress at zero.
+    //
+    // The reader_fut below pulls messages off `recv` as fast as iroh
+    // delivers them, so the receiver's side is never throttled by our
+    // disk pace. The main loop reads from `sig_rx` instead of `recv`
+    // directly. Channel capacity caps memory growth on a fast receiver
+    // / slow sender — once 64 sigs are buffered the reader awaits, but
+    // by that point the main loop has plenty to chew on without anyone
+    // stalling at the QUIC layer.
+    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<TransferMsg>(64);
+    let reader_stop = std::sync::Arc::new(tokio::sync::Notify::new());
 
-        if entry.is_symlink {
-            if let Some(ref target) = entry.symlink_target {
-                proto::write_message(
-                    send,
-                    &TransferMsg::CreateSymlink {
-                        path: entry.path.clone(),
-                        target: target.clone(),
-                    },
-                )
-                .await?;
+    let reader_fut = {
+        let stop = reader_stop.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = stop.notified() => break,
+                    res = proto::read_message::<TransferMsg>(recv) => {
+                        match res {
+                            Ok(msg) => {
+                                if sig_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_e) => {
+                                // Stream closed or errored — main loop
+                                // will surface a real error when its
+                                // `sig_rx.recv()` returns None on the
+                                // next delta candidate.
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-            continue;
+            Ok::<(), anyhow::Error>(())
         }
+    };
 
-        if entry.is_dir {
-            proto::write_message(
-                send,
-                &TransferMsg::CreateDirectory(DirEntry {
-                    path: entry.path.clone(),
-                    mode: entry.mode,
-                    mtime: entry.mtime,
-                }),
-            )
-            .await?;
-            progress.dir_created(&entry.path);
-            continue;
-        }
+    let main_fut = async {
+        let mut total_bytes = 0u64;
+        let mut bytes_saved = 0u64;
 
-        // Check if this file is a delta candidate
-        if delta_candidates.contains(&entry.path) {
-            // Read block signatures from receiver
-            let sig_msg: TransferMsg = proto::read_message(recv).await?;
-            match sig_msg {
-                TransferMsg::BlockSignatures {
-                    path: _,
-                    block_size,
-                    signatures,
-                } => {
-                    progress.file_started(&entry.path, entry.size);
+        for entry in files {
+            let full_path = base_dir.join(&entry.path);
 
-                    // Compute delta
-                    let ops = super::delta::compute_delta(
-                        &full_path,
-                        &signatures,
-                        block_size as usize,
-                    )?;
-
-                    // Send DeltaHeader
+            if entry.is_symlink {
+                if let Some(ref target) = entry.symlink_target {
                     proto::write_message(
                         send,
-                        &TransferMsg::DeltaHeader {
+                        &TransferMsg::CreateSymlink {
                             path: entry.path.clone(),
-                            new_size: entry.size,
-                            mode: entry.mode,
-                            mtime: entry.mtime,
+                            target: target.clone(),
                         },
                     )
                     .await?;
-
-                    // Send delta ops (buffered, flush at DeltaEnd)
-                    let mut delta_bytes = 0u64;
-                    for op in &ops {
-                        match op {
-                            crate::proto::DeltaOperation::CopyBlock { .. } => {
-                                // CopyBlock is just an index — minimal wire cost
-                                delta_bytes += 4; // approximate
-                            }
-                            crate::proto::DeltaOperation::Literal(data) => {
-                                delta_bytes += data.len() as u64;
-                            }
-                        }
-                        proto::write_message_buffered(send, &TransferMsg::DeltaOp(op.clone())).await?;
-                    }
-
-                    proto::write_message(send, &TransferMsg::DeltaEnd).await?;
-
-                    // Track savings
-                    total_bytes += delta_bytes;
-                    if entry.size > delta_bytes {
-                        bytes_saved += entry.size - delta_bytes;
-                    }
-
-                    progress.file_done(&entry.path);
                 }
-                other => {
-                    // Unexpected — fall back to full transfer
-                    tracing::warn!("expected BlockSignatures for {}, got: {other:?}", entry.path);
-                    progress.file_started(&entry.path, entry.size);
-                    let bytes = send_file_data(send, &full_path, entry, progress, &mut sizer, &mut read_buf, params).await?;
-                    total_bytes += bytes;
-                }
+                continue;
             }
-        } else {
-            // Regular full file transfer
-            progress.file_started(&entry.path, entry.size);
-            let bytes = send_file_data(send, &full_path, entry, progress, &mut sizer, &mut read_buf, params).await?;
-            total_bytes += bytes;
-        }
-    }
 
-    Ok((total_bytes, bytes_saved))
+            if entry.is_dir {
+                proto::write_message(
+                    send,
+                    &TransferMsg::CreateDirectory(DirEntry {
+                        path: entry.path.clone(),
+                        mode: entry.mode,
+                        mtime: entry.mtime,
+                    }),
+                )
+                .await?;
+                progress.dir_created(&entry.path);
+                continue;
+            }
+
+            if delta_candidates.contains(&entry.path) {
+                // Pull the next pre-fetched BlockSignatures from the
+                // drain channel. None means the reader task ended
+                // before producing a sig for this file — surface as
+                // a proper error.
+                let sig_msg = sig_rx.recv().await.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "BlockSignatures stream ended before sig for {}",
+                        entry.path
+                    )
+                })?;
+                match sig_msg {
+                    TransferMsg::BlockSignatures {
+                        path: _,
+                        block_size,
+                        signatures,
+                    } => {
+                        progress.file_started(&entry.path, entry.size);
+
+                        let ops = super::delta::compute_delta(
+                            &full_path,
+                            &signatures,
+                            block_size as usize,
+                        )?;
+
+                        proto::write_message(
+                            send,
+                            &TransferMsg::DeltaHeader {
+                                path: entry.path.clone(),
+                                new_size: entry.size,
+                                mode: entry.mode,
+                                mtime: entry.mtime,
+                            },
+                        )
+                        .await?;
+
+                        let mut delta_bytes = 0u64;
+                        for op in &ops {
+                            match op {
+                                crate::proto::DeltaOperation::CopyBlock { .. } => {
+                                    delta_bytes += 4;
+                                }
+                                crate::proto::DeltaOperation::Literal(data) => {
+                                    delta_bytes += data.len() as u64;
+                                }
+                            }
+                            proto::write_message_buffered(
+                                send,
+                                &TransferMsg::DeltaOp(op.clone()),
+                            )
+                            .await?;
+                        }
+
+                        proto::write_message(send, &TransferMsg::DeltaEnd).await?;
+
+                        total_bytes += delta_bytes;
+                        if entry.size > delta_bytes {
+                            bytes_saved += entry.size - delta_bytes;
+                        }
+
+                        progress.file_done(&entry.path);
+                    }
+                    other => {
+                        tracing::warn!(
+                            "expected BlockSignatures for {}, got: {other:?}",
+                            entry.path
+                        );
+                        progress.file_started(&entry.path, entry.size);
+                        let bytes = send_file_data(
+                            send,
+                            &full_path,
+                            entry,
+                            progress,
+                            &mut sizer,
+                            &mut read_buf,
+                            params,
+                        )
+                        .await?;
+                        total_bytes += bytes;
+                    }
+                }
+            } else {
+                progress.file_started(&entry.path, entry.size);
+                let bytes = send_file_data(
+                    send,
+                    &full_path,
+                    entry,
+                    progress,
+                    &mut sizer,
+                    &mut read_buf,
+                    params,
+                )
+                .await?;
+                total_bytes += bytes;
+            }
+        }
+
+        // All files processed. Tell the reader to stop and let
+        // try_join close out cleanly.
+        reader_stop.notify_one();
+        Ok::<_, anyhow::Error>((total_bytes, bytes_saved))
+    };
+
+    let (_reader_result, main_result) = tokio::try_join!(reader_fut, main_fut)?;
+    Ok(main_result)
 }
 
 /// Send a file's data (FileHeader + FileData chunks + FileEnd).
