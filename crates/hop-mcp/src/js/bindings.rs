@@ -947,55 +947,76 @@ fn install_claude_binding(
 }
 
 /// Anthropic OAuth token refresh endpoint and client ID.
-const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const ANTHROPIC_CLIENT_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
-
-/// Get a valid Anthropic token, refreshing if expired.
 ///
-/// Sources (in order):
-/// 1. hop secrets store — checks expiry, refreshes via OAuth if expired
-/// 2. Local ~/.claude/.credentials.json (fallback if no stored token)
+/// The client_id is Claude Code's public OAuth client identifier (a UUID, not
+/// the client-metadata URI — the metadata URI is what `https://claude.ai/oauth/
+/// claude-code-client-metadata` resolves to, but the token endpoint expects the
+/// underlying client_id from that metadata document). Verified against the
+/// claude-code binary's compiled OAuth constants.
+const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Get a valid Anthropic token from the daemon's own secrets store.
+///
+/// Two stored auth methods:
+/// - `setup_token`: a long-lived inference-only token from `claude setup-token`.
+///   Not refreshable — used as-is until the API rejects it.
+/// - any other (legacy OAuth): treated as a refreshable access_token with
+///   expiry tracking; refreshed via `refresh_anthropic_token` when within
+///   5 minutes of expiry.
+///
+/// The daemon does NOT fall back to `~/.claude/.credentials.json`: that file
+/// lives in the calling user's home, but the daemon typically runs as root
+/// (`$HOME=/var/root`), and we want the daemon's credential management to
+/// stand on its own anyway. If both stored and refreshable paths fail, the
+/// caller is expected to re-run `hop auth anthropic`.
 fn claude_get_token(ds: &Datastore, username: &str) -> Result<String> {
-    // Try 1: stored token (check expiry)
-    if let Ok(Some(token_bytes)) = ds.secrets_get(username, "ANTHROPIC_API_KEY") {
-        if let Ok(token) = String::from_utf8(token_bytes) {
-            if !token.is_empty() {
-                // Check if token is expired
-                let expiry = ds
-                    .secrets_get(username, "anthropic_token_expiry")
-                    .ok()
-                    .flatten()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(u64::MAX); // no expiry stored = assume valid
-
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-
-                if now_ms < expiry.saturating_sub(300_000) {
-                    // Token still valid (with 5-min buffer)
-                    return Ok(token);
-                }
-
-                // Token expired — try to refresh
-                tracing::info!("Anthropic token expired, attempting refresh");
-                if let Some(refreshed) = refresh_anthropic_token(ds, username) {
-                    return Ok(refreshed);
-                }
-                // Refresh failed — fall through to local credentials
-                tracing::warn!("Anthropic token refresh failed, trying local credentials");
-            }
-        }
+    let token_bytes = ds
+        .secrets_get(username, "ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("no Anthropic credentials for {username}. Run: hop auth anthropic"))?;
+    let token = String::from_utf8(token_bytes)
+        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY is not valid UTF-8 for {username}"))?;
+    if token.is_empty() {
+        anyhow::bail!("ANTHROPIC_API_KEY is empty for {username}. Run: hop auth anthropic");
     }
 
-    // Try 2: local credentials file (if Claude Code is installed and logged in)
-    if let Some(token) = read_local_claude_token() {
+    let method = ds
+        .secrets_get(username, "anthropic_method")
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+
+    // setup_token: long-lived, no refresh contract. Return as-is.
+    if method == "setup_token" {
         return Ok(token);
     }
 
-    anyhow::bail!("no Anthropic credentials for {username}. Run: hop auth anthropic");
+    // Legacy OAuth path: honour expiry, refresh when within 5min of expiring.
+    let expiry = ds
+        .secrets_get(username, "anthropic_token_expiry")
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if now_ms < expiry.saturating_sub(300_000) {
+        return Ok(token);
+    }
+
+    tracing::info!("Anthropic OAuth token expired, attempting refresh");
+    if let Some(refreshed) = refresh_anthropic_token(ds, username) {
+        return Ok(refreshed);
+    }
+    anyhow::bail!(
+        "Anthropic token for {username} expired and refresh failed. Run: hop auth anthropic"
+    );
 }
 
 /// Refresh an expired Anthropic OAuth token using the stored refresh token.
@@ -1069,31 +1090,6 @@ fn refresh_anthropic_token(ds: &Datastore, username: &str) -> Option<String> {
     );
 
     Some(access_token)
-}
-
-/// Read a valid token from the local ~/.claude/.credentials.json file.
-/// Claude Code auto-refreshes this file, so it's always the freshest source.
-/// Returns None if the file doesn't exist, can't be parsed, or token is expired.
-fn read_local_claude_token() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(&home).join(".claude/.credentials.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let oauth = json.get("claudeAiOauth")?;
-    let token = oauth.get("accessToken")?.as_str()?.to_string();
-    let expires_at = oauth.get("expiresAt")?.as_u64()?;
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
-
-    // Valid with 5 min buffer
-    if now_ms < expires_at.saturating_sub(300_000) {
-        Some(token)
-    } else {
-        None
-    }
 }
 
 /// Resolve the claude CLI binary path by checking known locations directly.

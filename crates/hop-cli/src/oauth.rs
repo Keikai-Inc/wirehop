@@ -31,6 +31,11 @@ pub struct OAuthProvider {
     pub scopes: &'static [&'static str],
     /// Maps hop secret names to where their values come from.
     pub secrets_map: &'static [(&'static str, SecretSource)],
+    /// All secret keys this provider's auth flow owns — including legacy
+    /// fields from prior flow versions. Used by `cmd_auth` to wipe stale
+    /// entries that the current flow doesn't write, so re-auth fully
+    /// replaces the credential record rather than partially overwriting.
+    pub managed_secrets: &'static [&'static str],
 }
 
 /// An API key provider (no OAuth — just prompt for a key).
@@ -40,6 +45,8 @@ pub struct ApiKeyProvider {
     pub console_url: &'static str,
     pub prompt: &'static str,
     pub secret_name: &'static str,
+    /// All secret keys this provider's auth flow owns — see `OAuthProvider`.
+    pub managed_secrets: &'static [&'static str],
 }
 
 // ── Provider Registry ─────────────────────────────────────────────
@@ -63,6 +70,13 @@ static GMAIL: OAuthProvider = OAuthProvider {
         ("gmail_refresh_token", SecretSource::Field("refresh_token")),
         ("gmail_token_expiry", SecretSource::Fixed("0")),
     ],
+    managed_secrets: &[
+        "google_client_id",
+        "google_client_secret",
+        "gmail_access_token",
+        "gmail_refresh_token",
+        "gmail_token_expiry",
+    ],
 };
 
 static ANTHROPIC: ApiKeyProvider = ApiKeyProvider {
@@ -70,6 +84,12 @@ static ANTHROPIC: ApiKeyProvider = ApiKeyProvider {
     console_url: "https://console.anthropic.com/settings/keys",
     prompt: "Paste your Anthropic API key",
     secret_name: "ANTHROPIC_API_KEY",
+    managed_secrets: &[
+        "ANTHROPIC_API_KEY",
+        "anthropic_method",
+        "anthropic_refresh_token",
+        "anthropic_token_expiry",
+    ],
 };
 
 pub fn oauth_provider(name: &str) -> Option<&'static OAuthProvider> {

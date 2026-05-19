@@ -2307,23 +2307,62 @@ async fn cmd_fleet(
 
 /// Run `hop auth <provider>` — authenticate with a service and store credentials.
 /// If `target` is Some, stores secrets on the remote host. If None, stores locally.
+///
+/// Re-auth wipes any of the provider's `managed_secrets` that this flow doesn't
+/// write, so leftover fields from a prior flow version (e.g. an old OAuth
+/// `refresh_token` / `token_expiry` lingering after the user moves to the
+/// setup-token flow) don't trip later token lookups.
 async fn cmd_auth(provider: &str, target: Option<&str>, config_dir: &std::path::Path) -> Result<()> {
-    if let Some(oauth) = oauth::oauth_provider(provider) {
-        let secrets = oauth::run_oauth_flow(oauth)?;
-        for (name, value) in &secrets {
-            store_auth_secret(target, config_dir, name, value.as_bytes()).await?;
-        }
-        println!("  \u{2713} {} authenticated.", provider);
+    let (secrets, managed) = if let Some(oauth) = oauth::oauth_provider(provider) {
+        (oauth::run_oauth_flow(oauth)?, oauth.managed_secrets)
     } else if let Some(apikey) = oauth::api_key_provider(provider) {
-        let secrets = oauth::run_api_key_flow(apikey)?;
-        for (name, value) in &secrets {
-            store_auth_secret(target, config_dir, name, value.as_bytes()).await?;
-        }
-        println!("  \u{2713} {} authenticated.", provider);
+        (oauth::run_api_key_flow(apikey)?, apikey.managed_secrets)
     } else {
         anyhow::bail!("Unknown auth provider: {provider}. Available: gmail, anthropic");
+    };
+
+    let written: std::collections::HashSet<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
+    for stale in managed.iter().filter(|k| !written.contains(*k)) {
+        clear_auth_secret(target, config_dir, stale).await.ok();
     }
+    for (name, value) in &secrets {
+        store_auth_secret(target, config_dir, name, value.as_bytes()).await?;
+    }
+    println!("  \u{2713} {} authenticated.", provider);
     Ok(())
+}
+
+/// Delete a secret locally or on a remote host. Missing-key is not an error.
+async fn clear_auth_secret(target: Option<&str>, config_dir: &std::path::Path, name: &str) -> Result<()> {
+    if let Some(host) = target {
+        let request = hop_core::proto::PeerRequest::SecretsDelete {
+            name: name.to_string(),
+        };
+        let (_resolved, _send, mut recv) = mux::connect_to_host(
+            config_dir,
+            host,
+            None,
+            &hop_core::proto::ClientMessage::RequestPeerOp(request),
+        ).await?;
+        let response: hop_core::proto::HostMessage = hop_core::proto::read_message(&mut recv).await?;
+        match response {
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Ok) => Ok(()),
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Error(e))
+                if e.contains("secret not found") => Ok(()),
+            hop_core::proto::HostMessage::PeerResponse(hop_core::proto::PeerResponse::Error(e)) => {
+                anyhow::bail!("Failed to delete secret on {host}: {e}")
+            }
+            _ => anyhow::bail!("Unexpected response from {host}"),
+        }
+    } else {
+        let ds = hop_core::datastore::Datastore::connect(config_dir)
+            .context("Failed to connect to daemon — is `hop host` running?")?;
+        let user = hop_core::unix_user::current_username()
+            .unwrap_or_else(|| "default".to_string());
+        // secrets_delete returns Ok(false) for missing keys, which is fine.
+        let _ = ds.secrets_delete(&user, name)?;
+        Ok(())
+    }
 }
 
 /// Store a secret locally or on a remote host.
