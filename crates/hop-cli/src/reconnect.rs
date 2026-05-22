@@ -137,6 +137,12 @@ pub async fn show_reconnect_tui_via_agent(
     let start = Instant::now();
     let mut attempt: u32 = initial_attempt_offset;
 
+    // Bytes pulled from stdin_rx while the reconnect dialog is up. Without
+    // this buffer, paste bytes that landed in stdin_rx mid-disconnect would
+    // be silently dropped by the quit-scanner. We replay these to the new
+    // session before returning so the paste survives the reconnect.
+    let mut pending_input: Vec<u8> = Vec::new();
+
     loop {
         attempt += 1;
         let backoff = backoff_secs(attempt);
@@ -155,7 +161,7 @@ pub async fn show_reconnect_tui_via_agent(
                     break;
                 }
 
-                if let Some(action) = poll_quit(stdin_rx) {
+                if let Some(action) = poll_quit(stdin_rx, &mut pending_input) {
                     cleanup(&mut stdout);
                     return action;
                 }
@@ -195,7 +201,19 @@ pub async fn show_reconnect_tui_via_agent(
         .await;
 
         match connect_result {
-            Ok(Ok((send, recv, new_session_id))) => {
+            Ok(Ok((mut send, recv, new_session_id))) => {
+                // Drain anything that arrived since the last poll, then replay
+                // buffered paste through the new session before handing off.
+                while let Ok(data) = stdin_rx.try_recv() {
+                    pending_input.extend_from_slice(&data);
+                }
+                if !pending_input.is_empty() {
+                    let _ = proto::write_message(
+                        &mut send,
+                        &ClientMessage::Input(std::mem::take(&mut pending_input)),
+                    )
+                    .await;
+                }
                 cleanup(&mut stdout);
                 return ReconnectAction::ReconnectedViaAgent {
                     send,
@@ -208,7 +226,7 @@ pub async fn show_reconnect_tui_via_agent(
             }
         }
 
-        if let Some(action) = poll_quit(stdin_rx) {
+        if let Some(action) = poll_quit(stdin_rx, &mut pending_input) {
             cleanup(&mut stdout);
             return action;
         }
@@ -289,15 +307,22 @@ fn spinning_char(elapsed: u64) -> char {
 }
 
 /// Non-blocking check for quit keys on stdin.
-/// Returns `Some(Quit)` if the user pressed `q` or Ctrl+C, `None` otherwise.
-fn poll_quit(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<ReconnectAction> {
-    // Drain any pending input from the shared stdin channel
+///
+/// Drains any data currently in `stdin_rx`. A chunk consisting of exactly a
+/// single `q` or `Ctrl+C` byte is treated as a quit keystroke; anything else
+/// is real input (typed text, a paste, escape sequences) and is appended to
+/// `pending_input` so the caller can replay it through the resumed session.
+/// Scanning every byte for `q`/0x03 would false-positive on pasted text
+/// containing those bytes.
+fn poll_quit(
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    pending_input: &mut Vec<u8>,
+) -> Option<ReconnectAction> {
     while let Ok(data) = stdin_rx.try_recv() {
-        for &byte in &data {
-            if byte == b'q' || byte == 0x03 {
-                return Some(ReconnectAction::Quit);
-            }
+        if data.len() == 1 && (data[0] == b'q' || data[0] == 0x03) {
+            return Some(ReconnectAction::Quit);
         }
+        pending_input.extend_from_slice(&data);
     }
 
     // Also check crossterm events (covers cases where raw mode is active

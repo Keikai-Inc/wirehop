@@ -57,8 +57,11 @@ pub struct DetachedSession {
     pub peer_id: String,
     /// Unix username the session runs as.
     pub username: Option<String>,
-    /// Send input bytes to the PTY writer task.
-    pub input_tx: mpsc::Sender<Vec<u8>>,
+    /// Send input bytes to the PTY writer task. Unbounded so the host's
+    /// shell select-loop never blocks on send when a fast paste fills the
+    /// PTY's kernel input buffer — blocking the loop would starve
+    /// heartbeats and trip the read deadline, causing a spurious reconnect.
+    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Route PTY output: `Some(tx)` = forward to client, `None` = discard.
     pub output_route: watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,
     /// Send resize commands to the background task holding the PTY master.
@@ -220,7 +223,7 @@ impl SessionRegistry {
 /// Result of attaching to an existing session.
 pub struct AttachResult {
     pub session_id: String,
-    pub input_tx: mpsc::Sender<Vec<u8>>,
+    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub resize_tx: mpsc::Sender<PtySize>,
     pub exit_rx: watch::Receiver<Option<i32>>,
     pub attach_epoch: u64,
@@ -434,7 +437,7 @@ mod tests {
 
     /// Helper to create a DetachedSession for testing.
     fn make_session(id: &str, peer: &str, attached: bool, exited: Option<i32>) -> DetachedSession {
-        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let (output_route, _output_rx) = watch::channel(None);
         let (resize_tx, _resize_rx) = mpsc::channel(1);
         let (exit_tx, exit_rx) = watch::channel(exited);

@@ -445,7 +445,7 @@ fn spawn_persistent_pty(
     config_dir: &std::path::Path,
 ) -> Result<(
     String,                                                          // session_id
-    mpsc::Sender<Vec<u8>>,                                           // input_tx
+    mpsc::UnboundedSender<Vec<u8>>,                                  // input_tx
     watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,                    // output_route
     mpsc::Sender<PtySize>,                                           // resize_tx
     watch::Receiver<Option<i32>>,                                     // exit_rx
@@ -543,8 +543,10 @@ fn spawn_persistent_pty(
         }
     });
 
-    // Input writer task
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Input writer task. Unbounded so the shell select-loop never blocks on
+    // send: if the PTY's small kernel input buffer fills mid-paste, bytes
+    // queue here instead of stalling the loop (which would starve heartbeats).
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer_clone = pty_writer.clone();
     tokio::task::spawn_blocking(move || {
         while let Some(data) = input_rx.blocking_recv() {
@@ -587,7 +589,7 @@ fn spawn_persistent_pty(
 async fn run_attached_loop(
     send: &mut SendStream,
     recv: &mut RecvStream,
-    input_tx: &mpsc::Sender<Vec<u8>>,
+    input_tx: &mpsc::UnboundedSender<Vec<u8>>,
     output_rx: &mut mpsc::Receiver<Vec<u8>>,
     resize_tx: &mpsc::Sender<PtySize>,
     exit_rx: &mut watch::Receiver<Option<i32>>,
@@ -606,7 +608,7 @@ async fn run_attached_loop(
     if let Some(msg) = leftover_msg {
         match msg {
             ClientMessage::Input(data) => {
-                let _ = input_tx.send(data).await;
+                let _ = input_tx.send(data);
             }
             ClientMessage::WindowSize {
                 cols, rows, pixel_width, pixel_height,
@@ -640,7 +642,7 @@ async fn run_attached_loop(
 
                 match msg {
                     Ok(ClientMessage::Input(data)) => {
-                        let _ = input_tx.send(data).await;
+                        let _ = input_tx.send(data);
                     }
                     Ok(ClientMessage::WindowSize {
                         cols, rows, pixel_width, pixel_height,
@@ -1063,7 +1065,22 @@ async fn client_shell_loop(
     #[cfg(not(unix))]
     drop(resize_tx); // silence unused warning; resize_rx will never yield
 
-    let mut stdout = std::io::stdout();
+    // Dedicated stdout writer task. Terminal rendering of paste echo is the
+    // slowest stage of the receive path and is synchronous; doing the write
+    // inline in the select! body would block heartbeats and host-message
+    // reads for as long as the terminal takes to drain, eventually tripping
+    // the read deadline and triggering a spurious reconnect mid-paste.
+    let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        while let Some(data) = stdout_rx.blocking_recv() {
+            if stdout.write_all(&data).is_err() {
+                break;
+            }
+            let _ = stdout.flush();
+        }
+    });
 
     let wake_detect = detect_sleep_wake();
     tokio::pin!(wake_detect);
@@ -1091,8 +1108,7 @@ async fn client_shell_loop(
 
                 match msg {
                     Ok(HostMessage::Output(data)) => {
-                        stdout.write_all(&data)?;
-                        stdout.flush()?;
+                        let _ = stdout_tx.send(data);
                     }
                     Ok(HostMessage::Exit(code)) => {
                         return Ok(SessionOutcome::Exited(code));
