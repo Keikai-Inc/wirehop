@@ -1,0 +1,10 @@
+[package]
+name = "hop-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
+
+[dev-dependencies]

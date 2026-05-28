@@ -4,45 +4,13 @@
 //! Multiple concurrent sessions per peer are supported — each `hop connect`
 //! gets its own PTY, and reconnects resume a specific session by ID.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hop_vt::VtScreen;
 use portable_pty::PtySize;
 use tokio::sync::{mpsc, oneshot, watch};
-
-/// Ring buffer that captures the last N bytes of PTY output.
-///
-/// Used to replay recent output when a client reconnects after a disconnect,
-/// so the reconnect feels seamless (like mosh) instead of showing a blank screen.
-pub struct ReplayBuffer {
-    buf: VecDeque<u8>,
-    capacity: usize,
-}
-
-impl ReplayBuffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            buf: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Append data, evicting oldest bytes if over capacity.
-    pub fn push(&mut self, data: &[u8]) {
-        for &byte in data {
-            if self.buf.len() == self.capacity {
-                self.buf.pop_front();
-            }
-            self.buf.push_back(byte);
-        }
-    }
-
-    /// Drain all buffered data and return it.
-    pub fn drain(&mut self) -> Vec<u8> {
-        self.buf.drain(..).collect()
-    }
-}
 
 /// A persistent PTY session that survives client disconnects.
 ///
@@ -64,8 +32,12 @@ pub struct DetachedSession {
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Route PTY output: `Some(tx)` = forward to client, `None` = discard.
     pub output_route: watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,
-    /// Send resize commands to the background task holding the PTY master.
-    pub resize_tx: mpsc::Sender<PtySize>,
+    /// Current PTY dimensions, watched by the PTY master task and the
+    /// VtScreen-feeder so a single send fans out to all consumers. Last-
+    /// write-wins: fast resize bursts (window drags) coalesce naturally,
+    /// and anyone holding a `watch::Receiver` can `borrow()` the current
+    /// size synchronously without consuming it.
+    pub resize_tx: watch::Sender<PtySize>,
     /// Watch channel that receives the child exit status.
     pub exit_rx: watch::Receiver<Option<i32>>,
     /// When the session was last detached (client disconnected).
@@ -79,14 +51,20 @@ pub struct DetachedSession {
     /// Handle for the broker background task (macOS sandbox proxy).
     /// Aborted when the session is cleaned up.
     pub broker_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Ring buffer capturing recent PTY output for replay on reconnect.
-    pub replay_buffer: Arc<Mutex<ReplayBuffer>>,
+    /// Off-screen virtual terminal that absorbs every PTY output byte.
+    /// On reconnect, `screen.lock().render_full_repaint()` produces bytes
+    /// that paint the current grid onto the new client's terminal —
+    /// replacing the old raw-byte ring that could leak truncated escape
+    /// sequences and stale mode bits.
+    pub screen: Arc<Mutex<VtScreen>>,
 }
 
 impl DetachedSession {
-    /// Resize the PTY to the given dimensions.
+    /// Publish a new PTY size to all watchers (PTY master, VtScreen).
+    /// Idempotent in the sense that watch coalesces — if the size hasn't
+    /// changed since the last send, watchers won't wake unnecessarily.
     pub fn resize(&self, size: PtySize) {
-        let _ = self.resize_tx.try_send(size);
+        let _ = self.resize_tx.send(size);
     }
 
     /// Check if the child process has exited.
@@ -224,10 +202,10 @@ impl SessionRegistry {
 pub struct AttachResult {
     pub session_id: String,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub resize_tx: mpsc::Sender<PtySize>,
+    pub resize_tx: watch::Sender<PtySize>,
     pub exit_rx: watch::Receiver<Option<i32>>,
     pub attach_epoch: u64,
-    pub replay_buffer: Arc<Mutex<ReplayBuffer>>,
+    pub screen: Arc<Mutex<VtScreen>>,
 }
 
 /// Info returned when cleaning up an exited session.
@@ -384,7 +362,7 @@ async fn run_registry_actor(
                             resize_tx: session.resize_tx.clone(),
                             exit_rx: session.exit_rx.clone(),
                             attach_epoch: epoch,
-                            replay_buffer: session.replay_buffer.clone(),
+                            screen: session.screen.clone(),
                         })
                     }
                 } else {
@@ -439,7 +417,8 @@ mod tests {
     fn make_session(id: &str, peer: &str, attached: bool, exited: Option<i32>) -> DetachedSession {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let (output_route, _output_rx) = watch::channel(None);
-        let (resize_tx, _resize_rx) = mpsc::channel(1);
+        let initial_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let (resize_tx, _resize_rx) = watch::channel(initial_size);
         let (exit_tx, exit_rx) = watch::channel(exited);
         drop(exit_tx); // keep the value set
 
@@ -455,7 +434,7 @@ mod tests {
             attached,
             attach_epoch: 0,
             broker_handle: None,
-            replay_buffer: Arc::new(Mutex::new(ReplayBuffer::new(65536))),
+            screen: Arc::new(Mutex::new(VtScreen::new(24, 80))),
         }
     }
 

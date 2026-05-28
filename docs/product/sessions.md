@@ -4,7 +4,7 @@ hop supports persistent PTY sessions that survive client disconnects, automatic 
 
 ## Session Persistence
 
-When a client disconnects (network drop, laptop close, etc.), the PTY session on the host stays alive. The shell process continues running and output is buffered for replay on reconnect.
+When a client disconnects (network drop, laptop close, etc.), the PTY session on the host stays alive. The shell process continues running and every output byte is absorbed by an off-screen virtual terminal so that on reconnect the host can repaint the current screen state.
 
 ### Behavior
 
@@ -12,14 +12,14 @@ When a client disconnects (network drop, laptop close, etc.), the PTY session on
 - A detached session keeps its shell process running in the background
 - Default timeout: **24 hours** after disconnect (configurable)
 - Sessions with exited child processes are reaped automatically
-- Output generated while detached is captured in a replay buffer (64 KB ring buffer)
+- All PTY output is fed through a `VtScreen` (alacritty terminal grid). On reconnect the host renders the current grid to bytes and sends those — not a ring of historic bytes.
 
 ### Session Lifecycle
 
 ```
-connect         -> new PTY spawned, session registered
+connect         -> new PTY spawned, session registered, VtScreen seeded
 disconnect      -> session enters "detached" state, timer starts
-reconnect       -> session re-attached, replay buffer drained to client
+reconnect       -> session re-attached, VtScreen repainted to client
 timeout/exit    -> session reaped, PTY closed (sends SIGHUP to shell)
 ```
 
@@ -54,7 +54,7 @@ When a connection drops, hop attempts automatic reconnection with a two-tier str
 
 - Prints a single-line inline banner: `[hop] Connection lost. Reconnecting...`
 - Attempts reconnection within a short timeout
-- On success: resumes the session seamlessly (replay buffer is drained)
+- On success: host repaints the current screen, then live output resumes
 - On failure: escalates to Tier 2
 
 ### Tier 2: TUI Reconnect
@@ -62,16 +62,27 @@ When a connection drops, hop attempts automatic reconnection with a two-tier str
 - Enters an alternate-screen TUI (ratatui-based)
 - Shows connection status and retry attempts
 - User can press a key to quit instead of waiting
-- On success: returns to the session with replay
+- On success: host repaints the current screen, then live output resumes
 
-### Replay Buffer
+### Resume Repaint
 
-The `ReplayBuffer` is a 64 KB ring buffer attached to each session. It captures the most recent PTY output so that reconnecting clients see recent context (like mosh) instead of a blank screen.
+Each session owns an off-screen virtual terminal (`hop_vt::VtScreen`) — an alacritty grid fed by a vt parser. Every PTY output byte advances this grid on the host as it's read; the grid is the canonical session state.
 
-```
-disconnect -> output continues into ring buffer (old bytes evicted)
-reconnect  -> buffer drained to client, then live output resumes
-```
+On resume, the host calls `screen.render_full_repaint()` which emits:
+
+- SGR reset and `\x1b[2J\x1b[H` (clear + home)
+- `\x1b[?1049h` if the captured app is in the alternate screen — so vim/htop/less land on the matching screen mode regardless of the client's prior state
+- One `\x1b[r;1H` cursor-move per row plus SGR-grouped UTF-8 cells
+- Final cursor restore at the captured app's logical position
+
+Because the bytes come from grid state and not a byte stream:
+
+- **No truncated escape sequences** — a 64 KB ring could bisect a long OSC/CSI/DCS; the grid only holds complete cells
+- **No stale mode bits** — alt-screen, scroll regions, cursor style follow the captured app's *current* state, not a historical sequence that may have been evicted
+- **No late query responses** — captured-app queries like `\x1b[c` (DA1) or `\x1b]11;?` are consumed by the parser, never replayed (a common source of `:3838/0c0c` color-leak artefacts in vim under naïve byte replay)
+- **No "long-inactivity blank screen"** — the grid contains whatever's on screen now, regardless of how long the session has been idle
+
+Scrollback is not preserved by the host; the captured app's PTY/shell don't maintain scrollback either. Pre-disconnect scrollback lives in the client's local terminal emulator, which preserves it through the `\x1b[2J` repaint by pushing the cleared viewport into its own scrollback.
 
 ---
 

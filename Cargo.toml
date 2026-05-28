@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/hop-mcp"]
+members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/hop-mcp", "crates/hop-vt"]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +11,7 @@ license = "LicenseRef-Proprietary"
 # Internal
 hop-core = { path = "crates/hop-core" }
 hop-mcp = { path = "crates/hop-mcp" }
+hop-vt = { path = "crates/hop-vt" }
 
 # Networking
 iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix" }

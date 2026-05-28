@@ -447,9 +447,9 @@ fn spawn_persistent_pty(
     String,                                                          // session_id
     mpsc::UnboundedSender<Vec<u8>>,                                  // input_tx
     watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,                    // output_route
-    mpsc::Sender<PtySize>,                                           // resize_tx
+    watch::Sender<PtySize>,                                          // resize_tx (current size)
     watch::Receiver<Option<i32>>,                                     // exit_rx
-    Arc<std::sync::Mutex<session_registry::ReplayBuffer>>,           // replay_buffer
+    Arc<std::sync::Mutex<hop_vt::VtScreen>>,                          // screen
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -515,15 +515,19 @@ fn spawn_persistent_pty(
     let (output_route_tx, output_route_rx) =
         watch::channel::<Option<mpsc::Sender<Vec<u8>>>>(None);
 
-    // Replay buffer: captures last 64KB of PTY output for seamless reconnects
-    let replay_buf = Arc::new(std::sync::Mutex::new(
-        session_registry::ReplayBuffer::new(65536),
-    ));
+    // Off-screen virtual terminal: every PTY output byte runs through a
+    // vt parser into an alacritty grid. On reconnect we render the current
+    // grid to bytes — escape sequences are present-tense and complete by
+    // construction, fixing the corruption the prior raw-byte ring caused.
+    let screen = Arc::new(std::sync::Mutex::new(hop_vt::VtScreen::new(
+        size.rows,
+        size.cols,
+    )));
 
-    // Persistent PTY reader — always captures to replay buffer, routes to client if attached
+    // Persistent PTY reader — feeds VtScreen, routes to client if attached.
     let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
     let route_rx = output_route_rx.clone();
-    let reader_replay_buf = replay_buf.clone();
+    let reader_screen = screen.clone();
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -531,8 +535,7 @@ fn spawn_persistent_pty(
                 Ok(0) => break,
                 Ok(n) => {
                     let data = buf[..n].to_vec();
-                    // Always capture to replay buffer
-                    { reader_replay_buf.lock().unwrap().push(&data); }
+                    { reader_screen.lock().unwrap().advance(&data); }
                     // Route to client if attached
                     if let Some(tx) = route_rx.borrow().clone() {
                         let _ = tx.blocking_send(data);
@@ -557,16 +560,48 @@ fn spawn_persistent_pty(
         }
     });
 
-    // Resize task — owns the PTY master, keeping it alive
-    let (resize_tx, mut resize_rx) = mpsc::channel::<PtySize>(4);
+    // Current PTY dimensions as a watch channel — single source of truth
+    // for the master, the VtScreen feeder, and anyone else who needs to
+    // know "how big is this session right now?". Initial value matches the
+    // size the PTY was opened with so observers can synchronously borrow()
+    // the current dims at startup without waiting for a changed() signal.
+    let (resize_tx, mut resize_rx) = watch::channel::<PtySize>(size);
+
+    // PTY-master task: owns the master handle (keeps the PTY alive) and
+    // applies resize commands as they land on the watch. Uses
+    // Handle::block_on because portable-pty's resize() is a blocking
+    // syscall and we're inside spawn_blocking; awaiting changed() directly
+    // would require a separate tokio task that can't safely hold the
+    // master across .await on a non-Send-bounded API.
     let master = pair.master;
     tokio::task::spawn_blocking(move || {
-        // Keep _master alive. Process resize commands until the channel closes.
         let _master = master;
-        while let Some(size) = resize_rx.blocking_recv() {
-            let _ = _master.resize(size);
+        let handle = tokio::runtime::Handle::current();
+        loop {
+            if handle.block_on(resize_rx.changed()).is_err() {
+                break; // all senders dropped → session ending
+            }
+            let new_size = *resize_rx.borrow_and_update();
+            let _ = _master.resize(new_size);
         }
-        // _master is dropped here → PTY closes → shell gets SIGHUP
+        // _master drops here → PTY closes → shell gets SIGHUP
+    });
+
+    // VtScreen-resize task: separate watcher for the off-screen grid.
+    // Same watch, separate consumer. Without this the screen would render
+    // at the size the PTY was opened with even after a SIGWINCH-driven
+    // resize, and the repaint we send on reconnect would be encoded for
+    // the wrong dimensions.
+    let mut screen_size_rx = resize_tx.subscribe();
+    let screen_for_resize = screen.clone();
+    tokio::spawn(async move {
+        while screen_size_rx.changed().await.is_ok() {
+            let new_size = *screen_size_rx.borrow_and_update();
+            screen_for_resize
+                .lock()
+                .unwrap()
+                .resize(new_size.rows, new_size.cols);
+        }
     });
 
     // Child exit watcher
@@ -578,7 +613,7 @@ fn spawn_persistent_pty(
         }
     });
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, replay_buf))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -591,7 +626,7 @@ async fn run_attached_loop(
     recv: &mut RecvStream,
     input_tx: &mpsc::UnboundedSender<Vec<u8>>,
     output_rx: &mut mpsc::Receiver<Vec<u8>>,
-    resize_tx: &mpsc::Sender<PtySize>,
+    resize_tx: &watch::Sender<PtySize>,
     exit_rx: &mut watch::Receiver<Option<i32>>,
     leftover_msg: Option<ClientMessage>,
     protocol_version: u8,
@@ -613,7 +648,7 @@ async fn run_attached_loop(
             ClientMessage::WindowSize {
                 cols, rows, pixel_width, pixel_height,
             } => {
-                let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height }).await;
+                let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
                 let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
             }
             _ => {}
@@ -647,7 +682,7 @@ async fn run_attached_loop(
                     Ok(ClientMessage::WindowSize {
                         cols, rows, pixel_width, pixel_height,
                     }) => {
-                        let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height }).await;
+                        let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
                         let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
                     }
                     Ok(_) => {
@@ -715,7 +750,7 @@ pub async fn host_shell_session_persistent(
 
     // If the client sent a session_id, try to resume that specific session.
     // Otherwise (new connection), always spawn a new PTY.
-    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch, replay_buf) =
+    let (session_id, resumed, input_tx, resize_tx, mut exit_rx, attach_epoch, screen) =
         if let Some(ref requested_id) = requested_session_id {
             // Reconnect: try to resume the specific session (peer_id validated inside actor)
             if let Some(result) = registry.attach(requested_id.clone(), peer_id.to_string(), client_output_tx.clone(), initial_size).await {
@@ -726,11 +761,11 @@ pub async fn host_shell_session_persistent(
                     result.resize_tx,
                     result.exit_rx,
                     result.attach_epoch,
-                    result.replay_buffer,
+                    result.screen,
                 )
             } else {
                 // Session gone or exited — spawn new
-                let (sid, itx, output_route, rtx, erx, rbuf) =
+                let (sid, itx, output_route, rtx, erx, scr) =
                     spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
@@ -745,14 +780,14 @@ pub async fn host_shell_session_persistent(
                     attached: true,
                     attach_epoch: 1,
                     broker_handle: None,
-                    replay_buffer: rbuf.clone(),
+                    screen: scr.clone(),
                 };
                 registry.insert(session).await;
-                (sid, false, itx, rtx, erx, 1u64, rbuf)
+                (sid, false, itx, rtx, erx, 1u64, scr)
             }
         } else {
             // New connection — always spawn a new PTY
-            let (sid, itx, output_route, rtx, erx, rbuf) =
+            let (sid, itx, output_route, rtx, erx, scr) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
@@ -767,10 +802,10 @@ pub async fn host_shell_session_persistent(
                 attached: true,
                 attach_epoch: 1,
                 broker_handle: None,
-                replay_buffer: rbuf.clone(),
+                screen: scr.clone(),
             };
             registry.insert(session).await;
-            (sid, false, itx, rtx, erx, 1u64, rbuf)
+            (sid, false, itx, rtx, erx, 1u64, scr)
         };
 
     // Start broker for sandboxed sessions (macOS)
@@ -810,18 +845,26 @@ pub async fn host_shell_session_persistent(
         resumed
     );
 
-    // Replay buffered output on resume so the client sees what happened while disconnected
+    // Repaint on resume: render the current grid as bytes so the client
+    // sees the present state — not whatever bytes happened to be in a
+    // ring at the moment of detach. Resize the screen to the client's
+    // dims first; the resize_tx fan-out is async (the screen-resize task
+    // processes changed() on a tokio scheduler) and we need a deterministic
+    // sequencing here. The lock window covers both ops so a concurrent
+    // PTY-reader advance() can't slip a render-in-old-dims between them.
     if resumed {
-        let replay_data = replay_buf.lock().unwrap().drain();
-        if !replay_data.is_empty() {
-            let compress = protocol_version >= 3;
-            tracing::info!(
-                "Replaying {} bytes of buffered output for session {}",
-                replay_data.len(),
-                &session_id[..8]
-            );
-            write_host_message(&mut send, &HostMessage::Output(replay_data), compress).await?;
-        }
+        let repaint_bytes = {
+            let mut s = screen.lock().unwrap();
+            s.resize(initial_size.rows, initial_size.cols);
+            s.render_full_repaint()
+        };
+        let compress = protocol_version >= 3;
+        tracing::info!(
+            "Repainting {} bytes for resumed session {}",
+            repaint_bytes.len(),
+            &session_id[..8]
+        );
+        write_host_message(&mut send, &HostMessage::Output(repaint_bytes), compress).await?;
     }
 
     // Run the attached I/O loop
