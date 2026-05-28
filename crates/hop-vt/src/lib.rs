@@ -1,9 +1,16 @@
-//! Virtual-terminal snapshot for session reconnect.
+//! Virtual-terminal snapshot for session reconnect and live observation.
 //!
 //! `VtScreen` owns an off-screen [`alacritty_terminal::Term`] that absorbs
 //! every byte produced by a captured PTY. The Term is the canonical session
-//! state — when a client (re)attaches, [`VtScreen::render_full_repaint`]
-//! emits bytes that paint the current grid onto the client's terminal cold.
+//! state — when a client (re)attaches, [`VtScreen::render`] emits bytes
+//! that paint the current grid onto the client's terminal cold, optionally
+//! clipped to a subscriber viewport smaller (or larger) than the native
+//! grid.
+//!
+//! Two callers today: hop's session-resume path (uses
+//! [`render_full_repaint`] — native dims, [`Prelude::Initial`]) and
+//! hop-tap-d's subscriber stream (uses all three [`Prelude`] variants
+//! with the actual subscriber viewport).
 //!
 //! Scrollback is intentionally disabled (`scrolling_history = 0`). The host
 //! never replays history; it shows what's on screen *now*. Pre-disconnect
@@ -19,6 +26,29 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+
+/// What [`VtScreen::render`] emits *before* the per-row cell paint.
+///
+/// The prelude is the part that establishes a known starting state on
+/// the receiver's terminal — screen mode, clear, scroll region — so the
+/// subsequent cells land in the right place. Each variant trades off
+/// aggressiveness for size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Prelude {
+    /// Subscriber just attached, or hop is resuming a session. Forces
+    /// the receiver into the captured app's current screen mode
+    /// (alt vs primary), then clears + homes. Safe regardless of what
+    /// state the receiver's terminal was in before.
+    Initial,
+    /// Subscriber resized after attach. Same as `Initial` plus a scroll-
+    /// region reset (`\x1b[r`), because a `DECSTBM` set during the
+    /// previous viewport (e.g. vim's status-line freeze) would otherwise
+    /// confine cells to a region smaller than the new viewport.
+    Resize,
+    /// Live update following a prior frame. Minimal: SGR reset + home
+    /// only. Assumes the receiver's terminal mode already matches.
+    Live,
+}
 
 /// Off-screen terminal that ingests PTY output and snapshots its current
 /// state as bytes for a (re)attaching client.
@@ -73,48 +103,48 @@ impl VtScreen {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Render the current grid as bytes that paint a fresh terminal into
-    /// the same visible state. Includes:
+    /// Render the current grid clipped to `(vp_rows, vp_cols)` with the
+    /// given prelude.
     ///
-    /// - SGR reset and `\x1b[2J\x1b[H` (clear + home)
-    /// - `\x1b[?1049h` if the captured app is in the alternate screen, so
-    ///   the client follows
-    /// - One `\x1b[r;1H` cursor-move per row + SGR-grouped UTF-8 cells
-    /// - Final cursor placement at the captured app's logical cursor
+    /// Clipping is **bottom-anchored** when `vp_rows < grid rows`: the
+    /// bottom rows are shown (where prompts and cursors live in
+    /// interactive shells, and where status lines live in full-screen
+    /// apps), not the top. Columns clip left-anchored (col 0 of the grid
+    /// → col 0 of the viewport).
     ///
-    /// Safe to send to a client whose terminal state is unknown — the
-    /// prelude resets enough that the result is the same regardless of
-    /// what was on screen before.
-    pub fn render_full_repaint(&self) -> Vec<u8> {
-        let rows = self.dims.lines as i32;
-        let cols = self.dims.cols as usize;
-        let mut out: Vec<u8> = Vec::with_capacity(rows as usize * cols * 4);
+    /// If the viewport is larger than the grid in either axis, the cells
+    /// outside the grid are erased to end-of-line so prior content on the
+    /// receiver doesn't bleed through.
+    ///
+    /// Always emits a final cursor-position; if the captured cursor falls
+    /// outside the visible viewport, the cursor is clamped to (1,1)
+    /// rather than left wherever the last cell-write landed.
+    pub fn render(&self, vp_rows: u16, vp_cols: u16, prelude: Prelude) -> Vec<u8> {
+        let grid_rows = self.dims.lines as i32;
+        let grid_cols = self.dims.cols as usize;
+        let vp_rows = vp_rows.max(1) as i32;
+        let vp_cols = vp_cols.max(1) as usize;
+        let render_rows = grid_rows.min(vp_rows);
+        let render_cols = grid_cols.min(vp_cols);
 
-        // Prelude: reset, clear, then conditionally enter alt-screen and
-        // clear that too. We always emit the primary clear so a client
-        // that was *not* in alt-screen ends up with its primary screen
-        // clean before alt-screen entry; a client already in alt-screen
-        // sees the alt-screen clear take effect.
-        out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
-        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
-        if alt {
-            out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
-        } else {
-            // Force primary screen in case the client was left in alt-
-            // screen by a prior session (e.g. vim exited during the
-            // disconnect — the captured app left alt mode but the
-            // client never received the `?1049l` because it was gone).
-            out.extend_from_slice(b"\x1b[?1049l");
-        }
+        // Bottom-anchored row clip: skip the top `row_offset` grid rows
+        // when the viewport is shorter. For a viewport ≥ the grid this
+        // is 0 (no clip).
+        let row_offset: i32 = grid_rows - render_rows;
+
+        let mut out: Vec<u8> = Vec::with_capacity(render_rows as usize * render_cols * 4);
+
+        self.emit_prelude(&mut out, prelude);
 
         let grid = self.term.grid();
         let mut last_attrs: Option<(Color, Color, Flags)> = None;
 
-        for row in 0..rows {
-            let _ = write!(out, "\x1b[{};1H", row + 1);
+        for vp_row in 0..render_rows {
+            let grid_row = vp_row + row_offset;
+            let _ = write!(out, "\x1b[{};1H", vp_row + 1);
             let mut col = 0usize;
-            while col < cols {
-                let p = Point::new(Line(row), Column(col));
+            while col < render_cols {
+                let p = Point::new(Line(grid_row), Column(col));
                 let cell = &grid[p];
 
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -136,21 +166,73 @@ impl VtScreen {
 
                 col += if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
             }
+            // Receiver wider than grid: erase the trailing cols on this
+            // row so a prior render's wider content can't survive.
+            if (render_cols as u16) < (vp_cols as u16) {
+                out.extend_from_slice(b"\x1b[K");
+            }
         }
 
         out.extend_from_slice(b"\x1b[0m");
 
-        // Place the cursor at the captured app's logical position. If the
-        // cursor is somehow outside the grid (e.g. immediately after a
-        // resize that hasn't been reconciled), clamp into bounds rather
-        // than skipping — a visible cursor at (1,1) is less wrong than
-        // an invisible cursor wherever the last cell landed.
+        // Translate the captured cursor to viewport coords by subtracting
+        // the bottom-anchor offset. If the cursor falls outside the
+        // visible viewport (e.g. cursor is in a clipped-away row), clamp
+        // to (1,1) — a visible cursor in the corner is less surprising
+        // than an invisible cursor wherever the last cell-write landed.
         let cursor_pt = grid.cursor.point;
-        let cur_row = cursor_pt.line.0.clamp(0, rows.saturating_sub(1)) + 1;
-        let cur_col = (cursor_pt.column.0 as i32).clamp(0, cols as i32 - 1) + 1;
-        let _ = write!(out, "\x1b[{};{}H", cur_row, cur_col);
+        let vp_cur_row = cursor_pt.line.0 - row_offset;
+        let vp_cur_col = cursor_pt.column.0 as i32;
+        let (cur_r, cur_c) =
+            if vp_cur_row >= 0 && vp_cur_row < render_rows && vp_cur_col >= 0 && (vp_cur_col as usize) < render_cols {
+                (vp_cur_row + 1, vp_cur_col + 1)
+            } else {
+                (1, 1)
+            };
+        let _ = write!(out, "\x1b[{};{}H", cur_r, cur_c);
 
         out
+    }
+
+    /// Render the current grid at native dimensions with `Prelude::Initial`.
+    /// Equivalent to `render(rows, cols, Prelude::Initial)` where
+    /// `(rows, cols) = dims()`.
+    pub fn render_full_repaint(&self) -> Vec<u8> {
+        let (rows, cols) = self.dims();
+        self.render(rows, cols, Prelude::Initial)
+    }
+
+    fn emit_prelude(&self, out: &mut Vec<u8>, prelude: Prelude) {
+        match prelude {
+            Prelude::Live => {
+                // Minimal — assume receiver already in matching mode.
+                out.extend_from_slice(b"\x1b[H\x1b[0m");
+            }
+            Prelude::Initial | Prelude::Resize => {
+                // 1. SGR reset
+                // 2. Force receiver's screen mode to match captured app's
+                //    *current* state (alt vs primary). Idempotent if
+                //    already there. Fixes the "vim exited during the
+                //    disconnect → client still in alt-screen" case for
+                //    Initial, and "alice resized after bob exited alt"
+                //    for Resize.
+                // 3. (Resize only) `\x1b[r` resets DECSTBM scroll region.
+                //    A prior viewport's scroll-region (vim status-line
+                //    freeze, less paging) would confine output to a
+                //    smaller area on the new viewport otherwise.
+                // 4. Clear + home in the resulting buffer.
+                out.extend_from_slice(b"\x1b[0m");
+                if self.is_alt_screen() {
+                    out.extend_from_slice(b"\x1b[?1049h");
+                } else {
+                    out.extend_from_slice(b"\x1b[?1049l");
+                }
+                if matches!(prelude, Prelude::Resize) {
+                    out.extend_from_slice(b"\x1b[r");
+                }
+                out.extend_from_slice(b"\x1b[2J\x1b[H");
+            }
+        }
     }
 }
 
@@ -272,14 +354,41 @@ mod tests {
     fn empty_screen_renders_clean_prelude() {
         let screen = VtScreen::new(4, 10);
         let out = screen.render_full_repaint();
-        // Must start with reset + clear + home (primary screen).
+        // Initial prelude (not in alt-screen): SGR reset → force primary
+        // screen → clear + home, in that order.
         assert!(
-            out.starts_with(b"\x1b[0m\x1b[2J\x1b[H"),
-            "missing reset/clear prelude: {:?}",
+            out.starts_with(b"\x1b[0m\x1b[?1049l\x1b[2J\x1b[H"),
+            "wrong Initial prelude: {:?}",
             String::from_utf8_lossy(&out)
         );
-        // Not in alt-screen → must emit `?1049l` to force primary.
-        assert!(out.windows(8).any(|w| w == b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn live_prelude_is_minimal() {
+        let mut screen = VtScreen::new(4, 10);
+        screen.advance(b"hi");
+        let out = screen.render(4, 10, Prelude::Live);
+        // Live: just home + SGR reset, no screen-mode toggles.
+        assert!(
+            out.starts_with(b"\x1b[H\x1b[0m"),
+            "wrong Live prelude: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(!out.windows(8).any(|w| w == b"\x1b[?1049l"));
+        assert!(!out.windows(8).any(|w| w == b"\x1b[?1049h"));
+    }
+
+    #[test]
+    fn resize_prelude_includes_scroll_region_reset() {
+        let screen = VtScreen::new(4, 10);
+        let out = screen.render(4, 10, Prelude::Resize);
+        // Resize: SGR reset → screen-mode force → scroll-region reset
+        // (\x1b[r) → clear + home.
+        assert!(
+            out.windows(3).any(|w| w == b"\x1b[r"),
+            "Resize prelude missing DECSTBM reset (\\x1b[r): {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[test]
@@ -407,5 +516,45 @@ mod tests {
             "cursor not at (3,5) in repaint tail: {:?}",
             &s[s.len().saturating_sub(40)..]
         );
+    }
+
+    #[test]
+    fn small_viewport_clips_bottom_anchored() {
+        // 6-row grid with content in rows 1-6; render to a 3-row viewport.
+        // Should show the BOTTOM 3 rows (4, 5, 6), not the top 3.
+        let mut screen = VtScreen::new(6, 10);
+        screen.advance(b"row1\r\nrow2\r\nrow3\r\nrow4\r\nrow5\r\nrow6");
+        let out = screen.render(3, 10, Prelude::Initial);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("row4"), "missing bottom row4: {s:?}");
+        assert!(s.contains("row5"), "missing bottom row5: {s:?}");
+        assert!(s.contains("row6"), "missing bottom row6: {s:?}");
+        assert!(!s.contains("row1"), "row1 should be clipped away: {s:?}");
+        assert!(!s.contains("row2"), "row2 should be clipped away: {s:?}");
+    }
+
+    #[test]
+    fn wide_viewport_erases_trailing_cells() {
+        // 8-col grid rendered into a 20-col viewport: each row should
+        // end with \x1b[K to clear whatever might have been there.
+        let mut screen = VtScreen::new(2, 8);
+        screen.advance(b"hello");
+        let out = screen.render(2, 20, Prelude::Initial);
+        // Count the \x1b[K occurrences — should be at least one per row.
+        let k_count = out.windows(3).filter(|w| *w == b"\x1b[K").count();
+        assert!(
+            k_count >= 2,
+            "expected ≥2 \\x1b[K for 2 rows of erase-to-EOL, got {k_count}"
+        );
+    }
+
+    #[test]
+    fn viewport_matching_grid_is_unclipped() {
+        // vp == grid dims should produce the same output as render_full_repaint.
+        let mut screen = VtScreen::new(4, 10);
+        screen.advance(b"hello\r\nworld");
+        let direct = screen.render(4, 10, Prelude::Initial);
+        let shim = screen.render_full_repaint();
+        assert_eq!(direct, shim, "render_full_repaint must match render(native, Initial)");
     }
 }
