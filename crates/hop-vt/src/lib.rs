@@ -103,6 +103,32 @@ impl VtScreen {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Snapshot every visible row of the grid as a plain `String` (the
+    /// cell characters, no SGR escape sequences). Returned vec has
+    /// exactly `rows` entries; each entry is exactly `cols` characters
+    /// wide with trailing whitespace preserved so the caller decides
+    /// whether to trim.
+    ///
+    /// Useful for log dumps, session-picker UIs, and quick-look tools
+    /// that want "what's on screen as text" without going through the
+    /// repaint pipeline. The cost is one allocation per row plus a
+    /// `cols`-wide push loop — fine for any non-hot-path use.
+    pub fn text_rows(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let cols = self.dims.cols;
+        let lines = self.dims.lines as i32;
+        (0..lines)
+            .map(|line_idx| {
+                let mut row = String::with_capacity(cols);
+                for col in 0..cols {
+                    let p = Point::new(Line(line_idx), Column(col));
+                    row.push(grid[p].c);
+                }
+                row
+            })
+            .collect()
+    }
+
     /// Render the current grid clipped to `(vp_rows, vp_cols)` with the
     /// given prelude.
     ///
@@ -546,6 +572,33 @@ mod tests {
             k_count >= 2,
             "expected ≥2 \\x1b[K for 2 rows of erase-to-EOL, got {k_count}"
         );
+    }
+
+    #[test]
+    fn text_rows_returns_grid_chars_no_escapes() {
+        let mut screen = VtScreen::new(3, 8);
+        screen.advance(b"hello\r\nworld\r\nbye");
+        let rows = screen.text_rows();
+        assert_eq!(rows.len(), 3, "expected 3 rows");
+        // Each row is exactly cols-wide (trailing space preserved).
+        assert!(rows.iter().all(|r| r.chars().count() == 8), "rows: {rows:?}");
+        // Content lands left-aligned; trailing space pad.
+        assert_eq!(rows[0].trim_end(), "hello");
+        assert_eq!(rows[1].trim_end(), "world");
+        assert_eq!(rows[2].trim_end(), "bye");
+        // No escape bytes in the text snapshot.
+        for r in &rows {
+            assert!(!r.contains('\x1b'), "escape in text_rows: {r:?}");
+        }
+    }
+
+    #[test]
+    fn text_rows_ignores_color_attributes() {
+        let mut screen = VtScreen::new(1, 12);
+        // Bold red "hi", then default "there"
+        screen.advance(b"\x1b[1;31mhi\x1b[0m there");
+        let rows = screen.text_rows();
+        assert_eq!(rows[0].trim_end(), "hi there");
     }
 
     #[test]
