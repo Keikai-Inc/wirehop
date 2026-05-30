@@ -911,6 +911,27 @@ pub async fn host_shell_session_persistent(
             &session_id[..8]
         );
         write_host_message(&mut send, &HostMessage::Output(repaint_bytes), compress).await?;
+
+        // The snapshot we just sent reflects the cache at the *instant* of
+        // reconnect, which can be a transient mid-tmux-scroll state: tmux
+        // may have just used a scroll-region (DECSTBM) to update one pane,
+        // which inherently clears all columns of those rows in the grid,
+        // and the *other* pane's app hasn't sent the bytes to refill them
+        // yet. Nudge the PTY size by +1 row and back to provoke two
+        // SIGWINCHes — the captured app redraws fully both times, those
+        // bytes flow into the cache and out to the client via normal live
+        // forwarding, overwriting any transient blanks within ~100ms.
+        // Sleep between sends because the watch coalesces — without a gap
+        // the receiver may only ever see the second value.
+        let nudge_size = PtySize {
+            rows: initial_size.rows.saturating_add(1),
+            cols: initial_size.cols,
+            pixel_width: initial_size.pixel_width,
+            pixel_height: initial_size.pixel_height,
+        };
+        let _ = resize_tx.send(nudge_size);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = resize_tx.send(initial_size);
     }
 
     // Run the attached I/O loop
