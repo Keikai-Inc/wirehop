@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Stdout};
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use hop_core::net::netmon;
 use hop_core::proto::{self, ClientMessage};
 
 use crate::mux::{self, ResolvedHost};
@@ -25,6 +27,55 @@ pub enum ReconnectAction {
     },
     /// User chose to quit.
     Quit,
+}
+
+/// What `poll_user_action` observed during a single poll cycle.
+#[derive(Debug, PartialEq, Eq)]
+enum PollAction {
+    /// User pressed `q` or Ctrl+C.
+    Quit,
+    /// User pressed Enter/Return — caller should skip any current backoff
+    /// and start a fresh attempt cycle.
+    RetryNow,
+    /// Nothing actionable observed.
+    None,
+}
+
+/// Tracks the local interface IP set so the reconnect loop can notice when
+/// the network situation changes (wifi rejoined, ethernet plugged in, VPN
+/// flipped) and skip out of any pending exponential-backoff sleep. A fresh
+/// network is the most likely moment for a reconnect to actually succeed,
+/// so waiting out a 30-second backoff there is the exact wrong move.
+struct NetWatcher {
+    last_addrs: BTreeSet<IpAddr>,
+    last_poll: Instant,
+}
+
+impl NetWatcher {
+    fn new() -> Self {
+        Self {
+            last_addrs: netmon::current_interface_addrs(),
+            last_poll: Instant::now(),
+        }
+    }
+
+    /// True if the interface address set differs from the last observation.
+    /// Throttles to once per second so we don't hammer `getifaddrs` from a
+    /// tight render loop. Updates `last_addrs` on change so a single
+    /// transition only fires once.
+    fn changed(&mut self) -> bool {
+        if self.last_poll.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.last_poll = Instant::now();
+        let curr = netmon::current_interface_addrs();
+        if curr != self.last_addrs {
+            self.last_addrs = curr;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Quick inline reconnection attempt (Tier 1).
@@ -136,6 +187,7 @@ pub async fn show_reconnect_tui_via_agent(
 
     let start = Instant::now();
     let mut attempt: u32 = initial_attempt_offset;
+    let mut net_watcher = NetWatcher::new();
 
     // Bytes pulled from stdin_rx while the reconnect dialog is up. Without
     // this buffer, paste bytes that landed in stdin_rx mid-disconnect would
@@ -161,9 +213,30 @@ pub async fn show_reconnect_tui_via_agent(
                     break;
                 }
 
-                if let Some(action) = poll_quit(stdin_rx, &mut pending_input) {
-                    cleanup(&mut stdout);
-                    return action;
+                match poll_user_action(stdin_rx, &mut pending_input) {
+                    PollAction::Quit => {
+                        cleanup(&mut stdout);
+                        return ReconnectAction::Quit;
+                    }
+                    PollAction::RetryNow => {
+                        // User pressed Enter — they want a try right now and
+                        // they want subsequent tries to be quick too. Reset
+                        // the counter so this loop iteration ends, the next
+                        // becomes attempt 1 (0s backoff), and the exponential
+                        // ladder starts over from scratch.
+                        attempt = 0;
+                        break;
+                    }
+                    PollAction::None => {}
+                }
+
+                if net_watcher.changed() {
+                    // Network just changed (wifi rejoined, VPN flipped,
+                    // ethernet plugged in). This is the single best moment
+                    // for a reconnect to actually succeed; bail out of the
+                    // backoff and start fresh.
+                    attempt = 0;
+                    break;
                 }
             }
         }
@@ -226,9 +299,18 @@ pub async fn show_reconnect_tui_via_agent(
             }
         }
 
-        if let Some(action) = poll_quit(stdin_rx, &mut pending_input) {
-            cleanup(&mut stdout);
-            return action;
+        match poll_user_action(stdin_rx, &mut pending_input) {
+            PollAction::Quit => {
+                cleanup(&mut stdout);
+                return ReconnectAction::Quit;
+            }
+            PollAction::RetryNow => {
+                attempt = 0;
+            }
+            PollAction::None => {}
+        }
+        if net_watcher.changed() {
+            attempt = 0;
         }
     }
 }
@@ -287,7 +369,7 @@ fn render_frame(
                 " Attempt #{attempt} | Elapsed: {elapsed_secs}s"
             )),
             Line::from(Span::styled(
-                " Press q or Ctrl+C to quit",
+                " Enter: retry now · q / Ctrl+C: quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -306,40 +388,55 @@ fn spinning_char(elapsed: u64) -> char {
     FRAMES[(elapsed as usize) % FRAMES.len()]
 }
 
-/// Non-blocking check for quit keys on stdin.
+/// Non-blocking check for user actions on stdin.
 ///
-/// Drains any data currently in `stdin_rx`. A chunk consisting of exactly a
-/// single `q` or `Ctrl+C` byte is treated as a quit keystroke; anything else
-/// is real input (typed text, a paste, escape sequences) and is appended to
-/// `pending_input` so the caller can replay it through the resumed session.
-/// Scanning every byte for `q`/0x03 would false-positive on pasted text
-/// containing those bytes.
-fn poll_quit(
+/// Drains any data currently in `stdin_rx`. A chunk consisting of exactly
+/// a single byte that matches one of the recognised commands is treated
+/// as that command; anything else is real input (typed text, paste,
+/// escape sequences) and is appended to `pending_input` so the caller can
+/// replay it through the resumed session. Scanning every byte for the
+/// command bytes would false-positive on pasted text.
+///
+/// Recognised single-byte commands:
+/// - `q`        / 0x03 (Ctrl+C) → `PollAction::Quit`
+/// - 0x0d (CR)  / 0x0a (LF)     → `PollAction::RetryNow`
+///
+/// When the terminal is in raw mode we also check `crossterm::event` for
+/// the same keys, since some terminals deliver them as parsed key events
+/// rather than raw bytes on stdin.
+fn poll_user_action(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     pending_input: &mut Vec<u8>,
-) -> Option<ReconnectAction> {
+) -> PollAction {
+    let mut action = PollAction::None;
     while let Ok(data) = stdin_rx.try_recv() {
-        if data.len() == 1 && (data[0] == b'q' || data[0] == 0x03) {
-            return Some(ReconnectAction::Quit);
+        if data.len() == 1 {
+            match data[0] {
+                b'q' | 0x03 => return PollAction::Quit,
+                0x0d | 0x0a => {
+                    action = PollAction::RetryNow;
+                    continue;
+                }
+                _ => {}
+            }
         }
         pending_input.extend_from_slice(&data);
     }
 
-    // Also check crossterm events (covers cases where raw mode is active
-    // and crossterm event polling picks up keys)
-    if event::poll(Duration::from_millis(250)).ok()?
+    if event::poll(Duration::from_millis(250)).unwrap_or(false)
         && let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read()
     {
         match code {
-            KeyCode::Char('q') => return Some(ReconnectAction::Quit),
+            KeyCode::Char('q') => return PollAction::Quit,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(ReconnectAction::Quit);
+                return PollAction::Quit;
             }
+            KeyCode::Enter => action = PollAction::RetryNow,
             _ => {}
         }
     }
 
-    None
+    action
 }
 
 /// Send WindowSize + SetEnv setup messages to the host.
