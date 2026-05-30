@@ -163,9 +163,17 @@ impl VtScreen {
         self.emit_prelude(&mut out, prelude);
 
         let grid = self.term.grid();
-        let mut last_attrs: Option<(Color, Color, Flags)> = None;
+        // Reset `last_attrs` on every row so the row's first cell always
+        // emits an explicit SGR. Without this, the first cell inherits the
+        // previous row's last SGR — which means losing the bytes from an
+        // earlier row leaves subsequent rows painting in undefined
+        // attribute state on the receiver. Per-row SGR independence costs
+        // ~5–10 bytes per row and makes each row independently renderable
+        // if anything earlier on the wire dropped.
+        let mut last_attrs: Option<(Color, Color, Flags)>;
 
         for vp_row in 0..render_rows {
+            last_attrs = None;
             let grid_row = vp_row + row_offset;
             let _ = write!(out, "\x1b[{};1H", vp_row + 1);
             let mut col = 0usize;
@@ -528,6 +536,40 @@ mod tests {
         assert_eq!(screen.dims(), (4, 10));
         screen.resize(4, 0);
         assert_eq!(screen.dims(), (4, 10));
+    }
+
+    #[test]
+    fn every_row_emits_explicit_sgr() {
+        // Each row's first cell-painting MUST be preceded by an SGR run
+        // (\x1b[0...m), so a row can be re-painted correctly even if any
+        // earlier row's bytes were lost on the wire. Without per-row SGR
+        // reset, the second row would inherit the first row's SGR — and
+        // if the first row drops, the second row paints with undefined
+        // attrs (often blank-on-blank, hence "missing data").
+        let mut screen = VtScreen::new(5, 8);
+        // Write 5 visibly distinct rows so each has real content.
+        screen.advance(b"\x1b[31maaaaaaaa\r\n");
+        screen.advance(b"\x1b[32mbbbbbbbb\r\n");
+        screen.advance(b"\x1b[33mcccccccc\r\n");
+        screen.advance(b"\x1b[34mdddddddd\r\n");
+        screen.advance(b"\x1b[35meeeeeeee");
+        let out = screen.render_full_repaint();
+        let s = String::from_utf8_lossy(&out);
+        // For each row N=1..=5, between the `\x1b[N;1H` cursor move and
+        // the first letter of that row's content, there must be an
+        // SGR-run starting with `\x1b[0`.
+        for (row, ch) in [(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')] {
+            let cup = format!("\x1b[{row};1H");
+            let cup_pos = s.find(&cup).unwrap_or_else(|| panic!("row {row} CUP missing"));
+            let after_cup = &s[cup_pos + cup.len()..];
+            // Find the first letter of this row's content.
+            let letter_pos = after_cup.find(ch).unwrap_or_else(|| panic!("row {row} content '{ch}' missing"));
+            let between = &after_cup[..letter_pos];
+            assert!(
+                between.contains("\x1b[0"),
+                "row {row} between CUP and content '{ch}' lacks SGR reset (got {between:?})"
+            );
+        }
     }
 
     #[test]
