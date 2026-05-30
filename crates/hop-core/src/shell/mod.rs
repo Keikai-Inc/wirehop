@@ -847,16 +847,22 @@ pub async fn host_shell_session_persistent(
 
     // Repaint on resume: render the current grid as bytes so the client
     // sees the present state — not whatever bytes happened to be in a
-    // ring at the moment of detach. Resize the screen to the client's
-    // dims first; the resize_tx fan-out is async (the screen-resize task
-    // processes changed() on a tokio scheduler) and we need a deterministic
-    // sequencing here. The lock window covers both ops so a concurrent
-    // PTY-reader advance() can't slip a render-in-old-dims between them.
+    // ring at the moment of detach. We deliberately do NOT mutate the
+    // screen here: synchronously resizing it to the new client's dims
+    // caused alacritty to grow the grid before the captured app had a
+    // chance to SIGWINCH-redraw, so the freshly-added rows/cols
+    // rendered as blank — manifesting as a missing lower-left quadrant
+    // when the left pane's app (Claude, vim, etc.) is slower to repaint
+    // than the right pane's. Instead, snapshot the screen as it stands
+    // and tell `render` the client's viewport so the bytes are sized for
+    // the receiving terminal; the async resize fan-out (PTY-master task
+    // and VtScreen-resize task) will catch up afterward via the watch,
+    // and the captured app's SIGWINCH-driven redraw will flow through
+    // the normal live-forwarding path.
     if resumed {
         let repaint_bytes = {
-            let mut s = screen.lock().unwrap();
-            s.resize(initial_size.rows, initial_size.cols);
-            s.render_full_repaint()
+            let s = screen.lock().unwrap();
+            s.render(initial_size.rows, initial_size.cols, hop_vt::Prelude::Initial)
         };
         let compress = protocol_version >= 3;
         tracing::info!(
