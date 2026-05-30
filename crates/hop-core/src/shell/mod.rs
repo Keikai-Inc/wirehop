@@ -860,10 +860,50 @@ pub async fn host_shell_session_persistent(
     // and the captured app's SIGWINCH-driven redraw will flow through
     // the normal live-forwarding path.
     if resumed {
-        let repaint_bytes = {
+        let dump_enabled = std::env::var_os("HOP_DEBUG_RESUME_DUMP").is_some();
+        let (repaint_bytes, dump_info) = {
             let s = screen.lock().unwrap();
-            s.render(initial_size.rows, initial_size.cols, hop_vt::Prelude::Initial)
+            let bytes = s.render(initial_size.rows, initial_size.cols, hop_vt::Prelude::Initial);
+            let info = if dump_enabled {
+                Some((s.dims(), s.text_rows()))
+            } else {
+                None
+            };
+            (bytes, info)
         };
+
+        if let Some((grid_dims, grid_text)) = dump_info {
+            // HOP_DEBUG_RESUME_DUMP=1 emits two files per resume:
+            //   /tmp/hop_resume_<id8>.bin   — the exact bytes sent over the wire
+            //   /tmp/hop_resume_<id8>.txt   — what the daemon's grid thinks is on
+            //                                  screen, as plain text per row
+            // Comparing the two answers "is data missing in the bytes, or missing
+            // from the grid itself?". Overwrites on every resume — copy off
+            // between cycles to capture multiple states.
+            let id8 = &session_id[..8];
+            let bin_path = format!("/tmp/hop_resume_{id8}.bin");
+            let txt_path = format!("/tmp/hop_resume_{id8}.txt");
+            let _ = std::fs::write(&bin_path, &repaint_bytes);
+            let mut txt = format!(
+                "# session={id8} grid_dims=(rows={}, cols={}) client_vp=(rows={}, cols={}) bytes={}\n",
+                grid_dims.0,
+                grid_dims.1,
+                initial_size.rows,
+                initial_size.cols,
+                repaint_bytes.len(),
+            );
+            for (i, row) in grid_text.iter().enumerate() {
+                txt.push_str(&format!("{:3}: {}\n", i + 1, row));
+            }
+            let _ = std::fs::write(&txt_path, txt);
+            tracing::info!(
+                "Resume dump: {} bytes → {}; grid text → {}",
+                repaint_bytes.len(),
+                bin_path,
+                txt_path,
+            );
+        }
+
         let compress = protocol_version >= 3;
         tracing::info!(
             "Repainting {} bytes for resumed session {}",
