@@ -307,6 +307,12 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // Polls interface addresses every 5s and calls endpoint.network_change() on change.
     let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), None);
 
+    // Relay reachability watcher. Probes the home relay every 30s and forces
+    // re-discovery after 3 consecutive failures. Catches cert expiry / relay
+    // crashes the interface watcher misses (the daemon's TCP session can stay
+    // ESTABLISHED for hours after the relay link is functionally broken).
+    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone());
+
     // Warn about legacy peers with no bound username when running as root
     #[cfg(unix)]
     if hop_core::unix_user::is_running_as_root() {

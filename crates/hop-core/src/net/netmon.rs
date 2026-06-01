@@ -15,6 +15,19 @@ use iroh::Endpoint;
 /// handoffs quickly enough to trigger path migration before QUIC times out.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Probe the home relay's HTTPS endpoint every 30s. Catches cert expiry,
+/// relay crashes, and silent iroh<->relay session breakage that the
+/// interface-address watcher misses.
+const RELAY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Time budget for a single relay probe (connect + TLS + HTTP response).
+const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Consecutive failures before forcing re-discovery. 3 × 30s = ~90s of
+/// sustained brokenness before recovery — tolerates transient blips while
+/// still beating the 30+ minute silent failure we hit on cert expiry.
+const RELAY_FAILURE_THRESHOLD: u32 = 3;
+
 /// Enumerate all non-loopback, non-link-local interface IP addresses.
 #[cfg(unix)]
 pub fn current_interface_addrs() -> BTreeSet<IpAddr> {
@@ -88,6 +101,89 @@ pub fn spawn_interface_watcher(
                 }
 
                 prev = curr;
+            }
+        }
+    })
+}
+
+/// Spawn a background task that probes the home relay's HTTPS endpoint.
+///
+/// On `RELAY_FAILURE_THRESHOLD` consecutive failures, logs at ERROR and calls
+/// `endpoint.network_change()` to force iroh to drop its current relay session
+/// and re-handshake. Catches failure modes the interface watcher misses:
+/// expired TLS cert, relay process crash, network partition, or a hung iroh
+/// relay-client task. The daemon's existing TCP session can stay ESTABLISHED
+/// long after the relay link is functionally dead — this watcher closes that gap.
+pub fn spawn_relay_health_watcher(endpoint: Endpoint) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(RELAY_PROBE_TIMEOUT)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Relay health watcher: failed to build http client: {e}");
+                return;
+            }
+        };
+
+        tracing::info!(
+            "Relay health watcher started (interval={}s, threshold={})",
+            RELAY_PROBE_INTERVAL.as_secs(),
+            RELAY_FAILURE_THRESHOLD
+        );
+
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            tokio::time::sleep(RELAY_PROBE_INTERVAL).await;
+
+            let Some(relay_url) = endpoint.addr().relay_urls().next().cloned() else {
+                // No home relay (LOCAL_ONLY mode or still bootstrapping). Skip.
+                continue;
+            };
+
+            let probe_url = format!("{}generate_204", relay_url.as_str());
+
+            match client.get(&probe_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            "Relay health restored after {} consecutive failures",
+                            consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                Ok(resp) => {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "Relay health probe to {} returned HTTP {} (failure {}/{})",
+                        probe_url,
+                        resp.status(),
+                        consecutive_failures,
+                        RELAY_FAILURE_THRESHOLD
+                    );
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "Relay health probe to {} failed: {e} (failure {}/{})",
+                        probe_url,
+                        consecutive_failures,
+                        RELAY_FAILURE_THRESHOLD
+                    );
+                }
+            }
+
+            if consecutive_failures >= RELAY_FAILURE_THRESHOLD {
+                tracing::error!(
+                    "Relay {} unreachable after {} consecutive probes — forcing iroh re-discovery",
+                    relay_url,
+                    consecutive_failures
+                );
+                endpoint.network_change().await;
+                consecutive_failures = 0;
             }
         }
     })
