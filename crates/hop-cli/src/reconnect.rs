@@ -4,7 +4,6 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
@@ -213,7 +212,7 @@ pub async fn show_reconnect_tui_via_agent(
                     break;
                 }
 
-                match poll_user_action(stdin_rx, &mut pending_input) {
+                match poll_user_action(stdin_rx, &mut pending_input).await {
                     PollAction::Quit => {
                         cleanup(&mut stdout);
                         return ReconnectAction::Quit;
@@ -299,7 +298,7 @@ pub async fn show_reconnect_tui_via_agent(
             }
         }
 
-        match poll_user_action(stdin_rx, &mut pending_input) {
+        match poll_user_action(stdin_rx, &mut pending_input).await {
             PollAction::Quit => {
                 cleanup(&mut stdout);
                 return ReconnectAction::Quit;
@@ -388,52 +387,54 @@ fn spinning_char(elapsed: u64) -> char {
     FRAMES[(elapsed as usize) % FRAMES.len()]
 }
 
-/// Non-blocking check for user actions on stdin.
+/// Drains pending stdin during the reconnect dialog, watching for the
+/// quit / retry-now control keys while preserving every other byte in order.
 ///
-/// Drains any data currently in `stdin_rx`. A chunk consisting of exactly
-/// a single byte that matches one of the recognised commands is treated
-/// as that command; anything else is real input (typed text, paste,
-/// escape sequences) and is appended to `pending_input` so the caller can
-/// replay it through the resumed session. Scanning every byte for the
-/// command bytes would false-positive on pasted text.
-///
-/// Recognised single-byte commands:
+/// A chunk consisting of exactly one byte — and only while no paste has been
+/// buffered yet — is treated as a deliberate dialog keypress:
 /// - `q`        / 0x03 (Ctrl+C) → `PollAction::Quit`
 /// - 0x0d (CR)  / 0x0a (LF)     → `PollAction::RetryNow`
 ///
-/// When the terminal is in raw mode we also check `crossterm::event` for
-/// the same keys, since some terminals deliver them as parsed key events
-/// rather than raw bytes on stdin.
-fn poll_user_action(
+/// Once `pending_input` holds bytes we are mid-paste, so a solitary control
+/// byte is far more likely the tail of that paste than a keypress; we keep it
+/// rather than risk dropping part of the stream. Everything else (typed text,
+/// paste, multi-byte escape sequences) is appended to `pending_input` so the
+/// caller can replay it through the resumed session. Crucially this keeps the
+/// closing `ESC[201~` bracketed-paste marker intact — drop it and the remote
+/// app (vim/tmux) stays stuck treating every later keystroke as literal paste.
+///
+/// We deliberately do NOT read stdin via `crossterm::event` here. A background
+/// blocking task owns the stdin fd and feeds `stdin_rx`; reading the fd again
+/// would race that task and silently steal paste bytes. Instead we block up to
+/// 250ms on the channel for the first chunk, which also paces the caller's
+/// countdown loop without busy-spinning.
+async fn poll_user_action(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     pending_input: &mut Vec<u8>,
 ) -> PollAction {
+    // Wait briefly for the first chunk to pace the caller's loop; a timeout or
+    // closed channel means there is nothing to do this cycle.
+    let first = match tokio::time::timeout(Duration::from_millis(250), stdin_rx.recv()).await {
+        Ok(Some(data)) => data,
+        _ => return PollAction::None,
+    };
+
     let mut action = PollAction::None;
-    while let Ok(data) = stdin_rx.try_recv() {
-        if data.len() == 1 {
+    let mut next = Some(first);
+    while let Some(data) = next.take() {
+        if data.len() == 1 && pending_input.is_empty() {
             match data[0] {
                 b'q' | 0x03 => return PollAction::Quit,
                 0x0d | 0x0a => {
                     action = PollAction::RetryNow;
+                    next = stdin_rx.try_recv().ok();
                     continue;
                 }
                 _ => {}
             }
         }
         pending_input.extend_from_slice(&data);
-    }
-
-    if event::poll(Duration::from_millis(250)).unwrap_or(false)
-        && let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read()
-    {
-        match code {
-            KeyCode::Char('q') => return PollAction::Quit,
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                return PollAction::Quit;
-            }
-            KeyCode::Enter => action = PollAction::RetryNow,
-            _ => {}
-        }
+        next = stdin_rx.try_recv().ok();
     }
 
     action
@@ -503,5 +504,67 @@ mod tests {
         assert_eq!(backoff_secs(0), 0);
         // very large attempt stays capped at 30
         assert_eq!(backoff_secs(100), 30);
+    }
+
+    /// A paste arriving as one chunk must be preserved byte-for-byte,
+    /// including the trailing `ESC[201~` bracketed-paste close marker. Losing
+    /// it leaves the remote app stuck treating later keystrokes as literal.
+    #[tokio::test]
+    async fn preserves_bracketed_paste_close_marker() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let mut paste = b"\x1b[200~hello world\x1b[201~".to_vec();
+        tx.send(paste.clone()).await.unwrap();
+        drop(tx);
+
+        let mut pending = Vec::new();
+        let action = poll_user_action(&mut rx, &mut pending).await;
+
+        assert_eq!(action, PollAction::None);
+        assert_eq!(pending, std::mem::take(&mut paste));
+    }
+
+    /// A lone control byte that arrives while a paste is already buffered is
+    /// the paste's tail, not a dialog command — it must be kept in order.
+    #[tokio::test]
+    async fn keeps_lone_control_byte_mid_paste() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        tx.send(b"\x1b[200~line one\n".to_vec()).await.unwrap();
+        tx.send(b"\r".to_vec()).await.unwrap(); // lone CR — would be RetryNow if empty
+        tx.send(b"line two\x1b[201~".to_vec()).await.unwrap();
+        drop(tx);
+
+        let mut pending = Vec::new();
+        let action = poll_user_action(&mut rx, &mut pending).await;
+
+        assert_eq!(action, PollAction::None);
+        assert_eq!(pending, b"\x1b[200~line one\n\rline two\x1b[201~".to_vec());
+    }
+
+    /// A solitary `q` / Ctrl-C with no buffered paste is a deliberate quit.
+    #[tokio::test]
+    async fn lone_quit_byte_with_empty_buffer_quits() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        tx.send(vec![b'q']).await.unwrap();
+        drop(tx);
+
+        let mut pending = Vec::new();
+        let action = poll_user_action(&mut rx, &mut pending).await;
+
+        assert_eq!(action, PollAction::Quit);
+    }
+
+    /// A solitary Enter with no buffered paste forces an immediate retry and
+    /// is consumed (not replayed into the resumed session).
+    #[tokio::test]
+    async fn lone_enter_with_empty_buffer_retries() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        tx.send(vec![b'\r']).await.unwrap();
+        drop(tx);
+
+        let mut pending = Vec::new();
+        let action = poll_user_action(&mut rx, &mut pending).await;
+
+        assert_eq!(action, PollAction::RetryNow);
+        assert!(pending.is_empty());
     }
 }
