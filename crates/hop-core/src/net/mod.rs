@@ -5,7 +5,7 @@ pub mod netmon;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{Connection, QuicTransportConfig};
+use iroh::endpoint::{Connection, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
@@ -65,7 +65,10 @@ fn hop_relay_mode() -> RelayMode {
 /// Waits for the endpoint to come online (connected to relay, address published
 /// to discovery) before returning.
 pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
-    let endpoint = Endpoint::builder()
+    // presets::N0 matches iroh 0.96's default builder (n0 DNS/pkarr address
+    // lookup so peers are findable by EndpointId). hop overrides the relay below
+    // with its own custom relay; the n0 relay default from the preset is replaced.
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
@@ -93,7 +96,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 /// Waits up to 5 seconds for the relay to come online. Clients can still
 /// connect via discovery if the relay is slow, so we proceed regardless.
 pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())

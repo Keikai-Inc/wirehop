@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 hop-vt.workspace = true
 iroh.workspace = true
+iroh-docs.workspace = true
+iroh-gossip.workspace = true
+iroh-blobs.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

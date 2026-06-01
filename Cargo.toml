@@ -14,10 +14,18 @@ hop-mcp = { path = "crates/hop-mcp" }
 hop-vt = { path = "crates/hop-vt" }
 
 # Networking
-iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix" }
+# iroh referenced as a crates.io version so the [patch.crates-io] below redirects
+# it AND the transitive iroh deps of iroh-docs/blobs/gossip to our fork (single
+# iroh instance). The fork is iroh 0.97.0 + our relay-cascade fix.
+iroh = "0.97"
+# iroh-docs CRDT + its mandatory companions (content-addressed values via blobs,
+# live replication via gossip). Stable lockstep matched to iroh 0.97.
+iroh-docs = "0.97"
+iroh-gossip = "0.97"
+iroh-blobs = "0.99"
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "signal"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -71,11 +79,21 @@ cron = "0.13"
 # Testing
 tempfile = "3"
 
-# Patch iroh-quinn to fix panic on drained connections under heavy stream load.
-# See vendor/iroh-quinn/src/connection.rs:287 — replaces unreachable!() with
-# graceful LocallyClosed fallback. Filed upstream: quinn-rs/quinn.
+# NOTE: iroh 0.97 switched from iroh-quinn (n0's quinn fork) to stock quinn
+# 0.11.x, so the previous `iroh-quinn` patch (a panic fix on drained connections)
+# is no longer in the dependency graph. TODO(p2p): verify whether stock
+# quinn 0.11.9 still has the `unreachable!()` panic on drained-without-error
+# connections (the fix was filed upstream at quinn-rs/quinn); if not, patch
+# `quinn` instead. Tracked as a Phase 1 robustness item.
 [patch.crates-io]
-iroh-quinn = { path = "vendor/iroh-quinn" }
+# Redirect iroh AND its sibling workspace crates (iroh-base, iroh-relay) to our
+# fork: upstream iroh 0.97.0 + the macOS relay-connection-cascade fix. All three
+# must be patched together — iroh-docs/blobs/gossip pull iroh-base/iroh-relay
+# from crates.io, and mixing those with the fork's copies yields two iroh_base
+# versions (PublicKey type mismatch).
+iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+iroh-base = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
 
 [profile.release]
 lto = true
