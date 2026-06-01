@@ -250,27 +250,25 @@ fn has_claude_cli() -> bool {
 }
 
 /// Extract an OAuth token (sk-ant-oat01-...) from setup-token's stdout.
-/// The output contains ASCII art and text; the token is on its own line.
+///
+/// Searches each line independently. The previous implementation joined all
+/// lines with an empty string, then captured alphanumeric chars after the
+/// `sk-ant-oat01-` marker — which silently appended the next line's leading
+/// word (e.g. "Store" from "Store this token somewhere safe") onto the token,
+/// producing an invalid bearer that Anthropic's API rejects with 401.
 fn extract_token_from_output(output: &str) -> Option<String> {
-    // Token lines may be split across multiple lines (line wrapping).
-    // Collect all text, then find the token pattern.
-    let clean: String = output
-        .lines()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join("");
-
-    // Find sk-ant-oat01- and capture until whitespace or non-token char
-    if let Some(start) = clean.find("sk-ant-oat01-") {
-        let token_chars: String = clean[start..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if token_chars.len() > 20 {
-            return Some(token_chars);
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(start) = trimmed.find("sk-ant-oat01-") {
+            let token_chars: String = trimmed[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if token_chars.len() > 20 {
+                return Some(token_chars);
+            }
         }
     }
-
     None
 }
 
@@ -600,4 +598,37 @@ fn base64_url_encode(data: &[u8]) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     URL_SAFE_NO_PAD.encode(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_token_does_not_swallow_next_line() {
+        // Realistic `claude setup-token` output: token on its own line,
+        // followed by instructional text. Prior bug joined lines with "" and
+        // appended "Store" (and would have appended anything else) to the
+        // captured token, breaking auth with 401 Invalid bearer token.
+        let output = "\
+            Your long-lived token:\n\
+            sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AAAA\n\
+            Store this token somewhere safe.\n\
+        ";
+        let token = extract_token_from_output(output).expect("token should be extracted");
+        assert_eq!(token, "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AAAA");
+        assert!(!token.contains("Store"));
+    }
+
+    #[test]
+    fn extract_token_handles_inline_label() {
+        let output = "Token: sk-ant-oat01-XYZ789-_ABC right here\n";
+        let token = extract_token_from_output(output).expect("token should be extracted");
+        assert_eq!(token, "sk-ant-oat01-XYZ789-_ABC");
+    }
+
+    #[test]
+    fn extract_token_returns_none_when_missing() {
+        assert!(extract_token_from_output("no token here").is_none());
+    }
 }
