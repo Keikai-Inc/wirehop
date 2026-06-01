@@ -1782,6 +1782,7 @@ dependencies = [
  "crossterm",
  "directories",
  "filetime",
+ "futures-lite",
  "hex",
  "hop-vt",
  "hostname",

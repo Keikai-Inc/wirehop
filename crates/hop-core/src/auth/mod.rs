@@ -104,6 +104,7 @@ pub async fn authenticate_client(
     recv: &mut RecvStream,
     remote_id: &PublicKey,
     config_dir: &Path,
+    netdoc: Option<&crate::netdoc::NetDoc>,
 ) -> Result<(AuthOutcome, Option<ClientMessage>)> {
     let peers = PeersStore::load(config_dir)?;
 
@@ -147,6 +148,15 @@ pub async fn authenticate_client(
                 );
                 peers.save(config_dir)?;
 
+                // Dual-write to the network document (best-effort) so the new
+                // peer replicates to other nodes. Never fail auth on a doc error.
+                if let Some(nd) = netdoc
+                    && let Some(entry) = peers.peers.iter().find(|p| p.node_id == remote_id.to_string())
+                    && let Err(e) = nd.put_peer(entry).await
+                {
+                    tracing::warn!("netdoc: failed to mirror invited peer: {e:#}");
+                }
+
                 // Tell client they're authorized
                 proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
 
@@ -166,11 +176,17 @@ pub async fn authenticate_client(
         | ClientMessage::RequestExec { .. }
         | ClientMessage::RequestExecV2 { .. }
         | ClientMessage::RequestAdmin(_) => {
+            // NOTE: authorization remains peers.json-authoritative in this
+            // increment (byte-identical to before). The network document is a
+            // shadow mirror only. Making the doc authoritative for adds, plus
+            // doc-driven revocation, lands in the next increment together with
+            // remove_peer dual-write and cross-host federation — doing it now,
+            // without remove_peer updating the doc, would let a stale doc entry
+            // re-authorize a removed peer.
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
                 let role = peers.peer_role(remote_id);
                 let sandbox = peers.peer_sandbox(remote_id);
-                // Update last seen
                 let mut peers = peers;
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;

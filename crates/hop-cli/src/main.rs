@@ -264,6 +264,9 @@ type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
     let public_key = secret_key.public();
     let secrets_key = hop_core::datastore::derive_secrets_key(&secret_key.to_bytes());
+    // Derive the netdoc endpoint key before the host secret is moved into the
+    // host endpoint. The netdoc stack runs on its own isolated endpoint.
+    let netdoc_key = net::derive_netdoc_secret_key(&secret_key);
     let endpoint = net::create_host_endpoint(secret_key).await?;
 
     let relay_url = net::host_relay_url(&endpoint);
@@ -312,6 +315,49 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // crashes the interface watcher misses (the daemon's TCP session can stay
     // ESTABLISHED for hours after the relay link is functionally broken).
     let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone());
+
+    // Network document (Phase 1): spawn the iroh-docs replication stack on its
+    // own isolated endpoint and migrate existing peers/roles on first run. This
+    // is best-effort and NON-FATAL — if any of it fails the daemon keeps serving
+    // on peers.json exactly as before. Done in the background so it never delays
+    // the accept loop; auth falls back to peers.json until the cell is populated.
+    let netdoc_cell: NetDocCell = std::sync::Arc::new(tokio::sync::OnceCell::new());
+    {
+        let cell = netdoc_cell.clone();
+        let cfg = config_dir.to_path_buf();
+        tokio::spawn(async move {
+            let endpoint = match net::create_netdoc_endpoint(netdoc_key).await {
+                Ok(ep) => ep,
+                Err(e) => {
+                    tracing::warn!("netdoc: endpoint bind failed, continuing without it: {e:#}");
+                    return;
+                }
+            };
+            let store_dir = cfg.join("netdoc");
+            let meta_path = cfg.join("netdoc.json");
+            match hop_core::netdoc::NetDoc::open_or_create(endpoint, &store_dir, &meta_path).await {
+                Ok((net, created)) => {
+                    if created {
+                        if let Ok(peers) = hop_core::config::PeersStore::load(&cfg) {
+                            match net.ensure_peers(&peers.peers).await {
+                                Ok(n) => tracing::info!("netdoc: migrated {n} peer(s)"),
+                                Err(e) => tracing::warn!("netdoc: peer migration failed: {e:#}"),
+                            }
+                        }
+                        if let Ok(roles) = hop_core::fleet::RolesStore::load(&cfg) {
+                            match net.ensure_roles(&roles.roles).await {
+                                Ok(n) => tracing::info!("netdoc: migrated {n} role(s)"),
+                                Err(e) => tracing::warn!("netdoc: role migration failed: {e:#}"),
+                            }
+                        }
+                    }
+                    tracing::info!("netdoc ready (namespace {})", net.namespace());
+                    let _ = cell.set(std::sync::Arc::new(net));
+                }
+                Err(e) => tracing::warn!("netdoc: init failed, continuing without it: {e:#}"),
+            }
+        });
+    }
 
     // Warn about legacy peers with no bound username when running as root
     #[cfg(unix)]
@@ -507,6 +553,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         let registry = registry.clone();
                         let ds = datastore.clone();
                         let ext = ext_dispatcher.clone();
+                        let nd = netdoc_cell.clone();
                         // Double-spawn: the inner task's JoinHandle lets us
                         // observe panics explicitly (via JoinError::is_panic)
                         // and log which connection died, instead of just
@@ -514,7 +561,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         // and losing the context.
                         tokio::spawn(async move {
                             let inner = tokio::spawn(async move {
-                                handle_incoming(inc, &config_dir, registry, ds, ext).await
+                                handle_incoming(inc, &config_dir, registry, ds, ext, nd).await
                             });
                             match inner.await {
                                 Ok(Ok(())) => {}
@@ -576,18 +623,24 @@ impl Drop for ConnCloseGuard<'_> {
     }
 }
 
+/// Shared, lazily-initialized handle to the network document. `None` until the
+/// netdoc stack finishes spawning in the background (auth falls back to
+/// peers.json until then), and stays empty if netdoc init fails.
+type NetDocCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<hop_core::netdoc::NetDoc>>>;
+
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
     ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
+    netdoc: NetDocCell,
 ) -> Result<()> {
     tracing::debug!("Awaiting QUIC handshake...");
     let conn: iroh::endpoint::Connection = incoming.await?;
     tracing::debug!("QUIC handshake complete from {}", conn.remote_id().fmt_short());
     let _close_guard = ConnCloseGuard { conn: &conn };
-    handle_incoming_inner(&conn, config_dir, registry, datastore, ext_dispatcher).await
+    handle_incoming_inner(&conn, config_dir, registry, datastore, ext_dispatcher, netdoc).await
 }
 
 async fn handle_incoming_inner(
@@ -596,6 +649,7 @@ async fn handle_incoming_inner(
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
     ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
+    netdoc: NetDocCell,
 ) -> Result<()> {
     let remote_id = conn.remote_id();
     let protocol_version = net::negotiated_protocol_version(conn);
@@ -605,11 +659,13 @@ async fn handle_incoming_inner(
     let (mut send, mut recv) = conn.accept_bi().await?;
     tracing::debug!("First bi-stream accepted from {}", remote_id.fmt_short());
 
+    let netdoc_ref = netdoc.get().map(|arc| arc.as_ref());
     let (outcome, _first_msg) = auth::authenticate_client(
         &mut send,
         &mut recv,
         &remote_id,
         config_dir,
+        netdoc_ref,
     )
     .await?;
 

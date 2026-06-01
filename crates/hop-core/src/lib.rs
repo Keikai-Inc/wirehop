@@ -7,6 +7,7 @@ pub mod extensions;
 pub mod fleet;
 pub mod invite;
 pub mod net;
+pub mod netdoc;
 pub mod proto;
 pub mod sandbox;
 pub mod shell;

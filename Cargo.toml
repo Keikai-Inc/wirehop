@@ -26,6 +26,7 @@ iroh-blobs = "0.99"
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "signal"] }
+futures-lite = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

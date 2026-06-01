@@ -114,6 +114,48 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     Ok(endpoint)
 }
 
+/// Derive a stable, dedicated secret key for the network-document endpoint.
+///
+/// The netdoc replication endpoint runs as a *separate* iroh endpoint (distinct
+/// NodeId) from the host's shell/auth endpoint, so the new iroh-docs stack is
+/// fully isolated from the battle-tested connection path. Deriving the key from
+/// the host secret keeps the netdoc NodeId stable across restarts without
+/// storing a second secret on disk.
+pub fn derive_netdoc_secret_key(host_secret: &SecretKey) -> SecretKey {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(host_secret.to_bytes());
+    h.update(b"hop-netdoc-endpoint-v1");
+    let out = h.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&out);
+    SecretKey::from_bytes(&bytes)
+}
+
+/// Create the iroh endpoint for the network-document (replication) stack.
+///
+/// Like [`create_host_endpoint`] but binds **no ALPNs** — the iroh-docs/gossip/
+/// blobs `Router` registers its own ALPNs on this endpoint when it spawns. Uses
+/// hop's custom relay so doc replication flows through controlled infrastructure.
+pub async fn create_netdoc_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .relay_mode(hop_relay_mode())
+        .transport_config(hop_transport_config())
+        .bind()
+        .await
+        .context("Failed to bind netdoc endpoint")?;
+
+    if tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online())
+        .await
+        .is_err()
+    {
+        tracing::warn!("netdoc relay did not come online within 10s, proceeding anyway");
+    }
+
+    Ok(endpoint)
+}
+
 /// Get the relay URL for a host endpoint, if available.
 pub fn host_relay_url(endpoint: &Endpoint) -> Option<RelayUrl> {
     endpoint.addr().relay_urls().next().cloned()
