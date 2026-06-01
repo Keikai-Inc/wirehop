@@ -33,4 +33,5 @@ How hop works — protocols, algorithms, internal architecture.
 | [transfer.md](technical/transfer.md) | Delta algorithm, negotiation, privilege-separated helper |
 | [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |
 | [networking.md](technical/networking.md) | iroh endpoint, relay, netmon, agent/mux IPC, reconnection |
+| [p2p-network.md](technical/p2p-network.md) | **(Design)** Orchestratorless P2P VPN — iroh-docs state, virtual IPs, TUN data plane, MagicDNS, decentralized invites/roles, commercial control plane |
 | [tap.md](technical/tap.md) | hop-tap internals — eBPF program, CO-RE, off-screen emulator, streaming dispatcher |
