@@ -755,6 +755,7 @@ mod tests {
             last_seen: None,
             username: None,
             role: PeerRole::Peer,
+            role_name: None,
             sandbox: SandboxPolicy::default(),
         }
     }

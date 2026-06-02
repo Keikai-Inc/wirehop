@@ -342,6 +342,7 @@ impl OrchestratorBackend for LocalBackend {
                 AdminRequest::CreateInvite {
                     username: username.map(String::from),
                     role: PeerRole::Peer,
+                    role_name: None,
                 },
             )
             .await?

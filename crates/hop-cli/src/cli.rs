@@ -30,6 +30,10 @@ pub enum Command {
         /// Unix username the invited peer will log in as
         #[arg(long)]
         user: Option<String>,
+        /// Named role for the invited peer (e.g. developer, ops). Defaults to the
+        /// host's configured default role.
+        #[arg(long)]
+        role: Option<String>,
         /// Human-readable name for this host (defaults to system hostname)
         #[arg(long)]
         name: Option<String>,
@@ -322,6 +326,9 @@ pub enum AdminAction {
         /// Unix username for the invited peer
         #[arg(long)]
         user: Option<String>,
+        /// Named role for the invited peer (e.g. developer, ops)
+        #[arg(long)]
+        role: Option<String>,
         /// Create a creator invite (admin access)
         #[arg(long)]
         creator: bool,

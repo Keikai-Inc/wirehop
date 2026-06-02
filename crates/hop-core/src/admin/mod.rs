@@ -26,8 +26,8 @@ pub fn handle_admin_request(
     datastore: Option<&Datastore>,
 ) -> AdminResponse {
     match request {
-        AdminRequest::CreateInvite { username, role } => {
-            handle_create_invite(config_dir, relay_url, host_public_key, username, role)
+        AdminRequest::CreateInvite { username, role, role_name } => {
+            handle_create_invite(config_dir, relay_url, host_public_key, username, role, role_name)
         }
         AdminRequest::ListPeers => handle_list_peers(config_dir),
         AdminRequest::RemovePeer { node_id_prefix } => {
@@ -126,6 +126,7 @@ fn handle_create_invite(
     host_public_key: &PublicKey,
     username: Option<String>,
     role: PeerRole,
+    role_name: Option<String>,
 ) -> AdminResponse {
     let expiry_secs = match role {
         PeerRole::Creator => 3600,  // 1 hour for creator invites
@@ -138,6 +139,7 @@ fn handle_create_invite(
         username.as_deref(),
         None,
         role,
+        role_name,
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
     ) {
@@ -239,6 +241,7 @@ fn handle_create_user(
             Some(username),
             None,
             PeerRole::Peer,
+            None,
             15 * 60,
             crate::sandbox::SandboxPolicy::default(),
         ) {
@@ -456,6 +459,7 @@ mod tests {
             AdminRequest::CreateInvite {
                 username: None,
                 role: PeerRole::Peer,
+                role_name: None,
             },
             dir.path(),
             None,
@@ -482,6 +486,7 @@ mod tests {
             AdminRequest::CreateInvite {
                 username: None,
                 role: PeerRole::Creator,
+                role_name: None,
             },
             dir.path(),
             Some("https://relay.example.com"),
@@ -611,6 +616,7 @@ mod tests {
             AdminRequest::CreateInvite {
                 username: None,
                 role: PeerRole::Creator,
+                role_name: None,
             },
             dir.path(),
             None,

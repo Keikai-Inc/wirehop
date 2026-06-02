@@ -146,6 +146,11 @@ pub async fn authenticate_client(
                     consumed.role.clone(),
                     consumed.sandbox.clone(),
                 );
+                // Record the named role (resolves to a RoleDefinition: reach +
+                // confinement). `None` → the peer is governed by the legacy tier.
+                if let Some(p) = peers.peers.iter_mut().find(|p| p.node_id == remote_id.to_string()) {
+                    p.role_name = consumed.role_name.clone();
+                }
                 peers.save(config_dir)?;
 
                 // Dual-write to the network document (best-effort) so the new

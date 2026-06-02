@@ -102,6 +102,9 @@ pub enum AdminRequest {
     CreateInvite {
         username: Option<String>,
         role: PeerRole,
+        /// Named role for the invited peer (`None` → host default role).
+        #[serde(default)]
+        role_name: Option<String>,
     },
     /// List authorized peers.
     ListPeers,

@@ -75,14 +75,14 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
-        Command::Invite { user, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Invite { user, role, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             // Ensure dir exists and auto-generate identity if needed (no need to run `hop id` first)
             std::fs::create_dir_all(&config_dir)
                 .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
-            cmd_invite(secret_key, &config_dir, user.as_deref(), name.as_deref(), sandbox)
+            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), name.as_deref(), sandbox)
         }
         Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -456,6 +456,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 creator_username.as_deref(),
                 None,
                 PeerRole::Creator,
+                Some("admin".to_string()),
                 3600, // 1-hour expiry
                 hop_core::sandbox::SandboxPolicy::default(),
             ) {
@@ -1000,6 +1001,7 @@ fn cmd_invite(
     secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     username: Option<&str>,
+    role_name: Option<&str>,
     host_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
 ) -> Result<()> {
@@ -1025,6 +1027,10 @@ fn cmd_invite(
     let relay_url = std::fs::read_to_string(config_dir.join("relay_url"))
         .ok()
         .or_else(|| Some(hop_core::net::HOP_RELAY_URL.to_string()));
+    // No --role → the host's configured default role (least-privilege `member`).
+    let resolved_role = role_name
+        .map(String::from)
+        .or_else(|| config::HostConfig::load(config_dir).ok().map(|c| c.default_role));
     let token = invite::generate_invite_with_role(
         &public_key,
         config_dir,
@@ -1032,6 +1038,7 @@ fn cmd_invite(
         username,
         host_name,
         PeerRole::Peer,
+        resolved_role,
         15 * 60,
         sandbox.clone(),
     )?;
@@ -2016,9 +2023,10 @@ async fn cmd_admin(
     action: AdminAction,
 ) -> Result<()> {
     let request = match &action {
-        AdminAction::Invite { user, creator, .. } => AdminRequest::CreateInvite {
+        AdminAction::Invite { user, role, creator, .. } => AdminRequest::CreateInvite {
             username: user.clone(),
             role: if *creator { PeerRole::Creator } else { PeerRole::Peer },
+            role_name: role.clone(),
         },
         AdminAction::Peers => AdminRequest::ListPeers,
         AdminAction::RemovePeer { id } => AdminRequest::RemovePeer {

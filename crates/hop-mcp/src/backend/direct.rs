@@ -355,6 +355,7 @@ impl OrchestratorBackend for DirectBackend {
                 AdminRequest::CreateInvite {
                     username: username.map(String::from),
                     role: PeerRole::Peer,
+                    role_name: None,
                 },
             )
             .await?

@@ -28,9 +28,13 @@ pub struct InviteToken {
     /// Human-readable name for the host (e.g. system hostname).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub host_name: Option<String>,
-    /// Role assigned to the invited peer (default: Peer).
+    /// Auth tier assigned to the invited peer (default: Peer).
     #[serde(default, skip_serializing_if = "is_default_peer_role")]
     pub role: PeerRole,
+    /// Named role assigned to the invited peer (resolves to a `RoleDefinition`).
+    /// `None` → the host's configured default role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
     /// Sandbox restrictions for this invite (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: SandboxPolicy,
@@ -54,9 +58,12 @@ pub struct PendingInvite {
     /// Unix username the invited peer will log in as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Role assigned to the invited peer (default: Peer).
+    /// Auth tier assigned to the invited peer (default: Peer).
     #[serde(default)]
     pub role: PeerRole,
+    /// Named role assigned to the invited peer (`None` → host default role).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
     /// Sandbox restrictions for this invite.
     #[serde(default)]
     pub sandbox: SandboxPolicy,
@@ -114,6 +121,7 @@ impl PendingInvitesStore {
             Some(ConsumedInvite {
                 username: invite.username,
                 role: invite.role,
+                role_name: invite.role_name,
                 sandbox: invite.sandbox,
             })
         } else {
@@ -126,6 +134,7 @@ impl PendingInvitesStore {
 pub struct ConsumedInvite {
     pub username: Option<String>,
     pub role: PeerRole,
+    pub role_name: Option<String>,
     pub sandbox: SandboxPolicy,
 }
 
@@ -149,6 +158,7 @@ pub fn generate_invite(
         username,
         host_name,
         PeerRole::Peer,
+        None,
         15 * 60,
         SandboxPolicy::default(),
     )
@@ -165,6 +175,7 @@ pub fn generate_invite_with_role(
     username: Option<&str>,
     host_name: Option<&str>,
     role: PeerRole,
+    role_name: Option<String>,
     expiry_secs: u64,
     sandbox: SandboxPolicy,
 ) -> Result<String> {
@@ -202,6 +213,7 @@ pub fn generate_invite_with_role(
         created_at: unix_now(),
         username: username.map(String::from),
         role: role.clone(),
+        role_name: role_name.clone(),
         sandbox: sandbox.clone(),
     });
     store.save(config_dir)?;
@@ -217,6 +229,7 @@ pub fn generate_invite_with_role(
         username: username.map(String::from),
         host_name: resolved_host_name,
         role,
+        role_name: role_name.clone(),
         sandbox,
     };
     let json = serde_json::to_string(&token)?;
@@ -282,6 +295,7 @@ mod tests {
             username: None,
             host_name: None,
             role: PeerRole::Peer,
+            role_name: None,
             sandbox: SandboxPolicy::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
@@ -297,6 +311,7 @@ mod tests {
             username: None,
             host_name: None,
             role: PeerRole::Creator,
+            role_name: None,
             sandbox: SandboxPolicy::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
@@ -323,6 +338,7 @@ mod tests {
             None,
             Some("test-host"),
             PeerRole::Creator,
+            None,
             3600,
             SandboxPolicy::default(),
         )
@@ -360,6 +376,7 @@ mod tests {
             None,
             None,
             PeerRole::Creator,
+            None,
             3600,
             SandboxPolicy::default(),
         )
@@ -414,6 +431,7 @@ mod tests {
                     created_at: 1000,
                     username: None,
                     role: PeerRole::Peer,
+                    role_name: None,
                     sandbox: SandboxPolicy::default(),
                 },
                 PendingInvite {
@@ -421,6 +439,7 @@ mod tests {
                     created_at: unix_now(),
                     username: None,
                     role: PeerRole::Creator,
+                    role_name: None,
                     sandbox: SandboxPolicy::default(),
                 },
             ],

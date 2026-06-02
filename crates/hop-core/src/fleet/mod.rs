@@ -98,6 +98,18 @@ impl RolesStore {
     pub fn seed_defaults(config_dir: &Path) -> Result<Self> {
         let store = Self {
             roles: vec![
+                // Least-privilege default: in the warren with an address, but
+                // default-deny reach (no host tags) until elevated.
+                RoleDefinition {
+                    name: "member".into(),
+                    host_tags: vec![],
+                    sudo: false,
+                    admin: false,
+                    user_mode: UserMode::Individual,
+                    groups: vec![],
+                    shell: None,
+                    sandbox: SandboxPolicy::default(),
+                },
                 RoleDefinition {
                     name: "admin".into(),
                     host_tags: vec!["*".into()],
@@ -254,6 +266,7 @@ pub fn handle_create_fleet_invite(
         None,
         None,
         PeerRole::Creator,
+        None,
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
     ) {
@@ -957,10 +970,14 @@ mod tests {
     // --- seed_defaults tests ---
 
     #[test]
-    fn seed_defaults_creates_five_roles() {
+    fn seed_defaults_creates_default_roles() {
         let dir = tempfile::tempdir().unwrap();
         let store = RolesStore::seed_defaults(dir.path()).unwrap();
-        assert_eq!(store.roles.len(), 5);
+        assert_eq!(store.roles.len(), 6);
+        // Least-privilege default exists with no reach.
+        let member = store.find_role("member").unwrap();
+        assert!(member.host_tags.is_empty());
+        assert!(!member.admin);
 
         // Verify file was written
         assert!(dir.path().join("roles.json").exists());
@@ -1014,9 +1031,11 @@ mod tests {
         RolesStore::seed_defaults(dir.path()).unwrap();
 
         let loaded = RolesStore::load(dir.path()).unwrap();
-        assert_eq!(loaded.roles.len(), 5);
-        assert_eq!(loaded.roles[0].name, "admin");
-        assert_eq!(loaded.roles[4].name, "ci");
+        assert_eq!(loaded.roles.len(), 6);
+        // member is seeded first; named lookups are order-independent.
+        assert_eq!(loaded.roles[0].name, "member");
+        assert!(loaded.find_role("admin").is_some());
+        assert!(loaded.find_role("ci").is_some());
     }
 
     // --- Fleet admin handler tests ---

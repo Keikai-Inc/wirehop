@@ -208,9 +208,14 @@ pub struct Peer {
     /// Unix username this peer logs in as (None = host's own user).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Role of this peer (default: Peer). Creator peers get admin access.
+    /// Auth tier of this peer (default: Peer). Creator peers get admin access.
+    /// Retained as the compatibility shim while the named-role model lands.
     #[serde(default)]
     pub role: PeerRole,
+    /// Named role (resolves to a `RoleDefinition`: tags → reach, sandbox →
+    /// confinement). `None` = legacy peer governed only by `role`/`sandbox`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -255,6 +260,7 @@ impl PeersStore {
                 last_seen: None,
                 username,
                 role,
+                role_name: None,
                 sandbox,
             });
         }
@@ -434,6 +440,15 @@ pub struct HostConfig {
     /// Default: 10.
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+
+    /// Named role assigned to invites that don't specify one. Defaults to the
+    /// least-privilege `member` (default-deny reach). Re-point per deployment.
+    #[serde(default = "default_role_name")]
+    pub default_role: String,
+}
+
+fn default_role_name() -> String {
+    "member".to_string()
 }
 
 fn default_session_timeout() -> u64 {
@@ -449,6 +464,7 @@ impl Default for HostConfig {
         Self {
             session_timeout_secs: default_session_timeout(),
             max_sessions: default_max_sessions(),
+            default_role: default_role_name(),
         }
     }
 }
