@@ -47,6 +47,68 @@ pub fn is_virtual_addr(addr: Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+// ── Data plane (unix only; opt-in) ───────────────────────────────────────
+
+/// Netmask for `100.64.0.0/10` (a /10 = `255.192.0.0`).
+#[cfg(unix)]
+const CGNAT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
+
+/// Shared slot holding the active TUN device when the VPN is enabled.
+/// `None` means the VPN is off — the inbound handler drops datagrams and the
+/// daemon's default behavior is entirely unaffected.
+#[cfg(unix)]
+pub type TunSlot = std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tun::AsyncDevice>>>>;
+
+/// Create a TUN device bound to `addr` within `100.64.0.0/10` and bring it up.
+/// The kernel installs a route for the /10 to this interface automatically.
+#[cfg(unix)]
+pub async fn create_tun(addr: Ipv4Addr) -> anyhow::Result<tun::AsyncDevice> {
+    let mut config = tun::configure();
+    config
+        .address(addr)
+        .netmask(CGNAT_NETMASK)
+        .mtu(VPN_MTU)
+        .up();
+    tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("create TUN device: {e}"))
+}
+
+/// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
+/// packets) to the TUN device. Dropped silently when the VPN is off.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct VpnInbound {
+    tun: TunSlot,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for VpnInbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VpnInbound").finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl VpnInbound {
+    pub fn new(tun: TunSlot) -> Self {
+        Self { tun }
+    }
+}
+
+#[cfg(unix)]
+impl iroh::protocol::ProtocolHandler for VpnInbound {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        while let Ok(dg) = conn.read_datagram().await {
+            if let Some(tun) = self.tun.read().await.clone() {
+                let _ = tun.send(&dg).await;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

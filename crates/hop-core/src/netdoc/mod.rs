@@ -44,6 +44,7 @@ const KEY_PEER_PREFIX: &str = "peer/";
 const KEY_ROLE_PREFIX: &str = "role/";
 const KEY_REVOCATION_PREFIX: &str = "revocation/";
 const KEY_IP_PREFIX: &str = "ip/";
+const KEY_VPN_PREFIX: &str = "vpn/";
 
 /// Base of the CGNAT range `100.64.0.0/10` (Tailscale-style), as a u32.
 const CGNAT_BASE: u32 = 0x6440_0000; // 100.64.0.0
@@ -91,13 +92,18 @@ pub enum Bootstrap {
 /// The network document handle: an open replicated namespace plus the iroh-docs
 /// protocol stack (docs + gossip + blobs) running on a `Router`.
 pub struct NetDoc {
-    /// Keeps the docs/gossip/blobs accept loop alive. Dropping aborts it.
+    /// Keeps the docs/gossip/blobs (+ vpn) accept loop alive. Dropping aborts it.
     _router: Router,
     /// Owns the persistent blobs backing store; also used to read entry values.
     fs_store: FsStore,
     doc: Doc,
     author: AuthorId,
     namespace: NamespaceId,
+    /// The endpoint the docs/vpn stack runs on (for opening VPN connections).
+    endpoint: Endpoint,
+    /// Active TUN device when the VPN is enabled (Phase 3, opt-in). `None` = off.
+    #[cfg(unix)]
+    vpn_tun: crate::vpn::TunSlot,
 }
 
 impl NetDoc {
@@ -138,11 +144,21 @@ impl NetDoc {
         };
         let namespace = doc.id();
 
-        let router = Router::builder(endpoint)
+        #[cfg(unix)]
+        let vpn_tun: crate::vpn::TunSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
+        let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .spawn();
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
+        // The VPN inbound handler is always registered so peers can establish the
+        // hop/vpn/1 path, but it only forwards packets once the TUN slot is set
+        // (i.e. the VPN is explicitly enabled). Off by default → no-op.
+        #[cfg(unix)]
+        {
+            builder = builder.accept(crate::vpn::VPN_ALPN, crate::vpn::VpnInbound::new(vpn_tun.clone()));
+        }
+        let router = builder.spawn();
 
         Ok(Self {
             _router: router,
@@ -150,6 +166,9 @@ impl NetDoc {
             doc,
             author,
             namespace,
+            endpoint,
+            #[cfg(unix)]
+            vpn_tun,
         })
     }
 
@@ -336,6 +355,118 @@ impl NetDoc {
         Ok(out)
     }
 
+    // ── VPN endpoint registry (Phase 3) ──────────────────────────────────
+
+    /// Publish that this host's virtual `addr` is reachable for VPN traffic at
+    /// this netdoc endpoint. Value: `"<endpoint_id_hex> <relay_url?>"`.
+    pub async fn register_vpn_endpoint(&self, addr: std::net::Ipv4Addr) -> Result<()> {
+        let relay = crate::net::host_relay_url(&self.endpoint)
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let value = format!("{} {relay}", self.endpoint.id());
+        let key = format!("{KEY_VPN_PREFIX}{addr}");
+        self.doc
+            .set_bytes(self.author, key.into_bytes(), value.into_bytes())
+            .await
+            .context("registering vpn endpoint")?;
+        Ok(())
+    }
+
+    /// Resolve a virtual `addr` to the VPN endpoint serving it.
+    pub async fn lookup_vpn_endpoint(
+        &self,
+        addr: std::net::Ipv4Addr,
+    ) -> Result<Option<(iroh::PublicKey, Option<iroh::RelayUrl>)>> {
+        let key = format!("{KEY_VPN_PREFIX}{addr}");
+        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+        let Some(entry) = self.doc.get_one(query).await.context("get_one vpn")? else {
+            return Ok(None);
+        };
+        if entry.content_len() == 0 {
+            return Ok(None);
+        }
+        let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+        let value = String::from_utf8_lossy(&bytes);
+        let mut parts = value.split_whitespace();
+        let id_hex = parts.next().unwrap_or_default();
+        let Ok(pubkey) = id_hex.parse::<iroh::PublicKey>() else {
+            return Ok(None);
+        };
+        let relay = parts.next().and_then(|s| s.parse::<iroh::RelayUrl>().ok());
+        Ok(Some((pubkey, relay)))
+    }
+
+    /// Enable the VPN data plane (Phase 3, opt-in): claim a virtual IP, create
+    /// the TUN device, advertise the endpoint, and start forwarding. Off unless
+    /// explicitly called. Returns the assigned virtual IP.
+    #[cfg(unix)]
+    pub async fn enable_vpn(
+        self: &std::sync::Arc<Self>,
+        host_node_id: &str,
+    ) -> Result<std::net::Ipv4Addr> {
+        let addr = self.claim_virtual_ip(host_node_id).await?;
+        let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
+        *self.vpn_tun.write().await = Some(tun.clone());
+        self.register_vpn_endpoint(addr).await?;
+        let me = std::sync::Arc::clone(self);
+        tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
+        Ok(addr)
+    }
+
+    /// Read packets off the TUN device and forward each to the owning peer over
+    /// a `hop/vpn/1` QUIC-datagram connection (re-using/reconnecting as needed).
+    #[cfg(unix)]
+    async fn vpn_outbound_loop(&self, tun: std::sync::Arc<tun::AsyncDevice>) {
+        use std::collections::HashMap;
+        let mut conns: HashMap<iroh::PublicKey, iroh::endpoint::Connection> = HashMap::new();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let n = match tun.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("vpn: TUN read error, stopping forwarder: {e}");
+                    break;
+                }
+            };
+            let pkt = &buf[..n];
+            let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
+            if !crate::vpn::is_virtual_addr(dst) {
+                continue;
+            }
+            let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
+                Ok(Some(v)) => v,
+                _ => continue, // unknown destination — drop
+            };
+            // Reuse an open connection, else dial one.
+            let conn = match conns.get(&pubkey) {
+                Some(c) if c.close_reason().is_none() => c.clone(),
+                _ => {
+                    match crate::net::connect_to_host_with_alpn(
+                        &self.endpoint,
+                        pubkey,
+                        relay.as_ref(),
+                        crate::vpn::VPN_ALPN,
+                    )
+                    .await
+                    {
+                        Ok((c, _)) => {
+                            conns.insert(pubkey, c.clone());
+                            c
+                        }
+                        Err(e) => {
+                            tracing::debug!("vpn: dial {pubkey} failed: {e}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(pkt)) {
+                tracing::debug!("vpn: send_datagram failed: {e}");
+                conns.remove(&pubkey);
+            }
+        }
+    }
+
     async fn lookup_ip_owner(&self, key: &str) -> Result<Option<String>> {
         let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
         let Some(entry) = self.doc.get_one(query).await.context("get_one ip")? else {
@@ -367,6 +498,15 @@ impl NetDoc {
             .await
             .context("sharing read ticket")?;
         Ok(ticket.to_string())
+    }
+
+    /// Produce a WRITE-capability ticket so another host can join this network
+    /// (federation, Phase 3): import it to replicate and contribute entries.
+    pub async fn write_ticket(&self) -> Result<DocTicket> {
+        self.doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .context("sharing write ticket")
     }
 
     // ── Peers ────────────────────────────────────────────────────────────
@@ -588,5 +728,38 @@ mod tests {
         // Lookups agree.
         assert_eq!(net.get_virtual_ip("a1").await.unwrap(), Some(ip_a1));
         assert_eq!(net.list_virtual_ips().await.unwrap().len(), 2);
+    }
+
+    /// Federation: a VPN endpoint registration written on host A must replicate
+    /// to host B after it imports A's write ticket. Validates the multi-node
+    /// doc-sync path (gossip + reconciliation) the VPN routing depends on.
+    #[tokio::test]
+    async fn federation_replicates_vpn_registration() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        let addr: std::net::Ipv4Addr = "100.64.1.2".parse().unwrap();
+        a.register_vpn_endpoint(addr).await.unwrap();
+        let ticket = a.write_ticket().await.unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(
+            test_endpoint().await,
+            dir_b.path(),
+            Bootstrap::Import(Box::new(ticket)),
+        )
+        .await
+        .expect("spawn B");
+
+        // Poll for replication (gossip + set reconciliation over loopback).
+        for _ in 0..50 {
+            if let Ok(Some((pubkey, _))) = b.lookup_vpn_endpoint(addr).await {
+                assert_eq!(pubkey, a.endpoint.id());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("vpn registration did not replicate A -> B within 10s");
     }
 }
