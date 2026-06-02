@@ -84,6 +84,12 @@ pub enum Command {
         action: Option<ConfigAction>,
     },
 
+    /// Manage this machine's warren (private network) membership
+    Warren {
+        #[command(subcommand)]
+        action: WarrenAction,
+    },
+
     /// List authorized peers or known hosts
     Peers {
         #[command(subcommand)]
@@ -305,6 +311,18 @@ pub enum AgentAction {
     /// Stop the running agent
     Stop,
     /// Check agent status
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum WarrenAction {
+    /// Put this machine on the warren VPN — redeem an invite (which carries the
+    /// warren), or use the ticket stored from a previous client connection.
+    Join {
+        /// Invite token. Omit to use the ticket stored from a prior connection.
+        invite: Option<String>,
+    },
+    /// Show this machine's warren membership and VPN state.
     Status,
 }
 

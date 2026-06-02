@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             cmd_config(action, &host_config_dir)
         }
+        Command::Warren { action } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            let secret_key = config::load_or_generate_identity(&config_dir)?;
+            cmd_warren(secret_key, &config_dir, action).await
+        }
         Command::Peers { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let user_config_dir = config::default_config_dir()?;
@@ -3963,6 +3968,87 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
     }
 
     Ok(())
+}
+
+async fn cmd_warren(
+    secret_key: iroh::SecretKey,
+    config_dir: &std::path::Path,
+    action: cli::WarrenAction,
+) -> Result<()> {
+    use cli::WarrenAction;
+    match action {
+        WarrenAction::Join { invite } => {
+            // Resolve the warren namespace ticket: from the invite (which now
+            // carries it), or from the ticket stored when we connected as a client.
+            let (ticket, redeem) = match invite {
+                Some(tok) => {
+                    let decoded = hop_core::invite::decode_invite(&tok)
+                        .context("invalid invite token")?;
+                    let t = decoded.warren_ticket.clone().context(
+                        "this invite does not carry a warren — the host has no VPN/warren enabled",
+                    )?;
+                    (t, Some(tok))
+                }
+                None => {
+                    let stored = std::fs::read_to_string(config_dir.join("warren-ticket"))
+                        .context("no invite given and no stored warren ticket — run `hop warren join <invite>` first")?;
+                    let t = stored.trim().to_string();
+                    anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
+                    (t, None)
+                }
+            };
+
+            // Write the join ticket so `hop host` imports the warren namespace on
+            // its next start (this is what makes the machine a node on the VPN).
+            std::fs::write(config_dir.join("netdoc-join.ticket"), &ticket)
+                .context("writing warren join ticket")?;
+
+            // Redeem the invite for membership (auth handshake → the inviting host
+            // records us in the warren directory with our role).
+            if let Some(tok) = redeem {
+                println!("Joining warren — redeeming invite for membership...");
+                if let Err(e) =
+                    cmd_exec(secret_key, &tok, config_dir, &["true".to_string()],
+                        hop_core::sandbox::SandboxPolicy::default()).await
+                {
+                    tracing::warn!("membership redeem failed (namespace still joined): {e:#}");
+                }
+            }
+
+            println!();
+            println!("This machine will join the warren VPN on the next host start.");
+            println!("  • Already a host/daemon?  restart it (the join ticket is now in place).");
+            println!("  • Client-only right now?  put it on the VPN with:");
+            println!("      curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --host");
+            Ok(())
+        }
+        WarrenAction::Status => {
+            // Membership / namespace.
+            let ns = std::fs::read_to_string(config_dir.join("netdoc.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("namespace").and_then(|n| n.as_str()).map(String::from));
+            let has_join = config_dir.join("netdoc-join.ticket").exists()
+                || config_dir.join("warren-ticket").exists();
+            let vpn_enabled = hop_core::config::HostConfig::load(config_dir)
+                .map(|c| c.vpn_enabled)
+                .unwrap_or(true);
+
+            match &ns {
+                Some(n) => println!("warren namespace  {n}"),
+                None if has_join => println!("warren namespace  (pending — joins on next host start)"),
+                None => println!("warren namespace  (none — this machine is a client / not on a warren)"),
+            }
+            println!("vpn (config)      {}", if vpn_enabled { "on" } else { "off" });
+            if ns.is_none() && has_join {
+                println!();
+                println!("A warren ticket is stored. Put this machine on the VPN with:");
+                println!("  hop warren join          # uses the stored ticket");
+                println!("  curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --host");
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Parse a boolean-ish config value (on/off, true/false, 1/0, yes/no, enabled/disabled).
