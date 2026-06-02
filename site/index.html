@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hop — Secure P2P Remote Access</title>
-  <meta name="description" content="SSH-like remote access without port forwarding, VPNs, or third-party routing. Direct encrypted peer-to-peer connections with a single binary.">
+  <title>hop — Secure P2P Remote Access &amp; Private Network</title>
+  <meta name="description" content="SSH-like shell, file transfer, and a built-in private network (the warren) — direct, encrypted, peer-to-peer. No port forwarding, no VPN appliance, no coordination server. One binary.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -281,9 +281,9 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> Secure P2P Remote Access</div>
-    <h1>Remote access,<br><span class="gradient">without the headaches</span></h1>
-    <p>SSH-like shell access without port forwarding, VPNs, or third-party routing. Direct encrypted peer-to-peer connections with a single binary.</p>
+    <div class="badge"><span class="dot"></span> Secure P2P Access &amp; Private Network</div>
+    <h1>Remote access &amp; a private network,<br><span class="gradient">without the headaches</span></h1>
+    <p>SSH-like shell, file transfer, and a built-in private network &mdash; direct, encrypted, peer-to-peer. No port forwarding, no VPN appliance, no coordination server. One binary, one command.</p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Get Started</a>
       <a href="#how-it-works" class="btn btn-ghost">How It Works</a>
@@ -330,7 +330,15 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
           </div>
           <h3>Single Binary</h3>
-          <p>One download. No runtime dependencies, no daemon required for basic use, no accounts to create. Just run it.</p>
+          <p>One download. No runtime dependencies, no accounts to create. The CLI client needs no daemon; always-on hosts run one. Just run it.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 7.5l3 8M16.5 7.5l-3 8M8 6h8"/></svg>
+          </div>
+          <h3>Private Network &mdash; the Warren</h3>
+          <p>Every machine joins your <strong>warren</strong>: a private peer-to-peer mesh with its own virtual IPs (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">100.64.x.x</code>) and MagicDNS names (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">myhost.hop</code>). On by default, reach is role-based &mdash; and there's <strong>no coordination server</strong>: membership lives in a replicated document, not someone else's cloud.</p>
         </div>
 
         <div class="card card-green">
@@ -449,6 +457,16 @@
           <div class="comparison-cell comparison-other">Tailscale, ngrok require accounts</div>
         </div>
         <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Private network</div>
+          <div class="comparison-cell hop-col">Built-in P2P mesh (the warren)</div>
+          <div class="comparison-cell comparison-other">Tailscale (separate WireGuard mesh)</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Control plane</div>
+          <div class="comparison-cell hop-col">None &mdash; fully P2P</div>
+          <div class="comparison-cell comparison-other">Tailscale routes trust through their coordinator</div>
+        </div>
+        <div class="comparison-row">
           <div class="comparison-cell comparison-label">Traffic routing</div>
           <div class="comparison-cell hop-col">Direct P2P</div>
           <div class="comparison-cell comparison-other">ngrok routes through their servers</div>
@@ -485,7 +503,7 @@
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Encrypted secrets</div>
-          <div class="comparison-cell hop-col">Built-in (AES-256)</div>
+          <div class="comparison-cell hop-col">Built-in (ChaCha20-Poly1305)</div>
           <div class="comparison-cell comparison-other">Vault, external KMS</div>
         </div>
         <div class="comparison-row">
@@ -507,21 +525,21 @@
     <div class="container">
       <div class="section-header">
         <h2>How it works</h2>
-        <p>Shell access and file transfer in a few commands.</p>
+        <p>Shell, file transfer, and a private network in a few commands.</p>
       </div>
 
       <div class="steps">
         <div class="step">
-          <h3>Start hosting</h3>
-          <p>Run <code>hop host</code> on the machine you want to access. It generates an identity and starts listening for connections.</p>
+          <h3>Start a host</h3>
+          <p>Run <code>hop host</code> on the machine you want to access. It generates an identity, starts listening, and joins your warren with its own virtual IP.</p>
         </div>
         <div class="step">
           <h3>Share an invite</h3>
-          <p>Run <code>hop invite</code> to generate a one-time token. Send it to whoever needs access&mdash;it's single-use and time-limited.</p>
+          <p>Run <code>hop invite --role developer</code> for a one-time token. Single-use, time-limited, and the role decides what the new member can reach.</p>
         </div>
         <div class="step">
-          <h3>Connect</h3>
-          <p>The other person runs <code>hop connect &lt;token&gt;</code> and gets a secure shell. Future connections are just <code>hop &lt;name&gt;</code>.</p>
+          <h3>Connect &amp; you're on the network</h3>
+          <p>The other person runs <code>hop connect &lt;token&gt;</code> for a secure shell. Future connections are just <code>hop &lt;name&gt;</code> &mdash; and they're on the warren, reachable by <code>name.hop</code>.</p>
         </div>
       </div>
 
@@ -662,18 +680,19 @@
   <section id="daemon" style="padding-bottom: 8rem;">
     <div class="container">
       <div class="section-header">
-        <h2>Run as a System Daemon</h2>
-        <p>One command to install hop as a persistent system service on macOS or Linux.</p>
+        <h2>Always-On Host on Your Warren</h2>
+        <p>One command turns a machine into a persistent node on your private network &mdash; macOS or Linux.</p>
       </div>
 
       <div class="daemon-grid">
         <div class="daemon-info">
-          <h3>Always-On Server</h3>
-          <p>The daemon installer detects your platform and sets up hop as a native system service that starts automatically at boot. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
+          <h3>A node, always reachable</h3>
+          <p>The daemon installer detects your platform and sets up hop as a native system service that starts at boot and stays on the warren &mdash; with a stable virtual IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
           <ul class="daemon-features">
             <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
             <li>Registers a native service (LaunchDaemon on macOS, systemd on Linux)</li>
-            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> automatically at boot</li>
+            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot, on the warren with a virtual IP + MagicDNS</li>
+            <li>Built-in P2P VPN is on by default &mdash; and fail-safe: shell/exec/transfer keep working even if it can't come up</li>
             <li>Automatic restarts on crash</li>
             <li>Works on macOS (Apple Silicon &amp; Intel) and Linux (x86_64, ARM64, ARMv7)</li>
           </ul>
