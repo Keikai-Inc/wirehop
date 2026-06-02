@@ -5,6 +5,12 @@
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --daemon
+#
+# Warren primers (applied to host config; also forwarded with --daemon):
+#   --no-vpn               Disable the warren VPN data plane (default: on)
+#   --tag <a,b>            Tag this host (drives role->tag reach + MagicDNS)
+#   --default-role <name>  Role for invites that don't specify one (default: member)
+#   --join <ticket>        Federate into an existing warren on first 'hop host'
 
 set -euo pipefail
 
@@ -34,13 +40,22 @@ trap 'rm -rf "${TMPDIR_HOP}"' EXIT
 INSTALL_DIR="/usr/local/bin"
 VERSION=""
 DAEMON=false
+# Warren primers — applied to host config after install (see apply_primers).
+NO_VPN=false
+TAGS=""
+DEFAULT_ROLE=""
+JOIN_TICKET=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2 ;;
-    --dir)     INSTALL_DIR="$2"; shift 2 ;;
-    --daemon)  DAEMON=true; shift ;;
-    *)         die "Unknown option: $1" ;;
+    --version)      VERSION="$2"; shift 2 ;;
+    --dir)          INSTALL_DIR="$2"; shift 2 ;;
+    --daemon)       DAEMON=true; shift ;;
+    --no-vpn)       NO_VPN=true; shift ;;
+    --tag)          TAGS="${TAGS:+${TAGS},}$2"; shift 2 ;;
+    --default-role) DEFAULT_ROLE="$2"; shift 2 ;;
+    --join)         JOIN_TICKET="$2"; shift 2 ;;
+    *)              die "Unknown option: $1" ;;
   esac
 done
 
@@ -169,12 +184,33 @@ fi
 
 if [[ "${DAEMON}" == "true" ]]; then
   info "Delegating to install-daemon.sh for full daemon setup..."
+  # Forward warren primers to the daemon installer.
+  DAEMON_ARGS=()
+  [[ "${NO_VPN}" == "true" ]]   && DAEMON_ARGS+=(--no-vpn)
+  [[ -n "${TAGS}" ]]            && DAEMON_ARGS+=(--tag "${TAGS}")
+  [[ -n "${DEFAULT_ROLE}" ]]    && DAEMON_ARGS+=(--default-role "${DEFAULT_ROLE}")
+  [[ -n "${JOIN_TICKET}" ]]     && DAEMON_ARGS+=(--join "${JOIN_TICKET}")
   if command -v curl >/dev/null 2>&1; then
-    exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh")
+    exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh") "${DAEMON_ARGS[@]}"
   elif command -v wget >/dev/null 2>&1; then
-    exec bash <(wget -qO- "${BASE_URL}/install-daemon.sh")
+    exec bash <(wget -qO- "${BASE_URL}/install-daemon.sh") "${DAEMON_ARGS[@]}"
   else
     die "Neither curl nor wget found."
+  fi
+fi
+
+# --- Apply warren primers to the user host config (client install) -----------
+
+HOP_BIN="${INSTALL_DIR}/hop"
+if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" ]]; then
+  [[ "${NO_VPN}" == "true" ]] && "${HOP_BIN}" config set vpn off >/dev/null && info "Warren VPN disabled (run 'hop config set vpn on' to re-enable)"
+  [[ -n "${TAGS}" ]]         && "${HOP_BIN}" config set tags "${TAGS}" >/dev/null && info "Host tags: ${TAGS}"
+  [[ -n "${DEFAULT_ROLE}" ]] && "${HOP_BIN}" config set default_role "${DEFAULT_ROLE}" >/dev/null && info "Default invite role: ${DEFAULT_ROLE}"
+  if [[ -n "${JOIN_TICKET}" ]]; then
+    CFG_DIR="$("${HOP_BIN}" config path)"
+    mkdir -p "${CFG_DIR}"
+    printf '%s' "${JOIN_TICKET}" > "${CFG_DIR}/netdoc-join.ticket"
+    info "Warren join ticket saved (federates on next 'hop host')"
   fi
 fi
 

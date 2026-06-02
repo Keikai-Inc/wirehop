@@ -101,6 +101,32 @@ hop invite --role developer
 # nothing else to configure.
 ```
 
+### Install-time configuration (primers)
+
+The installer can prime the host config at install time, so a machine comes up
+exactly how you want with no follow-up commands. The website's **install command
+builder** composes these flags from toggles; they work on both `install.sh` and
+`install-daemon.sh` (and are forwarded by `install.sh --daemon`):
+
+| Flag | Effect | Maps to |
+|---|---|---|
+| `--no-vpn` | Disable the warren VPN data plane | `vpn_enabled = false` |
+| `--tag <a,b>` | Tag this host (role→tag reach + MagicDNS) | `tags` |
+| `--default-role <name>` | Role for invites that don't specify one | `default_role` |
+| `--join <ticket>` | Federate into an existing warren | `<config>/netdoc-join.ticket` |
+
+```bash
+# A production web host, VPN on, joined to an existing warren:
+curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash -s -- \
+  --tag production,web --join <ticket>
+
+# A client box that should never bring up the VPN:
+curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --no-vpn
+```
+
+Each primer is just a wrapper over `hop config set <key> <value>` (or the join
+ticket file), so anything set at install can be changed later at runtime.
+
 **How the invite carries the network (Planned):** the invite token embeds the
 warren's join ticket (the netdoc `DocTicket`). Redeeming it:
 1. joins the network namespace (federation),

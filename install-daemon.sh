@@ -5,10 +5,53 @@
 #
 # macOS:  Downloads the latest .pkg, installs it, starts the LaunchDaemon.
 # Linux:  Installs the binary, creates a systemd service, enables it.
+#
+# Warren primers (applied to the daemon's host config):
+#   --no-vpn               Disable the warren VPN data plane (default: on)
+#   --tag <a,b>            Tag this host (drives role->tag reach + MagicDNS)
+#   --default-role <name>  Role for invites that don't specify one (default: member)
+#   --join <ticket>        Federate into an existing warren
 
 set -euo pipefail
 
 BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
+
+# Warren primers (parsed below; applied by apply_daemon_primers).
+NO_VPN=false
+TAGS=""
+DEFAULT_ROLE=""
+JOIN_TICKET=""
+HOP_BIN="/usr/local/bin/hop"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-vpn)       NO_VPN=true; shift ;;
+    --tag)          TAGS="${TAGS:+${TAGS},}$2"; shift 2 ;;
+    --default-role) DEFAULT_ROLE="$2"; shift 2 ;;
+    --join)         JOIN_TICKET="$2"; shift 2 ;;
+    *)              printf 'warn  Unknown option: %s\n' "$1" >&2; shift ;;
+  esac
+done
+
+# Apply warren primers to the daemon's host config dir ($1). Best-effort; fixes
+# ownership/perms on Linux so the daemon (root) and the hop group can read.
+apply_daemon_primers() {
+  local cfg_dir="$1" applied=false
+  [[ "${NO_VPN}" == "true" ]]   && sudo "${HOP_BIN}" config set vpn off --config "${cfg_dir}" >/dev/null && applied=true && info "Warren VPN disabled"
+  [[ -n "${TAGS}" ]]            && sudo "${HOP_BIN}" config set tags "${TAGS}" --config "${cfg_dir}" >/dev/null && applied=true && info "Host tags: ${TAGS}"
+  [[ -n "${DEFAULT_ROLE}" ]]    && sudo "${HOP_BIN}" config set default_role "${DEFAULT_ROLE}" --config "${cfg_dir}" >/dev/null && applied=true && info "Default invite role: ${DEFAULT_ROLE}"
+  if [[ -n "${JOIN_TICKET}" ]]; then
+    printf '%s' "${JOIN_TICKET}" | sudo tee "${cfg_dir}/netdoc-join.ticket" >/dev/null && applied=true && info "Warren join ticket saved (federates on next daemon start)"
+  fi
+  if [[ "$(uname -s)" == "Linux" && "${applied}" == "true" ]]; then
+    for f in host_config.json netdoc-join.ticket; do
+      if sudo test -f "${cfg_dir}/${f}"; then
+        sudo chown root:hop "${cfg_dir}/${f}" 2>/dev/null || true
+        sudo chmod 660 "${cfg_dir}/${f}" 2>/dev/null || true
+      fi
+    done
+  fi
+}
 
 # --- Colour helpers (disabled when piped) ------------------------------------
 
@@ -90,6 +133,12 @@ if [[ "${OS}" == "Darwin" ]]; then
   sudo installer -pkg "${TMPDIR_HOP}/${PKG_NAME}" -target /
 
   printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
+
+  # Apply warren primers to the daemon config, then restart so they take effect.
+  if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" ]]; then
+    apply_daemon_primers "/Library/Application Support/hop"
+    sudo launchctl kickstart -k system/com.hop.daemon >/dev/null 2>&1 || true
+  fi
 
   # Verify the daemon is actually running (postinstall should have started it).
   sleep 1
@@ -210,6 +259,11 @@ if command -v hop >/dev/null 2>&1; then
   if hop agent stop 2>/dev/null; then
     info "Restarted connection agent (will auto-launch on next use)"
   fi
+fi
+
+# Apply warren primers to /etc/hop before first start so the daemon picks them up.
+if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" ]]; then
+  apply_daemon_primers "/etc/hop"
 fi
 
 # Enable and start (or restart if already running)

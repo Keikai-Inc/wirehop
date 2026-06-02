@@ -171,15 +171,30 @@ hop sync --stats ./src myhost:~/src     # detailed stats
 
 ## Administration
 
-### `hop config [set <key> <value>]`
+### `hop config [set <key> <value>] | path`
 
-View or update host configuration.
+View or update host configuration (`host_config.json`), or print the resolved
+config directory.
+
+| Key | Values | Description |
+|---|---|---|
+| `session_timeout` | duration (`3600`, `1h`, `1d`) | Detached PTY session lifetime |
+| `max_sessions` | integer | Max detached PTY sessions |
+| `vpn` | `on` / `off` | Warren VPN data plane (default `on`) |
+| `tags` | comma-separated | Host tags (drive role→tag reach + MagicDNS); empty clears |
+| `default_role` | role name | Role for invites that don't specify one (default `member`) |
 
 ```bash
 hop config                          # show current config
 hop config set session_timeout 3600
 hop config set max_sessions 10
+hop config set vpn off              # disable the warren VPN
+hop config set tags production,web  # tag this host
+hop config set default_role developer
+hop config path                     # print the host config directory
 ```
+
+Changes take effect on the next `hop host` / daemon restart.
 
 ### `hop peers [remove|rename]`
 

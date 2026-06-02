@@ -312,11 +312,13 @@ pub enum AgentAction {
 pub enum ConfigAction {
     /// Set a configuration value
     Set {
-        /// Configuration key (session_timeout, max_sessions)
+        /// Configuration key (session_timeout, max_sessions, vpn, tags, default_role)
         key: String,
         /// New value
         value: String,
     },
+    /// Print the resolved host config directory
+    Path,
 }
 
 #[derive(Subcommand)]

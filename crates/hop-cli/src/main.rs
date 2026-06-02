@@ -3883,6 +3883,11 @@ fn parse_duration_ms(s: &str) -> Result<u64> {
 }
 
 fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Result<()> {
+    if let Some(ConfigAction::Path) = action {
+        println!("{}", config_dir.display());
+        return Ok(());
+    }
+
     let mut cfg = HostConfig::load(config_dir)?;
 
     match action {
@@ -3900,6 +3905,12 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
             };
             println!("session_timeout  {timeout} ({human})");
             println!("max_sessions     {}", cfg.max_sessions);
+            println!("vpn              {}", if cfg.vpn_enabled { "on" } else { "off" });
+            println!("default_role     {}", cfg.default_role);
+            println!(
+                "tags             {}",
+                if cfg.tags.is_empty() { "(none)".to_string() } else { cfg.tags.join(", ") }
+            );
         }
         Some(ConfigAction::Set { key, value }) => {
             match key.as_str() {
@@ -3915,15 +3926,52 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
                     cfg.save(config_dir)?;
                     println!("max_sessions set to {n}");
                 }
+                "vpn" => {
+                    let on = parse_bool_value(&value)?;
+                    cfg.vpn_enabled = on;
+                    cfg.save(config_dir)?;
+                    println!("vpn set to {}", if on { "on" } else { "off" });
+                }
+                "tags" => {
+                    // Comma-separated; empty string clears tags.
+                    let tags: Vec<String> = value
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    cfg.tags = tags.clone();
+                    cfg.save(config_dir)?;
+                    println!("tags set to {tags:?}");
+                }
+                "default_role" => {
+                    let role = value.trim().to_string();
+                    anyhow::ensure!(!role.is_empty(), "default_role must not be empty");
+                    cfg.default_role = role.clone();
+                    cfg.save(config_dir)?;
+                    println!("default_role set to {role}");
+                }
                 _ => {
-                    anyhow::bail!("Unknown config key '{key}'. Valid keys: session_timeout, max_sessions");
+                    anyhow::bail!(
+                        "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role"
+                    );
                 }
             }
             println!("Note: restart the host/daemon for changes to take effect.");
         }
+        // Handled by the early return above; arm kept for exhaustiveness.
+        Some(ConfigAction::Path) => unreachable!("config path handled before load"),
     }
 
     Ok(())
+}
+
+/// Parse a boolean-ish config value (on/off, true/false, 1/0, yes/no, enabled/disabled).
+fn parse_bool_value(s: &str) -> Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "enable" | "enabled" => Ok(true),
+        "off" | "false" | "0" | "no" | "disable" | "disabled" => Ok(false),
+        other => anyhow::bail!("expected on/off (got '{other}')"),
+    }
 }
 
 /// Parse a duration value that can be plain seconds or suffixed (s, m, h, d).

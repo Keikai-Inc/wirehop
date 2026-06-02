@@ -84,6 +84,74 @@
       color: var(--color-text-tertiary);
     }
 
+    /* --- Install command builder -------------------------------------------- */
+
+    .builder {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      margin-top: 1rem;
+    }
+    .builder-row {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .builder-row > label {
+      font-size: 0.8rem;
+      color: var(--color-text-secondary);
+      font-weight: 600;
+    }
+    .builder .hint-tag {
+      font-size: 0.7rem;
+      color: var(--color-text-tertiary);
+      font-weight: 400;
+      margin-left: 0.4rem;
+    }
+    .seg {
+      display: inline-flex;
+      background: var(--color-bg);
+      border: 1px solid var(--color-border);
+      border-radius: 0.5rem;
+      padding: 0.2rem;
+      gap: 0.2rem;
+      width: fit-content;
+    }
+    .seg button {
+      font-family: inherit;
+      font-size: 0.8rem;
+      color: var(--color-text-tertiary);
+      background: none;
+      border: none;
+      border-radius: 0.375rem;
+      padding: 0.35rem 0.85rem;
+      cursor: pointer;
+      transition: background 150ms, color 150ms;
+    }
+    .seg button.active {
+      background: var(--color-accent-teal);
+      color: #06201d;
+      font-weight: 600;
+    }
+    .seg button:not(.active):hover { color: var(--color-text); }
+    .builder input[type="text"],
+    .builder select {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--color-text);
+      background: var(--color-bg);
+      border: 1px solid var(--color-border);
+      border-radius: 0.5rem;
+      padding: 0.5rem 0.7rem;
+      width: 100%;
+      transition: border-color 150ms;
+    }
+    .builder input[type="text"]:focus,
+    .builder select:focus {
+      outline: none;
+      border-color: var(--color-accent-teal);
+    }
+
     /* --- Comparison ---------------------------------------------------------- */
 
     .comparison {
@@ -514,38 +582,52 @@
 
       <div class="grid grid-2">
         <div>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">Quick Install (all platforms)</h3>
-          <div style="display: flex; flex-direction: column; gap: 0.75rem;">
-            <div>
-              <div style="font-size: 0.8rem; color: var(--color-text-tertiary); margin-bottom: 0.375rem;">Install latest</div>
-              <div class="install-cmd" onclick="copyCmd('install-latest', 'copy-install-latest')">
-                <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash</code>
-                <button class="copy-btn" title="Copy to clipboard" id="copy-install-latest">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                </button>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">Build your install command</h3>
+
+          <!-- Composed command -->
+          <div class="install-cmd" onclick="copyCmd('install-builder', 'copy-install-builder')" style="align-items: flex-start;">
+            <code id="builder-cmd" style="white-space: pre-wrap; word-break: break-all;"><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash</code>
+            <button class="copy-btn" title="Copy to clipboard" id="copy-install-builder">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+
+          <!-- Controls -->
+          <div class="builder" oninput="buildInstallCmd()" onchange="buildInstallCmd()">
+            <div class="builder-row">
+              <label>Mode</label>
+              <div class="seg" id="seg-mode">
+                <button type="button" class="active" data-val="client">Client</button>
+                <button type="button" data-val="daemon">Always-on host</button>
               </div>
             </div>
-            <div>
-              <div style="font-size: 0.8rem; color: var(--color-text-tertiary); margin-bottom: 0.375rem;">Install specific version</div>
-              <div class="install-cmd" onclick="copyCmd('install-version', 'copy-install-version')">
-                <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.4.4</code>
-                <button class="copy-btn" title="Copy to clipboard" id="copy-install-version">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                </button>
+            <div class="builder-row">
+              <label>Warren VPN <span class="hint-tag">private network</span></label>
+              <div class="seg" id="seg-vpn">
+                <button type="button" class="active" data-val="on">On</button>
+                <button type="button" data-val="off">Off</button>
               </div>
             </div>
-            <div>
-              <div style="font-size: 0.8rem; color: var(--color-text-tertiary); margin-bottom: 0.375rem;">Custom install directory</div>
-              <div class="install-cmd" onclick="copyCmd('install-dir', 'copy-install-dir')">
-                <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin</code>
-                <button class="copy-btn" title="Copy to clipboard" id="copy-install-dir">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                </button>
-              </div>
+            <div class="builder-row">
+              <label for="b-tags">Host tags <span class="hint-tag">optional</span></label>
+              <input id="b-tags" type="text" placeholder="production, web" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="builder-row">
+              <label for="b-role">Default invite role</label>
+              <select id="b-role">
+                <option value="member">member (least-privilege)</option>
+                <option value="developer">developer</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <div class="builder-row">
+              <label for="b-join">Join an existing warren <span class="hint-tag">optional</span></label>
+              <input id="b-join" type="text" placeholder="paste join ticket" autocomplete="off" spellcheck="false">
             </div>
           </div>
+
           <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Downloads the binary, verifies the SHA-256 checksum, and installs to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/usr/local/bin</code>. Works with curl or wget.
+            Downloads the binary, verifies the SHA-256 checksum, and installs to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/usr/local/bin</code>. The VPN is on by default and degrades gracefully where it can't run. Works with curl or wget.
           </p>
         </div>
 
@@ -725,7 +807,62 @@
       'install-version': 'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.4.4',
       'install-dir':     'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin',
       'daemon-install':  'curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash',
+      'install-builder': 'curl -fsSL https://hop.keikai.ai/install.sh | bash',
     };
+
+    /* --- Interactive install command builder ------------------------------- */
+
+    // Segmented controls: one active button per group.
+    document.querySelectorAll('.seg').forEach(function (seg) {
+      seg.addEventListener('click', function (e) {
+        var btn = e.target.closest('button');
+        if (!btn) return;
+        seg.querySelectorAll('button').forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        buildInstallCmd();
+      });
+    });
+
+    function segValue(id) {
+      var active = document.querySelector('#' + id + ' button.active');
+      return active ? active.getAttribute('data-val') : '';
+    }
+
+    function buildInstallCmd() {
+      var mode = segValue('seg-mode');          // client | daemon
+      var vpn  = segValue('seg-vpn');            // on | off
+      var tags = (document.getElementById('b-tags').value || '').trim();
+      var role = document.getElementById('b-role').value;
+      var join = (document.getElementById('b-join').value || '').trim();
+
+      var script = mode === 'daemon' ? 'install-daemon.sh' : 'install.sh';
+      var flags = [];
+      if (vpn === 'off') flags.push('--no-vpn');
+      if (tags) flags.push('--tag ' + shellQuote(tags));
+      if (role && role !== 'member') flags.push('--default-role ' + role);
+      if (join) flags.push('--join ' + shellQuote(join));
+
+      var cmd = 'curl -fsSL https://hop.keikai.ai/' + script + ' | bash';
+      if (flags.length) cmd += ' -s -- ' + flags.join(' ');
+
+      cmds['install-builder'] = cmd;
+      var code = document.getElementById('builder-cmd');
+      if (code) {
+        code.innerHTML = '<span class="prompt">$</span> ' + escapeHtml(cmd);
+      }
+    }
+
+    // Quote a value for the shell if it contains spaces or shell-special chars.
+    function shellQuote(v) {
+      if (/^[A-Za-z0-9_,.:\/@%+=-]+$/.test(v)) return v;
+      return "'" + v.replace(/'/g, "'\\''") + "'";
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    document.addEventListener('DOMContentLoaded', buildInstallCmd);
 
     function copyInstall() { copyCmd('install-latest', 'copyBtn'); }
 
