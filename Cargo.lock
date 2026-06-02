@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "hop-cli"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "anyhow",
  "base64",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "hop-ext-echo"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "anyhow",
  "clap",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "hop-mcp"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "hop-vt"
-version = "0.6.30"
+version = "0.6.31"
 dependencies = [
  "alacritty_terminal",
 ]

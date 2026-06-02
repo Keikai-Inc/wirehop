@@ -1,10 +1,12 @@
 # Peer-to-Peer Private Network (Design)
 
-> **Status: Design / Planned.** Nothing in this document is implemented yet. It
-> captures the agreed architecture and the decisions behind it so implementation
-> can proceed in phases. Sections marked **(Commercial, deferred)** are planned
-> for later phases and are documented here only so the schema and trust model
-> don't have to be reworked when we get there.
+> **Status: MVP shipped (opt-in / experimental), as of v0.6.31.** The role-based
+> warren MVP — all 8 build-plan steps below — is implemented and validated by a
+> live multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`) plus the 53-test regression
+> suite. The VPN data plane remains **off by default** (`HOP_VPN=1` to enable)
+> and is not yet promoted to default-on. Sections marked **(Commercial, deferred)**
+> are planned for later phases and are documented here only so the schema and
+> trust model don't have to be reworked when we get there.
 
 ## Goal
 
@@ -357,7 +359,12 @@ to Phase 4's default-deny ACLs (#8)** rather than shipped in Phase 1. The
 federation primitives exist (`NetDoc::read_ticket`, `Bootstrap::Import`,
 `reconcile`'s per-host-ownership caveat) and are ready for that phase.
 
-## Next-stage build plan — the role-based warren MVP
+## Next-stage build plan — the role-based warren MVP ✅ *(shipped v0.6.31, opt-in)*
+
+All 8 steps below are implemented and validated (live multi-node TUN e2e
+`tests/e2e/vpn-e2e.sh` — real ICMP over `hop/vpn/1`, role-gated, 0% loss — plus
+the 53-test regression suite green). The VPN data plane stays **off by default**
+(`HOP_VPN=1`); promotion to default-on is the remaining follow-up.
 
 The next stage turns today's inert, opt-in VPN into a working role-driven warren:
 **role unification + federation safety + role→ACL derivation + a live multi-node
@@ -392,12 +399,18 @@ sequenced so each step compiles and tests.
 7. **Configurable MagicDNS domain** (`hop-core`). Resolver reads the warren domain
    from `network/config` (default `<warren-name>.hop`, else `hop`) instead of the
    hard-coded `.hop`.
-8. **Validation.** Unit: role→ACL resolution (dev reaches dev-tagged, denied prod;
-   member denied all; port ranges). **Live multi-node TUN e2e** (`NET_ADMIN` +
-   `/dev/net/tun` in the containers): host-a tagged `production`, host-b tagged
-   `developer`, a `developer` member — assert it reaches host-b and is denied
-   host-a over the real VPN. Plus the existing 53-test regression suite green.
-   This promotes Phase 3-4 from experimental toward default-on.
+8. **Validation.** ✅ Unit: role→ACL resolution covers the deny path
+   (`role_reaches` — wildcard, tag intersection, empty-role denies all;
+   `role_derived_reach_via_doc`). **Live multi-node TUN e2e**
+   (`tests/e2e/vpn-e2e.sh`, `NET_ADMIN` + `/dev/net/tun`): two federated nodes
+   join one warren (host-b imports host-a's namespace ticket + redeems the admin
+   creator invite); both enable the opt-in VPN; host-b pings host-a's virtual IP
+   over the real `hop/vpn/1` TUN — role-gated forwarding (admin/`*` reach both
+   directions), **0% packet loss**. The live harness exercises the allow path +
+   the full data plane (TUN bringup, `100.64.0.0/10` routing, federation
+   replication, MagicDNS vIPs); the tag-based deny path is covered by the unit
+   tests above. Plus the existing 53-test regression suite green. Remaining
+   follow-up: promote Phase 3-4 from experimental to default-on.
 
 **Rollout order within the stage:** role unification + `member` default first
 (auth-semantics change, guarded by the `peers.json` fallback so existing peers
