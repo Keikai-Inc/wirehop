@@ -12,5 +12,6 @@ pub mod proto;
 pub mod sandbox;
 pub mod shell;
 pub mod transfer;
+pub mod vpn;
 #[cfg(unix)]
 pub mod unix_user;
