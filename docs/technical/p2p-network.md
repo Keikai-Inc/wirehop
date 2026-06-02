@@ -510,9 +510,18 @@ extract `warren_ticket` → hand to the daemon), since it knows the tier.
   install page presents. Keep `--no-vpn`/`--tag`/`--default-role`; `--join` and
   `--daemon` become hidden aliases (`--daemon`→`--host`). `install-daemon.sh` →
   thin alias of `install.sh --host`.
-- **B — Upgrade path.** Node re-install detects `<config>/warren-ticket` + existing
-  membership and adopts it. Add `hop warren status` ("member of X; VPN: off") so
-  the upgrade is discoverable.
+- **B — Join the warren VPN (the client's upgrade).** A client is already a warren
+  *member* that simply hasn't lit up the VPN. Make the upgrade a first-class,
+  product-named action rather than a re-install dance: **`hop warren join`** —
+  "put this machine on the warren VPN." It takes sudo, sets up the host service,
+  and brings up the VPN using the already-stored `<config>/warren-ticket` +
+  existing membership (no re-invite). On success: "This machine is now part of
+  your warren — virtual IP `100.64.x.x`, reachable as `name.hop`." Add
+  `hop warren status` → "member of `<warren>`; VPN: off (client) — run
+  `hop warren join` to join the network." The **client install surfaces this as
+  the default next step** in its output (offered by default, discoverable), but it
+  stays **opt-in**: no root daemon appears unless the user chooses to join the VPN.
+  (Re-running `install.sh --host` is the equivalent path for scripted installs.)
 - **D — Site + docs.** Install page: client vs node (node primary), one optional
   "paste your invite" field; builder controls show only for node. Retire
   "warren join token" vocabulary across warren.md / p2p-network.md / cli-reference
