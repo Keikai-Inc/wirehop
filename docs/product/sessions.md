@@ -159,4 +159,4 @@ hop config set max_sessions 20
 
 Configuration is stored in `host_config.json` in the config directory.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

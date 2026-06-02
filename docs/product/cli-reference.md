@@ -83,6 +83,7 @@ Generate a one-time invite token/URL.
 | Flag | Description |
 |---|---|
 | `--user <USER>` | Unix username the invited peer will log in as |
+| `--role <ROLE>` | Named role for the invited peer (e.g. `developer`, `ops`). Defaults to the host's configured `default_role` (`member`) |
 | `--name <NAME>` | Human-readable name for this host |
 | `--read-only` | Restrict to read-only filesystem access |
 | `--no-network` | Block outbound network access |
@@ -92,9 +93,14 @@ Generate a one-time invite token/URL.
 
 ```bash
 hop invite --user jason
+hop invite --role developer            # role decides warren reach (tags)
 hop invite --user guest --read-only --scope /var/log
 hop invite --preset monitor
 ```
+
+The invited peer joins with the given role; the role's host tags decide what it
+can reach over the warren VPN (default-deny). Elevate later with `hop admin
+<host> grant` (below) — no re-invite needed.
 
 ### `hop creator-invite`
 
@@ -227,14 +233,15 @@ Remote administration (requires creator role).
 | `fleet-list` | List fleet members (orchestrator) |
 | `fleet-remove <id>` | Remove a fleet member (orchestrator) |
 | `fleet-tag <id>` | Update tags on a fleet member (orchestrator) |
-| `role <action>` | Manage roles (see below) |
+| `grant <id> <role>` | Change a peer's named role (elevation/demotion) |
 
 #### `hop admin <target> invite`
 
 | Flag | Description |
 |---|---|
 | `--user <USER>` | Unix username for the invited peer |
-| `--creator` | Create a creator invite (admin access) |
+| `--role <ROLE>` | Named role for the invited peer (e.g. `developer`, `ops`) |
+| `--creator` | Create a creator invite (admin access; sugar for the `admin` role) |
 | `--read-only` | Restrict to read-only filesystem access |
 | `--no-network` | Block outbound network access |
 | `--scope <PATH>` | Restrict filesystem to these paths (repeatable) |
@@ -243,7 +250,19 @@ Remote administration (requires creator role).
 
 ```bash
 hop admin myhost invite --user alice
+hop admin myhost invite --role developer
 hop admin myhost invite --creator
+```
+
+#### `hop admin <target> grant <id> <role>`
+
+Change an existing peer's named role without re-inviting. The new role's host
+tags re-resolve the peer's warren reach network-wide.
+
+```bash
+hop admin myhost grant abc123 developer   # elevate
+hop admin myhost grant abc123 admin       # full reach (tags ["*"])
+hop admin myhost grant abc123 member      # demote to default-deny
 ```
 
 #### `hop admin <target> create-user <username>`
@@ -534,4 +553,4 @@ These commands are hidden from `--help` and used internally by hop.
 
 **`__transfer-helper` modes:** `receive`, `send`, `sync-receive`
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

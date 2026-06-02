@@ -127,22 +127,31 @@ curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --no-vpn
 Each primer is just a wrapper over `hop config set <key> <value>` (or the join
 ticket file), so anything set at install can be changed later at runtime.
 
-**How the invite carries the network (Planned):** the invite token embeds the
-warren's join ticket (the netdoc `DocTicket`). Redeeming it:
+**How joining brings up the network (Shipped):** providing a warren join ticket
+(the netdoc `DocTicket`, via `--join`, `HOP_VPN_JOIN_TICKET`, or
+`<config>/netdoc-join.ticket`):
 1. joins the network namespace (federation),
-2. (node path) claims a virtual IP, brings up the TUN, writes split-DNS config,
-3. applies the role-derived ACL.
+2. (node path) claims a virtual IP, brings up the TUN, registers the VPN endpoint,
+3. resolves the role-derived ACL.
 
 So the VPN comes up *as a side effect of joining* — there is no separate
 "connect to VPN" step. Every member runs the hop daemon (the one-liner installs
 it), exactly as Tailscale runs `tailscaled` everywhere.
 
+> **(Remaining polish.)** Today membership (redeeming a `hop invite`) and the
+> warren join ticket (`--join`) are two values. The planned refinement folds the
+> join ticket *into* the invite token so a single redeem does both — the
+> mechanism is shipped; only the one-token UX is pending.
+
 ## The role model
 
-> **Cleanup (Planned):** today hop has *two* role concepts — `PeerRole`
-> (`Peer`/`Creator`, the auth tier) and `RoleDefinition` (named fleet roles with
-> `host_tags`). These merge into **one conventional role model**: a named role
-> that carries both the auth tier and the network access.
+> **Unification (Shipped, with a compat shim):** hop is converging its two role
+> concepts — `PeerRole` (`Peer`/`Creator`, the auth tier) and `RoleDefinition`
+> (named roles with `host_tags`) — into **one named role**. Peer entries and
+> invites now carry a role **name** (`role_name`), `member` is the seeded
+> least-privilege default, and `hop invite --role` / `hop admin grant` operate on
+> names. `PeerRole` survives as a migration shim for legacy peers; the named role
+> is authoritative going forward.
 
 A **role** defines:
 - **Auth tier** — `member` vs `admin` (can it manage the warren?).
@@ -151,12 +160,11 @@ A **role** defines:
 
 ### Default roles
 
-These are the **currently seeded** roles (`crates/hop-core/src/fleet`), plus the
-planned `member` default:
+These are the **currently seeded** roles (`crates/hop-core/src/fleet`):
 
 | Role | Reaches (tags) | Notes |
 |------|----------------|-------|
-| `member` *(Planned — the new default)* | none | In the warren with an address; **default-deny** until granted. The safe default. |
+| `member` *(the default)* | none | In the warren with an address; **default-deny** until granted. The safe default. |
 | `developer` | `developer`, `staging` | Day-to-day engineering access. |
 | `ops` | `*` | Infrastructure. |
 | `ci` | `build` | Build/deploy targets. |
@@ -167,19 +175,18 @@ planned `member` default:
 same role→tag model to VPN reach. The exact tag sets are tunable — the table
 reflects the seed defaults, not a fixed contract.)*
 
-### The default role (Planned)
+### The default role (Shipped)
 
-`hop invite` with no `--role` assigns the **org default role**, which starts as
-`member` (least-privilege, default-deny). The founder can re-point the org
-default (e.g. to `developer` for a small all-engineer team). Naming a role on
-the invite always overrides it.
+`hop invite` with no `--role` assigns the **org default role** (`HostConfig.default_role`),
+which starts as `member` (least-privilege, default-deny reach). The founder can
+re-point it with `hop config set default_role <name>` (e.g. to `developer` for a
+small all-engineer team). Naming a role on the invite always overrides it.
 
-This fixes today's footgun: currently no-role defaults to `Peer` = **full
-unrestricted shell** to the host. In a network where the role is the firewall,
-silently granting full shell on a forgotten flag is exactly what we design out —
-the default must be safe.
+This closes the old footgun where a forgotten flag silently granted broad access:
+the default role now reaches **nothing** until a role grants it, so the safe
+outcome is the one you get by default.
 
-### Role → ACL derivation (Planned, the keystone)
+### Role → ACL derivation (Shipped, the keystone)
 
 The VPN ACL is **not authored** — it is the projection of the role model:
 
@@ -220,19 +227,18 @@ systems: you assign a role, and reach + confinement are set together. `--role
 monitor` → reaches the monitored hosts *and* gets a read-only, no-network
 session. One decision, two layers, no contradiction.
 
-### Changing a role after invite (Planned)
+### Changing a role after invite (Shipped)
 
 Members are elevated/demoted without re-inviting:
 
 ```
-hop role grant <peer> ops      # elevate
-hop role set   <peer> member   # demote / reset
+hop admin <host> grant <peer> ops       # elevate
+hop admin <host> grant <peer> member    # demote / reset
 ```
 
 This updates the member's role in the membership doc, which replicates to every
 node and triggers ACL re-resolution — the member's reach changes within seconds,
-no token re-issue. (Today the only path is `remove-peer` + re-invite; the
-elevation command is new.)
+no token re-issue.
 
 ## Status
 
@@ -268,24 +274,22 @@ Validated by unit/integration tests (role-reach, role-derived reach via doc,
 federation replication, federated additive reconcile, ACL, DNS codec, config
 default-on/opt-out), the **live multi-node TUN e2e**, and the 53-test regression
 e2e — which runs in TUN-less containers, so its green run is the standing proof
-that default-on degrades gracefully and the default daemon is unchanged.
-
-Validated by unit/integration tests (routing, federation replication, ACL, DNS)
-and the 53-test regression e2e. The live multi-node TUN packet flow is not yet in
-an automated testbed — hence experimental.
+that default-on degrades gracefully and the default daemon is unchanged. The live
+multi-node TUN packet flow is exercised by `tests/e2e/vpn-e2e.sh` (real ICMP over
+`hop/vpn/1`, role-gated, 0% loss).
 
 ### Planned (the warren product)
 See the roadmap below.
 
 ## Roadmap
 
-| Milestone | Scope |
-|-----------|-------|
-| **Role cleanup** | Merge `PeerRole` + `RoleDefinition` into one conventional role model. Add the configurable, least-privilege **org-default role**. Add **`hop role grant/set`** for post-invite elevation. |
-| **M1 — Invisible ACL** | Role→tag→ACL derivation, resolved at enforcement time. Host tagging via role/invite. Turns the experimental VPN from "default-deny, no way to open it" into "opens automatically by role." |
-| **M2 — Network membership** | Invite-to-network-with-a-role (not per-host); Owner/Admin-managed central membership every node reads; receiver-side ACL enforcement. The architectural shift from per-host to warren-wide access. |
-| **M3 — Usable end to end** | Client vs node redemption branch; `--join` auto-brings-up the VPN; MagicDNS OS auto-config; the **live multi-node TUN e2e** that promotes the data plane to default-on. |
-| **M4 — One-line onboarding** | Installer `--join`/`--invite` flags; invite token embeds the warren ticket; the founder narrative end to end. Script rename: `install.sh` = client, node installer reframed as "join the warren". |
+| Milestone | Status | Scope |
+|-----------|--------|-------|
+| **Role cleanup** | ✅ Shipped (compat shim) | Converge `PeerRole` + `RoleDefinition` into one named role. Configurable least-privilege **org-default role** (`member`). **`hop admin <host> grant`** for post-invite elevation. |
+| **M1 — Invisible ACL** | ✅ Shipped | Role→tag→ACL derivation, resolved at enforcement time. Host tagging via role/invite. Turns the VPN from "default-deny, no way to open it" into "opens automatically by role." |
+| **M2 — Network membership** | ◑ Mostly | Invite-to-network-with-a-role, doc-replicated membership every node reads, receiver-side ACL enforcement — **shipped**. The cryptographic Owner/Admin write-capability is still **Planned** (ties to the trust root). |
+| **M3 — Usable end to end** | ◑ Mostly | `--join` brings up the VPN + the **live multi-node TUN e2e** that promoted the data plane to **default-on** — shipped. Client-vs-node redemption polish and MagicDNS OS auto-config (split-DNS) remain. |
+| **M4 — One-line onboarding** | ◑ Partial | Installer `--join`/primer flags + the website command builder — **shipped**. Folding the warren ticket *into* the invite token, and the `install.sh`/node-installer rename, remain. |
 
 The only command a founder ever types remains `hop invite --role X`. Everything
 else is install-and-redeem.

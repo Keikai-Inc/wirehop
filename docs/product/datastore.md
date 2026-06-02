@@ -238,4 +238,4 @@ datastore.ts_purge_before("cpu", cutoff)?;
 
 KV and secrets entries do not have automatic expiry; delete them explicitly when no longer needed.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

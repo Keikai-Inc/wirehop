@@ -16,10 +16,10 @@ hop is a single-binary CLI tool that provides secure shell access, file transfer
 > **hop's defining guarantee is decentralization, not minimalism.** The wedge is
 > that hop runs **independent of any third party or central control plane** —
 > not that it avoids a background process. As hop grows into a full private
-> network (the **[warren](warren.md)**), members run a local daemon (like
-> Tailscale's, but with no coordination server behind it). "Single binary, no
-> central anything" is the promise; a per-member daemon is fully in keeping with
-> it.
+> network (the **[warren](warren.md)** — now shipped, default-on), members run a
+> local daemon (like Tailscale's, but with no coordination server behind it).
+> "Single binary, no central anything" is the promise; a per-member daemon is
+> fully in keeping with it.
 
 ## Core User Flows
 
@@ -85,6 +85,20 @@ hop mcp                 # start MCP server on stdio
 # Exposes hop_exec (sandboxed JS) and hop_skills tools
 ```
 
+### 8. Private Network (the warren)
+
+```bash
+hop invite --role developer       # role decides reach over the VPN
+hop config set vpn off            # opt out of the default-on VPN
+hop admin myhost grant abc123 ops # change a member's reach later
+```
+
+Every daemon brings up a built-in P2P VPN (**default-on**): a virtual IP in
+`100.64.0.0/10`, MagicDNS (`*.hop`), and role→tag reach (default-deny). Bringup is
+fail-safe — if a TUN can't be created or the CGNAT range conflicts (e.g.
+Tailscale), it's skipped and shell/exec/transfer are unaffected. See
+[warren.md](warren.md).
+
 ## Architecture
 
 ```
@@ -124,11 +138,11 @@ hop mcp                 # start MCP server on stdio
 | Crate | Purpose |
 |---|---|
 | `hop-cli` | Binary crate -- thin CLI wrapper, binary name `hop` |
-| `hop-core` | Library -- networking, PTY, auth, config, protocol, sandbox, fleet |
+| `hop-core` | Library -- networking, PTY, auth, config, protocol, sandbox, fleet, warren (netdoc + VPN) |
 | `hop-mcp` | MCP server, JS runtime (QuickJS), capabilities, skills store |
 
 ### Wire Protocol
 
 All messages are length-prefixed bincode frames over QUIC bi-directional streams.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

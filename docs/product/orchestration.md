@@ -243,4 +243,4 @@ hop myserver cap setup email-monitor
 | 6 | `hop.ai()` convenience | Planned | Sugar over hop.http + hop.secrets |
 | 7 | Interactive setup wizard | Planned | `hop myhost cap setup email-monitor` |
 
-*Last updated: v0.4.4*
+*Last updated: v0.6.33*

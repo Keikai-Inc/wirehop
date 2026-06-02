@@ -93,9 +93,10 @@ items below are kept for the record.)*
   `fleet_registrations.json` / `aggregate_invites.json` still live as separate
   files; only `peers.json`/`roles.json` migrate into the netdoc today. Migrate
   fleet state into the document to complete decentralization.
-- 🔧 **Role-system merge.** Collapse `PeerRole` + `RoleDefinition` into one named
-  role; add the configurable least-privilege org-default (`member`); add
-  `hop role grant/set` for post-invite elevation. Prerequisite for M1.
+- ✅ **Role-system merge.** *(shipped, compat shim)* Peers/invites carry a named
+  role (`role_name`); the configurable least-privilege org-default (`member`) is
+  seeded; `hop admin <host> grant` does post-invite elevation. `PeerRole` remains
+  as a migration shim.
 
 ## Triage
 

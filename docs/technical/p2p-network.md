@@ -304,41 +304,40 @@ the proving ground for the doc and addressing before any commercial work.
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
 
-### Role-model unification (Planned — prerequisite for the warren)
+### Role-model unification (Shipped, with a compat shim)
 
 The product layer ([`../product/warren.md`](../product/warren.md)) requires
-collapsing hop's two role concepts into one:
+collapsing hop's two role concepts into one. This is now shipped:
 
-- **Today:** `PeerRole` (`Peer`/`Creator`, the auth tier, used by the basic
-  invite) and `RoleDefinition` (named fleet roles with `host_tags`, used by
-  aggregate invites) are separate. The basic invite's no-role default is
-  `PeerRole::Peer` = unrestricted shell, no admin.
-- **Target:** one named-role model carrying auth tier + `host_tags` + ports. A
-  configurable, least-privilege **org-default role** (`member`, default-deny) so
-  `hop invite` with no `--role` is safe rather than granting full shell.
-- **Elevation:** `hop role grant/set` updates a member's role entry in the
-  document; replication + ACL re-resolution apply the change network-wide without
-  re-issuing an invite. (Today the only path is `remove_peer` + re-invite.)
-- **ACL derivation:** rules are stored/evaluated as role→tag (not per-IP) and
-  resolved against the membership doc at enforcement time, so they're stable
-  across join/leave. This supersedes hand-authored `acl/policy` for the default
-  case.
+- **Named role on peers/invites.** Peer entries and invites carry a role
+  **name** (`role_name`); `PeerRole` (`Peer`/`Creator`) survives only as a
+  migration shim for legacy peers.
+- **Safe org default.** A configurable, least-privilege **org-default role**
+  (`member`, default-deny reach) is seeded; `HostConfig.default_role` (default
+  `member`) is used when `hop invite` is run with no `--role`. `hop config set
+  default_role <name>` re-points it.
+- **Elevation:** `hop admin <host> grant <peer> <role>` (proto `SetPeerRole`)
+  updates a member's role entry in the document; replication + ACL re-resolution
+  apply the change network-wide without re-issuing an invite.
+- **ACL derivation:** reach is stored/evaluated as role→tag (not per-IP) and
+  resolved against the membership doc at enforcement time (`vpn_reach_allowed`),
+  so it's stable across join/leave. This supersedes hand-authored `acl/policy`
+  for the default case.
 
-### Federation safety (Planned — required before sharing a namespace)
+### Federation safety (Partially shipped)
 
 Cross-host federation (one shared namespace) needs two safeguards the per-host
 model doesn't:
 
-- **Read vs write capability.** Today the join/`enable_vpn` path hands out a
-  **write** ticket — any member could rewrite membership/roles/ACL. Members must
-  instead get a **read** replica; membership/role/ACL **writes** require an
-  Owner/Admin-signed capability (consistent with the trust-root chain, #9). This
-  is what makes "Owner-managed membership" hold without a central server.
-- **Ownership-scoped reconcile.** `reconcile` revokes "doc peers not in *my*
-  `peers.json`" — safe per-host, but on a shared namespace it would revoke other
-  hosts' members. Reconcile must be scoped to entries this host owns. The
-  additive `ip`/`vpn`/`name` tables are already federation-safe (each host writes
-  only its own); membership/roles need this scoping first.
+- **Ownership-scoped reconcile (Shipped).** On a shared namespace `reconcile`
+  is **additive-only** — it no longer revokes "doc peers not in *my* `peers.json`",
+  so one host can't cross-revoke another's members. The additive `ip`/`vpn`/`name`
+  tables are federation-safe by construction (each host writes only its own).
+- **Read vs write capability (Planned — ties to the commercial trust root, #9).**
+  Today the join path hands out an iroh-docs **write** ticket, so a member could
+  in principle rewrite membership/roles. Cryptographically gating writes behind an
+  Owner/Admin-signed capability (members get a read replica) is the remaining
+  hardening, deferred to the trust-root work.
 
 ### Phase 1 implementation status
 
@@ -376,11 +375,11 @@ VPN — core access (exec/shell/transfer) is never affected. Opt out with
 The 53-test regression suite runs in TUN-less containers, so its green run is the
 standing proof that default-on degrades gracefully.
 
-The next stage turns today's inert, opt-in VPN into a working role-driven warren:
+This stage turned the previously inert VPN into a working role-driven warren:
 **role unification + federation safety + role→ACL derivation + a live multi-node
 TUN e2e.** These are interdependent (a member's reach across hosts needs both the
-unified role and a safely-shared namespace), so they ship as one coherent stage,
-sequenced so each step compiles and tests.
+unified role and a safely-shared namespace), so they shipped as one coherent
+stage, sequenced so each step compiled and tested.
 
 1. **Canonical role** (`hop-core`). Make `RoleDefinition` the one role type: add
    `ports` (default all) for reach; `admin: bool` is the auth tier (subsumes
@@ -403,7 +402,7 @@ sequenced so each step compiles and tests.
    evaluation with: src IP → member → role → permitted tags+ports; dst IP → host →
    tags; allow iff dst tag ∈ role tags ∧ port permitted; default-deny. Reads
    membership/roles/tags from the replicated doc.
-6. **Role elevation** (`hop-cli` + admin proto). `hop role grant/set <peer>
+6. **Role elevation** (`hop-cli` + admin proto). `hop admin <host> grant <peer>
    <role>` updates the peer's role entry (peers.json + doc) → reconcile → ACL
    re-resolves network-wide, no re-invite.
 7. **Configurable MagicDNS domain** (`hop-core`). Resolver reads the warren domain
@@ -414,18 +413,20 @@ sequenced so each step compiles and tests.
    `role_derived_reach_via_doc`). **Live multi-node TUN e2e**
    (`tests/e2e/vpn-e2e.sh`, `NET_ADMIN` + `/dev/net/tun`): two federated nodes
    join one warren (host-b imports host-a's namespace ticket + redeems the admin
-   creator invite); both enable the opt-in VPN; host-b pings host-a's virtual IP
-   over the real `hop/vpn/1` TUN — role-gated forwarding (admin/`*` reach both
-   directions), **0% packet loss**. The live harness exercises the allow path +
-   the full data plane (TUN bringup, `100.64.0.0/10` routing, federation
-   replication, MagicDNS vIPs); the tag-based deny path is covered by the unit
-   tests above. Plus the existing 53-test regression suite green. Remaining
-   follow-up: promote Phase 3-4 from experimental to default-on.
+   creator invite); both run the VPN (now default-on); host-b pings host-a's
+   virtual IP over the real `hop/vpn/1` TUN — role-gated forwarding (admin/`*`
+   reach both directions), **0% packet loss**. The live harness exercises the
+   allow path + the full data plane (TUN bringup, `100.64.0.0/10` routing,
+   federation replication, MagicDNS vIPs); the tag-based deny path is covered by
+   the unit tests above. Plus the existing 53-test regression suite green.
+   ✅ Phase 3-4 has since been promoted to **default-on** (v0.6.32), with an
+   install-time / runtime opt-out (`--no-vpn`, `HOP_VPN=0`, `vpn_enabled=false`).
 
-**Rollout order within the stage:** role unification + `member` default first
-(auth-semantics change, guarded by the `peers.json` fallback so existing peers
-are unaffected) → federation safety → ACL derivation (only affects the opt-in
-VPN) → e2e → flip the VPN default-on once the live e2e is green.
+**Rollout order within the stage (as executed):** role unification + `member`
+default first (auth-semantics change, guarded by the `peers.json` fallback so
+existing peers are unaffected) → federation safety → ACL derivation (affects only
+the VPN data plane) → live e2e → flipped the VPN default-on once the e2e was
+green (v0.6.32).
 
 ## What stays the same
 

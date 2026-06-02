@@ -16,7 +16,7 @@ Workspace-level settings in the root `Cargo.toml`:
 
 ```toml
 [workspace.package]
-version = "0.4.3"
+version = "0.6.33"
 edition = "2024"
 license = "LicenseRef-Proprietary"
 ```
@@ -47,6 +47,8 @@ The core library providing networking, authentication, protocol, file transfer, 
 | `invite/mod.rs` | Invite token generation/verification (Argon2 hashing) |
 | `net/mod.rs` | iroh endpoint creation, QUIC connection management |
 | `net/netmon.rs` | Network interface polling, reconnection triggers |
+| `netdoc/mod.rs` | **Warren network document**: iroh-docs/gossip/blobs CRDT (on an isolated endpoint) holding membership, roles, revocations, virtual IPs, VPN endpoints, host tags, names; virtual-IP allocation, role→tag→ACL reach resolver, federation (DocTickets), MagicDNS |
+| `vpn/` | **Warren VPN data plane** (unix): TUN device (`100.64.0.0/10`, MTU 1280), ALPN `hop/vpn/1` over QUIC datagrams, `VpnInbound` handler, `role_reaches` ACL (`acl.rs`), DNS A-record codec (`dns.rs`), CGNAT-conflict guard |
 | `proto/mod.rs` | Wire protocol: message enums, frame encoding, ALPN versions |
 | `sandbox/` | OS-native sandboxing (macOS Seatbelt, Linux Landlock) |
 | `shell/` | PTY session management, session registry |
@@ -57,7 +59,11 @@ The core library providing networking, authentication, protocol, file transfer, 
 **Key dependencies:**
 
 ```toml
-iroh          # QUIC-based P2P networking (custom fork)
+iroh          # QUIC-based P2P networking (custom fork: thedracle/iroh@hop-relay-fix-0.97, iroh 0.97)
+iroh-docs     # CRDT document replication for the warren network document (0.97)
+iroh-gossip   # Gossip overlay backing iroh-docs (0.97)
+iroh-blobs    # Content-addressed blob store backing iroh-docs (0.99)
+tun           # TUN/utun device for the VPN data plane (unix)
 tokio         # Async runtime
 bincode       # Binary serialization for wire protocol
 redb          # Embedded key-value database
@@ -66,6 +72,10 @@ chacha20poly1305  # AEAD encryption for secrets
 portable-pty  # Cross-platform PTY spawning
 landlock      # Linux filesystem sandbox (cfg(target_os = "linux"))
 ```
+
+> The custom iroh fork is wired in via `[patch.crates-io]` in the root
+> `Cargo.toml` (iroh + iroh-base + iroh-relay → `thedracle/iroh@hop-relay-fix-0.97`,
+> which is iroh 0.97.0 plus a macOS relay-cascade fix).
 
 ## Crate: hop-cli
 
@@ -160,4 +170,4 @@ lto = "thin"         # Faster cross-compilation (QEMU)
 codegen-units = 4    # Parallel codegen
 ```
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

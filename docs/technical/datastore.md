@@ -255,4 +255,4 @@ Returns the number of deleted points.
 - The `before` timestamp is exclusive -- points at exactly `before` are retained.
 - Non-existent metrics or empty tables return 0 without error.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

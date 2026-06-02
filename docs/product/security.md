@@ -137,19 +137,50 @@ consulted for peers not locally known. See
 
 ### Peer Roles
 
-| Role | Description |
+Every peer and invite now carries a **named role** (`role_name`). The auth tier
+(`PeerRole`) is kept as a compatibility shim for legacy peers:
+
+| Tier (`PeerRole`) | Description |
 |---|---|
 | `Peer` | Standard access; bound to a Unix user |
 | `Creator` | Administrative access; can create invites, manage peers, fleet operations |
 
-Creator role is required for `hop admin` commands.
+Creator-tier is required for `hop admin` commands. Named roles (e.g. `member`,
+`developer`, `admin`) layer on top and decide **warren reach** (below). The
+no-role default is the least-privilege `member` (default-deny reach), set via
+`HostConfig.default_role`; elevate later with `hop admin <host> grant <peer>
+<role>` — no re-invite.
 
-> **Direction (see [warren.md](warren.md)):** `PeerRole` (`Peer`/`Creator`) and
-> the fleet `RoleDefinition` (named roles) merge into one named-role model where a
-> role carries an auth tier **plus** two layers of access — **reach** (which
-> hosts/ports, the network ACL) and **confinement** (what a hop session may do,
-> the sandbox). The no-role default becomes a least-privilege `member`
-> (default-deny), replacing today's `Peer` = full shell.
+### Two layers of access control: reach vs confinement
+
+A role sets **two independent gates**, AND-ed together (the more-restrictive
+wins where they touch — they never override each other):
+
+| Layer | Answers | Mechanism |
+|-------|---------|-----------|
+| **Reach** (network ACL) | *Can this member connect to that host/service at all?* | role→tag rule resolved at enforcement time against the membership doc (`vpn_reach_allowed`); **default-deny** |
+| **Confinement** (sandbox) | *What may a hop session do once open?* | macOS Seatbelt / Linux Landlock; commands, paths, network egress |
+
+- **Reach** gates the warren VPN data plane: a packet is forwarded only if the
+  source member's role tags reach the destination host's tags (`role_reaches`,
+  wildcard `*` or tag intersection). A role with no tags (`member`) reaches
+  nothing.
+- **Confinement** governs what a hop-spawned shell/exec/agent can do; it does not
+  govern a raw VPN connection to a service (that service's own auth does).
+
+Because a role carries both `host_tags` (reach) and a `sandbox` (confinement),
+you assign one role and both are set coherently. See
+[warren.md](warren.md) for the full model.
+
+### Warren VPN security posture
+
+The VPN data plane is **default-on** but **fail-safe**: bringup is best-effort,
+so a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a host already
+running Tailscale) only skips the VPN — `hop exec`/shell/transfer over the
+existing authenticated channels are never affected. The VPN can be disabled with
+`HOP_VPN=0`, `vpn_enabled = false`, or the installer `--no-vpn`; `HOP_VPN=1`
+forces bringup past the conflict guard. Forwarding is default-deny: nothing flows
+until a role grants reach.
 
 ---
 
@@ -163,4 +194,4 @@ When the hop daemon runs as root:
 
 This ensures that even though the daemon listens as root, all user-facing operations run with minimal privileges. The username binding is set at invite time and cannot be changed by the connecting peer.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

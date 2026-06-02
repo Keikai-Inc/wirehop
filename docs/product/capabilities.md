@@ -178,4 +178,4 @@ The script handles token refresh automatically:
 hop kv get briefings 2026-03-30   # specific date
 ```
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

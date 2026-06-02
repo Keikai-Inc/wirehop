@@ -275,4 +275,4 @@ The hop binary re-invokes itself with the `__sandbox-shell` subcommand, applies 
 
 For users: `hop __sandbox-shell --policy <json> -- su - <username>`
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

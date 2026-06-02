@@ -144,4 +144,4 @@ File transfers show real-time progress by default:
 
 When the hop daemon runs as root and a session is bound to a Unix user, file transfers are executed via a privilege-separated helper process (`__transfer-helper`). The helper runs as the target user, ensuring all file I/O uses kernel-enforced user permissions. This applies to all transfer modes: copy push, copy pull, sync push, and sync pull.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

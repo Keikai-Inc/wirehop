@@ -271,4 +271,4 @@ pub fn hash_file_content(path: &Path) -> Result<u64>
 
 Uses xxHash3-64 in streaming mode (64 KiB read buffer) to hash file contents without loading the entire file into memory. The hash is stored in `FileEntry.content_hash` for sync comparison.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

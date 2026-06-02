@@ -149,4 +149,4 @@ pub fn derive_secrets_key(identity_key: &[u8; 32]) -> [u8; 32] {
 3. Opens datastore with `Datastore::open_with_secrets(path, secrets_key)`
 4. All `secrets_get/set/delete/list` operations use this key for the session
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

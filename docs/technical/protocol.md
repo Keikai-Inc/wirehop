@@ -9,9 +9,15 @@ pub const ALPN_V0: &[u8] = b"hop/0";  // Legacy: basic shell + auth + transfer
 pub const ALPN_V1: &[u8] = b"hop/1";  // + compression, content hashing, parallel streams, delta transfer
 pub const ALPN_V2: &[u8] = b"hop/2";  // + admin protocol, fleet, roles
 pub const ALPN_V3: &[u8] = b"hop/3";  // + zstd compression on large frames (Output messages)
+
+pub const VPN_ALPN: &[u8] = b"hop/vpn/1";  // Warren VPN data plane (separate endpoint)
 ```
 
 The host endpoint binds with ALPNs in preference order: `[V3, V2, V1, V0]`. The `negotiated_protocol_version()` function maps the negotiated ALPN to a `u8` (0-3).
+
+`hop/vpn/1` is **not** part of this stack: it runs on the warren's separate,
+isolated netdoc endpoint (see [Warren protocols](#warren-protocols-vpn--netdoc))
+and carries raw L3 IP packets as QUIC datagrams, not length-prefixed frames.
 
 ## Frame Format
 
@@ -259,4 +265,55 @@ pub enum DeltaOperation {
 }
 ```
 
-*Last updated: v0.4.3*
+---
+
+## Warren protocols (VPN + netdoc)
+
+The warren private network runs on a **separate iroh endpoint** (derived key →
+stable NodeId, `net::create_netdoc_endpoint`), independent of the main hop stack
+above. It has two protocols.
+
+### VPN data plane — `hop/vpn/1`
+
+- **Transport:** QUIC **datagrams** (`send_datagram`/`read_datagram`), not
+  length-prefixed bincode frames. Each datagram is one raw L3 IP packet.
+- **MTU:** 1280 (`VPN_MTU`); the TUN interface is configured to match.
+- **Handler:** `VpnInbound` (an iroh `ProtocolHandler`) writes received datagrams
+  to the local TUN device; an outbound loop reads the TUN, looks up the
+  destination virtual IP's owner, applies the reach ACL, and sends a datagram.
+- **Addressing:** virtual IPs in `100.64.0.0/10` (CGNAT range), allocated
+  deterministically (hash of NodeId) and claimed in the netdoc.
+- **Reach ACL:** `vpn_reach_allowed(src, dst)` resolves src IP → member → role →
+  tags and dst IP → host → tags, then `role_reaches` (wildcard `*` or tag
+  intersection). **Default-deny.**
+
+### Network document (netdoc) — iroh-docs CRDT
+
+Membership and network state replicate as an iroh-docs document (backed by
+iroh-gossip + iroh-blobs). Entries are `key → JSON value` for debuggability:
+
+| Key prefix | Holds |
+|---|---|
+| `peer/<node_id>` | Authorized peer (role_name, username, sandbox, timestamps) |
+| `role/<name>` | Role definition (host_tags, admin, sandbox, …) |
+| `revocation/<node_id>` | Tombstone for a removed peer |
+| `ip/<addr>` | Virtual-IP → owner NodeId claim |
+| `vpn/<addr>` | VPN endpoint (NodeId + relay) for a virtual IP |
+| `tag/<node_id>` | A host's tags |
+| `name/<name>` | MagicDNS name → virtual IP |
+| `network/<key>` | Network config (e.g. `network/domain` for MagicDNS) |
+| `acl/policy` | Legacy hand-authored ACL (superseded by role→tag derivation) |
+
+**Federation** is via iroh-docs `DocTicket`s (a write ticket lets a host join the
+namespace; `HOP_VPN_JOIN_TICKET` / `<config>/netdoc-join.ticket` / installer
+`--join`). On a shared namespace, `reconcile` is **additive-only** so hosts can't
+cross-revoke each other's entries; the `ip`/`vpn`/`name` tables are
+federation-safe by construction (each host writes only its own).
+
+### MagicDNS
+
+A minimal DNS `A`-record codec (`vpn/dns.rs`) answers `<name>.<domain>` lookups
+from the `name/*` table on the virtual interface. The domain comes from
+`network/domain` (default `hop`).
+
+*Last updated: v0.6.33*

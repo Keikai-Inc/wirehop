@@ -220,4 +220,4 @@ fn remove_dangerous_globals(ctx: &Ctx<'_>) -> Result<()> {
 
 QuickJS does not natively provide these globals, but they are removed defensively in case future versions or extensions add them.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

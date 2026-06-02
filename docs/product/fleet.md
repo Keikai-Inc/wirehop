@@ -2,13 +2,15 @@
 
 hop supports fleet operations where any `hop host` can act as an orchestrator. Fleet features are integrated -- there is no separate fleet server. Fleet data is stored alongside normal host configuration.
 
-> **Direction:** the "orchestrator" model below describes today's behavior. Under
-> the [warren](warren.md) direction it evolves toward a fully decentralized model:
-> the orchestrator's role definitions and role-based (aggregate) invites are kept
-> and extended, but membership/role/tag state moves into a replicated network
-> document (no host *owns* the registry), and write authority becomes a
-> cryptographic Owner/Admin capability rather than a designated orchestrator host.
-> See [warren.md](warren.md) → "Legacy → warren reconciliation."
+> **Direction (largely shipped):** the "orchestrator" model below still works as
+> described. Under the [warren](warren.md) it has become mostly decentralized:
+> membership/role/tag state now also lives in a **replicated network document**
+> (iroh-docs) that federates across hosts via a join ticket (`--join` /
+> `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke
+> another's entries. Role definitions and role-based (aggregate) invites are kept
+> and extended (roles now drive warren VPN reach). The one piece still **planned**
+> is making write authority a cryptographic Owner/Admin capability (today the
+> join path hands out an iroh-docs write ticket). See [warren.md](warren.md).
 
 ## Architecture
 
@@ -170,4 +172,4 @@ hop admin <target> role delete temp-role
 
 `roles.json` is designed to be human-readable (pretty-printed JSON) and git-committable, enabling infrastructure-as-code workflows.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

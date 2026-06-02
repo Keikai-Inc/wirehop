@@ -203,4 +203,4 @@ Parent skills (like `install/package`) automatically inline their sub-skills (e.
 
 Keyword search scores matches across title (3x), ID (2.5x), tags (2x), description (1x), and example code (0.5x). Returns top N results ranked by relevance.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*

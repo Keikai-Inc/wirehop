@@ -73,6 +73,40 @@ When a relay URL is provided (from known_hosts or invite tokens), it is included
 
 The default ALPN for `connect_to_host` is `ALPN_V2`. Use `connect_to_host_with_alpn` for a specific version.
 
+## Warren Network Document & VPN
+
+The warren (P2P private network) runs on a **third, isolated iroh endpoint**,
+separate from the host and client endpoints above.
+
+### netdoc endpoint
+
+`net::create_netdoc_endpoint` binds an endpoint keyed by `derive_netdoc_secret_key`
+(a stable, derived NodeId distinct from the host identity). It runs the iroh-docs
+replication stack — an `iroh::protocol::Router` hosting `Docs` (CRDT), `Gossip`,
+and `Blobs` — which `crates/hop-core/src/netdoc/mod.rs` wraps as `NetDoc`. This
+document holds membership, roles, revocations, virtual IPs, VPN endpoints, host
+tags, and MagicDNS names (see [protocol.md](protocol.md#warren-protocols-vpn--netdoc)).
+Like the host endpoint it waits for relay readiness before publishing, and it
+re-publishes its VPN endpoint (NodeId + relay) into the document so peers can dial
+it by virtual IP.
+
+### VPN data plane (`hop/vpn/1`)
+
+When the VPN is enabled (default-on; see below), `NetDoc::enable_vpn`:
+
+1. claims a stable virtual IP in `100.64.0.0/10` (deterministic hash + doc claim),
+2. creates a TUN device (`vpn::create_tun`, utun on macOS / `/dev/net/tun` on
+   Linux, MTU 1280, netmask `255.192.0.0` so the kernel routes the whole `/10`),
+3. registers the VPN endpoint + host tags in the document,
+4. spawns an outbound loop (TUN → reach-check → QUIC datagram to the destination's
+   VPN endpoint) and the `VpnInbound` handler (datagram → TUN).
+
+**Default-on, fail-safe.** Bringup is best-effort: if the TUN can't be created or
+`cgnat_range_in_use()` finds the `100.64.0.0/10` range already claimed by another
+interface (e.g. Tailscale), the VPN is skipped and the daemon serves normally.
+`HOP_VPN=0` / `vpn_enabled = false` opt out; `HOP_VPN=1` forces past the conflict
+guard.
+
 ## Network Monitoring
 
 `crates/hop-core/src/net/netmon.rs` implements a lightweight interface poller that detects IP address changes and kicks iroh's re-discovery.
@@ -260,4 +294,4 @@ pub struct AuditEntry {
 
 Written as append-only JSONL (one JSON object per line). The file is opened with `O_CREAT | O_APPEND` for crash-safe writes. Serialization or file open failures are logged as warnings but do not fail the operation.
 
-*Last updated: v0.4.3*
+*Last updated: v0.6.33*
