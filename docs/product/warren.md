@@ -81,6 +81,11 @@ All network administration collapses into **install + `hop invite`**. There are
 no `net init`, `add-server`, `tag`, or `up` commands — the network self-forms
 from the first daemon and grows through invites.
 
+> **(Planned flow.)** The commands below are the *target* experience. Today the
+> basic invite takes `--creator` (not `--role <named>`), the VPN is opt-in
+> (`HOP_VPN=1`), and there is no `--join` installer flag yet. See **Status**
+> and **Roadmap** for what's shipped vs planned.
+
 ```
 # Founder — install hop. The network ("warren") auto-creates; founder is Owner.
 curl -fsSL https://hop.keik.ai | bash

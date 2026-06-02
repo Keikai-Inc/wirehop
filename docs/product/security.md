@@ -125,7 +125,15 @@ Client: hop connect <invite-token>
           -> decodes token, connects to host, presents secret
           -> host verifies Argon2 hash, consumes invite
           -> peer is added to authorized peers (peers.json)
+          -> peer is also mirrored into the network document (iroh-docs)
 ```
+
+Since Phase 1 (0.6.26), authorization is **doc-aware**: membership lives in a
+replicated network document, with `peers.json` kept as a synced mirror and
+fallback. A peer in `peers.json` is always allowed (no lockout); the document is
+consulted for peers not locally known. See
+[../technical/p2p-network.md](../technical/p2p-network.md) and
+[warren.md](warren.md).
 
 ### Peer Roles
 
@@ -135,6 +143,13 @@ Client: hop connect <invite-token>
 | `Creator` | Administrative access; can create invites, manage peers, fleet operations |
 
 Creator role is required for `hop admin` commands.
+
+> **Direction (see [warren.md](warren.md)):** `PeerRole` (`Peer`/`Creator`) and
+> the fleet `RoleDefinition` (named roles) merge into one named-role model where a
+> role carries an auth tier **plus** two layers of access — **reach** (which
+> hosts/ports, the network ACL) and **confinement** (what a hop session may do,
+> the sandbox). The no-role default becomes a least-privilege `member`
+> (default-deny), replacing today's `Peer` = full shell.
 
 ---
 

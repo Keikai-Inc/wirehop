@@ -31,7 +31,14 @@ Status legend: ✅ resolved by decision · 📝 doc fix needed · 🔧 open tech
   today's footgun (no-role → `Peer` = full unrestricted shell). The org default
   is re-pointable; implementation is part of the role-system merge.
 
-## 📝 Doc honesty fixes still needed (warren.md describes unbuilt things in present tense)
+## 📝 Doc honesty fixes — ✅ all addressed
+
+*(All resolved as of the consistency pass: client read-replica + onboarding
+`--role` flow marked Planned; default-role table corrected to seeded roles;
+`hop ls` discovery marked Planned; MagicDNS domain decided (configurable);
+`security.md` auth flow + role direction updated; `fleet.md` cross-references the
+warren evolution; the technical doc gained a "Federation safety" section. The
+items below are kept for the record.)*
 
 - 📝 **Client "carries a read-only replica."** Today only the `hop host` daemon
   runs the netdoc stack; a plain `hop` client has **no** replica. The
@@ -90,11 +97,17 @@ Status legend: ✅ resolved by decision · 📝 doc fix needed · 🔧 open tech
 
 ## Triage
 
-1. **Already decided (just land the doc edits):** the ✅ block — positioning,
-   control-plane semantics, daemon/root model.
-2. **Make the docs honest (small edits):** the 📝 block — so warren.md describes a
-   buildable system and matches seeded roles + live DNS.
-3. **Build, in order:** role-system merge → M1 (role→ACL derivation) → read/write
-   capability split + ownership-scoped reconcile (M2) → receiver-side ACL +
-   fleet-state migration. These are the genuine engineering items, now with their
-   sharp edges named.
+1. ✅ **Already decided** (✅ block) — positioning, control-plane semantics,
+   daemon/root model, default-role behavior, DNS domain. Doc edits landed.
+2. ✅ **Docs made honest** (📝 block) — every present-tense overclaim is now marked
+   Planned or corrected; `security.md`/`fleet.md` updated; cross-refs added.
+3. 🔧 **Build next** — the only remaining work is engineering. It is now planned
+   in detail: see **[../technical/p2p-network.md](../technical/p2p-network.md) →
+   "Next-stage build plan — the role-based warren MVP"** (role unification +
+   federation safety + role→ACL derivation + live multi-node TUN e2e). The open
+   🔧 items above (inert VPN, write-ticket, federated reconcile, receiver-side
+   ACL, fleet-state migration, role-system merge) are all steps of that plan.
+
+**Status: product/technical docs are internally consistent and consistent with
+the implementation. All gaps are either resolved-by-decision, doc-corrected, or
+captured as sequenced steps in the build plan.**

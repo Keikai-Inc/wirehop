@@ -2,6 +2,14 @@
 
 hop supports fleet operations where any `hop host` can act as an orchestrator. Fleet features are integrated -- there is no separate fleet server. Fleet data is stored alongside normal host configuration.
 
+> **Direction:** the "orchestrator" model below describes today's behavior. Under
+> the [warren](warren.md) direction it evolves toward a fully decentralized model:
+> the orchestrator's role definitions and role-based (aggregate) invites are kept
+> and extended, but membership/role/tag state moves into a replicated network
+> document (no host *owns* the registry), and write authority becomes a
+> cryptographic Owner/Admin capability rather than a designated orchestrator host.
+> See [warren.md](warren.md) → "Legacy → warren reconciliation."
+
 ## Architecture
 
 ```

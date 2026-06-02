@@ -317,6 +317,22 @@ collapsing hop's two role concepts into one:
   across join/leave. This supersedes hand-authored `acl/policy` for the default
   case.
 
+### Federation safety (Planned — required before sharing a namespace)
+
+Cross-host federation (one shared namespace) needs two safeguards the per-host
+model doesn't:
+
+- **Read vs write capability.** Today the join/`enable_vpn` path hands out a
+  **write** ticket — any member could rewrite membership/roles/ACL. Members must
+  instead get a **read** replica; membership/role/ACL **writes** require an
+  Owner/Admin-signed capability (consistent with the trust-root chain, #9). This
+  is what makes "Owner-managed membership" hold without a central server.
+- **Ownership-scoped reconcile.** `reconcile` revokes "doc peers not in *my*
+  `peers.json`" — safe per-host, but on a shared namespace it would revoke other
+  hosts' members. Reconcile must be scoped to entries this host owns. The
+  additive `ip`/`vpn`/`name` tables are already federation-safe (each host writes
+  only its own); membership/roles need this scoping first.
+
 ### Phase 1 implementation status
 
 **Shipped (per-host model):** the iroh-docs stack runs on a dedicated, isolated
@@ -340,6 +356,53 @@ let any network member reach every host's shell — so it is intentionally **cou
 to Phase 4's default-deny ACLs (#8)** rather than shipped in Phase 1. The
 federation primitives exist (`NetDoc::read_ticket`, `Bootstrap::Import`,
 `reconcile`'s per-host-ownership caveat) and are ready for that phase.
+
+## Next-stage build plan — the role-based warren MVP
+
+The next stage turns today's inert, opt-in VPN into a working role-driven warren:
+**role unification + federation safety + role→ACL derivation + a live multi-node
+TUN e2e.** These are interdependent (a member's reach across hosts needs both the
+unified role and a safely-shared namespace), so they ship as one coherent stage,
+sequenced so each step compiles and tests.
+
+1. **Canonical role** (`hop-core`). Make `RoleDefinition` the one role type: add
+   `ports` (default all) for reach; `admin: bool` is the auth tier (subsumes
+   `Creator`). Seed a least-privilege **`member`** role (no tags, default-deny).
+   Add `default_role` to the warren config (doc `network/config`, default
+   `member`). Peer entries carry a role **name**; `PeerRole` becomes a thin compat
+   shim (`Creator`↔admin, `Peer`↔default) during migration.
+2. **Invite by role** (`hop-cli` + proto). `hop invite --role <name>`; `--creator`
+   = sugar for `--role admin`; no `--role` → org default. Redeem stores the role
+   name in the peer entry + doc.
+3. **Host tags in the doc** (`hop-core`). Each host publishes its tags
+   (`tag/<host_id>`); source from config / an install `--tag` flag; default
+   untagged.
+4. **Federation safety** (`hop-core`) — prerequisite for multi-node. Split **read
+   vs write** capability (members get a read replica; membership/role/ACL writes
+   need an Owner/Admin-signed capability), and make `reconcile`
+   **ownership-scoped** (only revoke entries this host owns) so a shared namespace
+   doesn't cross-revoke.
+5. **Role→tag→ACL resolver** (`vpn::acl` + `netdoc`). Replace static `acl/policy`
+   evaluation with: src IP → member → role → permitted tags+ports; dst IP → host →
+   tags; allow iff dst tag ∈ role tags ∧ port permitted; default-deny. Reads
+   membership/roles/tags from the replicated doc.
+6. **Role elevation** (`hop-cli` + admin proto). `hop role grant/set <peer>
+   <role>` updates the peer's role entry (peers.json + doc) → reconcile → ACL
+   re-resolves network-wide, no re-invite.
+7. **Configurable MagicDNS domain** (`hop-core`). Resolver reads the warren domain
+   from `network/config` (default `<warren-name>.hop`, else `hop`) instead of the
+   hard-coded `.hop`.
+8. **Validation.** Unit: role→ACL resolution (dev reaches dev-tagged, denied prod;
+   member denied all; port ranges). **Live multi-node TUN e2e** (`NET_ADMIN` +
+   `/dev/net/tun` in the containers): host-a tagged `production`, host-b tagged
+   `developer`, a `developer` member — assert it reaches host-b and is denied
+   host-a over the real VPN. Plus the existing 53-test regression suite green.
+   This promotes Phase 3-4 from experimental toward default-on.
+
+**Rollout order within the stage:** role unification + `member` default first
+(auth-semantics change, guarded by the `peers.json` fallback so existing peers
+are unaffected) → federation safety → ACL derivation (only affects the opt-in
+VPN) → e2e → flip the VPN default-on once the live e2e is green.
 
 ## What stays the same
 
