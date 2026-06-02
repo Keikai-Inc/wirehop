@@ -445,6 +445,12 @@ pub struct HostConfig {
     /// least-privilege `member` (default-deny reach). Re-point per deployment.
     #[serde(default = "default_role_name")]
     pub default_role: String,
+
+    /// Tags for this host (e.g. `["production", "web"]`). Drive role→tag VPN
+    /// reach (a role reaching tag `production` can reach hosts tagged so) and
+    /// MagicDNS. Empty = untagged.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_role_name() -> String {
@@ -465,6 +471,7 @@ impl Default for HostConfig {
             session_timeout_secs: default_session_timeout(),
             max_sessions: default_max_sessions(),
             default_role: default_role_name(),
+            tags: Vec::new(),
         }
     }
 }

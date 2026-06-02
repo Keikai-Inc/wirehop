@@ -404,6 +404,90 @@ impl NetDoc {
         Ok(Some((pubkey, relay)))
     }
 
+    // ── Host tags + role-derived reach (Steps 3 & 5) ─────────────────────
+
+    /// Publish this host's tags (drives role→tag VPN reach + MagicDNS).
+    pub async fn register_host_tags(&self, host_id: &str, tags: &[String]) -> Result<()> {
+        let key = format!("tag/{host_id}");
+        let value = serde_json::to_vec(tags).context("serializing host tags")?;
+        self.doc
+            .set_bytes(self.author, key.into_bytes(), value)
+            .await
+            .context("registering host tags")?;
+        Ok(())
+    }
+
+    /// Look up a host's tags from the document (empty if unset).
+    pub async fn lookup_host_tags(&self, host_id: &str) -> Result<Vec<String>> {
+        let key = format!("tag/{host_id}");
+        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+        let Some(entry) = self.doc.get_one(query).await.context("get_one tag")? else {
+            return Ok(Vec::new());
+        };
+        if entry.content_len() == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+        Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// Resolve a role by name from the document's role entries.
+    pub async fn find_role(&self, name: &str) -> Result<Option<RoleDefinition>> {
+        Ok(self.list_roles().await?.into_iter().find(|r| r.name == name))
+    }
+
+    /// Role-derived VPN reach (Step 5): is `src_ip` permitted to reach `dst_ip`?
+    /// Resolves src IP → peer → role → tags and dst IP → host → tags through the
+    /// document, then applies [`crate::vpn::acl::role_reaches`]. Default-deny on
+    /// any missing link (unknown peer, no role, etc.).
+    pub async fn vpn_reach_allowed(
+        &self,
+        src_ip: std::net::Ipv4Addr,
+        dst_ip: std::net::Ipv4Addr,
+    ) -> bool {
+        let ips = match self.list_virtual_ips().await {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let owner = |ip: std::net::Ipv4Addr| ips.iter().find(|(a, _)| *a == ip).map(|(_, n)| n.clone());
+        let (Some(src_node), Some(dst_node)) = (owner(src_ip), owner(dst_ip)) else {
+            return false;
+        };
+        // Source peer's role.
+        let Ok(Some(peer)) = self.get_peer(&src_node).await else { return false };
+        let Some(role_name) = peer.role_name else { return false };
+        let Ok(Some(role)) = self.find_role(&role_name).await else { return false };
+        // Destination host's tags.
+        let dst_tags = self.lookup_host_tags(&dst_node).await.unwrap_or_default();
+        crate::vpn::acl::role_reaches(&role.host_tags, &dst_tags)
+    }
+
+    /// The warren's MagicDNS domain (doc `network/domain`, default `hop`).
+    /// A named warren sets `<warren-name>.hop`; unnamed falls back to `hop`.
+    pub async fn network_domain(&self) -> String {
+        let query = Query::single_latest_per_key().key_exact(b"network/domain").build();
+        match self.doc.get_one(query).await {
+            Ok(Some(e)) if e.content_len() > 0 => self
+                .fs_store
+                .get_bytes(e.content_hash())
+                .await
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "hop".to_string()),
+            _ => "hop".to_string(),
+        }
+    }
+
+    /// Set the warren's MagicDNS domain.
+    pub async fn set_network_domain(&self, domain: &str) -> Result<()> {
+        self.doc
+            .set_bytes(self.author, b"network/domain".to_vec(), domain.as_bytes().to_vec())
+            .await
+            .context("writing network domain")?;
+        Ok(())
+    }
+
     /// Read the network's ACL policy from the document (default-deny if unset).
     pub async fn get_acl_policy(&self) -> Result<crate::vpn::acl::AclPolicy> {
         let query = Query::single_latest_per_key().key_exact(b"acl/policy").build();
@@ -426,27 +510,26 @@ impl NetDoc {
         Ok(())
     }
 
-    /// Enable the VPN data plane (Phase 3, opt-in): claim a virtual IP, create
-    /// the TUN device, advertise the endpoint, and start forwarding under the
-    /// network's ACL policy (default-deny). Off unless explicitly called.
+    /// Enable the VPN data plane (Phase 3, opt-in): claim a virtual IP, register
+    /// this host's tags + endpoint, create the TUN device, and start forwarding
+    /// under **role-derived reach** (Step 5; default-deny). Off unless explicitly
+    /// called.
     #[cfg(unix)]
     pub async fn enable_vpn(
         self: &std::sync::Arc<Self>,
         host_node_id: &str,
+        host_tags: &[String],
     ) -> Result<std::net::Ipv4Addr> {
         let addr = self.claim_virtual_ip(host_node_id).await?;
         let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
         *self.vpn_tun.write().await = Some(tun.clone());
         self.register_vpn_endpoint(addr).await?;
-        let policy = self.get_acl_policy().await.unwrap_or_default();
-        if policy.default == crate::vpn::acl::Action::Deny && policy.rules.is_empty() {
-            tracing::warn!(
-                "vpn: ACL policy is default-deny with no rules — all VPN traffic is blocked. \
-                 Set a policy via NetDoc::set_acl_policy to permit flows."
-            );
+        // Publish this host's tags so other members' roles can resolve reach.
+        if let Err(e) = self.register_host_tags(host_node_id, host_tags).await {
+            tracing::warn!("vpn: host-tag registration failed: {e:#}");
         }
         let me = std::sync::Arc::clone(self);
-        tokio::spawn(async move { me.vpn_outbound_loop(tun, policy).await });
+        tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
 
         // MagicDNS: register this host's name → virtual IP and serve `*.hop`
         // lookups on the virtual interface (split-DNS points `.hop` here).
@@ -496,7 +579,9 @@ impl NetDoc {
                 return;
             }
         };
-        tracing::info!("vpn: MagicDNS serving *.hop on {addr}:53");
+        let domain = self.network_domain().await;
+        let suffix = format!(".{domain}");
+        tracing::info!("vpn: MagicDNS serving *.{domain} on {addr}:53");
         let mut buf = [0u8; 512];
         loop {
             let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -504,7 +589,7 @@ impl NetDoc {
                 Err(_) => continue,
             };
             let Some(query) = crate::vpn::dns::parse_query(&buf[..n]) else { continue };
-            let resolved = match query.name.strip_suffix(".hop") {
+            let resolved = match query.name.strip_suffix(&suffix) {
                 Some(host) => self.lookup_name(host).await.ok().flatten(),
                 None => None,
             };
@@ -516,11 +601,7 @@ impl NetDoc {
     /// Read packets off the TUN device and forward each to the owning peer over
     /// a `hop/vpn/1` QUIC-datagram connection (re-using/reconnecting as needed).
     #[cfg(unix)]
-    async fn vpn_outbound_loop(
-        &self,
-        tun: std::sync::Arc<tun::AsyncDevice>,
-        policy: crate::vpn::acl::AclPolicy,
-    ) {
+    async fn vpn_outbound_loop(&self, tun: std::sync::Arc<tun::AsyncDevice>) {
         use std::collections::HashMap;
         let mut conns: HashMap<iroh::PublicKey, iroh::endpoint::Connection> = HashMap::new();
         let mut buf = vec![0u8; 65535];
@@ -537,14 +618,11 @@ impl NetDoc {
             if !crate::vpn::is_virtual_addr(dst) {
                 continue;
             }
-            // ACL enforcement (default-deny). Drop packets the policy forbids.
-            if let Some(src) = crate::vpn::parse_src_ipv4(pkt) {
-                let port = crate::vpn::parse_dest_port(pkt);
-                if !policy.permits(src, dst, port) {
-                    continue;
-                }
-            } else {
-                continue;
+            // Role-derived reach (Step 5; default-deny). Drop packets the source
+            // peer's role doesn't permit to the destination host's tags.
+            match crate::vpn::parse_src_ipv4(pkt) {
+                Some(src) if self.vpn_reach_allowed(src, dst).await => {}
+                _ => continue,
             }
             let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
                 Ok(Some(v)) => v,
@@ -811,6 +889,50 @@ mod tests {
         assert_eq!(peers[0].node_id, "a1");
         assert!(net.is_revoked("b2").await.unwrap());
         assert!(!net.is_revoked("a1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn role_derived_reach_via_doc() {
+        use crate::proto::{RoleDefinition, UserMode};
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn");
+
+        // A developer role reaches `staging`-tagged hosts.
+        net.put_role(&RoleDefinition {
+            name: "developer".into(),
+            host_tags: vec!["staging".into()],
+            user_mode: UserMode::Individual,
+            sudo: false,
+            admin: false,
+            groups: vec![],
+            shell: None,
+            sandbox: SandboxPolicy::default(),
+        })
+        .await
+        .unwrap();
+
+        // src peer = a developer; dst host tagged staging.
+        let src_ip = net.claim_virtual_ip("devpeer").await.unwrap();
+        let dst_ip = net.claim_virtual_ip("staginghost").await.unwrap();
+        let mut dev = sample_peer("devpeer", "dev");
+        dev.role_name = Some("developer".into());
+        net.put_peer(&dev).await.unwrap();
+        net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
+
+        // Developer reaches the staging host.
+        assert!(net.vpn_reach_allowed(src_ip, dst_ip).await);
+
+        // Re-tag the host production-only → developer is denied.
+        net.register_host_tags("staginghost", &["production".into()]).await.unwrap();
+        assert!(!net.vpn_reach_allowed(src_ip, dst_ip).await);
+
+        // A member (no role_name) reaches nothing.
+        let m_ip = net.claim_virtual_ip("memberpeer").await.unwrap();
+        net.put_peer(&sample_peer("memberpeer", "m")).await.unwrap();
+        net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
+        assert!(!net.vpn_reach_allowed(m_ip, dst_ip).await);
     }
 
     #[test]

@@ -355,6 +355,13 @@ pub enum AdminAction {
         /// NodeId prefix of the peer to remove
         id: String,
     },
+    /// Change a peer's role on the remote host (elevation/demotion)
+    Grant {
+        /// NodeId prefix of the peer
+        id: String,
+        /// Named role to assign (e.g. developer, ops, admin, member)
+        role: String,
+    },
     /// Create a Unix user on the remote host
     CreateUser {
         /// Username to create

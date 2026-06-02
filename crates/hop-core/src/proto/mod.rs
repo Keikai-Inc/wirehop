@@ -106,6 +106,11 @@ pub enum AdminRequest {
         #[serde(default)]
         role_name: Option<String>,
     },
+    /// Change an existing peer's named role (elevation/demotion).
+    SetPeerRole {
+        node_id_prefix: String,
+        role_name: String,
+    },
     /// List authorized peers.
     ListPeers,
     /// Remove a peer by node_id prefix.
@@ -178,6 +183,8 @@ pub enum AdminResponse {
     PeerList { peers: Vec<PeerInfo> },
     /// A peer was removed.
     PeerRemoved { success: bool },
+    /// A peer's role was changed.
+    PeerRoleUpdated { success: bool },
     /// A Unix user was created.
     UserCreated {
         username: String,

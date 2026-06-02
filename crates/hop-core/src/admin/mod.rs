@@ -33,6 +33,9 @@ pub fn handle_admin_request(
         AdminRequest::RemovePeer { node_id_prefix } => {
             handle_remove_peer(config_dir, &node_id_prefix)
         }
+        AdminRequest::SetPeerRole { node_id_prefix, role_name } => {
+            handle_set_peer_role(config_dir, &node_id_prefix, &role_name)
+        }
         AdminRequest::CreateUser {
             username,
             sudo,
@@ -172,6 +175,28 @@ fn handle_list_peers(config_dir: &Path) -> AdminResponse {
         Err(e) => AdminResponse::Error {
             message: format!("failed to load peers: {e}"),
         },
+    }
+}
+
+fn handle_set_peer_role(config_dir: &Path, node_id_prefix: &str, role_name: &str) -> AdminResponse {
+    match PeersStore::load(config_dir) {
+        Ok(mut store) => {
+            let mut found = false;
+            for p in store.peers.iter_mut().filter(|p| p.node_id.starts_with(node_id_prefix)) {
+                p.role_name = Some(role_name.to_string());
+                found = true;
+            }
+            if found {
+                if let Err(e) = store.save(config_dir) {
+                    return AdminResponse::Error { message: format!("updated but failed to save: {e}") };
+                }
+                log_admin_action(config_dir, "set_peer_role", &format!("{node_id_prefix} -> {role_name}"));
+            }
+            // The post-admin reconcile hook mirrors the change into the document,
+            // which re-resolves role-derived reach network-wide.
+            AdminResponse::PeerRoleUpdated { success: found }
+        }
+        Err(e) => AdminResponse::Error { message: format!("failed to load peers: {e}") },
     }
 }
 

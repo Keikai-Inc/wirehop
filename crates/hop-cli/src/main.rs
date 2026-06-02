@@ -389,8 +389,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     // daemon behavior unchanged.
                     #[cfg(unix)]
                     if std::env::var("HOP_VPN").as_deref() == Ok("1") {
-                        match net.enable_vpn(&host_node_id).await {
-                            Ok(ip) => tracing::info!("vpn: enabled (experimental), virtual IP {ip}"),
+                        let host_tags = hop_core::config::HostConfig::load(&cfg)
+                            .map(|c| c.tags)
+                            .unwrap_or_default();
+                        match net.enable_vpn(&host_node_id, &host_tags).await {
+                            Ok(ip) => tracing::info!(
+                                "vpn: enabled (experimental), virtual IP {ip}, tags {host_tags:?}"
+                            ),
                             Err(e) => tracing::warn!("vpn: enable failed: {e:#}"),
                         }
                     }
@@ -2032,6 +2037,10 @@ async fn cmd_admin(
         AdminAction::RemovePeer { id } => AdminRequest::RemovePeer {
             node_id_prefix: id.clone(),
         },
+        AdminAction::Grant { id, role } => AdminRequest::SetPeerRole {
+            node_id_prefix: id.clone(),
+            role_name: role.clone(),
+        },
         AdminAction::CreateUser {
             username,
             sudo,
@@ -2170,6 +2179,13 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
         AdminResponse::PeerRemoved { success } => {
             if success {
                 println!("Peer removed.");
+            } else {
+                println!("No peer found with that ID prefix.");
+            }
+        }
+        AdminResponse::PeerRoleUpdated { success } => {
+            if success {
+                println!("Peer role updated.");
             } else {
                 println!("No peer found with that ID prefix.");
             }

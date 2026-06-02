@@ -94,12 +94,43 @@ impl AclPolicy {
     }
 }
 
+/// Role-derived reach (Step 5): does a role whose `host_tags` are `role_tags`
+/// permit reaching a host tagged `host_tags`? `*` in the role's tags is a
+/// wildcard (reaches everything); otherwise any tag intersection allows. Empty
+/// role tags → reaches nothing (the least-privilege `member` default).
+pub fn role_reaches(role_tags: &[String], host_tags: &[String]) -> bool {
+    if role_tags.iter().any(|t| t == "*") {
+        return true;
+    }
+    role_tags.iter().any(|rt| host_tags.iter().any(|ht| ht == rt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn role_reach_rules() {
+        // Wildcard role reaches anything.
+        assert!(role_reaches(&tags(&["*"]), &tags(&["production"])));
+        // developer (developer,staging) reaches a staging host.
+        assert!(role_reaches(&tags(&["developer", "staging"]), &tags(&["staging", "web"])));
+        // developer does NOT reach a production-only host.
+        assert!(!role_reaches(&tags(&["developer", "staging"]), &tags(&["production"])));
+        // member (no tags) reaches nothing.
+        assert!(!role_reaches(&[], &tags(&["production"])));
+        assert!(!role_reaches(&[], &[]));
+        // untagged host is unreachable except by wildcard.
+        assert!(!role_reaches(&tags(&["developer"]), &[]));
+        assert!(role_reaches(&tags(&["*"]), &[]));
     }
 
     #[test]
