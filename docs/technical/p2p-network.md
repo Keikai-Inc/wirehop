@@ -428,6 +428,114 @@ existing peers are unaffected) → federation safety → ACL derivation (affects
 the VPN data plane) → live e2e → flipped the VPN default-on once the e2e was
 green (v0.6.32).
 
+## Next-stage build plan — token unification + the two install tiers (Planned)
+
+> **Status: Planned / design agreed.** This stage reconciles two accidental
+> dualities — (a) "regular invite" vs "warren join token", and (b) the install
+> story — into one mental model. Nothing here is implemented yet.
+
+### Product framing (what the user sees)
+
+The category (Tailscale, ZeroTier, NetBird) installs a root daemon by default but
+gates *joining the network* behind an explicit step (`up`/`join`), and resolves
+"new vs existing network" from **identity via a coordinator**. hop has **no
+coordinator**, so the only signal for "new vs join" is a **token** (or its
+absence). hop is also more *asymmetric* than the symmetric mesh VPNs — it has a
+real client-vs-host split, closer to `ssh`/`sshd`. Two install tiers fall out:
+
+| Tier | sudo / daemon | VPN / virtual IP / `name.hop` | Has a warren? | Purpose |
+|------|---------------|-------------------------------|---------------|---------|
+| **Connect from this machine** (client) | no | no | no (member only) | reach hosts you're invited to, SSH-style, zero footprint |
+| **A machine to reach** (node) — *default* | yes | yes | yes (its namespace) | be *on* the private network |
+
+Two ways to reach a host, and only one is the VPN: **direct hop session**
+(`hop host`, exec, cp — P2P, no VPN, works from a client) vs **warren IP
+reachability** (services by virtual IP / `name.hop`, nodes only). That is why a
+no-sudo client needs no VPN.
+
+**One-warren default, no create/join prompt.** The "a machine to reach" path has
+a single optional field: *paste your invite (leave blank to start your own)*.
+Blank → anchor your own warren (founder / home server / company's first server).
+Token → join. Joining while **trivial** (no members yet) silently adopts the
+target warren (no island); joining once you **have members** becomes a gated
+populated-warren merge (admin + two-sided consent — see Federation safety).
+
+### The unification: one token, one membership, tier = install
+
+Today the daemon writes **two** artifacts — `creator_invite` (an `InviteToken`:
+how to reach the host + role) and `netdoc.ticket` (a `DocTicket`: how to replicate
+the namespace). Fold the second into the first:
+
+- Add `warren_ticket: Option<String>` (the namespace `DocTicket`) to `InviteToken`.
+  "Warren join token" disappears as a separate concept — there is only **an
+  invite**.
+- **Redeeming always = becoming a warren member with a role** (the host already
+  dual-writes the peer entry into the doc). Tier decides what your *local* machine
+  does with it:
+  - **Node** (default, sudo): membership **+** joins the namespace via
+    `warren_ticket` → virtual IP, MagicDNS, on the mesh.
+  - **Client** (no sudo): membership **+** direct-session reach; `warren_ticket`
+    stored **dormant** for a later upgrade.
+- **Upgrade client → node** = re-run the node install; it detects the stored
+  `warren-ticket` + existing membership and brings up the VPN. No re-invite.
+- Single-use invite = invite a person; the existing multi-use **aggregate/fleet
+  invite** (role + tags) = provision N servers. Both just carry `warren_ticket`.
+
+**Capability decision (MVP):** the embedded `DocTicket` is **write-capable** — a
+node must write to claim its virtual IP / register its endpoint, so a read-only
+ticket can't power the node path with today's self-claim architecture. It inherits
+the invite's protection (single-use, expiring, secret) and additive-only
+reconcile. Cryptographic write-gating (members get read; writes need an
+Owner/Admin-signed capability) remains the trust-root hardening (#9).
+
+**Main engineering risk / bridge:** redeeming is a client/connect action
+(`hop connect`), but joining the namespace as a node is a `hop host` action
+(reads `netdoc-join.ticket`). The **installer orchestrates the bridge** (redeem →
+extract `warren_ticket` → hand to the daemon), since it knows the tier.
+
+### Phases (each compiles + is independently testable)
+
+- **A — Unify the token.** `InviteToken` gains `warren_ticket` (`skip_if_none` →
+  old invites parse, old clients ignore). Invite generation (`cmd_invite`, creator
+  invite at `main.rs`, `admin::handle_create_invite`, aggregate/fleet) reads the
+  existing `<config>/netdoc.ticket` and embeds it. `cmd_connect` redeem persists a
+  present `warren_ticket` to `<config>/warren-ticket` (dormant). `netdoc.ticket`
+  stays on disk for back-compat but is no longer the user-facing path.
+- **C — Reconcile the installer.** One `install.sh`: default branch = today's
+  `install-daemon.sh` (node), `--client` = today's lightweight install. Unify the
+  join input as `--invite <token>` (node → extract ticket → `netdoc-join.ticket`;
+  client → redeem + store). Keep `--no-vpn`/`--tag`/`--default-role`; `--join`
+  becomes a hidden alias. `install-daemon.sh` → thin alias of `install.sh`.
+- **B — Upgrade path.** Node re-install detects `<config>/warren-ticket` + existing
+  membership and adopts it. Add `hop warren status` ("member of X; VPN: off") so
+  the upgrade is discoverable.
+- **D — Site + docs.** Install page: client vs node (node primary), one optional
+  "paste your invite" field; builder controls show only for node. Retire
+  "warren join token" vocabulary across warren.md / p2p-network.md / cli-reference
+  / security.
+- **E — Validate + release.** Unit (invite round-trips `warren_ticket`; redeem
+  persists; old ticketless invite still authorizes). e2e: `vpn-e2e.sh` reworked so
+  host-b joins as a node from the **single unified invite**; plus a client-redeems
+  → reaches host by direct session → node-reinstall **upgrades** → pings case.
+  53-test regression green. Release + sync branches.
+
+**Execution order:** A → C → B → D → E.
+
+### Back-compat (rock-solid)
+
+- Old invites (no `warren_ticket`) still authorize for direct-session access; they
+  just can't make you a node. No breakage.
+- `install-daemon.sh` URL is a permanent alias.
+- Existing nodes/namespaces untouched; newly-minted invites simply gain the ticket.
+
+### Open product decision
+
+For the **startup persona**, should a developer's laptop default to **client**
+(reach servers, no root; upgrade-to-node available) — onboarding email hands out
+an **invite**, dev picks tier at install? This plan assumes yes. The alternative
+is making the laptop a full node by default (Tailscale-like, but root on every
+dev machine).
+
 ## What stays the same
 
 - iroh as transport; relay for NAT traversal (unchanged).
