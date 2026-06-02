@@ -6,12 +6,20 @@ hop is a single-binary CLI tool that provides secure shell access, file transfer
 
 | SSH pain point | hop solution |
 |---|---|
-| Requires port forwarding or a VPN | Direct P2P via NAT traversal + relay fallback |
-| Tailscale/ZeroTier require accounts and background daemons | Single binary, no accounts |
+| Requires port forwarding or a VPN appliance | Direct P2P via NAT traversal + relay fallback |
+| Tailscale/ZeroTier route trust through a central coordination server | Fully peer-to-peer — no central control plane, no accounts, no third party to depend on |
 | ngrok/Cloudflare Tunnel route traffic through third parties | End-to-end encrypted, peer-to-peer |
 | Key management and `authorized_keys` | One-time invite tokens with automatic key exchange |
 | No built-in session persistence | Sessions survive disconnects (24h default) |
 | No native file sync | Built-in `cp` and `sync` with delta transfer |
+
+> **hop's defining guarantee is decentralization, not minimalism.** The wedge is
+> that hop runs **independent of any third party or central control plane** —
+> not that it avoids a background process. As hop grows into a full private
+> network (the **[warren](warren.md)**), members run a local daemon (like
+> Tailscale's, but with no coordination server behind it). "Single binary, no
+> central anything" is the promise; a per-member daemon is fully in keeping with
+> it.
 
 ## Core User Flows
 

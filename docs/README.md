@@ -14,6 +14,7 @@ What hop does — user-facing behavior, CLI commands, JS APIs.
 | [datastore.md](product/datastore.md) | KV, time-series, cron scheduling, secrets, retention |
 | [fleet.md](product/fleet.md) | Fleet management, roles, aggregate invites |
 | [warren.md](product/warren.md) | **(Product design)** The warren — hop's zero-config private network: client vs node, role-is-the-access model, onboarding, roadmap |
+| [warren-gaps.md](product/warren-gaps.md) | **(Living)** Consistency gaps between the warren docs and the implementation, triaged (resolved-by-decision / doc-fix / open work) |
 | [transfer.md](product/transfer.md) | `hop cp`, `hop sync`, delta transfer, compression |
 | [security.md](product/security.md) | Sandbox system, auth, invites, privilege separation |
 | [mcp.md](product/mcp.md) | MCP server, tools, skills library, AI agent integration |

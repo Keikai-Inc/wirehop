@@ -55,7 +55,7 @@ governed by your role; *how* you reach it is governed by which path you install.
 | Virtual IP + MagicDNS name | No | Yes |
 | `hop <host>` (shell/exec/transfer/MCP) | ✅ role-permitted hosts | ✅ |
 | Reach services at IP:port (the VPN) | ❌ | ✅ ACL-gated |
-| Network-doc replica | read-only (discovery + auth) | read/write (full member) |
+| Network-doc replica | read-only (discovery + auth) *(Planned)* | read/write (full member) |
 
 - A **client** is the lightweight "SSH-replacement" user — a contractor or CI
   runner who just needs into specific boxes. No root, no TUN.
@@ -63,9 +63,10 @@ governed by your role; *how* you reach it is governed by which path you install.
   **server** is simply a node that others have a role to hop *into*; a laptop is
   a node nobody is authorized to reach inbound. Same daemon, governed by roles.
 
-The client always carries a **read-only replica** of the network document so
-`hop ls` shows every host its role permits (no stale `known_hosts`) — it knows
-the network without being on the fabric.
+*(Planned)* The client will carry a **read-only replica** of the network
+document so `hop ls` shows every host its role permits (no stale `known_hosts`) —
+knowing the network without being on the fabric. *(Today only the `hop host`
+daemon runs the netdoc stack; a plain client has no replica yet.)*
 
 ## Onboarding (zero-config)
 
@@ -111,14 +112,21 @@ A **role** defines:
 
 ### Default roles
 
+These are the **currently seeded** roles (`crates/hop-core/src/fleet`), plus the
+planned `member` default:
+
 | Role | Reaches (tags) | Notes |
 |------|----------------|-------|
-| `member` *(default)* | none | In the warren with an address; **default-deny** until granted. The safe default. |
-| `developer` | `dev`, `staging` | Day-to-day engineering access. |
+| `member` *(Planned — the new default)* | none | In the warren with an address; **default-deny** until granted. The safe default. |
+| `developer` | `developer`, `staging` | Day-to-day engineering access. |
 | `ops` | `*` | Infrastructure. |
-| `ci` | `ci`, `build` | Build/deploy targets. |
-| `security` | `*` | Audit-oriented. |
-| `admin` / Owner | `*` | Full reach + manages the warren. |
+| `ci` | `build` | Build/deploy targets. |
+| `security` | `production`, `staging` | Audit-oriented. |
+| `admin` | `*` | Full reach + manages the warren. |
+
+*(Today these roles drive fleet aggregate-invite access; the warren extends the
+same role→tag model to VPN reach. The exact tag sets are tunable — the table
+reflects the seed defaults, not a fixed contract.)*
 
 ### The default role (Planned)
 
@@ -191,6 +199,33 @@ See the roadmap below.
 
 The only command a founder ever types remains `hop invite --role X`. Everything
 else is install-and-redeem.
+
+## Legacy → warren reconciliation
+
+hop's original design ("SSH without a server") baked in some assumptions that the
+warren supersedes. The reconciling principle is **decentralization, not
+minimalism** — hop's guarantee is *no central control plane / no third party*,
+**not** *no daemon*. With that lens, each legacy piece has a clear destination:
+
+| Concept | What it was (legacy) | Where it's going |
+|---|---|---|
+| **The guarantee** | "single binary, no background daemon" as the wedge | "fully P2P, no central coordination server, no third party" — a per-member daemon is fine |
+| **Auth source of truth** | per-host `peers.json` ("who may connect to *me*") | replicated CRDT document (doc-authoritative; `peers.json` becomes a synced mirror/fallback) — *in progress, Phase 1* |
+| **Roles** | two systems: `PeerRole` (`Peer`/`Creator`) + fleet `RoleDefinition` | one unified named role = auth tier + tags + access |
+| **The fleet "orchestrator"** | a host that *owns* the member registry + `roles.json` + aggregate invites (soft centralization) | **no orchestrator** — the warren document *is* the shared registry, replicated to every node; write authority is a cryptographic **capability** (Owner/Admin-signed), not a server |
+| **Fleet storage** | `fleet.json` / `fleet_registrations.json` / `aggregate_invites.json` (separate files on the orchestrator) | membership/tags/role-invites as entries in the warren document, replicated |
+| **Invites** | host-scoped (authorize me to one host) | network-scoped (join the warren with a role); token carries the warren ticket |
+| **`known_hosts`** | client-side cache of individual hosts | read-replica of the warren document (auto-discovery) |
+| **Client model** | the only model: a rootless CLI that connects to hosts | one of **two tiers** — client (rootless CLI, kept first-class) and node (daemon, on the fabric) |
+
+**On "no control plane" precisely:** the warren has **no central server** — the
+document is fully replicated and any node can serve it. It is *not* anarchy:
+membership/role/ACL **writes** require an Owner/Admin-signed capability, so
+"Owner-managed" means *cryptographically authorized*, not *server-controlled*.
+That is what reconciles "no control plane" with "the founder owns membership."
+The old fleet **orchestrator** dissolves into this: its role definitions and
+role-based invites are kept and extended; its position as the *authority that
+holds the registry* is replaced by the replicated document.
 
 ## Design principles (the bar every feature meets)
 
