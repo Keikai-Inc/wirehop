@@ -26,6 +26,21 @@ hop host
 hop host --quiet    # systemd/launchd mode
 ```
 
+**Warren VPN (default-on).** The daemon brings up the warren VPN automatically
+(a TUN device with a `100.64.0.0/10` virtual IP, role-gated reach). Bringup is
+best-effort and never blocks core access — if a TUN can't be created (no
+privilege / no `/dev/net/tun`) or the CGNAT range is already in use by another
+overlay (e.g. Tailscale), the VPN is skipped and `hop exec`/shell/transfer work
+exactly as before.
+
+| Control | Effect |
+|---|---|
+| *(default)* | VPN on, auto — skips on TUN failure or `100.64.0.0/10` conflict |
+| `vpn_enabled = false` in host config | VPN off |
+| `HOP_VPN=0` (env) | VPN off (overrides config; also a recovery escape hatch) |
+| `HOP_VPN=1` (env) | VPN on, **forced** past the conflict guard (overrides config) |
+| `HOP_VPN_JOIN_TICKET=<ticket>` (env) | Join an existing warren's namespace (federation) |
+
 ### `hop connect <target>`
 
 Connect to a host by NodeId, invite token, or known host alias.

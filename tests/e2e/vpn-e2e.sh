@@ -38,16 +38,19 @@ DOCKERFILE
 docker network create "$NET" >/dev/null
 docker volume create "$VOL" >/dev/null
 
+# Note: HOP_VPN is intentionally NOT set — this proves the VPN comes up by
+# DEFAULT (v0.6.32 default-on). The containers grant TUN + NET_ADMIN so the
+# auto path succeeds; the conflict guard finds no existing 100.64.0.0/10.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
-        -v "$VOL:/shared" -e HOP_VPN=1 -e RUST_LOG=hop=info,hop_core=info --user root)
+        -v "$VOL:/shared" -e RUST_LOG=hop=info,hop_core=info --user root)
 
 echo "=== starting host-a (warren owner) ==="
 docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
-  HOP_VPN=1 hop --config /cfg host --quiet >/cfg/log 2>&1 &
+  hop --config /cfg host --quiet >/cfg/log 2>&1 &
   while [ ! -f /cfg/creator_invite ]; do sleep 1; done
   cp /cfg/creator_invite /shared/invite-a
-  while ! grep -q "virtual IP" /cfg/log; do sleep 1; done
+  while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
   grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-a
   cp /cfg/netdoc.ticket /shared/ticket-a
   touch /shared/ready-a
@@ -69,8 +72,8 @@ docker run -d --name hop-vpn-b "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
   while [ ! -f /shared/ticket-a ]; do sleep 1; done
   export HOP_VPN_JOIN_TICKET="$(cat /shared/ticket-a)"
-  HOP_VPN=1 hop --config /cfg host --quiet >/cfg/log 2>&1 &
-  while ! grep -q "virtual IP" /cfg/log; do sleep 1; done
+  hop --config /cfg host --quiet >/cfg/log 2>&1 &
+  while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
   # Redeem host-a creator invite → become an admin member of the shared warren.
   hop --config /cfg exec "$(cat /shared/invite-a)" -- true >/cfg/redeem.log 2>&1 || true
   grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-b

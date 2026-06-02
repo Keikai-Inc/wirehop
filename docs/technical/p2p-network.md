@@ -1,12 +1,17 @@
 # Peer-to-Peer Private Network (Design)
 
-> **Status: MVP shipped (opt-in / experimental), as of v0.6.31.** The role-based
-> warren MVP — all 8 build-plan steps below — is implemented and validated by a
-> live multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`) plus the 53-test regression
-> suite. The VPN data plane remains **off by default** (`HOP_VPN=1` to enable)
-> and is not yet promoted to default-on. Sections marked **(Commercial, deferred)**
-> are planned for later phases and are documented here only so the schema and
-> trust model don't have to be reworked when we get there.
+> **Status: MVP shipped — VPN default-on, as of v0.6.32.** The role-based warren
+> MVP (all 8 build-plan steps below) is implemented and validated by a live
+> multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`) plus the 53-test regression suite.
+> The VPN data plane is now **default-on**: the daemon brings up the TUN
+> automatically, but bringup is **always best-effort** — if a TUN can't be
+> created (no privilege / no `/dev/net/tun`) or `100.64.0.0/10` is already in use
+> by another overlay (e.g. Tailscale), it degrades gracefully and keeps serving
+> exec/shell/transfer untouched. Opt out with `HOP_VPN=0` or `vpn_enabled = false`
+> in host config; `HOP_VPN=1` forces bringup past the conflict guard. Sections
+> marked **(Commercial, deferred)** are planned for later phases and are
+> documented here only so the schema and trust model don't have to be reworked
+> when we get there.
 
 ## Goal
 
@@ -294,8 +299,8 @@ the proving ground for the doc and addressing before any commercial work.
 |-------|-------|-------------------|
 | **1. Decentralize state** ✅ *(per-host)* | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
 | **2. Virtual IPs** ✅ | Deterministic-proposal + doc-claim allocation (#2). Claimed per host on startup. | Tests conflict resolution without TUN complexity. |
-| **3. VPN packet plane** ⚙️ *(opt-in/experimental)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket. Off by default (`HOP_VPN=1`). | Actual P2P LAN reachability. |
-| **4. DNS + ACL** ⚙️ *(opt-in/experimental)* | MagicDNS resolver for `*.hop` (#7); default-deny userspace ACL filter on the forwarding path (#8). Active only with the opt-in VPN. | Friendly names + safe service exposure. |
+| **3. VPN packet plane** ✅ *(default-on, best-effort)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket. Default-on; skips gracefully on TUN failure / CGNAT conflict (`HOP_VPN=0` to opt out, `HOP_VPN=1` to force). | Actual P2P LAN reachability. |
+| **4. DNS + ACL** ✅ *(default-on)* | MagicDNS resolver for `*.hop` (#7); role→tag→ACL filter on the forwarding path (#8, default-deny). Active with the default-on VPN. | Friendly names + safe service exposure. |
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
 
@@ -359,12 +364,17 @@ to Phase 4's default-deny ACLs (#8)** rather than shipped in Phase 1. The
 federation primitives exist (`NetDoc::read_ticket`, `Bootstrap::Import`,
 `reconcile`'s per-host-ownership caveat) and are ready for that phase.
 
-## Next-stage build plan — the role-based warren MVP ✅ *(shipped v0.6.31, opt-in)*
+## Next-stage build plan — the role-based warren MVP ✅ *(shipped; default-on v0.6.32)*
 
 All 8 steps below are implemented and validated (live multi-node TUN e2e
 `tests/e2e/vpn-e2e.sh` — real ICMP over `hop/vpn/1`, role-gated, 0% loss — plus
-the 53-test regression suite green). The VPN data plane stays **off by default**
-(`HOP_VPN=1`); promotion to default-on is the remaining follow-up.
+the 53-test regression suite green). As of v0.6.32 the VPN data plane is
+**default-on** with best-effort bringup: a TUN-creation failure or a
+`100.64.0.0/10` conflict (e.g. a host already running Tailscale) only skips the
+VPN — core access (exec/shell/transfer) is never affected. Opt out with
+`HOP_VPN=0` / `vpn_enabled = false`; `HOP_VPN=1` forces past the conflict guard.
+The 53-test regression suite runs in TUN-less containers, so its green run is the
+standing proof that default-on degrades gracefully.
 
 The next stage turns today's inert, opt-in VPN into a working role-driven warren:
 **role unification + federation safety + role→ACL derivation + a live multi-node

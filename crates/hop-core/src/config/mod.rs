@@ -451,10 +451,22 @@ pub struct HostConfig {
     /// MagicDNS. Empty = untagged.
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Whether the warren VPN data plane is enabled. Default: `true` (default-on,
+    /// auto). The daemon brings up the TUN unless a `100.64.0.0/10` conflict is
+    /// detected or TUN creation fails — in either case it degrades gracefully and
+    /// keeps serving exec/shell/transfer. The `HOP_VPN` env var overrides this:
+    /// `HOP_VPN=1` forces on (past the conflict guard), `HOP_VPN=0` forces off.
+    #[serde(default = "default_vpn_enabled")]
+    pub vpn_enabled: bool,
 }
 
 fn default_role_name() -> String {
     "member".to_string()
+}
+
+fn default_vpn_enabled() -> bool {
+    true
 }
 
 fn default_session_timeout() -> u64 {
@@ -472,6 +484,7 @@ impl Default for HostConfig {
             max_sessions: default_max_sessions(),
             default_role: default_role_name(),
             tags: Vec::new(),
+            vpn_enabled: default_vpn_enabled(),
         }
     }
 }
@@ -523,6 +536,30 @@ mod tests {
     #[test]
     fn peer_role_defaults_to_peer() {
         assert_eq!(PeerRole::default(), PeerRole::Peer);
+    }
+
+    #[test]
+    fn host_config_vpn_default_on() {
+        // Default-on: a fresh config enables the VPN.
+        assert!(HostConfig::default().vpn_enabled);
+    }
+
+    #[test]
+    fn host_config_backward_compat_vpn_default_on() {
+        // Existing host_config.json files predate `vpn_enabled` — they must
+        // deserialize to default-on so upgrading flips the VPN on without
+        // re-writing config.
+        let json = r#"{ "session_timeout_secs": 3600, "max_sessions": 5 }"#;
+        let cfg: HostConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.vpn_enabled);
+        assert_eq!(cfg.default_role, "member");
+    }
+
+    #[test]
+    fn host_config_vpn_opt_out_honored() {
+        let json = r#"{ "vpn_enabled": false }"#;
+        let cfg: HostConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.vpn_enabled);
     }
 
     #[test]

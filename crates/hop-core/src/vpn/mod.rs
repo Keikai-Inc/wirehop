@@ -65,6 +65,23 @@ pub fn is_virtual_addr(addr: Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+/// If another network interface already holds an address in `100.64.0.0/10`,
+/// return it. hop's virtual network shares the CGNAT range with Tailscale and
+/// some carrier-grade NATs, so when the VPN is left at its default (auto) we
+/// refuse to bring up our TUN in that case rather than clobber the existing
+/// overlay's route. An explicit `HOP_VPN=1` overrides this guard.
+///
+/// This runs *before* hop's own TUN exists, so it never matches our own address.
+#[cfg(unix)]
+pub fn cgnat_range_in_use() -> Option<Ipv4Addr> {
+    crate::net::netmon::current_interface_addrs()
+        .into_iter()
+        .find_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) if is_virtual_addr(v4) => Some(v4),
+            _ => None,
+        })
+}
+
 // ── Data plane (unix only; opt-in) ───────────────────────────────────────
 
 /// Netmask for `100.64.0.0/10` (a /10 = `255.192.0.0`).

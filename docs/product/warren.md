@@ -81,9 +81,10 @@ All network administration collapses into **install + `hop invite`**. There are
 no `net init`, `add-server`, `tag`, or `up` commands — the network self-forms
 from the first daemon and grows through invites.
 
-> **(Planned flow.)** The commands below are the *target* experience. Today the
-> basic invite takes `--creator` (not `--role <named>`), the VPN is opt-in
-> (`HOP_VPN=1`), and there is no `--join` installer flag yet. See **Status**
+> **(Mostly shipped.)** The commands below are the *target* experience. Today
+> `hop invite --role <named>` and the **default-on VPN** are shipped (opt out with
+> `HOP_VPN=0`); federation still joins via a namespace ticket
+> (`HOP_VPN_JOIN_TICKET`) rather than a `--join` installer flag. See **Status**
 > and **Roadmap** for what's shipped vs planned.
 
 ```
@@ -215,7 +216,7 @@ elevation command is new.)
 - **Virtual IP allocation** — every node claims a stable `100.64.0.0/10`
   address. *(0.6.27)*
 
-### Shipped (experimental, opt-in / off by default — `HOP_VPN=1`)
+### Shipped — VPN default-on *(0.6.32)*
 - **VPN data plane** — `hop/vpn/1` QUIC-datagram forwarding over a TUN device,
   federation via write ticket. *(0.6.28)*
 - **MagicDNS** resolver, configurable per-warren domain. *(0.6.28, 0.6.30)*
@@ -226,18 +227,22 @@ elevation command is new.)
   (replaces the static default-deny policy); role elevation
   (`hop admin <host> grant <peer> <role>`); federation safety (additive-only
   reconcile when joined to a shared namespace).
+- **Step 8 — live multi-node TUN e2e** *(0.6.31)*: two federated nodes route real
+  ICMP over the TUN, role-gated, 0% loss (`tests/e2e/vpn-e2e.sh`). Joiners become
+  role-bearing members by redeeming an invite; the namespace owner self-registers
+  as `admin` so it can originate/return traffic (M4a).
+- **Default-on** *(0.6.32)*: the daemon brings up the VPN automatically.
+  `HostConfig.vpn_enabled` (default `true`) and the `HOP_VPN` env var
+  (`1`=force-on past the conflict guard, `0`=off) control it. Bringup is
+  best-effort: a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a host
+  already running Tailscale) only skips the VPN — **core access is never
+  affected**.
 
 Validated by unit/integration tests (role-reach, role-derived reach via doc,
-federation replication, federated additive reconcile, ACL, DNS codec) and the
-53-test regression e2e (proving the default daemon is unchanged).
-
-**Not yet done — Step 8 (live multi-node TUN e2e).** A *meaningful* role-gated
-ping test needs the **M4 "invite carries the network"** integration so a joining
-machine becomes a role-bearing **member** of the *shared* doc (not just a
-namespace replica), plus a host being a member of its own warren so it can
-originate/return traffic. Federation gives the doc; membership gives the role —
-they're still separate. TUN itself is confirmed working in the test environment,
-so the harness is feasible once M4 lands.
+federation replication, federated additive reconcile, ACL, DNS codec, config
+default-on/opt-out), the **live multi-node TUN e2e**, and the 53-test regression
+e2e — which runs in TUN-less containers, so its green run is the standing proof
+that default-on degrades gracefully and the default daemon is unchanged.
 
 Validated by unit/integration tests (routing, federation replication, ACL, DNS)
 and the 53-test regression e2e. The live multi-node TUN packet flow is not yet in

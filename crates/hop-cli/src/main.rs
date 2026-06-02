@@ -384,19 +384,44 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 
                     let net = std::sync::Arc::new(net);
 
-                    // Phase 3 (opt-in, experimental): enable the VPN data plane only
-                    // when HOP_VPN=1. Off by default → no TUN, no traffic, default
-                    // daemon behavior unchanged.
+                    // Phase 3: the warren VPN data plane is default-on. The env
+                    // var overrides config: HOP_VPN=1 forces on (past the CGNAT
+                    // guard), HOP_VPN=0 forces off; otherwise the config flag
+                    // (default true) decides. Bringup is ALWAYS best-effort — a
+                    // TUN-creation failure or a 100.64.0.0/10 conflict only skips
+                    // the VPN; exec/shell/transfer keep working untouched.
                     #[cfg(unix)]
-                    if std::env::var("HOP_VPN").as_deref() == Ok("1") {
-                        let host_tags = hop_core::config::HostConfig::load(&cfg)
-                            .map(|c| c.tags)
-                            .unwrap_or_default();
-                        match net.enable_vpn(&host_node_id, &host_tags).await {
-                            Ok(ip) => tracing::info!(
-                                "vpn: enabled (experimental), virtual IP {ip}, tags {host_tags:?}"
-                            ),
-                            Err(e) => tracing::warn!("vpn: enable failed: {e:#}"),
+                    {
+                        let host_cfg = hop_core::config::HostConfig::load(&cfg).unwrap_or_default();
+                        let force = std::env::var("HOP_VPN").ok();
+                        let mode = match force.as_deref() {
+                            Some("1") | Some("true") | Some("on") => Some(true),
+                            Some("0") | Some("false") | Some("off") => Some(false),
+                            _ => None, // unset → fall back to config
+                        };
+                        let enabled = mode.unwrap_or(host_cfg.vpn_enabled);
+                        let forced_on = mode == Some(true);
+                        if !enabled {
+                            tracing::info!("vpn: disabled (HOP_VPN=0 or config); core access unaffected");
+                        } else if !forced_on
+                            && let Some(existing) = hop_core::vpn::cgnat_range_in_use()
+                        {
+                            // Auto mode + another overlay (e.g. Tailscale) owns the
+                            // CGNAT range → don't clobber its route. HOP_VPN=1 forces.
+                            tracing::warn!(
+                                "vpn: 100.64.0.0/10 already in use by another interface ({existing}); \
+                                 skipping VPN bringup to avoid a route conflict (set HOP_VPN=1 to force)"
+                            );
+                        } else {
+                            let host_tags = host_cfg.tags.clone();
+                            match net.enable_vpn(&host_node_id, &host_tags).await {
+                                Ok(ip) => tracing::info!(
+                                    "vpn: enabled, virtual IP {ip}, tags {host_tags:?}"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "vpn: bringup failed, continuing without it (core access unaffected): {e:#}"
+                                ),
+                            }
                         }
                     }
 

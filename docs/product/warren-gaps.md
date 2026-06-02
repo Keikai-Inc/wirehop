@@ -73,10 +73,12 @@ items below are kept for the record.)*
 
 ## 🔧 Open technical work (now well-defined — this *is* the roadmap)
 
-- 🔧 **The experimental VPN passes zero traffic.** ACL is default-deny and there
-  is no way to set a policy (Rust method only). *Fix:* derive the ACL from
-  roles×tags (M1) so it opens automatically by role. Until then `HOP_VPN=1` = on
-  the fabric, everything blocked.
+- ✅ **VPN traffic flows by role and is default-on.** *(0.6.31–0.6.32)* The ACL
+  is derived from roles×tags and enforced on the forwarding path, validated by a
+  live multi-node TUN e2e (real ICMP, role-gated, 0% loss). The VPN is now
+  default-on with best-effort bringup (`HOP_VPN=0` / `vpn_enabled=false` to opt
+  out; `HOP_VPN=1` forces past the `100.64.0.0/10` conflict guard) — a TUN
+  failure or CGNAT conflict only skips the VPN, never core access.
 - 🔧 **Members get a *write* ticket → any member could rewrite membership/ACL.**
   The reconciliation says writes must be Owner/Admin-capability-gated and members
   get a **read** replica. *Fix:* split read vs write capability in the
