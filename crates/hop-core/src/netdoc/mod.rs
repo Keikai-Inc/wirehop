@@ -32,6 +32,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::Peer;
 use crate::proto::RoleDefinition;
 
+/// A coarse timestamp (epoch seconds as a string) for revocation/audit fields.
+fn now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
 const KEY_PEER_PREFIX: &str = "peer/";
 const KEY_ROLE_PREFIX: &str = "role/";
 const KEY_REVOCATION_PREFIX: &str = "revocation/";
@@ -195,6 +203,56 @@ impl NetDoc {
             }
         }
         Ok(n)
+    }
+
+    /// Make the document match the given peers/roles (the host's local
+    /// peers.json/roles.json). Adds new peers, **revokes** peers that are no
+    /// longer present, and upserts/removes roles. Idempotent and self-healing.
+    ///
+    /// SAFETY: this assumes a per-host namespace — i.e. the document only
+    /// contains peers this host manages. With cross-host federation (a shared
+    /// namespace), revoking "doc peers not in my local peers.json" would wrongly
+    /// revoke peers owned by other hosts; that model requires per-host ownership
+    /// scoping before reconcile can run against a shared namespace.
+    pub async fn reconcile(&self, peers: &[Peer], roles: &[RoleDefinition]) -> Result<()> {
+        use std::collections::HashSet;
+
+        let desired_peers: HashSet<&str> = peers.iter().map(|p| p.node_id.as_str()).collect();
+
+        // Adds: present locally, missing from the doc, not already revoked.
+        for p in peers {
+            if !self.is_revoked(&p.node_id).await? && self.get_peer(&p.node_id).await?.is_none() {
+                self.put_peer(p).await?;
+            }
+        }
+        // Removals: in the doc but no longer present locally → revoke.
+        for existing in self.list_peers().await? {
+            if !desired_peers.contains(existing.node_id.as_str()) {
+                self.revoke(&existing.node_id, "removed", &now_timestamp()).await?;
+            }
+        }
+
+        // Roles: upsert all desired (handles create + update), delete the rest.
+        let desired_roles: HashSet<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        for r in roles {
+            self.put_role(r).await?;
+        }
+        for er in self.list_roles().await? {
+            if !desired_roles.contains(er.name.as_str()) {
+                self.del_role(&er.name).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a role entry (tombstone).
+    pub async fn del_role(&self, name: &str) -> Result<()> {
+        let key = format!("{KEY_ROLE_PREFIX}{name}");
+        self.doc
+            .del(self.author, key.into_bytes())
+            .await
+            .context("deleting role entry")?;
+        Ok(())
     }
 
     /// Produce a read-capability ticket for embedding in an invite, so a new
@@ -372,5 +430,29 @@ mod tests {
         assert!(net.is_revoked("aaaa").await.unwrap());
         assert!(net.get_peer("aaaa").await.unwrap().is_none());
         assert_eq!(net.list_peers().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_adds_and_revokes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = test_endpoint().await;
+        let net = NetDoc::spawn(ep, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+
+        let alice = sample_peer("a1", "alice");
+        let bob = sample_peer("b2", "bob");
+
+        // Reconcile to {alice, bob} → both present.
+        net.reconcile(&[alice.clone(), bob.clone()], &[]).await.unwrap();
+        assert_eq!(net.list_peers().await.unwrap().len(), 2);
+
+        // Reconcile to {alice} → bob revoked and dropped.
+        net.reconcile(&[alice.clone()], &[]).await.unwrap();
+        let peers = net.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, "a1");
+        assert!(net.is_revoked("b2").await.unwrap());
+        assert!(!net.is_revoked("a1").await.unwrap());
     }
 }

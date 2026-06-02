@@ -290,12 +290,36 @@ the proving ground for the doc and addressing before any commercial work.
 
 | Phase | Scope | Independent value |
 |-------|-------|-------------------|
-| **1. Decentralize state** | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
+| **1. Decentralize state** ✅ *(per-host)* | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
 | **2. Virtual IPs** | Deterministic-proposal + doc-claim allocation (#2). Addresses shown in `hop ls`. No traffic flows yet. | Tests conflict resolution without TUN complexity. |
 | **3. VPN packet plane** | TUN/utun (#6), `hop/vpn/v1` over QUIC datagrams (#5), daemon-to-daemon forwarding. Opt-in per peer. Per-network kill switch. | Actual P2P LAN reachability. |
 | **4. DNS + ACL** | MagicDNS-style resolver (#7); userspace ACL filter, default-deny (#8); `hop expose`/`hop access grant`. | Friendly names + safe service exposure. |
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
+
+### Phase 1 implementation status
+
+**Shipped (per-host model):** the iroh-docs stack runs on a dedicated, isolated
+endpoint (`net::create_netdoc_endpoint`, derived key → stable NodeId). On startup
+the daemon opens-or-creates its network namespace (id persisted to `netdoc.json`)
+and **reconciles** it against `peers.json`/`roles.json`; it reconciles again after
+every admin mutation, so the document is a complete, self-healing, authoritative-
+wired store. Auth is doc-aware: a peer in `peers.json` is **always** allowed
+(local truth is never overridden by doc state — no lockout path), and the doc is
+consulted only for peers *not* locally known, with a revocation gate. `peers.json`
+remains a continuously-synced mirror for back-compat, downgrade safety, and
+inspection. netdoc spawn/reconcile are **non-fatal** — any failure leaves the
+daemon serving on `peers.json` exactly as before.
+
+**Deliberately deferred — cross-host federation / network-wide membership.** The
+"inviter offline" win across *multiple* hosts requires a shared namespace where a
+peer admitted on host A is authorized on host B. That is a **network-wide
+membership** model (a peer reaches *any* host), which is a security expansion over
+today's per-host isolation. Shipping it without per-service access control would
+let any network member reach every host's shell — so it is intentionally **coupled
+to Phase 4's default-deny ACLs (#8)** rather than shipped in Phase 1. The
+federation primitives exist (`NetDoc::read_ticket`, `Bootstrap::Import`,
+`reconcile`'s per-host-ownership caveat) and are ready for that phase.
 
 ## What stays the same
 

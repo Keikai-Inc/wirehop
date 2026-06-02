@@ -176,13 +176,12 @@ pub async fn authenticate_client(
         | ClientMessage::RequestExec { .. }
         | ClientMessage::RequestExecV2 { .. }
         | ClientMessage::RequestAdmin(_) => {
-            // NOTE: authorization remains peers.json-authoritative in this
-            // increment (byte-identical to before). The network document is a
-            // shadow mirror only. Making the doc authoritative for adds, plus
-            // doc-driven revocation, lands in the next increment together with
-            // remove_peer dual-write and cross-host federation — doing it now,
-            // without remove_peer updating the doc, would let a stale doc entry
-            // re-authorize a removed peer.
+            // Authorization order, designed so the network document can never
+            // lock out a locally-authorized peer:
+            //   1. peers.json authorizes  -> ALWAYS allow (trusted local truth;
+            //      doc state is never allowed to reject a local peer).
+            //   2. otherwise consult the replicated doc: revoked -> reject;
+            //      present -> allow (federated / inviter-offline peer); else reject.
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
                 let role = peers.peer_role(remote_id);
@@ -191,6 +190,27 @@ pub async fn authenticate_client(
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;
                 Ok((AuthOutcome::Authorized { username, role, sandbox }, Some(msg)))
+            } else if let Some(nd) = netdoc {
+                let remote_hex = remote_id.to_string();
+                if nd.is_revoked(&remote_hex).await.unwrap_or(false) {
+                    proto::write_message(send, &HostMessage::AuthResult { authorized: false }).await?;
+                    tracing::warn!("Revoked peer {} rejected (netdoc)", remote_id.fmt_short());
+                    Ok((AuthOutcome::Rejected, None))
+                } else if let Some(dp) = nd.get_peer(&remote_hex).await.ok().flatten() {
+                    tracing::info!("Authorized peer {} via netdoc replica", remote_id.fmt_short());
+                    Ok((
+                        AuthOutcome::Authorized {
+                            username: dp.username,
+                            role: dp.role,
+                            sandbox: dp.sandbox,
+                        },
+                        Some(msg),
+                    ))
+                } else {
+                    proto::write_message(send, &HostMessage::AuthResult { authorized: false }).await?;
+                    tracing::warn!("Unauthorized peer {} rejected", remote_id.fmt_short());
+                    Ok((AuthOutcome::Rejected, None))
+                }
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;

@@ -336,20 +336,23 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             let store_dir = cfg.join("netdoc");
             let meta_path = cfg.join("netdoc.json");
             match hop_core::netdoc::NetDoc::open_or_create(endpoint, &store_dir, &meta_path).await {
-                Ok((net, created)) => {
-                    if created {
-                        if let Ok(peers) = hop_core::config::PeersStore::load(&cfg) {
-                            match net.ensure_peers(&peers.peers).await {
-                                Ok(n) => tracing::info!("netdoc: migrated {n} peer(s)"),
-                                Err(e) => tracing::warn!("netdoc: peer migration failed: {e:#}"),
-                            }
-                        }
-                        if let Ok(roles) = hop_core::fleet::RolesStore::load(&cfg) {
-                            match net.ensure_roles(&roles.roles).await {
-                                Ok(n) => tracing::info!("netdoc: migrated {n} role(s)"),
-                                Err(e) => tracing::warn!("netdoc: role migration failed: {e:#}"),
-                            }
-                        }
+                Ok((net, _created)) => {
+                    // Reconcile the document with the host's peers.json/roles.json
+                    // on every start (initial migration on first run, drift
+                    // correction afterwards). Best-effort.
+                    let peers = hop_core::config::PeersStore::load(&cfg)
+                        .map(|p| p.peers)
+                        .unwrap_or_default();
+                    let roles = hop_core::fleet::RolesStore::load(&cfg)
+                        .map(|r| r.roles)
+                        .unwrap_or_default();
+                    match net.reconcile(&peers, &roles).await {
+                        Ok(()) => tracing::info!(
+                            "netdoc: reconciled {} peer(s), {} role(s)",
+                            peers.len(),
+                            roles.len()
+                        ),
+                        Err(e) => tracing::warn!("netdoc: startup reconcile failed: {e:#}"),
                     }
                     tracing::info!("netdoc ready (namespace {})", net.namespace());
                     let _ = cell.set(std::sync::Arc::new(net));
@@ -692,8 +695,9 @@ async fn handle_incoming_inner(
             let cd = config_dir.to_path_buf();
             let ds = datastore.clone();
             let ext = ext_dispatcher.clone();
+            let nd = netdoc.get().cloned();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
+                if let Err(e) = dispatch_session(_first_msg, conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext, nd).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -712,8 +716,9 @@ async fn handle_incoming_inner(
             let cd = config_dir.to_path_buf();
             let ds = datastore.clone();
             let ext = ext_dispatcher.clone();
+            let nd = netdoc.get().cloned();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
+                if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext, nd).await {
                     tracing::error!("Session error: {e:#}");
                 }
             });
@@ -744,8 +749,9 @@ async fn handle_incoming_inner(
         let cd = config_dir.to_path_buf();
         let ds = datastore.clone();
         let ext = ext_dispatcher.clone();
+        let nd = netdoc.get().cloned();
         tokio::spawn(async move {
-            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext).await {
+            if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext, nd).await {
                 tracing::error!("Session error: {e:#}");
             }
         });
@@ -769,6 +775,7 @@ async fn dispatch_session(
     registry: RegistryHandle,
     datastore: hop_core::datastore::Datastore,
     ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
+    netdoc: Option<std::sync::Arc<hop_core::netdoc::NetDoc>>,
 ) -> Result<()> {
     match msg {
         Some(ClientMessage::RequestShell) => {
@@ -920,6 +927,23 @@ async fn dispatch_session(
                 &host_public_key,
                 Some(&datastore),
             );
+            // Mirror peer/role state into the network document after any admin
+            // mutation (best-effort). Reconcile is idempotent and self-healing —
+            // it adds new peers/roles and revokes ones removed from peers.json,
+            // so RemovePeer immediately writes a doc revocation.
+            if let Some(nd) = &netdoc
+                && !matches!(response, AdminResponse::Error { .. })
+            {
+                let peers = hop_core::config::PeersStore::load(config_dir)
+                    .map(|p| p.peers)
+                    .unwrap_or_default();
+                let roles = hop_core::fleet::RolesStore::load(config_dir)
+                    .map(|r| r.roles)
+                    .unwrap_or_default();
+                if let Err(e) = nd.reconcile(&peers, &roles).await {
+                    tracing::warn!("netdoc: reconcile after admin request failed: {e:#}");
+                }
+            }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
         Some(other) => {
