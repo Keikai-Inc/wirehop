@@ -38,6 +38,26 @@ pub struct InviteToken {
     /// Sandbox restrictions for this invite (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: SandboxPolicy,
+    /// The warren's namespace ticket (iroh-docs `DocTicket`), so redeeming this
+    /// invite can put the machine on the warren VPN as a node. `None` for hosts
+    /// that have no warren yet (degrades to direct-session access only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warren_ticket: Option<String>,
+    /// Suggested install tier for onboarding (`client` reaches hosts, `node`
+    /// joins the warren VPN). Advisory only — the machine-local choice (sudo /
+    /// `--host`) is the real gate. `None` → let the installer/page decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_tier: Option<Tier>,
+}
+
+/// Install tier an invite suggests for the redeeming machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    /// Reach hosts you're invited to; no daemon, no VPN.
+    Client,
+    /// Join the warren VPN as a node (daemon, virtual IP).
+    Node,
 }
 
 fn is_default_peer_role(role: &PeerRole) -> bool {
@@ -222,6 +242,13 @@ pub fn generate_invite_with_role(
     let resolved_host_name = host_name
         .map(String::from)
         .or_else(system_hostname);
+    // Embed the warren's namespace ticket (if this host has a warren) so the
+    // invite doubles as the warren join token. The daemon writes it to
+    // <config>/netdoc.ticket on startup; absent → direct-session access only.
+    let warren_ticket = std::fs::read_to_string(config_dir.join("netdoc.ticket"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let token = InviteToken {
         node_id: host_public_key.to_string(),
         secret: secret_hex,
@@ -231,6 +258,8 @@ pub fn generate_invite_with_role(
         role,
         role_name: role_name.clone(),
         sandbox,
+        warren_ticket,
+        suggested_tier: None,
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -297,6 +326,8 @@ mod tests {
             role: PeerRole::Peer,
             role_name: None,
             sandbox: SandboxPolicy::default(),
+            warren_ticket: None,
+            suggested_tier: None,
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(!json.contains("role"), "Peer role should not be serialized: {json}");
@@ -313,6 +344,8 @@ mod tests {
             role: PeerRole::Creator,
             role_name: None,
             sandbox: SandboxPolicy::default(),
+            warren_ticket: None,
+            suggested_tier: None,
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(json.contains(r#""role":"creator""#), "Creator role should be serialized: {json}");
@@ -323,6 +356,36 @@ mod tests {
         let json = r#"{"secret_hash":"$argon2id$...","created_at":1700000000}"#;
         let invite: PendingInvite = serde_json::from_str(json).unwrap();
         assert_eq!(invite.role, PeerRole::Peer);
+    }
+
+    #[test]
+    fn invite_token_warren_ticket_roundtrips() {
+        let token = InviteToken {
+            node_id: "abc".into(),
+            secret: "def".into(),
+            relay_url: None,
+            username: None,
+            host_name: None,
+            role: PeerRole::Peer,
+            role_name: None,
+            sandbox: SandboxPolicy::default(),
+            warren_ticket: Some("docticketblob".into()),
+            suggested_tier: Some(Tier::Client),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        let back: InviteToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warren_ticket.as_deref(), Some("docticketblob"));
+        assert_eq!(back.suggested_tier, Some(Tier::Client));
+    }
+
+    #[test]
+    fn invite_token_backward_compat_without_warren_fields() {
+        // Old invites predate warren_ticket/suggested_tier — must still decode,
+        // degrading to direct-session access (no node join).
+        let json = r#"{"node_id":"abc","secret":"def"}"#;
+        let token: InviteToken = serde_json::from_str(json).unwrap();
+        assert!(token.warren_ticket.is_none());
+        assert!(token.suggested_tier.is_none());
     }
 
     #[test]
