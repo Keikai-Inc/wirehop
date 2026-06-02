@@ -336,7 +336,21 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             };
             let store_dir = cfg.join("netdoc");
             let meta_path = cfg.join("netdoc.json");
-            match hop_core::netdoc::NetDoc::open_or_create(endpoint, &store_dir, &meta_path).await {
+            // Opt-in federation: HOP_VPN_JOIN_TICKET (or <config>/netdoc-join.ticket)
+            // joins an existing network's namespace on first run.
+            let join = std::env::var("HOP_VPN_JOIN_TICKET")
+                .ok()
+                .or_else(|| std::fs::read_to_string(cfg.join("netdoc-join.ticket")).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| match s.parse() {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!("netdoc: invalid join ticket ignored: {e}");
+                        None
+                    }
+                });
+            match hop_core::netdoc::NetDoc::open_or_create(endpoint, &store_dir, &meta_path, join).await {
                 Ok((net, _created)) => {
                     // Reconcile the document with the host's peers.json/roles.json
                     // on every start (initial migration on first run, drift
@@ -361,7 +375,27 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         Err(e) => tracing::warn!("netdoc: virtual IP claim failed: {e:#}"),
                     }
                     tracing::info!("netdoc ready (namespace {})", net.namespace());
-                    let _ = cell.set(std::sync::Arc::new(net));
+
+                    // Publish a write ticket so other hosts can join this network
+                    // (federation). Written to <config>/netdoc.ticket.
+                    if let Ok(ticket) = net.write_ticket().await {
+                        let _ = std::fs::write(cfg.join("netdoc.ticket"), ticket.to_string());
+                    }
+
+                    let net = std::sync::Arc::new(net);
+
+                    // Phase 3 (opt-in, experimental): enable the VPN data plane only
+                    // when HOP_VPN=1. Off by default → no TUN, no traffic, default
+                    // daemon behavior unchanged.
+                    #[cfg(unix)]
+                    if std::env::var("HOP_VPN").as_deref() == Ok("1") {
+                        match net.enable_vpn(&host_node_id).await {
+                            Ok(ip) => tracing::info!("vpn: enabled (experimental), virtual IP {ip}"),
+                            Err(e) => tracing::warn!("vpn: enable failed: {e:#}"),
+                        }
+                    }
+
+                    let _ = cell.set(net);
                 }
                 Err(e) => tracing::warn!("netdoc: init failed, continuing without it: {e:#}"),
             }

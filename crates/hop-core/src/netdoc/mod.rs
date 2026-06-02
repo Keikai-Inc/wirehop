@@ -186,6 +186,7 @@ impl NetDoc {
         endpoint: Endpoint,
         store_dir: &Path,
         meta_path: &Path,
+        join: Option<DocTicket>,
     ) -> Result<(Self, bool)> {
         let existing = std::fs::read_to_string(meta_path)
             .ok()
@@ -202,7 +203,14 @@ impl NetDoc {
                     (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true)
                 }
             },
-            None => (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true),
+            // First run: join an existing network if given a ticket, else create.
+            None => match join {
+                Some(ticket) => {
+                    tracing::info!("netdoc: joining network via import ticket");
+                    (Self::spawn(endpoint, store_dir, Bootstrap::Import(Box::new(ticket))).await?, true)
+                }
+                None => (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true),
+            },
         };
 
         if created {
