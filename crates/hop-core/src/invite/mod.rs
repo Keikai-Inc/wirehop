@@ -267,6 +267,12 @@ pub fn generate_invite_with_role(
     Ok(encoded)
 }
 
+/// Encode an `InviteToken` back into its base64url-JSON string form.
+pub fn encode_invite(token: &InviteToken) -> Result<String> {
+    let json = serde_json::to_string(token)?;
+    Ok(URL_SAFE_NO_PAD.encode(json.as_bytes()))
+}
+
 /// Decode an invite token string back into its parts.
 pub fn decode_invite(token: &str) -> Result<InviteToken> {
     let json_bytes = URL_SAFE_NO_PAD

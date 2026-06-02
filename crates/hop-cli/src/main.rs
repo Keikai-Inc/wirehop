@@ -384,7 +384,23 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     // Publish a write ticket so other hosts can join this network
                     // (federation). Written to <config>/netdoc.ticket.
                     if let Ok(ticket) = net.write_ticket().await {
-                        let _ = std::fs::write(cfg.join("netdoc.ticket"), ticket.to_string());
+                        let ticket_str = ticket.to_string();
+                        let _ = std::fs::write(cfg.join("netdoc.ticket"), &ticket_str);
+                        // The creator invite is generated at startup, before the
+                        // netdoc namespace exists, so it can't embed the ticket
+                        // up front. Augment it now (same secret) so the founder's
+                        // invite doubles as the warren join token.
+                        let ci_path = cfg.join("creator_invite");
+                        if let Ok(tok_str) = std::fs::read_to_string(&ci_path)
+                            && let Ok(mut tok) = hop_core::invite::decode_invite(tok_str.trim())
+                            && tok.warren_ticket.is_none()
+                        {
+                            tok.warren_ticket = Some(ticket_str);
+                            if let Ok(reencoded) = hop_core::invite::encode_invite(&tok) {
+                                let _ = config::write_shared_file(&ci_path, &reencoded);
+                                tracing::info!("creator invite augmented with warren ticket");
+                            }
+                        }
                     }
 
                     let net = std::sync::Arc::new(net);

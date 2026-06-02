@@ -48,11 +48,12 @@ echo "=== starting host-a (warren owner) ==="
 docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
-  while [ ! -f /cfg/creator_invite ]; do sleep 1; done
-  cp /cfg/creator_invite /shared/invite-a
+  # The creator invite is augmented with the warren ticket once netdoc is ready
+  # (logged "creator invite augmented"); that completes before "vpn: enabled".
+  # So the single creator invite = membership + warren join (the unified token).
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
+  cp /cfg/creator_invite /shared/invite-a
   grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-a
-  cp /cfg/netdoc.ticket /shared/ticket-a
   touch /shared/ready-a
   echo "host-a vIP: $(cat /shared/vip-a)"
   tail -f /cfg/log
@@ -67,15 +68,19 @@ docker exec hop-vpn-a test -f /shared/ready-a || { echo "FAIL: host-a not ready"
 VIP_A=$(docker exec hop-vpn-a cat /shared/vip-a)
 echo "host-a virtual IP: $VIP_A"
 
-echo "=== starting host-b (joins warren + redeems invite) ==="
+echo "=== starting host-b (joins the warren from ONE unified invite) ==="
 docker run -d --name hop-vpn-b "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
-  while [ ! -f /shared/ticket-a ]; do sleep 1; done
-  export HOP_VPN_JOIN_TICKET="$(cat /shared/ticket-a)"
+  while [ ! -f /shared/invite-a ]; do sleep 1; done
+  INVITE="$(cat /shared/invite-a)"
+  # Unified token: the single invite carries host-a s warren. `hop warren join`
+  # redeems it for membership AND writes the namespace join ticket — no separate
+  # netdoc ticket, no separate redeem step.
+  hop --config /cfg warren join "$INVITE" >/cfg/join.log 2>&1 || true
+  # Bring up the host; it imports the namespace from /cfg/netdoc-join.ticket and
+  # the VPN comes up default-on.
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
-  # Redeem host-a creator invite → become an admin member of the shared warren.
-  hop --config /cfg exec "$(cat /shared/invite-a)" -- true >/cfg/redeem.log 2>&1 || true
   grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-b
   touch /shared/ready-b
   echo "host-b vIP: $(cat /shared/vip-b)"
@@ -97,6 +102,14 @@ sleep 15
 echo "=== diagnostics: interfaces + routes on host-b ==="
 docker exec hop-vpn-b ip addr show | grep -A2 -iE 'utun|tun' || true
 docker exec hop-vpn-b ip route | grep -i '100.64' || true
+echo "=== diagnostics: unified-invite join ==="
+echo "--- invite-a (bytes) ---"; docker exec hop-vpn-a wc -c /shared/invite-a 2>/dev/null || true
+echo "--- host-b warren join.log ---"; docker exec hop-vpn-b cat /cfg/join.log 2>/dev/null | tail -20 || true
+echo "--- host-b netdoc-join.ticket present? ---"; docker exec hop-vpn-b ls -l /cfg/netdoc-join.ticket 2>/dev/null || echo "(absent)"
+echo "--- host-a namespace vs host-b namespace ---"
+docker exec hop-vpn-a grep -o 'namespace [0-9a-f]*' /cfg/log | head -1 || true
+docker exec hop-vpn-b grep -o 'namespace [0-9a-f]*' /cfg/log | head -1 || true
+echo "--- host-a peers (did host-b's redeem register?) ---"; docker exec hop-vpn-a cat /cfg/peers.json 2>/dev/null | head -20 || true
 
 echo "=== TEST: ping host-a virtual IP ($VIP_A) from host-b over the TUN ==="
 if docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
