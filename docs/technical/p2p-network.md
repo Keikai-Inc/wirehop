@@ -428,11 +428,16 @@ existing peers are unaffected) → federation safety → ACL derivation (affects
 the VPN data plane) → live e2e → flipped the VPN default-on once the e2e was
 green (v0.6.32).
 
-## Next-stage build plan — token unification + the two install tiers (Planned)
+## Next-stage build plan — token unification + the two install tiers ✅ *(shipped v0.6.34)*
 
-> **Status: Planned / design agreed.** This stage reconciles two accidental
-> dualities — (a) "regular invite" vs "warren join token", and (b) the install
-> story — into one mental model. Nothing here is implemented yet.
+> **Status: Shipped (v0.6.34).** This stage reconciled two accidental dualities —
+> (a) "regular invite" vs "warren join token", and (b) the install story — into
+> one mental model. The invite now carries the warren (`warren_ticket` on
+> `InviteToken`); the founder's creator invite is augmented with it once netdoc
+> is ready; `hop warren join [invite]` redeems membership + joins the namespace;
+> the installer is one `install.sh` (no-arg = client, `--host` = node) with a
+> unified `--invite`. Validated by a live multi-node TUN e2e that joins the whole
+> warren from one invite (0% loss) + the 53-test regression suite.
 
 ### Product framing (what the user sees)
 
