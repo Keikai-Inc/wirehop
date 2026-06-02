@@ -553,6 +553,25 @@ impl NetDoc {
         if let Err(e) = self.register_host_tags(host_node_id, host_tags).await {
             tracing::warn!("vpn: host-tag registration failed: {e:#}");
         }
+        // M4a: a host that OWNS this warren (created the namespace, not federated)
+        // self-registers as an `admin` member so it can originate and return VPN
+        // traffic. Joiners get their membership/role from the inviter, never
+        // self-assigned. Only the owner of a namespace can self-claim admin.
+        if !self.federated && self.get_peer(host_node_id).await.ok().flatten().is_none() {
+            let me = Peer {
+                node_id: host_node_id.to_string(),
+                name: "self".to_string(),
+                authorized_at: now_timestamp(),
+                last_seen: None,
+                username: None,
+                role: crate::config::PeerRole::Creator,
+                role_name: Some("admin".to_string()),
+                sandbox: crate::sandbox::SandboxPolicy::default(),
+            };
+            if let Err(e) = self.put_peer(&me).await {
+                tracing::warn!("vpn: self-member registration failed: {e:#}");
+            }
+        }
         let me = std::sync::Arc::clone(self);
         tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
 
