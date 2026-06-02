@@ -297,6 +297,26 @@ the proving ground for the doc and addressing before any commercial work.
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
 
+### Role-model unification (Planned — prerequisite for the warren)
+
+The product layer ([`../product/warren.md`](../product/warren.md)) requires
+collapsing hop's two role concepts into one:
+
+- **Today:** `PeerRole` (`Peer`/`Creator`, the auth tier, used by the basic
+  invite) and `RoleDefinition` (named fleet roles with `host_tags`, used by
+  aggregate invites) are separate. The basic invite's no-role default is
+  `PeerRole::Peer` = unrestricted shell, no admin.
+- **Target:** one named-role model carrying auth tier + `host_tags` + ports. A
+  configurable, least-privilege **org-default role** (`member`, default-deny) so
+  `hop invite` with no `--role` is safe rather than granting full shell.
+- **Elevation:** `hop role grant/set` updates a member's role entry in the
+  document; replication + ACL re-resolution apply the change network-wide without
+  re-issuing an invite. (Today the only path is `remove_peer` + re-invite.)
+- **ACL derivation:** rules are stored/evaluated as role→tag (not per-IP) and
+  resolved against the membership doc at enforcement time, so they're stable
+  across join/leave. This supersedes hand-authored `acl/policy` for the default
+  case.
+
 ### Phase 1 implementation status
 
 **Shipped (per-host model):** the iroh-docs stack runs on a dedicated, isolated

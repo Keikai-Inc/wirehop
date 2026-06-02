@@ -1,0 +1,201 @@
+# Warren — hop's Private Network (Product Design)
+
+> **Status:** This document is the product vision and roadmap for hop's
+> peer-to-peer private network. Some of it ships today (clearly marked
+> **Shipped** / **Experimental**); the rest is **Planned**. The technical
+> implementation lives in [`../technical/p2p-network.md`](../technical/p2p-network.md).
+
+## Vision
+
+hop has always been "SSH without a server" — one binary, reach any machine
+you're invited to, no port-forwarding, no VPN appliance. The **warren** extends
+that into a full private network for a team, with one defining principle:
+
+> **The role *is* the access.** You never write ACLs. You invite someone as a
+> `developer` and the network already knows what a developer can reach.
+
+The target customer is a **small, globally-distributed startup** doing remote
+work: a founder, a handful of engineers, a few servers. They should never touch
+a VPN config, an exit node, or a firewall rule. They install hop, invite their
+team by role, and the network configures itself.
+
+### Positioning
+
+| Layer | Pitch |
+|-------|-------|
+| **hop** (the tool) | Reach any machine you're invited to. One binary, no server. |
+| **warren** (the network) | Invite your team and they're on a private network with exactly the access their role allows. No appliance, no exit nodes, no ACL files. |
+
+**Differentiators:**
+1. **Role-native access** — access is a consequence of who someone is, not hand-authored policy. (Tailscale makes you write ACL policy; hop derives it from roles.)
+2. **No control plane** — membership lives in a replicated CRDT ([iroh-docs](../technical/p2p-network.md)), not a coordination server. The network keeps working even when no central service is up.
+3. **Two depths, one invite** — join the full network, or just hop into one box. Same role, same token; the recipient chooses their footprint.
+
+## Vocabulary
+
+One consistent language across product, CLI, and marketing:
+
+| Term | Meaning |
+|------|---------|
+| **hop** | The tool, and the verb — *hop into a machine*. |
+| **warren** | A team's private network (the mesh / VPN). "Your warren." |
+| **node** | A machine that lives in the warren — has a virtual IP, a name, is reachable. Runs the hop daemon. |
+| **client** | A machine with just the `hop` CLI: can hop into permitted machines, but doesn't live in the warren (no virtual IP). |
+| **role** | A named identity (`developer`, `ops`, …) that determines what a member can reach. |
+| **invite** | A single-use token that admits a machine to the warren with a role. |
+
+## The two paths: client vs node
+
+The split is a **presence** axis, not a capability axis. *What* you can reach is
+governed by your role; *how* you reach it is governed by which path you install.
+
+| | `install.sh` → **hop client** | `join.sh` / `install.sh --join` → **hop node** *(Planned naming)* |
+|---|---|---|
+| Daemon / root | No | Yes |
+| Virtual IP + MagicDNS name | No | Yes |
+| `hop <host>` (shell/exec/transfer/MCP) | ✅ role-permitted hosts | ✅ |
+| Reach services at IP:port (the VPN) | ❌ | ✅ ACL-gated |
+| Network-doc replica | read-only (discovery + auth) | read/write (full member) |
+
+- A **client** is the lightweight "SSH-replacement" user — a contractor or CI
+  runner who just needs into specific boxes. No root, no TUN.
+- A **node** is a full warren member — engineer laptops and servers alike. A
+  **server** is simply a node that others have a role to hop *into*; a laptop is
+  a node nobody is authorized to reach inbound. Same daemon, governed by roles.
+
+The client always carries a **read-only replica** of the network document so
+`hop ls` shows every host its role permits (no stale `known_hosts`) — it knows
+the network without being on the fabric.
+
+## Onboarding (zero-config)
+
+All network administration collapses into **install + `hop invite`**. There are
+no `net init`, `add-server`, `tag`, or `up` commands — the network self-forms
+from the first daemon and grows through invites.
+
+```
+# Founder — install hop. The network ("warren") auto-creates; founder is Owner.
+curl -fsSL https://hop.keik.ai | bash
+
+# Invite anyone (person or server) with a role:
+hop invite --role developer
+#  → prints a one-liner the recipient pastes:
+#     curl -fsSL https://hop.keik.ai | bash -s -- --join <token>
+#     (drop --join for CLI-only client access)
+
+# Recipient installs + redeems. They're on the warren with developer access —
+# nothing else to configure.
+```
+
+**How the invite carries the network (Planned):** the invite token embeds the
+warren's join ticket (the netdoc `DocTicket`). Redeeming it:
+1. joins the network namespace (federation),
+2. (node path) claims a virtual IP, brings up the TUN, writes split-DNS config,
+3. applies the role-derived ACL.
+
+So the VPN comes up *as a side effect of joining* — there is no separate
+"connect to VPN" step. Every member runs the hop daemon (the one-liner installs
+it), exactly as Tailscale runs `tailscaled` everywhere.
+
+## The role model
+
+> **Cleanup (Planned):** today hop has *two* role concepts — `PeerRole`
+> (`Peer`/`Creator`, the auth tier) and `RoleDefinition` (named fleet roles with
+> `host_tags`). These merge into **one conventional role model**: a named role
+> that carries both the auth tier and the network access.
+
+A **role** defines:
+- **Auth tier** — `member` vs `admin` (can it manage the warren?).
+- **Reach** — which host **tags** it can access (`host_tags`).
+- **Ports/services** — default all; tightenable.
+
+### Default roles
+
+| Role | Reaches (tags) | Notes |
+|------|----------------|-------|
+| `member` *(default)* | none | In the warren with an address; **default-deny** until granted. The safe default. |
+| `developer` | `dev`, `staging` | Day-to-day engineering access. |
+| `ops` | `*` | Infrastructure. |
+| `ci` | `ci`, `build` | Build/deploy targets. |
+| `security` | `*` | Audit-oriented. |
+| `admin` / Owner | `*` | Full reach + manages the warren. |
+
+### The default role (Planned)
+
+`hop invite` with no `--role` assigns the **org default role**, which starts as
+`member` (least-privilege, default-deny). The founder can re-point the org
+default (e.g. to `developer` for a small all-engineer team). Naming a role on
+the invite always overrides it.
+
+This fixes today's footgun: currently no-role defaults to `Peer` = **full
+unrestricted shell** to the host. In a network where the role is the firewall,
+silently granting full shell on a forgotten flag is exactly what we design out —
+the default must be safe.
+
+### Role → ACL derivation (Planned, the keystone)
+
+The VPN ACL is **not authored** — it is the projection of the role model:
+
+> A member with role `R` may reach hosts whose tags intersect `R`'s `host_tags`,
+> on `R`'s permitted ports. Everything else is denied.
+
+Rules are expressed as **role→tag**, resolved at enforcement time against the
+replicated membership doc (packet src IP → member → role; dst IP → host → tags).
+They're stable as people join and leave — no per-IP rule regeneration. When a new
+developer joins, the existing `developer → dev` rule already covers them.
+
+### Changing a role after invite (Planned)
+
+Members are elevated/demoted without re-inviting:
+
+```
+hop role grant <peer> ops      # elevate
+hop role set   <peer> member   # demote / reset
+```
+
+This updates the member's role in the membership doc, which replicates to every
+node and triggers ACL re-resolution — the member's reach changes within seconds,
+no token re-issue. (Today the only path is `remove-peer` + re-invite; the
+elevation command is new.)
+
+## Status
+
+### Shipped (default-on)
+- **Decentralized membership** (iroh-docs) with doc-authoritative auth + a
+  `peers.json` fallback that guarantees no lockout. *(0.6.26)*
+- **Virtual IP allocation** — every node claims a stable `100.64.0.0/10`
+  address. *(0.6.27)*
+
+### Shipped (experimental, opt-in / off by default — `HOP_VPN=1`)
+- **VPN data plane** — `hop/vpn/1` QUIC-datagram forwarding over a TUN device,
+  federation via write ticket. *(0.6.28)*
+- **Default-deny ACL** filter on the forwarding path. *(0.6.28)*
+- **MagicDNS** resolver for `*.hop`. *(0.6.28)*
+
+Validated by unit/integration tests (routing, federation replication, ACL, DNS)
+and the 53-test regression e2e. The live multi-node TUN packet flow is not yet in
+an automated testbed — hence experimental.
+
+### Planned (the warren product)
+See the roadmap below.
+
+## Roadmap
+
+| Milestone | Scope |
+|-----------|-------|
+| **Role cleanup** | Merge `PeerRole` + `RoleDefinition` into one conventional role model. Add the configurable, least-privilege **org-default role**. Add **`hop role grant/set`** for post-invite elevation. |
+| **M1 — Invisible ACL** | Role→tag→ACL derivation, resolved at enforcement time. Host tagging via role/invite. Turns the experimental VPN from "default-deny, no way to open it" into "opens automatically by role." |
+| **M2 — Network membership** | Invite-to-network-with-a-role (not per-host); Owner/Admin-managed central membership every node reads; receiver-side ACL enforcement. The architectural shift from per-host to warren-wide access. |
+| **M3 — Usable end to end** | Client vs node redemption branch; `--join` auto-brings-up the VPN; MagicDNS OS auto-config; the **live multi-node TUN e2e** that promotes the data plane to default-on. |
+| **M4 — One-line onboarding** | Installer `--join`/`--invite` flags; invite token embeds the warren ticket; the founder narrative end to end. Script rename: `install.sh` = client, node installer reframed as "join the warren". |
+
+The only command a founder ever types remains `hop invite --role X`. Everything
+else is install-and-redeem.
+
+## Design principles (the bar every feature meets)
+
+1. **Zero-config by default** — there is always a sensible default; configuration is opt-in tuning, never required.
+2. **Role is the access** — one source of truth drives both `hop`-shell access and VPN reach; no second ACL system.
+3. **Additive, never regressive** — the VPN is a strict superset of the client; "just hop to a box" stays first-class forever.
+4. **Safe by default** — least-privilege default role, default-deny ACL, no-lockout auth fallback.
+5. **No control plane** — the network depends on no central service to keep running.
