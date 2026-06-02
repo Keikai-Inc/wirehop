@@ -202,6 +202,25 @@ hop config path                     # print the host config directory
 
 Changes take effect on the next `hop host` / daemon restart.
 
+### `hop warren [join|status]`
+
+Manage this machine's membership of the warren (private network).
+
+| Subcommand | Description |
+|---|---|
+| `join [<invite>]` | Put this machine on the warren VPN. With an invite (which carries the warren), it redeems for membership and joins the namespace; with no argument it uses the ticket stored from a prior client connection. |
+| `status` | Show this machine's warren namespace membership and VPN state. |
+
+```bash
+hop warren join <invite>   # join the warren VPN from an invite
+hop warren join            # upgrade a client using its stored ticket
+hop warren status
+```
+
+> A **client** install reaches hosts it's invited to with no VPN. `hop warren
+> join` upgrades it to a **node** on the warren (needs sudo to bring up the TUN;
+> on a fresh machine, `install.sh --host` does the privileged setup).
+
 ### `hop peers [remove|rename]`
 
 List authorized peers or known hosts.

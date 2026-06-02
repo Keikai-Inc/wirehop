@@ -101,31 +101,40 @@ hop invite --role developer
 # nothing else to configure.
 ```
 
-### Install-time configuration (primers)
+### Two install tiers, one command
 
-The installer can prime the host config at install time, so a machine comes up
-exactly how you want with no follow-up commands. The website's **install command
-builder** composes these flags from toggles; they work on both `install.sh` and
-`install-daemon.sh` (and are forwarded by `install.sh --daemon`):
+`install.sh` is the only installer, and what a machine *is* comes from one choice:
+
+| | **Connect from this machine** (client) | **A machine to reach** (node) |
+|---|---|---|
+| Command | `curl …/install.sh \| bash` *(no-arg default)* | `curl …/install.sh \| bash -s -- --host` |
+| sudo / daemon | no | yes |
+| Warren VPN / virtual IP / `name.hop` | no | yes (on by default) |
+| Purpose | reach hosts you're invited to | be on the private network |
+
+A client is a full **member** that simply hasn't lit up the VPN — upgrade anytime
+with `hop warren join` (no re-invite). Node primers (forwarded by `install.sh
+--host`):
 
 | Flag | Effect | Maps to |
 |---|---|---|
-| `--no-vpn` | Disable the warren VPN data plane | `vpn_enabled = false` |
+| `--invite <token>` | Redeem an invite (it carries the warren) → join | membership + `netdoc-join.ticket` |
+| `--no-vpn` | Set up a host but disable the VPN | `vpn_enabled = false` |
 | `--tag <a,b>` | Tag this host (role→tag reach + MagicDNS) | `tags` |
 | `--default-role <name>` | Role for invites that don't specify one | `default_role` |
-| `--join <ticket>` | Federate into an existing warren | `<config>/netdoc-join.ticket` |
 
 ```bash
-# A production web host, VPN on, joined to an existing warren:
-curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash -s -- \
-  --tag production,web --join <ticket>
+# A production web host that joins an existing warren from one invite:
+curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- \
+  --host --tag production,web --invite <token>
 
-# A client box that should never bring up the VPN:
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --no-vpn
+# A laptop that just reaches the servers (no sudo, no VPN):
+curl -fsSL https://hop.keikai.ai/install.sh | bash
 ```
 
-Each primer is just a wrapper over `hop config set <key> <value>` (or the join
-ticket file), so anything set at install can be changed later at runtime.
+Each primer is a wrapper over `hop config set <key> <value>` (or `hop warren
+join`), so anything set at install can be changed at runtime. `install-daemon.sh`
+remains as a back-compat alias of `install.sh --host`.
 
 **How joining brings up the network (Shipped):** providing a warren join ticket
 (the netdoc `DocTicket`, via `--join`, `HOP_VPN_JOIN_TICKET`, or

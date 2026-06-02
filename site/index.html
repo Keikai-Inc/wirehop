@@ -613,24 +613,28 @@
           <!-- Controls -->
           <div class="builder" oninput="buildInstallCmd()" onchange="buildInstallCmd()">
             <div class="builder-row">
-              <label>Mode</label>
+              <label>This machine is&hellip;</label>
               <div class="seg" id="seg-mode">
-                <button type="button" class="active" data-val="client">Client</button>
-                <button type="button" data-val="daemon">Always-on host</button>
+                <button type="button" class="active" data-val="client">Connecting from</button>
+                <button type="button" data-val="node">On the warren</button>
               </div>
             </div>
             <div class="builder-row">
-              <label>Warren VPN <span class="hint-tag">private network</span></label>
+              <label for="b-invite">Your invite <span class="hint-tag">optional — it carries the warren</span></label>
+              <input id="b-invite" type="text" placeholder="paste invite token" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="builder-row node-only">
+              <label>Warren VPN <span class="hint-tag">on by default</span></label>
               <div class="seg" id="seg-vpn">
                 <button type="button" class="active" data-val="on">On</button>
                 <button type="button" data-val="off">Off</button>
               </div>
             </div>
-            <div class="builder-row">
+            <div class="builder-row node-only">
               <label for="b-tags">Host tags <span class="hint-tag">optional</span></label>
               <input id="b-tags" type="text" placeholder="production, web" autocomplete="off" spellcheck="false">
             </div>
-            <div class="builder-row">
+            <div class="builder-row node-only">
               <label for="b-role">Default invite role</label>
               <select id="b-role">
                 <option value="member">member (least-privilege)</option>
@@ -638,14 +642,10 @@
                 <option value="admin">admin</option>
               </select>
             </div>
-            <div class="builder-row">
-              <label for="b-join">Join an existing warren <span class="hint-tag">optional</span></label>
-              <input id="b-join" type="text" placeholder="paste join ticket" autocomplete="off" spellcheck="false">
-            </div>
           </div>
 
-          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            Downloads the binary, verifies the SHA-256 checksum, and installs to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">/usr/local/bin</code>. The VPN is on by default and degrades gracefully where it can't run. Works with curl or wget.
+          <p id="builder-hint" style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
+            <strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">hop warren join</code>.
           </p>
         </div>
 
@@ -700,7 +700,7 @@
 
         <div>
           <div class="install-cmd" onclick="copyCmd('daemon-install', 'copy-daemon')" style="margin-bottom: 1rem;">
-            <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash</code>
+            <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host</code>
             <button class="copy-btn" title="Copy to clipboard" id="copy-daemon">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             </button>
@@ -825,7 +825,7 @@
       'install-latest':  'curl -fsSL https://hop.keikai.ai/install.sh | bash',
       'install-version': 'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.4.4',
       'install-dir':     'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin',
-      'daemon-install':  'curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash',
+      'daemon-install':  'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host',
       'install-builder': 'curl -fsSL https://hop.keikai.ai/install.sh | bash',
     };
 
@@ -848,26 +848,38 @@
     }
 
     function buildInstallCmd() {
-      var mode = segValue('seg-mode');          // client | daemon
-      var vpn  = segValue('seg-vpn');            // on | off
-      var tags = (document.getElementById('b-tags').value || '').trim();
-      var role = document.getElementById('b-role').value;
-      var join = (document.getElementById('b-join').value || '').trim();
+      var mode   = segValue('seg-mode');          // client | node
+      var vpn    = segValue('seg-vpn');            // on | off
+      var tags   = (document.getElementById('b-tags').value || '').trim();
+      var role   = document.getElementById('b-role').value;
+      var invite = (document.getElementById('b-invite').value || '').trim();
+      var isNode = mode === 'node';
 
-      var script = mode === 'daemon' ? 'install-daemon.sh' : 'install.sh';
+      // Node-only controls are hidden for the client tier (no VPN there).
+      document.querySelectorAll('.builder-row.node-only').forEach(function (el) {
+        el.style.display = isNode ? '' : 'none';
+      });
+
       var flags = [];
-      if (vpn === 'off') flags.push('--no-vpn');
-      if (tags) flags.push('--tag ' + shellQuote(tags));
-      if (role && role !== 'member') flags.push('--default-role ' + role);
-      if (join) flags.push('--join ' + shellQuote(join));
+      if (isNode) flags.push('--host');
+      if (invite) flags.push('--invite ' + shellQuote(invite));
+      if (isNode && vpn === 'off') flags.push('--no-vpn');
+      if (isNode && tags) flags.push('--tag ' + shellQuote(tags));
+      if (isNode && role && role !== 'member') flags.push('--default-role ' + role);
 
-      var cmd = 'curl -fsSL https://hop.keikai.ai/' + script + ' | bash';
+      // Always one script — install.sh. --host opts into the node/VPN tier.
+      var cmd = 'curl -fsSL https://hop.keikai.ai/install.sh | bash';
       if (flags.length) cmd += ' -s -- ' + flags.join(' ');
 
       cmds['install-builder'] = cmd;
       var code = document.getElementById('builder-cmd');
-      if (code) {
-        code.innerHTML = '<span class="prompt">$</span> ' + escapeHtml(cmd);
+      if (code) code.innerHTML = '<span class="prompt">$</span> ' + escapeHtml(cmd);
+
+      var hint = document.getElementById('builder-hint');
+      if (hint) {
+        hint.innerHTML = isNode
+          ? "<strong>On the warren:</strong> sudo daemon, a virtual IP + <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">name.hop</code>, role-based reach. The VPN is on by default and fail-safe. Default-deny until you hand out invites."
+          : "<strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">hop warren join</code>.";
       }
     }
 
