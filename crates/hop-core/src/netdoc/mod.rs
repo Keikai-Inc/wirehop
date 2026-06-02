@@ -69,6 +69,10 @@ pub fn deterministic_ip(node_id: &str) -> std::net::Ipv4Addr {
 #[derive(Debug, Serialize, Deserialize)]
 struct NetDocMeta {
     namespace: NamespaceId,
+    /// Whether this namespace was joined from another host (federation). Kept so
+    /// a rejoined host stays additive-only on reconcile across restarts.
+    #[serde(default)]
+    federated: bool,
 }
 
 /// A revocation entry: marks a peer as no longer authorized network-wide.
@@ -101,6 +105,10 @@ pub struct NetDoc {
     namespace: NamespaceId,
     /// The endpoint the docs/vpn stack runs on (for opening VPN connections).
     endpoint: Endpoint,
+    /// True when this namespace was joined from another host (federation). In
+    /// that case reconcile is additive-only — it must not revoke peers owned by
+    /// other hosts in the shared namespace.
+    federated: bool,
     /// Active TUN device when the VPN is enabled (Phase 3, opt-in). `None` = off.
     #[cfg(unix)]
     vpn_tun: crate::vpn::TunSlot,
@@ -131,6 +139,7 @@ impl NetDoc {
 
         let author = docs.author_default().await.context("default author")?;
 
+        let federated = matches!(bootstrap, Bootstrap::Import(_));
         let doc = match bootstrap {
             Bootstrap::Create => docs.create().await.context("creating namespace")?,
             Bootstrap::Open(id) => docs
@@ -167,6 +176,7 @@ impl NetDoc {
             author,
             namespace,
             endpoint,
+            federated,
             #[cfg(unix)]
             vpn_tun,
         })
@@ -190,15 +200,15 @@ impl NetDoc {
     ) -> Result<(Self, bool)> {
         let existing = std::fs::read_to_string(meta_path)
             .ok()
-            .and_then(|s| serde_json::from_str::<NetDocMeta>(&s).ok())
-            .map(|m| m.namespace);
+            .and_then(|s| serde_json::from_str::<NetDocMeta>(&s).ok());
 
-        let (net, created) = match existing {
-            Some(id) => match Self::spawn(endpoint.clone(), store_dir, Bootstrap::Open(id)).await {
+        let (mut net, created) = match &existing {
+            Some(meta) => match Self::spawn(endpoint.clone(), store_dir, Bootstrap::Open(meta.namespace)).await {
                 Ok(net) => (net, false),
                 Err(e) => {
                     tracing::warn!(
-                        "netdoc: saved namespace {id} could not be opened ({e}); creating fresh"
+                        "netdoc: saved namespace {} could not be opened ({e}); creating fresh",
+                        meta.namespace
                     );
                     (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true)
                 }
@@ -213,9 +223,15 @@ impl NetDoc {
             },
         };
 
+        // Restore the persisted federation status on reopen (Open loses it).
+        if let Some(meta) = &existing {
+            net.federated = meta.federated;
+        }
+
         if created {
             let meta = NetDocMeta {
                 namespace: net.namespace,
+                federated: net.federated,
             };
             let json = serde_json::to_string_pretty(&meta).context("serializing netdoc meta")?;
             std::fs::write(meta_path, json)
@@ -272,21 +288,30 @@ impl NetDoc {
                 self.put_peer(p).await?;
             }
         }
-        // Removals: in the doc but no longer present locally → revoke.
-        for existing in self.list_peers().await? {
-            if !desired_peers.contains(existing.node_id.as_str()) {
-                self.revoke(&existing.node_id, "removed", &now_timestamp()).await?;
+        // Removals: in the doc but no longer present locally → revoke. Skipped
+        // when federated — on a shared namespace the doc contains peers owned by
+        // OTHER hosts, and revoking them from our local view would wrongly evict
+        // them. (Per-entry ownership scoping + Owner/Admin-capability-gated writes
+        // are the deeper hardening; see docs/technical/p2p-network.md.)
+        if !self.federated {
+            for existing in self.list_peers().await? {
+                if !desired_peers.contains(existing.node_id.as_str()) {
+                    self.revoke(&existing.node_id, "removed", &now_timestamp()).await?;
+                }
             }
         }
 
-        // Roles: upsert all desired (handles create + update), delete the rest.
+        // Roles: upsert all desired (handles create + update). Deletion of
+        // not-desired roles is skipped when federated (shared role set).
         let desired_roles: HashSet<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         for r in roles {
             self.put_role(r).await?;
         }
-        for er in self.list_roles().await? {
-            if !desired_roles.contains(er.name.as_str()) {
-                self.del_role(&er.name).await?;
+        if !self.federated {
+            for er in self.list_roles().await? {
+                if !desired_roles.contains(er.name.as_str()) {
+                    self.del_role(&er.name).await?;
+                }
             }
         }
         Ok(())
@@ -964,6 +989,44 @@ mod tests {
         // Lookups agree.
         assert_eq!(net.get_virtual_ip("a1").await.unwrap(), Some(ip_a1));
         assert_eq!(net.list_virtual_ips().await.unwrap().len(), 2);
+    }
+
+    /// Federation safety (Step 4): a federated host must NOT revoke peers it
+    /// doesn't own when reconciling against its own (empty) peers.json.
+    #[tokio::test]
+    async fn federated_reconcile_is_additive() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.put_peer(&sample_peer("ownedbyA", "alice")).await.unwrap();
+        let ticket = a.write_ticket().await.unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(
+            test_endpoint().await,
+            dir_b.path(),
+            Bootstrap::Import(Box::new(ticket)),
+        )
+        .await
+        .expect("spawn B");
+        assert!(b.federated, "imported namespace must be marked federated");
+
+        // Wait for A's peer to replicate to B.
+        let mut replicated = false;
+        for _ in 0..50 {
+            if b.get_peer("ownedbyA").await.unwrap().is_some() {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(replicated, "peer did not replicate A -> B");
+
+        // B reconciles against its own (empty) peers.json — must NOT revoke A's peer.
+        b.reconcile(&[], &[]).await.unwrap();
+        assert!(b.get_peer("ownedbyA").await.unwrap().is_some(), "federated reconcile wrongly revoked another host's peer");
+        assert!(!b.is_revoked("ownedbyA").await.unwrap());
     }
 
     /// Federation: a VPN endpoint registration written on host A must replicate
