@@ -21,10 +21,13 @@ NO_VPN=false
 TAGS=""
 DEFAULT_ROLE=""
 JOIN_TICKET=""
+INVITE=""
 HOP_BIN="/usr/local/bin/hop"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --host)         shift ;;   # implied (this is the node installer); accept for symmetry
+    --invite)       INVITE="$2"; shift 2 ;;
     --no-vpn)       NO_VPN=true; shift ;;
     --tag)          TAGS="${TAGS:+${TAGS},}$2"; shift 2 ;;
     --default-role) DEFAULT_ROLE="$2"; shift 2 ;;
@@ -40,6 +43,10 @@ apply_daemon_primers() {
   [[ "${NO_VPN}" == "true" ]]   && sudo "${HOP_BIN}" config set vpn off --config "${cfg_dir}" >/dev/null && applied=true && info "Warren VPN disabled"
   [[ -n "${TAGS}" ]]            && sudo "${HOP_BIN}" config set tags "${TAGS}" --config "${cfg_dir}" >/dev/null && applied=true && info "Host tags: ${TAGS}"
   [[ -n "${DEFAULT_ROLE}" ]]    && sudo "${HOP_BIN}" config set default_role "${DEFAULT_ROLE}" --config "${cfg_dir}" >/dev/null && applied=true && info "Default invite role: ${DEFAULT_ROLE}"
+  # Unified invite: redeems for membership + writes the namespace join ticket.
+  if [[ -n "${INVITE}" ]]; then
+    sudo "${HOP_BIN}" warren join "${INVITE}" --config "${cfg_dir}" && applied=true && info "Joined warren via invite"
+  fi
   if [[ -n "${JOIN_TICKET}" ]]; then
     printf '%s' "${JOIN_TICKET}" | sudo tee "${cfg_dir}/netdoc-join.ticket" >/dev/null && applied=true && info "Warren join ticket saved (federates on next daemon start)"
   fi
@@ -135,7 +142,7 @@ if [[ "${OS}" == "Darwin" ]]; then
   printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
 
   # Apply warren primers to the daemon config, then restart so they take effect.
-  if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" ]]; then
+  if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" || -n "${INVITE}" ]]; then
     apply_daemon_primers "/Library/Application Support/hop"
     sudo launchctl kickstart -k system/com.hop.daemon >/dev/null 2>&1 || true
   fi
@@ -262,7 +269,7 @@ if command -v hop >/dev/null 2>&1; then
 fi
 
 # Apply warren primers to /etc/hop before first start so the daemon picks them up.
-if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" ]]; then
+if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" || -n "${INVITE}" ]]; then
   apply_daemon_primers "/etc/hop"
 fi
 

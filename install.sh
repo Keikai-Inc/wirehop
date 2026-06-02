@@ -6,11 +6,15 @@
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
 #   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --daemon
 #
-# Warren primers (applied to host config; also forwarded with --daemon):
-#   --no-vpn               Disable the warren VPN data plane (default: on)
+# Tiers:
+#   (default)              Client — reach hosts you're invited to. No sudo, no VPN.
+#   --host                 Node — put this machine on the warren VPN (sudo, daemon).
+#
+# Warren options (forwarded to the --host path):
+#   --invite <token>       Redeem an invite (it carries the warren) — join the network
+#   --no-vpn               Set up a host but disable the VPN data plane
 #   --tag <a,b>            Tag this host (drives role->tag reach + MagicDNS)
 #   --default-role <name>  Role for invites that don't specify one (default: member)
-#   --join <ticket>        Federate into an existing warren on first 'hop host'
 
 set -euo pipefail
 
@@ -45,16 +49,18 @@ NO_VPN=false
 TAGS=""
 DEFAULT_ROLE=""
 JOIN_TICKET=""
+INVITE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)      VERSION="$2"; shift 2 ;;
     --dir)          INSTALL_DIR="$2"; shift 2 ;;
-    --daemon)       DAEMON=true; shift ;;
+    --host|--daemon) DAEMON=true; shift ;;   # --host: put this machine on the warren (node)
+    --invite)       INVITE="$2"; shift 2 ;;  # unified: an invite carries the warren
     --no-vpn)       NO_VPN=true; shift ;;
     --tag)          TAGS="${TAGS:+${TAGS},}$2"; shift 2 ;;
     --default-role) DEFAULT_ROLE="$2"; shift 2 ;;
-    --join)         JOIN_TICKET="$2"; shift 2 ;;
+    --join)         JOIN_TICKET="$2"; shift 2 ;;  # hidden: raw netdoc ticket (back-compat)
     *)              die "Unknown option: $1" ;;
   esac
 done
@@ -190,6 +196,7 @@ if [[ "${DAEMON}" == "true" ]]; then
   [[ -n "${TAGS}" ]]            && DAEMON_ARGS+=(--tag "${TAGS}")
   [[ -n "${DEFAULT_ROLE}" ]]    && DAEMON_ARGS+=(--default-role "${DEFAULT_ROLE}")
   [[ -n "${JOIN_TICKET}" ]]     && DAEMON_ARGS+=(--join "${JOIN_TICKET}")
+  [[ -n "${INVITE}" ]]          && DAEMON_ARGS+=(--invite "${INVITE}")
   if command -v curl >/dev/null 2>&1; then
     exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh") "${DAEMON_ARGS[@]}"
   elif command -v wget >/dev/null 2>&1; then
@@ -214,6 +221,18 @@ if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOI
   fi
 fi
 
+# Client + invite: redeem it now so the host is saved and (if the invite carries
+# a warren) the ticket is stored for a later `hop warren join`. Non-fatal.
+if [[ -n "${INVITE}" ]]; then
+  info "Redeeming invite..."
+  if "${HOP_BIN}" exec "${INVITE}" -- true >/dev/null 2>&1; then
+    info "Connected. You can reach the host with: hop <name>"
+    info "To put THIS machine on the warren VPN later: hop warren join"
+  else
+    warn "Could not auto-redeem the invite; connect manually with: hop connect ${INVITE}"
+  fi
+fi
+
 # --- PATH check --------------------------------------------------------------
 
 if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
@@ -226,16 +245,17 @@ fi
 printf "\n${BOLD}hop v${VERSION}${RESET} installed successfully!\n"
 printf "Run ${BOLD}hop --help${RESET} to get started.\n"
 
-# Hint about daemon setup if service not already running
+# Offer the warren-VPN upgrade if this is a client install and no host is running.
 if [[ "${DAEMON}" == "false" ]]; then
+  show_hint=false
   if [[ "${OS}" == "linux" ]] && ! systemctl is-active --quiet hop 2>/dev/null; then
-    printf "\nTo run as a daemon (starts on boot):\n"
-    printf "  curl -fsSL https://hop.keik.ai/install-daemon.sh | bash\n"
-  elif [[ "${OS}" == "darwin" ]]; then
-    DAEMON_LABEL="com.hop.daemon"
-    if ! launchctl print "system/${DAEMON_LABEL}" &>/dev/null 2>&1; then
-      printf "\nTo run as a daemon (starts on boot):\n"
-      printf "  curl -fsSL https://hop.keik.ai/install-daemon.sh | bash\n"
-    fi
+    show_hint=true
+  elif [[ "${OS}" == "darwin" ]] && ! launchctl print "system/com.hop.daemon" &>/dev/null 2>&1; then
+    show_hint=true
+  fi
+  if [[ "${show_hint}" == "true" ]]; then
+    printf "\nThis is a client install (reach hosts you're invited to — no VPN).\n"
+    printf "To put this machine ON your warren (private network, always-on host):\n"
+    printf "  curl -fsSL %s/install.sh | bash -s -- --host\n" "${BASE_URL}"
   fi
 fi
