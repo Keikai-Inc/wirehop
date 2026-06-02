@@ -325,6 +325,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     {
         let cell = netdoc_cell.clone();
         let cfg = config_dir.to_path_buf();
+        let host_node_id = public_key.to_string();
         tokio::spawn(async move {
             let endpoint = match net::create_netdoc_endpoint(netdoc_key).await {
                 Ok(ep) => ep,
@@ -353,6 +354,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                             roles.len()
                         ),
                         Err(e) => tracing::warn!("netdoc: startup reconcile failed: {e:#}"),
+                    }
+                    // Phase 2: claim this host's stable virtual IP in the doc.
+                    match net.claim_virtual_ip(&host_node_id).await {
+                        Ok(ip) => tracing::info!("netdoc: virtual IP {ip} (100.64.0.0/10)"),
+                        Err(e) => tracing::warn!("netdoc: virtual IP claim failed: {e:#}"),
                     }
                     tracing::info!("netdoc ready (namespace {})", net.namespace());
                     let _ = cell.set(std::sync::Arc::new(net));
