@@ -445,8 +445,8 @@ real client-vs-host split, closer to `ssh`/`sshd`. Two install tiers fall out:
 
 | Tier | sudo / daemon | VPN / virtual IP / `name.hop` | Has a warren? | Purpose |
 |------|---------------|-------------------------------|---------------|---------|
-| **Connect from this machine** (client) | no | no | no (member only) | reach hosts you're invited to, SSH-style, zero footprint |
-| **A machine to reach** (node) — *default* | yes | yes | yes (its namespace) | be *on* the private network |
+| **Connect from this machine** (client) — *no-arg default* | no | no | no (member only) | reach hosts you're invited to, SSH-style, zero footprint |
+| **A machine to reach** (node) — *explicit `--host`* | yes | yes | yes (its namespace) | be *on* the private network |
 
 Two ways to reach a host, and only one is the VPN: **direct hop session**
 (`hop host`, exec, cp — P2P, no VPN, works from a client) vs **warren IP
@@ -466,9 +466,10 @@ Today the daemon writes **two** artifacts — `creator_invite` (an `InviteToken`
 how to reach the host + role) and `netdoc.ticket` (a `DocTicket`: how to replicate
 the namespace). Fold the second into the first:
 
-- Add `warren_ticket: Option<String>` (the namespace `DocTicket`) to `InviteToken`.
-  "Warren join token" disappears as a separate concept — there is only **an
-  invite**.
+- Add `warren_ticket: Option<String>` (the namespace `DocTicket`) and
+  `suggested_tier: Option<Tier>` (`client` | `node`, for org-steering) to
+  `InviteToken`. "Warren join token" disappears as a separate concept — there is
+  only **an invite**.
 - **Redeeming always = becoming a warren member with a role** (the host already
   dual-writes the peer entry into the doc). Tier decides what your *local* machine
   does with it:
@@ -501,11 +502,14 @@ extract `warren_ticket` → hand to the daemon), since it knows the tier.
   existing `<config>/netdoc.ticket` and embeds it. `cmd_connect` redeem persists a
   present `warren_ticket` to `<config>/warren-ticket` (dormant). `netdoc.ticket`
   stays on disk for back-compat but is no longer the user-facing path.
-- **C — Reconcile the installer.** One `install.sh`: default branch = today's
-  `install-daemon.sh` (node), `--client` = today's lightweight install. Unify the
-  join input as `--invite <token>` (node → extract ticket → `netdoc-join.ticket`;
-  client → redeem + store). Keep `--no-vpn`/`--tag`/`--default-role`; `--join`
-  becomes a hidden alias. `install-daemon.sh` → thin alias of `install.sh`.
+- **C — Reconcile the installer.** One `install.sh`: **no-arg = client** (today's
+  lightweight binary install, no sudo); **`--host` = node** (today's
+  `install-daemon.sh` path — sudo, service, VPN on by default). Unify the join
+  input as `--invite <token>` (node → extract ticket → `netdoc-join.ticket`;
+  client → redeem + store). An invite's `suggested_tier` drives the default the
+  install page presents. Keep `--no-vpn`/`--tag`/`--default-role`; `--join` and
+  `--daemon` become hidden aliases (`--daemon`→`--host`). `install-daemon.sh` →
+  thin alias of `install.sh --host`.
 - **B — Upgrade path.** Node re-install detects `<config>/warren-ticket` + existing
   membership and adopts it. Add `hop warren status` ("member of X; VPN: off") so
   the upgrade is discoverable.
@@ -528,13 +532,28 @@ extract `warren_ticket` → hand to the daemon), since it knows the tier.
 - `install-daemon.sh` URL is a permanent alias.
 - Existing nodes/namespaces untouched; newly-minted invites simply gain the ticket.
 
-### Open product decision
+### Resolved product decision — laptops default to client
 
-For the **startup persona**, should a developer's laptop default to **client**
-(reach servers, no root; upgrade-to-node available) — onboarding email hands out
-an **invite**, dev picks tier at install? This plan assumes yes. The alternative
-is making the laptop a full node by default (Tailscale-like, but root on every
-dev machine).
+A developer's laptop defaults to **client** (reach servers, no root;
+upgrade-to-node one re-install away). Rationale: it matches how startups and
+larger orgs actually run — engineers get *access to servers*, not an addressable
+mesh peer + root daemon on every laptop — and it plays to hop's differentiator
+(the no-root client tier the symmetric mesh VPNs can't offer). Node-by-default
+(Tailscale-like: every machine a reachable peer, root everywhere) was rejected as
+too heavy for the common case.
+
+**Org-steering lever.** Because the tier is otherwise a local choice (gated by
+`sudo` availability), the **invite carries a suggested tier** (`suggested_tier:
+client | node`) so a company's onboarding link sets the right expectation —
+"this link gives you access to the servers (no sudo)" vs "this link puts your
+machine on the network (needs admin)". The machine-local `sudo`/`--client`/`--host`
+choice remains the real gate; the suggestion just drives the default + the
+install-page copy.
+
+This makes the **no-argument `curl … | bash` resolve to the client** (safe, no
+surprise root); becoming a node is the explicit **"a machine to reach"** path
+(`--host`), where the VPN is then on by default (opt out with `--no-vpn`). The
+install page leads with the intent choice rather than burying either tier.
 
 ## What stays the same
 
