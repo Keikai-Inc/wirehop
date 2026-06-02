@@ -218,8 +218,26 @@ elevation command is new.)
 ### Shipped (experimental, opt-in / off by default — `HOP_VPN=1`)
 - **VPN data plane** — `hop/vpn/1` QUIC-datagram forwarding over a TUN device,
   federation via write ticket. *(0.6.28)*
-- **Default-deny ACL** filter on the forwarding path. *(0.6.28)*
-- **MagicDNS** resolver for `*.hop`. *(0.6.28)*
+- **MagicDNS** resolver, configurable per-warren domain. *(0.6.28, 0.6.30)*
+- **Role-based warren MVP — Steps 1-7** *(0.6.29, 0.6.30)*: unified role model
+  (`role_name` on peers/invites; least-privilege `member` default;
+  `HostConfig.default_role`); `hop invite --role <name>`; host tags
+  (`HostConfig.tags`); **role→tag→ACL reach** enforced on the forwarding path
+  (replaces the static default-deny policy); role elevation
+  (`hop admin <host> grant <peer> <role>`); federation safety (additive-only
+  reconcile when joined to a shared namespace).
+
+Validated by unit/integration tests (role-reach, role-derived reach via doc,
+federation replication, federated additive reconcile, ACL, DNS codec) and the
+53-test regression e2e (proving the default daemon is unchanged).
+
+**Not yet done — Step 8 (live multi-node TUN e2e).** A *meaningful* role-gated
+ping test needs the **M4 "invite carries the network"** integration so a joining
+machine becomes a role-bearing **member** of the *shared* doc (not just a
+namespace replica), plus a host being a member of its own warren so it can
+originate/return traffic. Federation gives the doc; membership gives the role —
+they're still separate. TUN itself is confirmed working in the test environment,
+so the harness is feasible once M4 lands.
 
 Validated by unit/integration tests (routing, federation replication, ACL, DNS)
 and the 53-test regression e2e. The live multi-node TUN packet flow is not yet in
