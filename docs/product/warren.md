@@ -152,6 +152,35 @@ replicated membership doc (packet src IP → member → role; dst IP → host �
 They're stable as people join and leave — no per-IP rule regeneration. When a new
 developer joins, the existing `developer → dev` rule already covers them.
 
+### Two layers of access control: reach vs confinement
+
+hop has **two** access-control systems that serve different, non-overlapping
+purposes. They are not redundant and neither can do the other's job:
+
+| Layer | Answers | Scope | Modeled on |
+|-------|---------|-------|------------|
+| **Reach** (the ACL) | *Can I connect to it?* | network — `member → host:port` | corporate network / security groups |
+| **Confinement** (the sandbox) | *What can a hop session do once it's open?* | host — commands, paths, network egress inside a hop shell/exec/agent | least-privilege; the agentic read-only model (e.g. a monitor cron that may look but not touch) |
+
+- **Reach** decides whether a connection is permitted at all — covering both the
+  `hop <host>` session path and IP-level VPN service access (both derived from the
+  same role tags, so they always agree).
+- **Confinement** decides what a hop-spawned *session* may do once running. It
+  applies to hop shells/exec/agents — **not** to a raw VPN connection to a
+  service like Postgres, whose own auth governs that.
+
+**They compose, they don't collide.** Each is an independent gate at a different
+point, AND-ed together: an action is allowed only if it passes every applicable
+layer, and where they touch the more-restrictive one wins (a `no_network`
+sandbox session simply won't use the VPN even if the ACL would allow it — correct,
+not a conflict). Neither layer ever overrides the other.
+
+**The role sets both, so they stay coherent.** A `RoleDefinition` already carries
+`host_tags` (→ reach) *and* a `sandbox` (→ confinement). You never configure two
+systems: you assign a role, and reach + confinement are set together. `--role
+monitor` → reaches the monitored hosts *and* gets a read-only, no-network
+session. One decision, two layers, no contradiction.
+
 ### Changing a role after invite (Planned)
 
 Members are elevated/demoted without re-inviting:

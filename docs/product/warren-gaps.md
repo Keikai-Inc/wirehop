@@ -49,10 +49,13 @@ Status legend: ✅ resolved by decision · 📝 doc fix needed · 🔧 open tech
 - 📝 **`security.md` is stale.** Its auth flow still ends at "added to
   `peers.json`" with no mention of the netdoc / doc-authoritative auth / mirror
   from Phase 1. Update it.
-- 📝 **Sandbox vs ACL — two access systems, unexplained.** Per-peer
-  `SandboxPolicy` (what a shell session may do) and per-network ACL (which
-  IP:ports you may reach) are different layers; no doc says when each applies or
-  how they compose. Add a short "two layers of access control" explainer.
+- ✅ **Sandbox vs ACL — two access systems.** *Resolved:* they are complementary
+  layers — **reach** (ACL: *can I connect?*, the corporate-network model) vs
+  **confinement** (sandbox: *what may a hop session do?*, the agentic
+  least-privilege model). They compose as independent AND-gates at different
+  points (never override each other; more-restrictive wins where they touch), and
+  the **role sets both** (`host_tags` → reach, `sandbox` → confinement) so they
+  stay coherent. Documented in warren.md → "Two layers of access control."
 
 ## 🔧 Open technical work (now well-defined — this *is* the roadmap)
 
