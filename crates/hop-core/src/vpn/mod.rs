@@ -33,6 +33,24 @@ pub fn parse_dest_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]))
 }
 
+pub mod acl;
+pub mod dns;
+
+/// Parse the destination transport port (TCP/UDP) from a raw L3 packet, if the
+/// protocol carries ports and the packet is long enough. ICMP etc. → `None`.
+pub fn parse_dest_port(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 24 || (packet[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    let proto = packet[9];
+    // TCP (6) / UDP (17): destination port is bytes 2..4 of the transport header.
+    if !(proto == 6 || proto == 17) || packet.len() < ihl + 4 {
+        return None;
+    }
+    Some(u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+}
+
 /// Parse the source IPv4 address from a raw L3 packet (bytes 12..16).
 pub fn parse_src_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.len() < 20 || (packet[0] >> 4) != 4 {

@@ -291,9 +291,9 @@ the proving ground for the doc and addressing before any commercial work.
 | Phase | Scope | Independent value |
 |-------|-------|-------------------|
 | **1. Decentralize state** ✅ *(per-host)* | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
-| **2. Virtual IPs** | Deterministic-proposal + doc-claim allocation (#2). Addresses shown in `hop ls`. No traffic flows yet. | Tests conflict resolution without TUN complexity. |
-| **3. VPN packet plane** | TUN/utun (#6), `hop/vpn/v1` over QUIC datagrams (#5), daemon-to-daemon forwarding. Opt-in per peer. Per-network kill switch. | Actual P2P LAN reachability. |
-| **4. DNS + ACL** | MagicDNS-style resolver (#7); userspace ACL filter, default-deny (#8); `hop expose`/`hop access grant`. | Friendly names + safe service exposure. |
+| **2. Virtual IPs** ✅ | Deterministic-proposal + doc-claim allocation (#2). Claimed per host on startup. | Tests conflict resolution without TUN complexity. |
+| **3. VPN packet plane** ⚙️ *(opt-in/experimental)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket. Off by default (`HOP_VPN=1`). | Actual P2P LAN reachability. |
+| **4. DNS + ACL** ⚙️ *(opt-in/experimental)* | MagicDNS resolver for `*.hop` (#7); default-deny userspace ACL filter on the forwarding path (#8). Active only with the opt-in VPN. | Friendly names + safe service exposure. |
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
 

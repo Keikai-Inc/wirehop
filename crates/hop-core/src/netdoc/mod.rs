@@ -404,9 +404,31 @@ impl NetDoc {
         Ok(Some((pubkey, relay)))
     }
 
+    /// Read the network's ACL policy from the document (default-deny if unset).
+    pub async fn get_acl_policy(&self) -> Result<crate::vpn::acl::AclPolicy> {
+        let query = Query::single_latest_per_key().key_exact(b"acl/policy").build();
+        match self.doc.get_one(query).await.context("get_one acl")? {
+            Some(e) if e.content_len() > 0 => {
+                let bytes = self.fs_store.get_bytes(e.content_hash()).await?;
+                Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+            }
+            _ => Ok(crate::vpn::acl::AclPolicy::default_deny()),
+        }
+    }
+
+    /// Write the network's ACL policy to the document (replicates to all nodes).
+    pub async fn set_acl_policy(&self, policy: &crate::vpn::acl::AclPolicy) -> Result<()> {
+        let value = serde_json::to_vec(policy).context("serializing acl policy")?;
+        self.doc
+            .set_bytes(self.author, b"acl/policy".to_vec(), value)
+            .await
+            .context("writing acl policy")?;
+        Ok(())
+    }
+
     /// Enable the VPN data plane (Phase 3, opt-in): claim a virtual IP, create
-    /// the TUN device, advertise the endpoint, and start forwarding. Off unless
-    /// explicitly called. Returns the assigned virtual IP.
+    /// the TUN device, advertise the endpoint, and start forwarding under the
+    /// network's ACL policy (default-deny). Off unless explicitly called.
     #[cfg(unix)]
     pub async fn enable_vpn(
         self: &std::sync::Arc<Self>,
@@ -416,15 +438,89 @@ impl NetDoc {
         let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
         *self.vpn_tun.write().await = Some(tun.clone());
         self.register_vpn_endpoint(addr).await?;
+        let policy = self.get_acl_policy().await.unwrap_or_default();
+        if policy.default == crate::vpn::acl::Action::Deny && policy.rules.is_empty() {
+            tracing::warn!(
+                "vpn: ACL policy is default-deny with no rules — all VPN traffic is blocked. \
+                 Set a policy via NetDoc::set_acl_policy to permit flows."
+            );
+        }
         let me = std::sync::Arc::clone(self);
-        tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
+        tokio::spawn(async move { me.vpn_outbound_loop(tun, policy).await });
+
+        // MagicDNS: register this host's name → virtual IP and serve `*.hop`
+        // lookups on the virtual interface (split-DNS points `.hop` here).
+        if let Ok(h) = hostname::get() {
+            let name = h.to_string_lossy().to_lowercase();
+            if let Err(e) = self.register_name(&name, addr).await {
+                tracing::warn!("vpn: name registration failed: {e:#}");
+            }
+        }
+        let dns = std::sync::Arc::clone(self);
+        tokio::spawn(async move { dns.vpn_dns_loop(addr).await });
+
         Ok(addr)
+    }
+
+    /// Register `name` → virtual `addr` for MagicDNS (replicates to all nodes).
+    pub async fn register_name(&self, name: &str, addr: std::net::Ipv4Addr) -> Result<()> {
+        let key = format!("name/{}", name.to_lowercase());
+        self.doc
+            .set_bytes(self.author, key.into_bytes(), addr.to_string().into_bytes())
+            .await
+            .context("registering name")?;
+        Ok(())
+    }
+
+    /// Resolve a host `name` to its virtual IP via the document.
+    pub async fn lookup_name(&self, name: &str) -> Result<Option<std::net::Ipv4Addr>> {
+        let key = format!("name/{}", name.to_lowercase());
+        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+        let Some(entry) = self.doc.get_one(query).await.context("get_one name")? else {
+            return Ok(None);
+        };
+        if entry.content_len() == 0 {
+            return Ok(None);
+        }
+        let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+        Ok(String::from_utf8_lossy(&bytes).parse().ok())
+    }
+
+    /// MagicDNS server: answer `A` queries for `*.hop` on the virtual interface.
+    #[cfg(unix)]
+    async fn vpn_dns_loop(&self, addr: std::net::Ipv4Addr) {
+        let sock = match tokio::net::UdpSocket::bind((addr, 53)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("vpn: DNS bind on {addr}:53 failed ({e}); MagicDNS disabled");
+                return;
+            }
+        };
+        tracing::info!("vpn: MagicDNS serving *.hop on {addr}:53");
+        let mut buf = [0u8; 512];
+        loop {
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(query) = crate::vpn::dns::parse_query(&buf[..n]) else { continue };
+            let resolved = match query.name.strip_suffix(".hop") {
+                Some(host) => self.lookup_name(host).await.ok().flatten(),
+                None => None,
+            };
+            let resp = crate::vpn::dns::build_response(&query, resolved);
+            let _ = sock.send_to(&resp, peer).await;
+        }
     }
 
     /// Read packets off the TUN device and forward each to the owning peer over
     /// a `hop/vpn/1` QUIC-datagram connection (re-using/reconnecting as needed).
     #[cfg(unix)]
-    async fn vpn_outbound_loop(&self, tun: std::sync::Arc<tun::AsyncDevice>) {
+    async fn vpn_outbound_loop(
+        &self,
+        tun: std::sync::Arc<tun::AsyncDevice>,
+        policy: crate::vpn::acl::AclPolicy,
+    ) {
         use std::collections::HashMap;
         let mut conns: HashMap<iroh::PublicKey, iroh::endpoint::Connection> = HashMap::new();
         let mut buf = vec![0u8; 65535];
@@ -439,6 +535,15 @@ impl NetDoc {
             let pkt = &buf[..n];
             let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
             if !crate::vpn::is_virtual_addr(dst) {
+                continue;
+            }
+            // ACL enforcement (default-deny). Drop packets the policy forbids.
+            if let Some(src) = crate::vpn::parse_src_ipv4(pkt) {
+                let port = crate::vpn::parse_dest_port(pkt);
+                if !policy.permits(src, dst, port) {
+                    continue;
+                }
+            } else {
                 continue;
             }
             let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
