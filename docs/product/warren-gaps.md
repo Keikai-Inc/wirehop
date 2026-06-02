@@ -25,6 +25,11 @@ Status legend: ✅ resolved by decision · 📝 doc fix needed · 🔧 open tech
 - ✅ **Fleet "orchestrator" as a soft central authority.** *Now:* dissolves into
   the replicated document + capability-based writes; its role definitions and
   role-based invites are kept and extended, not its authority-holding position.
+- ✅ **Default-role behavior (confirmed).** `hop invite` with no role assigns the
+  org default, which is **least-privilege `member`: in the warren with an address
+  but default-deny — reaches nothing until a role grants it.** This replaces
+  today's footgun (no-role → `Peer` = full unrestricted shell). The org default
+  is re-pointable; implementation is part of the role-system merge.
 
 ## 📝 Doc honesty fixes still needed (warren.md describes unbuilt things in present tense)
 
@@ -43,9 +48,11 @@ Status legend: ✅ resolved by decision · 📝 doc fix needed · 🔧 open tech
   new `member` default Planned.
 - 📝 **`hop ls` scope.** It lists local `known_hosts`/peers, not a network-wide,
   role-filtered view. Correct the capability-table wording.
-- 📝 **MagicDNS domain mismatch.** Live resolver answers `<host>.hop` (hardcoded);
-  docs show `<host>.<org>.hop` (e.g. `web.acme.hop`). Decide: a configurable
-  per-warren domain (preferred) vs the flat `.hop`, and align code + docs.
+- ✅/🔧 **MagicDNS domain.** *Decided:* **configurable per-warren domain with
+  conventional defaults** — named warren → `<warren-name>.hop` (`web.acme.hop`),
+  unnamed → flat `hop` (`web.hop`); domain stored in the warren document. Docs
+  updated. *Implementation* (live resolver currently hard-codes `.hop`) folds
+  into the role/onboarding work.
 - 📝 **`security.md` is stale.** Its auth flow still ends at "added to
   `peers.json`" with no mention of the netdoc / doc-authoritative auth / mirror
   from Phase 1. Update it.
