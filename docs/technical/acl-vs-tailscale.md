@@ -234,6 +234,10 @@ distribution** (no coordinator) and the **role = reach + OS-sandbox** model. The
 goal is a *familiar surface and standards-based engine* over hop's existing
 decentralized, role-centric core — not Tailscale's centralized architecture.
 
+> The phased implementation of all of the above (Cedar engine, importer, and the
+> feature-gap closers) is specced in
+> [acl-cedar-plan.md](acl-cedar-plan.md).
+
 [RFC 8259]: https://www.rfc-editor.org/rfc/rfc8259
 
 ## Sources
