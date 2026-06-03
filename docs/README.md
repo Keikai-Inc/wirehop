@@ -36,4 +36,5 @@ How hop works — protocols, algorithms, internal architecture.
 | [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |
 | [networking.md](technical/networking.md) | iroh endpoint, relay, netmon, **warren netdoc + VPN data plane**, agent/mux IPC, reconnection |
 | [p2p-network.md](technical/p2p-network.md) | **(Shipped MVP + design)** Orchestratorless P2P VPN — iroh-docs state, virtual IPs, TUN data plane, MagicDNS, decentralized invites/roles; commercial control plane (Planned) |
+| [acl-vs-tailscale.md](technical/acl-vs-tailscale.md) | **(Comparison)** hop's warren ACL (role→tag reach + OS-sandbox confinement) vs Tailscale's ACL/grants/app-capabilities — distribution, expressiveness, the capability gap |
 | [tap.md](technical/tap.md) | hop-tap internals — eBPF program, CO-RE, off-screen emulator, streaming dispatcher |
