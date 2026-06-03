@@ -44,6 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["hickory-dns
 # Same fix for reqwest 0.13 (used by pkarr for HTTP relay lookups).
 reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["hickory-dns"] }
 bytes = "1.11.1"
+cedar-policy = "4.11.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

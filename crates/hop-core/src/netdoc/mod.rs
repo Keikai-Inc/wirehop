@@ -113,7 +113,17 @@ pub struct NetDoc {
     /// Active TUN device when the VPN is enabled (Phase 3, opt-in). `None` = off.
     #[cfg(unix)]
     vpn_tun: crate::vpn::TunSlot,
+    /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
+    /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
+    /// the policy/entity set inline.
+    reach_cache: std::sync::Arc<
+        tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<crate::vpn::cedar::AclEngine>)>>,
+    >,
 }
+
+/// How long a built reach engine is reused before a rebuild. Membership changes
+/// converge within this window on the enforcement path.
+const REACH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl NetDoc {
     /// Spawn the docs stack on `endpoint`, persisting under `store_dir`, and
@@ -180,6 +190,7 @@ impl NetDoc {
             federated,
             #[cfg(unix)]
             vpn_tun,
+            reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -432,7 +443,13 @@ impl NetDoc {
             return Ok(0);
         }
         let n = peers.len();
-        self.doc.start_sync(peers).await.context("start_sync")?;
+        // Best-effort: an unaddressable peer (no relay + no direct addr, e.g. in
+        // hermetic tests) can make start_sync error; that must not fail the
+        // daemon's resume. The keepalive retries, and the engine accepts incoming
+        // sync regardless.
+        if let Err(e) = self.doc.start_sync(peers).await {
+            tracing::debug!("netdoc: start_sync during resume failed (best-effort): {e:#}");
+        }
         Ok(n)
     }
 
@@ -504,6 +521,7 @@ impl NetDoc {
             .set_bytes(self.author, key.into_bytes(), value)
             .await
             .context("registering host tags")?;
+        self.invalidate_reach_cache().await;
         Ok(())
     }
 
@@ -519,6 +537,26 @@ impl NetDoc {
         }
         let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
         Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// All host-tag entries (`node_id → tags`) from the document.
+    pub async fn list_host_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let query = Query::key_prefix(b"tag/").build();
+        let stream = self.doc.get_many(query).await.context("get_many tag")?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out = std::collections::HashMap::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.context("reading tag entry")?;
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let key = String::from_utf8_lossy(entry.key());
+            let Some(node) = key.strip_prefix("tag/") else { continue };
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            let tags: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
+            out.insert(node.to_string(), tags);
+        }
+        Ok(out)
     }
 
     /// Resolve a role by name from the document's role entries.
@@ -543,13 +581,76 @@ impl NetDoc {
         let (Some(src_node), Some(dst_node)) = (owner(src_ip), owner(dst_ip)) else {
             return false;
         };
-        // Source peer's role.
-        let Ok(Some(peer)) = self.get_peer(&src_node).await else { return false };
-        let Some(role_name) = peer.role_name else { return false };
-        let Ok(Some(role)) = self.find_role(&role_name).await else { return false };
-        // Destination host's tags.
-        let dst_tags = self.lookup_host_tags(&dst_node).await.unwrap_or_default();
-        crate::vpn::acl::role_reaches(&role.host_tags, &dst_tags)
+        // Cedar reach engine (cached); default-deny on any build failure.
+        match self.reach_engine().await {
+            Some(engine) => engine.is_reach_allowed(&src_node, &dst_node, None),
+            None => false,
+        }
+    }
+
+    /// Get the cached Cedar reach engine, rebuilding it from current membership
+    /// if absent or older than `REACH_CACHE_TTL`. The hot forwarding path calls
+    /// `is_reach_allowed` on the returned engine — a pure, in-memory decision.
+    pub async fn reach_engine(&self) -> Option<std::sync::Arc<crate::vpn::cedar::AclEngine>> {
+        // Fast path: fresh cached engine.
+        if let Some((built, engine)) = self.reach_cache.read().await.as_ref()
+            && built.elapsed() < REACH_CACHE_TTL
+        {
+            return Some(engine.clone());
+        }
+        // Rebuild from a membership snapshot.
+        let peers = self.list_peers().await.unwrap_or_default();
+        let roles = self.list_roles().await.unwrap_or_default();
+        let host_tags = self.list_host_tags().await.unwrap_or_default();
+        let authored = self.get_authored_policy().await;
+        let engine = match crate::vpn::cedar::AclEngine::build(
+            &peers,
+            &roles,
+            &host_tags,
+            authored.as_deref(),
+        ) {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(e) => {
+                tracing::warn!("netdoc: building reach engine failed (default-deny): {e:#}");
+                return None;
+            }
+        };
+        *self.reach_cache.write().await =
+            Some((std::time::Instant::now(), engine.clone()));
+        Some(engine)
+    }
+
+    /// Drop the cached reach engine so the next decision rebuilds from current
+    /// membership. Called after local reach-affecting writes (peer/role/tag/
+    /// policy) so admin actions reflect immediately; replicated changes converge
+    /// via `REACH_CACHE_TTL`.
+    pub async fn invalidate_reach_cache(&self) {
+        *self.reach_cache.write().await = None;
+    }
+
+    /// Authored Cedar policy text appended to the generated default reach policy
+    /// (Phase 3), read from `acl/cedar`. `None` until an operator sets one.
+    pub async fn get_authored_policy(&self) -> Option<String> {
+        let query = Query::single_latest_per_key().key_exact(b"acl/cedar").build();
+        match self.doc.get_one(query).await {
+            Ok(Some(e)) if e.content_len() > 0 => self
+                .fs_store
+                .get_bytes(e.content_hash())
+                .await
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Set the authored Cedar policy text (Phase 3). Validated by the caller.
+    pub async fn set_authored_policy(&self, policy: &str) -> Result<()> {
+        self.doc
+            .set_bytes(self.author, b"acl/cedar".to_vec(), policy.as_bytes().to_vec())
+            .await
+            .context("writing authored Cedar policy")?;
+        self.invalidate_reach_cache().await;
+        Ok(())
     }
 
     /// The warren's MagicDNS domain (doc `network/domain`, default `hop`).
@@ -819,6 +920,7 @@ impl NetDoc {
             .set_bytes(self.author, key.into_bytes(), value)
             .await
             .context("writing peer entry")?;
+        self.invalidate_reach_cache().await;
         Ok(())
     }
 
@@ -846,6 +948,7 @@ impl NetDoc {
             .set_bytes(self.author, key.into_bytes(), value)
             .await
             .context("writing role entry")?;
+        self.invalidate_reach_cache().await;
         Ok(())
     }
 
@@ -874,6 +977,7 @@ impl NetDoc {
             .del(self.author, peer_key.into_bytes())
             .await
             .context("deleting peer entry on revoke")?;
+        self.invalidate_reach_cache().await;
         Ok(())
     }
 
@@ -924,6 +1028,18 @@ mod tests {
     use super::*;
     use crate::config::PeerRole;
     use crate::sandbox::SandboxPolicy;
+
+    async fn test_endpoint_with_key(sk: iroh::SecretKey) -> Endpoint {
+        // A node keeps a stable netdoc identity across restarts (production uses
+        // `derive_netdoc_secret_key`); reopening its persisted store under a
+        // *different* key is not a real scenario. Tests that reopen must reuse
+        // the same key, or the blobs store rejects content written under another.
+        iroh::endpoint::Builder::empty()
+            .secret_key(sk)
+            .bind()
+            .await
+            .expect("bind test endpoint")
+    }
 
     async fn test_endpoint() -> Endpoint {
         // Empty builder: no relay, no discovery — purely local, fine for a
@@ -1132,10 +1248,12 @@ mod tests {
         let ticket = a.write_ticket().await.unwrap();
 
         // B joins (import → live sync) and receives A's VPN endpoint entry.
+        // B keeps a stable identity across its "reboot" (as production does).
+        let b_key = iroh::SecretKey::from_bytes(&[7u8; 32]);
         let dir_b = tempfile::tempdir().unwrap();
         {
             let b = NetDoc::spawn(
-                test_endpoint().await,
+                test_endpoint_with_key(b_key.clone()).await,
                 dir_b.path(),
                 Bootstrap::Import(Box::new(ticket)),
             )
@@ -1153,8 +1271,8 @@ mod tests {
         } // drop B — simulates shutdown, releasing the store.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // B REOPENS the persisted namespace (the reboot path).
-        let b2 = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Open(ns))
+        // B REOPENS the persisted namespace (the reboot path) — same identity.
+        let b2 = NetDoc::spawn(test_endpoint_with_key(b_key).await, dir_b.path(), Bootstrap::Open(ns))
             .await
             .expect("reopen B");
         // resume_sync must rediscover A from the persisted vpn/ table.
