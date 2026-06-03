@@ -90,6 +90,12 @@ pub enum Command {
         action: WarrenAction,
     },
 
+    /// Inspect and import warren access policy (ACL)
+    Acl {
+        #[command(subcommand)]
+        action: AclAction,
+    },
+
     /// List authorized peers or known hosts
     Peers {
         #[command(subcommand)]
@@ -312,6 +318,27 @@ pub enum AgentAction {
     Stop,
     /// Check agent status
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum AclAction {
+    /// Import a Tailscale tailnet policy file (HuJSON) → hop roles + reach
+    Import {
+        /// Path to the Tailscale policy file (HuJSON/JSON)
+        file: std::path::PathBuf,
+        /// Write the imported roles to roles.json (default: dry-run report only)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Check whether a role reaches a host with the given tags
+    Check {
+        /// Role name (from roles.json)
+        role: String,
+        /// Destination host tags
+        tags: Vec<String>,
+    },
+    /// Print the seeded/derived reach of every role
+    Show,
 }
 
 #[derive(Subcommand)]

@@ -129,6 +129,10 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_warren(secret_key, &config_dir, action).await
         }
+        Command::Acl { action } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            cmd_acl(action, &config_dir)
+        }
         Command::Peers { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let user_config_dir = config::default_config_dir()?;
@@ -3996,6 +4000,73 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
     }
 
     Ok(())
+}
+
+fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
+    use cli::AclAction;
+    use hop_core::fleet::RolesStore;
+    match action {
+        AclAction::Import { file, apply } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let result = hop_core::vpn::tailscale_import::import_tailscale_policy(&text)?;
+            print!("{}", result.report());
+            if apply {
+                let mut store = RolesStore::load(config_dir)?;
+                let (mut added, mut updated) = (0u32, 0u32);
+                for role in result.roles {
+                    if let Some(existing) = store.roles.iter_mut().find(|r| r.name == role.name) {
+                        *existing = role;
+                        updated += 1;
+                    } else {
+                        store.roles.push(role);
+                        added += 1;
+                    }
+                }
+                store.save(config_dir)?;
+                println!("\nApplied to roles.json ({added} added, {updated} updated). Restart the host/daemon to take effect.");
+            } else {
+                println!("\n(dry run — re-run with --apply to write these roles to roles.json)");
+            }
+            Ok(())
+        }
+        AclAction::Check { role, tags } => {
+            let store = RolesStore::load(config_dir)?;
+            let Some(r) = store.find_role(&role) else {
+                anyhow::bail!("unknown role '{role}' (see `hop acl show`)");
+            };
+            let reaches = hop_core::vpn::acl::role_reaches(&r.host_tags, &tags);
+            println!(
+                "{} {role} -> host[{}]",
+                if reaches { "ALLOW" } else { "DENY " },
+                tags.join(",")
+            );
+            println!(
+                "  role reach tags: {}",
+                if r.host_tags.is_empty() { "(none — default-deny)".into() } else { r.host_tags.join(", ") }
+            );
+            Ok(())
+        }
+        AclAction::Show => {
+            let store = RolesStore::load(config_dir)?;
+            if store.roles.is_empty() {
+                println!("No roles defined (run `hop host` once to seed defaults).");
+                return Ok(());
+            }
+            println!("{:<16} reaches", "role");
+            for r in &store.roles {
+                let reach = if r.host_tags.iter().any(|t| t == "*") {
+                    "* (all hosts)".to_string()
+                } else if r.host_tags.is_empty() {
+                    "(none — default-deny)".to_string()
+                } else {
+                    r.host_tags.join(", ")
+                };
+                println!("{:<16} {reach}", r.name);
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn cmd_warren(
