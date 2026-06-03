@@ -405,6 +405,18 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
 
                     let net = std::sync::Arc::new(net);
 
+                    // Robustness: iroh-docs only starts live sync on the first
+                    // `import`; reopening the namespace (every restart, e.g. after
+                    // a reboot) does not. Actively re-establish sync with the
+                    // warren's known peers so a rebooted node reconverges instead
+                    // of running on a stale snapshot, and keep it converged.
+                    match net.resume_sync().await {
+                        Ok(n) if n > 0 => tracing::info!("netdoc: resumed warren sync with {n} peer(s)"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("netdoc: resume sync failed: {e:#}"),
+                    }
+                    net.spawn_sync_keepalive(std::time::Duration::from_secs(300));
+
                     // Phase 3: the warren VPN data plane is default-on. The env
                     // var overrides config: HOP_VPN=1 forces on (past the CGNAT
                     // guard), HOP_VPN=0 forces off; otherwise the config flag

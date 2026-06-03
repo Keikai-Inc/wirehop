@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use iroh::Endpoint;
+use iroh::EndpointAddr;
 use iroh::protocol::Router;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
@@ -386,6 +387,70 @@ impl NetDoc {
             out.push((addr, String::from_utf8_lossy(&bytes).into_owned()));
         }
         Ok(out)
+    }
+
+    // ── Sync resumption (robustness across restarts) ─────────────────────
+
+    /// Re-establish live document sync with the warren's known peers.
+    ///
+    /// iroh-docs only starts live sync automatically on `import` (the first
+    /// join, where the ticket carries peer addresses). `open` — the path taken
+    /// on every restart once the namespace is persisted — does NOT. Without
+    /// this, a rebooted node would open a stale local replica and never
+    /// reconverge. We rebuild peer addresses from the replicated `vpn/` endpoint
+    /// table (each entry is `"<endpoint_id> <relay?>"`, the netdoc-endpoint
+    /// address sync runs on) and call `start_sync`, so the node actively rejoins
+    /// the swarm. Best-effort and idempotent — safe to call on every start and
+    /// periodically. Returns the number of peers re-synced with.
+    pub async fn resume_sync(&self) -> Result<usize> {
+        let self_id = self.endpoint.id();
+        let query = Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build();
+        let stream = self.doc.get_many(query).await.context("get_many vpn")?;
+        let mut stream = std::pin::pin!(stream);
+        let mut peers: Vec<EndpointAddr> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.context("reading vpn entry")?;
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            let value = String::from_utf8_lossy(&bytes);
+            let mut parts = value.split_whitespace();
+            let Some(id_hex) = parts.next() else { continue };
+            let Ok(pubkey) = id_hex.parse::<iroh::PublicKey>() else { continue };
+            if pubkey == self_id || !seen.insert(pubkey) {
+                continue;
+            }
+            let mut addr = EndpointAddr::from(pubkey);
+            if let Some(relay) = parts.next().and_then(|r| r.parse().ok()) {
+                addr = addr.with_relay_url(relay);
+            }
+            peers.push(addr);
+        }
+        if peers.is_empty() {
+            return Ok(0);
+        }
+        let n = peers.len();
+        self.doc.start_sync(peers).await.context("start_sync")?;
+        Ok(n)
+    }
+
+    /// Spawn a background task that periodically re-affirms sync with known
+    /// peers, so membership stays converged across transient disconnects and
+    /// late-joining nodes — not just at startup.
+    pub fn spawn_sync_keepalive(self: &std::sync::Arc<Self>, interval: std::time::Duration) {
+        let me = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match me.resume_sync().await {
+                    Ok(n) if n > 0 => tracing::debug!("netdoc: re-synced with {n} peer(s)"),
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("netdoc: periodic re-sync failed: {e:#}"),
+                }
+            }
+        });
     }
 
     // ── VPN endpoint registry (Phase 3) ──────────────────────────────────
@@ -1046,6 +1111,55 @@ mod tests {
         b.reconcile(&[], &[]).await.unwrap();
         assert!(b.get_peer("ownedbyA").await.unwrap().is_some(), "federated reconcile wrongly revoked another host's peer");
         assert!(!b.is_revoked("ownedbyA").await.unwrap());
+    }
+
+    /// Reboot resilience: a node that REOPENS its namespace (`Bootstrap::Open`,
+    /// the restart path) must rediscover the warren's peers from its persisted
+    /// `vpn/` table and re-establish sync via `resume_sync` — iroh-docs only
+    /// auto-syncs on `import`, not on reopen. (Actual network reconvergence is
+    /// covered by the live `vpn-e2e.sh` reboot phase; here we verify the
+    /// peer-rediscovery logic survives a reopen with no discovery configured.)
+    #[tokio::test]
+    async fn reopened_namespace_resumes_sync_from_persisted_peers() {
+        // A creates the warren and publishes its VPN endpoint.
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        let a_ip: std::net::Ipv4Addr = "100.64.0.1".parse().unwrap();
+        a.register_vpn_endpoint(a_ip).await.unwrap();
+        let ns = a.namespace();
+        let ticket = a.write_ticket().await.unwrap();
+
+        // B joins (import → live sync) and receives A's VPN endpoint entry.
+        let dir_b = tempfile::tempdir().unwrap();
+        {
+            let b = NetDoc::spawn(
+                test_endpoint().await,
+                dir_b.path(),
+                Bootstrap::Import(Box::new(ticket)),
+            )
+            .await
+            .expect("spawn B");
+            let mut ok = false;
+            for _ in 0..50 {
+                if b.lookup_vpn_endpoint(a_ip).await.unwrap().is_some() {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert!(ok, "A's VPN endpoint did not replicate to B");
+        } // drop B — simulates shutdown, releasing the store.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // B REOPENS the persisted namespace (the reboot path).
+        let b2 = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Open(ns))
+            .await
+            .expect("reopen B");
+        // resume_sync must rediscover A from the persisted vpn/ table.
+        let n = b2.resume_sync().await.expect("resume_sync");
+        assert!(n >= 1, "reopened node found no warren peers to re-sync with");
     }
 
     /// Federation: a VPN endpoint registration written on host A must replicate

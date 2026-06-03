@@ -123,4 +123,34 @@ else
     echo "--- host-b log tail ---"; docker exec hop-vpn-b cat /cfg/log | tail -25 || true
     RC=1
 fi
+
+# ── Reboot reconvergence: restart host-b's daemon (Open path, not Import) and
+#    confirm it reopens the SAME warren, actively re-syncs, and still routes.
+if [ "$RC" = "0" ]; then
+    echo ""
+    echo "=== REBOOT TEST: restart host-b's daemon and re-verify ==="
+    NS_BEFORE=$(docker exec hop-vpn-b grep -o 'namespace [0-9a-f]*' /cfg/log | head -1)
+    docker exec hop-vpn-b pkill -f 'config /cfg host' || true
+    sleep 3
+    # Relaunch the host exactly as a boot service would; logs append to /cfg/log.
+    docker exec -d hop-vpn-b bash -c 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+    echo "waiting for host-b to come back up (max 90s)..."
+    for i in $(seq 1 90); do
+      if docker exec hop-vpn-b sh -c 'grep -c "resumed warren sync" /cfg/log' 2>/dev/null | grep -q '[1-9]'; then break; fi
+      sleep 1
+    done
+    NS_AFTER=$(docker exec hop-vpn-b grep -o 'namespace [0-9a-f]*' /cfg/log | tail -1)
+    RESUMED=$(docker exec hop-vpn-b grep -c 'resumed warren sync' /cfg/log 2>/dev/null || echo 0)
+    echo "namespace before reboot: $NS_BEFORE"
+    echo "namespace after  reboot: $NS_AFTER"
+    echo "resume-sync occurrences: $RESUMED"
+    echo "--- re-ping host-a after host-b reboot ---"
+    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$RESUMED" -ge 1 ] 2>/dev/null && docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
+        echo "REBOOT TEST PASSED: same warren reopened, sync re-established, routing intact."
+    else
+        echo "REBOOT TEST FAILED."
+        docker exec hop-vpn-b cat /cfg/log | tail -30 || true
+        RC=1
+    fi
+fi
 exit $RC
