@@ -1,10 +1,20 @@
-# Build plan — Cedar ACL engine + Tailscale compatibility (Planned)
+# Build plan — Cedar ACL engine + Tailscale compatibility ✅ *(shipped)*
 
-> **Status: Planned / design.** Closes the ACL gaps identified in
-> [acl-vs-tailscale.md](acl-vs-tailscale.md): adopt **Cedar** as hop's standard
-> policy engine, add a **Tailscale-ACL importer**, and address the feature gaps
-> (port/proto granularity, explainability, app capabilities, posture,
-> autogroups). Nothing here is implemented yet.
+> **Status: Shipped.** All 7 phases are implemented and tested. Cedar
+> (`cedar-policy`) is the reach engine; `role → tag` compiles to a generated
+> default policy and is enforced via a cached `is_authorized` on the forwarding
+> path (validated by `vpn-e2e.sh`). Port/proto context + `AclEngine::explain`,
+> authored Cedar policies (`acl/cedar`), the Tailscale importer (`hop acl
+> import`, with app-capability + autogroup mapping), role app-capabilities
+> (`hop acl caps`), self-attested device posture (os/version → Cedar principal
+> attrs), and autogroups (`Autogroup::members`/`admin`) all ship.
+>
+> **Documented follow-ups** (foundation laid, not yet wired): the authored-policy
+> **set** CLI and live `hop acl explain`/`show` against the running daemon (need
+> a local daemon-netdoc IPC channel — redb is single-process); app-capability
+> **delivery** to services (`hop whois` / `HOP_APP_CAPS`); and **cryptographic
+> posture attestation** (today posture is self-attested). The file-based
+> `hop acl import`/`check`/`show`/`caps` work without the daemon.
 
 ## Principles (don't regress these)
 
@@ -147,4 +157,4 @@ Unit (Cedar parity / policy round-trip / importer translation), the 53-test
 regression suite (default behavior unchanged), and `vpn-e2e.sh` (reach + reboot).
 Phase 4 adds an importer golden-file test; Phase 5 adds a capability-delivery e2e.
 
-*Last updated: v0.6.35*
+*Last updated: v0.6.36*
