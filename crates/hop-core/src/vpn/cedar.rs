@@ -51,9 +51,15 @@ impl AclEngine {
         let role_by_name: HashMap<&str, &RoleDefinition> =
             roles.iter().map(|r| (r.name.as_str(), r)).collect();
 
-        let mut ents: Vec<serde_json::Value> = Vec::with_capacity(peers.len() + host_tags.len());
+        let mut ents: Vec<serde_json::Value> = Vec::with_capacity(peers.len() + host_tags.len() + 2);
 
-        // Principals: each peer with its role flattened onto it.
+        // Autogroups (Phase 7): membership groups authored policies can target
+        // (`principal in Autogroup::"members"` / `"admin"`).
+        ents.push(serde_json::json!({ "uid": { "type": "Autogroup", "id": "members" }, "attrs": {}, "parents": [] }));
+        ents.push(serde_json::json!({ "uid": { "type": "Autogroup", "id": "admin" }, "attrs": {}, "parents": [] }));
+
+        // Principals: each peer with its role flattened onto it, and made a
+        // member of the relevant autogroups.
         for p in peers {
             let (reach_tags, wildcard, admin): (Vec<String>, bool, bool) = match p
                 .role_name
@@ -67,10 +73,14 @@ impl AclEngine {
                 ),
                 None => (Vec::new(), false, false),
             };
+            let mut parents = vec![serde_json::json!({ "type": "Autogroup", "id": "members" })];
+            if admin {
+                parents.push(serde_json::json!({ "type": "Autogroup", "id": "admin" }));
+            }
             ents.push(serde_json::json!({
                 "uid": { "type": "Peer", "id": p.node_id },
                 "attrs": { "reach_tags": reach_tags, "wildcard": wildcard, "admin": admin },
-                "parents": []
+                "parents": parents
             }));
         }
 
@@ -218,5 +228,23 @@ mod tests {
         // upstream at IP→node resolution before the engine is consulted; a
         // wildcard principal reaching any resource matches role_reaches(["*"], _).)
         assert!(!e.is_reach_allowed("ghost", "hostStaging", None));
+    }
+
+    #[test]
+    fn authored_policy_with_autogroup_and_port() {
+        // An authored Cedar policy: members may reach the lobby host on 80 only.
+        let roles = vec![role("member", &[])];
+        let peers = vec![peer("m1", "member")];
+        let mut tags = HashMap::new();
+        tags.insert("lobby".to_string(), vec!["lobby".to_string()]);
+        let authored = r#"
+            permit ( principal in Autogroup::"members", action == Action::"connect", resource )
+            when { resource.tags.contains("lobby") && context.port == 80 };
+        "#;
+        let e = AclEngine::build(&peers, &roles, &tags, Some(authored)).unwrap();
+        // member normally reaches nothing, but the authored policy grants port 80.
+        assert!(e.is_reach_allowed("m1", "lobby", Some(80)));
+        // ...and only port 80.
+        assert!(!e.is_reach_allowed("m1", "lobby", Some(443)));
     }
 }
