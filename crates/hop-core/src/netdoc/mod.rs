@@ -559,6 +559,47 @@ impl NetDoc {
         Ok(out)
     }
 
+    /// Publish this node's device-posture attributes (Phase 6): self-attested
+    /// `os`, `version`, etc., replicated so role policies can gate reach on them
+    /// (`when { principal.os == "linux" }`). Self-attested for the MVP;
+    /// cryptographic attestation is the trust-root follow-up.
+    pub async fn register_posture(
+        &self,
+        node_id: &str,
+        posture: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let key = format!("posture/{node_id}");
+        let value = serde_json::to_vec(posture).context("serializing posture")?;
+        self.doc
+            .set_bytes(self.author, key.into_bytes(), value)
+            .await
+            .context("registering posture")?;
+        self.invalidate_reach_cache().await;
+        Ok(())
+    }
+
+    /// All posture entries (`node_id → attrs`) from the document.
+    pub async fn list_posture(
+        &self,
+    ) -> Result<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>> {
+        let query = Query::key_prefix(b"posture/").build();
+        let stream = self.doc.get_many(query).await.context("get_many posture")?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out = std::collections::HashMap::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.context("reading posture entry")?;
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let key = String::from_utf8_lossy(entry.key());
+            let Some(node) = key.strip_prefix("posture/") else { continue };
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            let attrs = serde_json::from_slice(&bytes).unwrap_or_default();
+            out.insert(node.to_string(), attrs);
+        }
+        Ok(out)
+    }
+
     /// Resolve a role by name from the document's role entries.
     pub async fn find_role(&self, name: &str) -> Result<Option<RoleDefinition>> {
         Ok(self.list_roles().await?.into_iter().find(|r| r.name == name))
@@ -603,11 +644,13 @@ impl NetDoc {
         let peers = self.list_peers().await.unwrap_or_default();
         let roles = self.list_roles().await.unwrap_or_default();
         let host_tags = self.list_host_tags().await.unwrap_or_default();
+        let posture = self.list_posture().await.unwrap_or_default();
         let authored = self.get_authored_policy().await;
         let engine = match crate::vpn::cedar::AclEngine::build(
             &peers,
             &roles,
             &host_tags,
+            &posture,
             authored.as_deref(),
         ) {
             Ok(e) => std::sync::Arc::new(e),
@@ -719,6 +762,15 @@ impl NetDoc {
         // Publish this host's tags so other members' roles can resolve reach.
         if let Err(e) = self.register_host_tags(host_node_id, host_tags).await {
             tracing::warn!("vpn: host-tag registration failed: {e:#}");
+        }
+        // Self-attest device posture (Phase 6): OS + hop version, for posture-
+        // gated reach policies.
+        let posture = std::collections::BTreeMap::from([
+            ("os".to_string(), std::env::consts::OS.to_string()),
+            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ]);
+        if let Err(e) = self.register_posture(host_node_id, &posture).await {
+            tracing::warn!("vpn: posture registration failed: {e:#}");
         }
         // M4a: a host that OWNS this warren (created the namespace, not federated)
         // self-registers as an `admin` member so it can originate and return VPN
@@ -1135,6 +1187,7 @@ mod tests {
             groups: vec![],
             shell: None,
             sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
         })
         .await
         .unwrap();

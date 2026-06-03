@@ -46,6 +46,7 @@ impl AclEngine {
         peers: &[Peer],
         roles: &[RoleDefinition],
         host_tags: &HashMap<String, Vec<String>>,
+        posture: &HashMap<String, std::collections::BTreeMap<String, String>>,
         authored: Option<&str>,
     ) -> Result<Self> {
         let role_by_name: HashMap<&str, &RoleDefinition> =
@@ -77,9 +78,20 @@ impl AclEngine {
             if admin {
                 parents.push(serde_json::json!({ "type": "Autogroup", "id": "admin" }));
             }
+            // Base attrs + any device-posture attributes (Phase 6: os, version, …)
+            // so authored policies can gate on `principal.os == "linux"` etc.
+            let mut attrs = serde_json::Map::new();
+            attrs.insert("reach_tags".into(), serde_json::json!(reach_tags));
+            attrs.insert("wildcard".into(), serde_json::json!(wildcard));
+            attrs.insert("admin".into(), serde_json::json!(admin));
+            if let Some(post) = posture.get(&p.node_id) {
+                for (k, v) in post {
+                    attrs.insert(k.clone(), serde_json::json!(v));
+                }
+            }
             ents.push(serde_json::json!({
                 "uid": { "type": "Peer", "id": p.node_id },
-                "attrs": { "reach_tags": reach_tags, "wildcard": wildcard, "admin": admin },
+                "attrs": attrs,
                 "parents": parents
             }));
         }
@@ -175,6 +187,7 @@ mod tests {
             groups: vec![],
             shell: None,
             sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
         }
     }
 
@@ -206,7 +219,7 @@ mod tests {
         tags.insert("hostProd".to_string(), vec!["production".to_string()]);
         tags.insert("hostStaging".to_string(), vec!["staging".to_string(), "web".to_string()]);
         tags.insert("hostUntagged".to_string(), vec![]);
-        AclEngine::build(&peers, &roles, &tags, None).unwrap()
+        AclEngine::build(&peers, &roles, &tags, &HashMap::new(), None).unwrap()
     }
 
     #[test]
@@ -241,10 +254,47 @@ mod tests {
             permit ( principal in Autogroup::"members", action == Action::"connect", resource )
             when { resource.tags.contains("lobby") && context.port == 80 };
         "#;
-        let e = AclEngine::build(&peers, &roles, &tags, Some(authored)).unwrap();
+        let e = AclEngine::build(&peers, &roles, &tags, &HashMap::new(), Some(authored)).unwrap();
         // member normally reaches nothing, but the authored policy grants port 80.
         assert!(e.is_reach_allowed("m1", "lobby", Some(80)));
         // ...and only port 80.
         assert!(!e.is_reach_allowed("m1", "lobby", Some(443)));
+    }
+
+    #[test]
+    fn authored_policy_gating_on_device_posture() {
+        // Phase 6: a posture-gated authored policy. Use a non-wildcard admin role
+        // (no reach by default) so reach to prod comes ONLY from the posture
+        // policy — admins may reach production only from Linux devices.
+        let roles = vec![RoleDefinition {
+            name: "admin".into(),
+            host_tags: vec![], // no default reach; the authored policy grants it
+            user_mode: Default::default(),
+            sudo: false,
+            admin: true,
+            groups: vec![],
+            shell: None,
+            sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
+        }];
+        let peers = vec![peer("linuxAdmin", "admin"), peer("macAdmin", "admin")];
+        let mut tags = HashMap::new();
+        tags.insert("prod".to_string(), vec!["production".to_string()]);
+        let mut posture = HashMap::new();
+        posture.insert(
+            "linuxAdmin".to_string(),
+            std::collections::BTreeMap::from([("os".to_string(), "linux".to_string())]),
+        );
+        posture.insert(
+            "macAdmin".to_string(),
+            std::collections::BTreeMap::from([("os".to_string(), "macos".to_string())]),
+        );
+        let authored = r#"
+            permit ( principal in Autogroup::"admin", action == Action::"connect", resource )
+            when { resource.tags.contains("production") && principal.os == "linux" };
+        "#;
+        let e = AclEngine::build(&peers, &roles, &tags, &posture, Some(authored)).unwrap();
+        assert!(e.is_reach_allowed("linuxAdmin", "prod", None), "linux admin permitted by posture policy");
+        assert!(!e.is_reach_allowed("macAdmin", "prod", None), "mac admin denied by posture policy");
     }
 }

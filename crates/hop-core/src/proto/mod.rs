@@ -260,6 +260,12 @@ pub struct RoleDefinition {
     /// Sandbox policy enforced for peers with this role.
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: SandboxPolicy,
+    /// Application-layer capability grants (ACL Phase 5): a map of
+    /// `{domain}/{path}` capability names to arrays of arbitrary JSON config
+    /// objects, mirroring Tailscale's app-capability shape. Surfaced to services
+    /// a member reaches so they can self-authorize. Empty for most roles.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub capabilities: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 /// Whether users for a role get individual or shared Unix accounts.

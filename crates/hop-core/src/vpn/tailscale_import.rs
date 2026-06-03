@@ -113,6 +113,8 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
     let mut result = ImportResult::default();
     // role name → set of reach tags (deduped, ordered)
     let mut role_reach: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // role name → app capabilities (Phase 5): name → array of config objects
+    let mut role_caps: BTreeMap<String, BTreeMap<String, Vec<serde_json::Value>>> = BTreeMap::new();
     let mut tags_seen: Vec<String> = Vec::new();
 
     // Seed a role for every declared group (even if it appears in no rule).
@@ -157,10 +159,25 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
     }
     for grant in &policy.grants {
         add_reach(&grant.src, &grant.dst, &mut result.notes);
-        if grant.app.is_some() {
-            result.skipped.push(
-                "grant `app` capabilities (hop app-capability grants are a separate feature)".into(),
-            );
+        // App capabilities (Phase 5): attach the grant's `app` map to each src
+        // role's capabilities so services the role reaches can self-authorize.
+        if let Some(app) = &grant.app {
+            if let Ok(caps) = serde_json::from_value::<BTreeMap<String, Vec<serde_json::Value>>>(app.clone()) {
+                for src in &grant.src {
+                    if let Some(role) = src_to_role(src, &mut result.notes) {
+                        let entry = role_caps.entry(role).or_default();
+                        for (name, cfg) in &caps {
+                            entry.entry(name.clone()).or_default().extend(cfg.clone());
+                        }
+                    }
+                }
+                result.notes.push(format!(
+                    "imported {} app capability/ies onto the matching role(s)",
+                    caps.len()
+                ));
+            } else {
+                result.skipped.push("grant `app` block with unexpected shape (expected {name: [objects]})".into());
+            }
         }
         if !grant.ip.is_empty() {
             result.notes.push(
@@ -173,6 +190,7 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
     for (name, mut tags) in role_reach {
         tags.sort();
         tags.dedup();
+        let capabilities = role_caps.remove(&name).unwrap_or_default();
         result.roles.push(RoleDefinition {
             name,
             host_tags: tags,
@@ -182,6 +200,7 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
             groups: vec![],
             shell: None,
             sandbox: Default::default(),
+            capabilities,
         });
     }
     result.roles.sort_by(|a, b| a.name.cmp(&b.name));
@@ -382,8 +401,11 @@ mod tests {
           ]
         }"#;
         let r = import_tailscale_policy(policy).unwrap();
-        assert_eq!(r.roles.iter().find(|x| x.name == "eng").unwrap().host_tags, vec!["fileserver"]);
-        assert!(r.skipped.iter().any(|s| s.contains("app")));
+        let eng = r.roles.iter().find(|x| x.name == "eng").unwrap();
+        assert_eq!(eng.host_tags, vec!["fileserver"]);
+        // The grant's app capability is imported onto the role (Phase 5).
+        assert!(eng.capabilities.contains_key("example.com/cap/drive"));
+        assert!(r.notes.iter().any(|n| n.contains("app capabilit")));
         assert!(r.notes.iter().any(|n| n.contains("ip")));
     }
 

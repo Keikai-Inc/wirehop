@@ -2155,6 +2155,7 @@ async fn cmd_admin(
                     groups: groups.clone(),
                     shell: shell.clone(),
                     sandbox: hop_core::sandbox::SandboxPolicy::default(),
+                    capabilities: Default::default(),
                 },
             },
             RoleAction::List => AdminRequest::ListRoles,
@@ -4063,6 +4064,24 @@ fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
                     r.host_tags.join(", ")
                 };
                 println!("{:<16} {reach}", r.name);
+            }
+            Ok(())
+        }
+        AclAction::Caps { role } => {
+            let store = RolesStore::load(config_dir)?;
+            let Some(r) = store.find_role(&role) else {
+                anyhow::bail!("unknown role '{role}' (see `hop acl show`)");
+            };
+            if r.capabilities.is_empty() {
+                println!("role '{role}' has no application capability grants");
+            } else {
+                println!("'{role}' application capabilities:");
+                for (name, cfgs) in &r.capabilities {
+                    println!("  {name}");
+                    for cfg in cfgs {
+                        println!("    {}", serde_json::to_string(cfg).unwrap_or_default());
+                    }
+                }
             }
             Ok(())
         }

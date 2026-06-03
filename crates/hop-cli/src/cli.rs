@@ -339,6 +339,11 @@ pub enum AclAction {
     },
     /// Print the seeded/derived reach of every role
     Show,
+    /// Show a role's application capability grants
+    Caps {
+        /// Role name (from roles.json)
+        role: String,
+    },
 }
 
 #[derive(Subcommand)]

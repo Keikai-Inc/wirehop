@@ -109,6 +109,7 @@ impl RolesStore {
                     groups: vec![],
                     shell: None,
                     sandbox: SandboxPolicy::default(),
+                    capabilities: Default::default(),
                 },
                 RoleDefinition {
                     name: "admin".into(),
@@ -119,6 +120,7 @@ impl RolesStore {
                     groups: vec!["docker".into()],
                     shell: None,
                     sandbox: SandboxPolicy::default(),
+                    capabilities: Default::default(),
                 },
                 RoleDefinition {
                     name: "ops".into(),
@@ -129,6 +131,7 @@ impl RolesStore {
                     groups: vec!["docker".into()],
                     shell: None,
                     sandbox: SandboxPolicy::default(),
+                    capabilities: Default::default(),
                 },
                 RoleDefinition {
                     name: "developer".into(),
@@ -139,6 +142,7 @@ impl RolesStore {
                     groups: vec![],
                     shell: None,
                     sandbox: SandboxPolicy::default(),
+                    capabilities: Default::default(),
                 },
                 RoleDefinition {
                     name: "security".into(),
@@ -149,6 +153,7 @@ impl RolesStore {
                     groups: vec![],
                     shell: None,
                     sandbox: SandboxPolicy::preset_audit(),
+                    capabilities: Default::default(),
                 },
                 RoleDefinition {
                     name: "ci".into(),
@@ -159,6 +164,7 @@ impl RolesStore {
                     groups: vec![],
                     shell: None,
                     sandbox: SandboxPolicy::preset_deploy(),
+                    capabilities: Default::default(),
                 },
             ],
         };
@@ -699,6 +705,7 @@ mod tests {
             groups,
             shell,
             sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
         }
     }
 
