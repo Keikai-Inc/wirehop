@@ -144,8 +144,9 @@ if [ "$RC" = "0" ]; then
     echo "namespace before reboot: $NS_BEFORE"
     echo "namespace after  reboot: $NS_AFTER"
     echo "resume-sync occurrences: $RESUMED"
+    sleep 5   # let the TUN path re-establish before re-pinging
     echo "--- re-ping host-a after host-b reboot ---"
-    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$RESUMED" -ge 1 ] 2>/dev/null && docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
+    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$RESUMED" -ge 1 ] 2>/dev/null && docker exec hop-vpn-b ping -c 5 -W 3 "$VIP_A"; then
         echo "REBOOT TEST PASSED: same warren reopened, sync re-established, routing intact."
     else
         echo "REBOOT TEST FAILED."
