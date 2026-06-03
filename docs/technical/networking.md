@@ -90,6 +90,16 @@ Like the host endpoint it waits for relay readiness before publishing, and it
 re-publishes its VPN endpoint (NodeId + relay) into the document so peers can dial
 it by virtual IP.
 
+**Sync resumption (reboot resilience).** iroh-docs only starts live sync on the
+first `import` (the ticket carries peer addresses); reopening a persisted
+namespace — the path on every restart — does **not**. So on each daemon start
+`NetDoc::resume_sync` rebuilds peer addresses from the replicated `vpn/` endpoint
+table and calls `Doc::start_sync`, and `spawn_sync_keepalive` re-affirms it every
+5 minutes. Without this a rebooted node would reopen a stale local replica and
+never reconverge (membership/role/IP updates wouldn't propagate). The persisted
+namespace id (`netdoc.json`), local replica, and deterministic virtual IP mean a
+rebooted node rejoins the *same* warren with the *same* address.
+
 ### VPN data plane (`hop/vpn/1`)
 
 When the VPN is enabled (default-on; see below), `NetDoc::enable_vpn`:
