@@ -181,6 +181,61 @@ hop derives it from an invite that pins a role; there's no IdP integration yet
 - **Default-deny least-privilege member** out of the box, with reach that's stable
   across membership churn (role↔tag, not per-IP).
 
+## Conventionality, open standards, and a migration path
+
+**Is Tailscale's ACL conventional / standards-based?** Partly.
+
+- **Format — open and conventional.** The policy file is **HuJSON / JWCC**
+  ("JSON With Commas and Comments"), an extension of JSON ([RFC 8259]) that
+  Tailscale open-sourced (`github.com/tailscale/hujson`). There's also a visual
+  policy editor. So the *syntax* is just JSON-with-comments.
+- **Basics are familiar.** `{ "action": "accept", "src": …, "dst": …, "proto": … }`
+  reads like firewall / security-group rules — a model most operators know.
+- **Semantics are bespoke.** The schema is **not** built on any authorization
+  standard — not XACML, not Cedar, not OPA/Rego, not OpenFGA/Zanzibar. And the
+  parts beyond the basics carry real learning curve: **tags + tagOwners** (which
+  allow nested ownership hierarchies Tailscale itself flags as hard to track),
+  **autogroups**, and the recent **ACLs → grants** migration.
+
+So: an open *format* and firewall-like *basics*, but proprietary semantics with a
+non-trivial learning curve. (There is no dominant open standard for *network
+reach* policy specifically; the 5-tuple + tags is the de-facto lingua franca.)
+
+**Open authorization standards** worth knowing for hop:
+
+| Option | Shape | Fit for hop |
+|---|---|---|
+| **Cedar** (AWS, Apache-2.0) | IAM-like, human-readable, deny-by-default, formally verified/analyzable, **Rust crate `cedar-policy`**, ~40–60× faster than Rego | Strong — Rust-native, analyzable ("why denied?"), matches hop's rock-solid bar |
+| **OPA / Rego** (CNCF) | Datalog-derived, infra-level, powerful but harder to read | Heavier; less readable |
+| **OpenFGA / Zanzibar** | relationship-based (ReBAC) | App object graphs, not L3 reach |
+
+**Recommendations to make hop's ACL conventional, understandable, and easy for a
+Tailscale user to adopt** (independent moves, in priority order):
+
+1. **Match the vocabulary + give it an editable surface** *(highest leverage)*.
+   hop already has the primitives — `tags` and the `AclPolicy` `src`/`dst`/port
+   filter. Surface a **human-editable policy in JWCC** using Tailscale's exact
+   words — `accept`, `src`, `dst`, `tag:`, `group:`, default-deny — so a Tailscale
+   user's mental model transfers 1:1. Add a `hop acl` view/edit command and worked
+   examples. (This also finally wires `AclPolicy` onto the live path.)
+2. **Ship a Tailscale-ACL importer.** Translate a pasted tailnet grant/ACL into
+   hop roles/tags/rules: map what maps (`src`/`dst`/tags/ports), and clearly
+   report what doesn't yet (app capabilities, device posture). "Paste your tailnet
+   policy" is the most concrete possible on-ramp.
+3. **Consider Cedar as the engine underneath.** Compiling hop's role→tag policy to
+   **Cedar** would make hop's authz *standards-based, auditable, and analyzable*
+   (e.g. `hop acl explain <src> <dst>` → "allowed because role `dev` reaches
+   `tag:staging`"), arguably more principled than Tailscale's bespoke schema. It's
+   a bigger lift and Cedar is app-authz-oriented, so treat it as a direction, not
+   a mandate.
+
+**Do not trade away** hop's differentiators for familiarity: the **decentralized
+distribution** (no coordinator) and the **role = reach + OS-sandbox** model. The
+goal is a *familiar surface and standards-based engine* over hop's existing
+decentralized, role-centric core — not Tailscale's centralized architecture.
+
+[RFC 8259]: https://www.rfc-editor.org/rfc/rfc8259
+
 ## Sources
 
 - hop: `crates/hop-core/src/vpn/acl.rs`, `crates/hop-core/src/netdoc/mod.rs`
@@ -191,6 +246,11 @@ hop derives it from an invite that pins a role; there's no IdP integration yet
   [Grants syntax](https://tailscale.com/docs/reference/syntax/grants),
   [Application capabilities](https://tailscale.com/docs/features/access-control/grants/grants-app-capabilities),
   [Policy file syntax](https://tailscale.com/docs/reference/syntax/policy-file),
-  [Device posture](https://tailscale.com/blog/device-posture).
+  [Device posture](https://tailscale.com/blog/device-posture),
+  [HuJSON / JWCC](https://github.com/tailscale/hujson),
+  [visual policy editor](https://tailscale.com/docs/features/visual-editor).
+- Standards: [Cedar policy language](https://www.cedarpolicy.com/) (Rust crate
+  `cedar-policy`), [Open Policy Agent / Rego](https://www.openpolicyagent.org/),
+  [JSON / RFC 8259](https://www.rfc-editor.org/rfc/rfc8259).
 
 *Last updated: v0.6.35*
