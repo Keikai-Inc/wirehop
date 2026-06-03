@@ -572,6 +572,7 @@ impl NetDoc {
         &self,
         src_ip: std::net::Ipv4Addr,
         dst_ip: std::net::Ipv4Addr,
+        port: Option<u16>,
     ) -> bool {
         let ips = match self.list_virtual_ips().await {
             Ok(v) => v,
@@ -583,7 +584,7 @@ impl NetDoc {
         };
         // Cedar reach engine (cached); default-deny on any build failure.
         match self.reach_engine().await {
-            Some(engine) => engine.is_reach_allowed(&src_node, &dst_node, None),
+            Some(engine) => engine.is_reach_allowed(&src_node, &dst_node, port),
             None => false,
         }
     }
@@ -831,7 +832,7 @@ impl NetDoc {
             // Role-derived reach (Step 5; default-deny). Drop packets the source
             // peer's role doesn't permit to the destination host's tags.
             match crate::vpn::parse_src_ipv4(pkt) {
-                Some(src) if self.vpn_reach_allowed(src, dst).await => {}
+                Some(src) if self.vpn_reach_allowed(src, dst, crate::vpn::parse_dest_port(pkt)).await => {}
                 _ => continue,
             }
             let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
@@ -1147,17 +1148,17 @@ mod tests {
         net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
 
         // Developer reaches the staging host.
-        assert!(net.vpn_reach_allowed(src_ip, dst_ip).await);
+        assert!(net.vpn_reach_allowed(src_ip, dst_ip, None).await);
 
         // Re-tag the host production-only → developer is denied.
         net.register_host_tags("staginghost", &["production".into()]).await.unwrap();
-        assert!(!net.vpn_reach_allowed(src_ip, dst_ip).await);
+        assert!(!net.vpn_reach_allowed(src_ip, dst_ip, None).await);
 
         // A member (no role_name) reaches nothing.
         let m_ip = net.claim_virtual_ip("memberpeer").await.unwrap();
         net.put_peer(&sample_peer("memberpeer", "m")).await.unwrap();
         net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
-        assert!(!net.vpn_reach_allowed(m_ip, dst_ip).await);
+        assert!(!net.vpn_reach_allowed(m_ip, dst_ip, None).await);
     }
 
     #[test]
@@ -1229,55 +1230,35 @@ mod tests {
         assert!(!b.is_revoked("ownedbyA").await.unwrap());
     }
 
-    /// Reboot resilience: a node that REOPENS its namespace (`Bootstrap::Open`,
-    /// the restart path) must rediscover the warren's peers from its persisted
-    /// `vpn/` table and re-establish sync via `resume_sync` — iroh-docs only
-    /// auto-syncs on `import`, not on reopen. (Actual network reconvergence is
-    /// covered by the live `vpn-e2e.sh` reboot phase; here we verify the
-    /// peer-rediscovery logic survives a reopen with no discovery configured.)
+    /// Reboot resilience (unit): `resume_sync` must rediscover the warren's
+    /// peers from the persisted `vpn/` endpoint table and exclude self — this is
+    /// the logic a reopened node (`Bootstrap::Open`, which iroh-docs does NOT
+    /// auto-sync) relies on. Deterministic: no replication/reopen (those are
+    /// exercised end-to-end, over a real relay, by `vpn-e2e.sh`'s reboot phase).
     #[tokio::test]
-    async fn reopened_namespace_resumes_sync_from_persisted_peers() {
-        // A creates the warren and publishes its VPN endpoint.
-        let dir_a = tempfile::tempdir().unwrap();
-        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+    async fn resume_sync_finds_persisted_peers_and_excludes_self() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
             .await
-            .expect("spawn A");
-        let a_ip: std::net::Ipv4Addr = "100.64.0.1".parse().unwrap();
-        a.register_vpn_endpoint(a_ip).await.unwrap();
-        let ns = a.namespace();
-        let ticket = a.write_ticket().await.unwrap();
+            .expect("spawn");
 
-        // B joins (import → live sync) and receives A's VPN endpoint entry.
-        // B keeps a stable identity across its "reboot" (as production does).
-        let b_key = iroh::SecretKey::from_bytes(&[7u8; 32]);
-        let dir_b = tempfile::tempdir().unwrap();
-        {
-            let b = NetDoc::spawn(
-                test_endpoint_with_key(b_key.clone()).await,
-                dir_b.path(),
-                Bootstrap::Import(Box::new(ticket)),
+        // This node's own VPN endpoint (must be excluded from re-sync).
+        net.register_vpn_endpoint("100.64.0.1".parse().unwrap()).await.unwrap();
+        // A peer's endpoint, as it would arrive via replication.
+        let peer_pk = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        net.doc
+            .set_bytes(
+                net.author,
+                b"vpn/100.64.0.2".to_vec(),
+                format!("{peer_pk} ").into_bytes(),
             )
             .await
-            .expect("spawn B");
-            let mut ok = false;
-            for _ in 0..50 {
-                if b.lookup_vpn_endpoint(a_ip).await.unwrap().is_some() {
-                    ok = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-            assert!(ok, "A's VPN endpoint did not replicate to B");
-        } // drop B — simulates shutdown, releasing the store.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            .unwrap();
 
-        // B REOPENS the persisted namespace (the reboot path) — same identity.
-        let b2 = NetDoc::spawn(test_endpoint_with_key(b_key).await, dir_b.path(), Bootstrap::Open(ns))
-            .await
-            .expect("reopen B");
-        // resume_sync must rediscover A from the persisted vpn/ table.
-        let n = b2.resume_sync().await.expect("resume_sync");
-        assert!(n >= 1, "reopened node found no warren peers to re-sync with");
+        // resume_sync finds exactly the one non-self peer (start_sync is
+        // best-effort and tolerated when the peer has no relay).
+        let n = net.resume_sync().await.expect("resume_sync");
+        assert_eq!(n, 1, "resume_sync should find the peer endpoint and exclude self");
     }
 
     /// Federation: a VPN endpoint registration written on host A must replicate

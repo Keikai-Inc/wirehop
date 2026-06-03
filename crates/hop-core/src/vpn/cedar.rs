@@ -98,30 +98,54 @@ impl AclEngine {
         Ok(Self { policies, entities, authorizer: Authorizer::new() })
     }
 
-    /// May `src_node` (a Peer) reach `dst_node` (a Host)? Port is reserved for
-    /// Phase 2 (per-port policies); ignored here for parity with `role_reaches`.
-    pub fn is_reach_allowed(&self, src_node: &str, dst_node: &str, _port: Option<u16>) -> bool {
-        self.decision(src_node, dst_node, _port) == Decision::Allow
+    /// May `src_node` (a Peer) reach `dst_node` (a Host) on `port`? The generated
+    /// default policy ignores port (tag-level reach); authored/imported policies
+    /// can scope on `context.port`.
+    pub fn is_reach_allowed(&self, src_node: &str, dst_node: &str, port: Option<u16>) -> bool {
+        match self.request(src_node, dst_node, port) {
+            Some(req) => {
+                self.authorizer
+                    .is_authorized(&req, &self.policies, &self.entities)
+                    .decision()
+                    == Decision::Allow
+            }
+            None => false,
+        }
     }
 
-    /// The raw Cedar decision (used by `is_reach_allowed` and, later, explain).
-    pub fn decision(&self, src_node: &str, dst_node: &str, _port: Option<u16>) -> Decision {
-        let Ok(principal) = format!(r#"Peer::"{src_node}""#).parse::<EntityUid>() else {
-            return Decision::Deny;
+    /// Human-readable reach explanation (Phase 2 — `hop acl explain`): the
+    /// decision plus the policy ids that determined it.
+    pub fn explain(&self, src_node: &str, dst_node: &str, port: Option<u16>) -> String {
+        let portstr = port.map(|p| format!(":{p}")).unwrap_or_default();
+        let Some(req) = self.request(src_node, dst_node, port) else {
+            return format!("DENY  {src_node} -> {dst_node}{portstr}  (unresolvable principal/resource)");
         };
-        let Ok(action) = r#"Action::"connect""#.parse::<EntityUid>() else {
-            return Decision::Deny;
+        let resp = self.authorizer.is_authorized(&req, &self.policies, &self.entities);
+        let reasons: Vec<String> = resp
+            .diagnostics()
+            .reason()
+            .map(|id| id.to_string())
+            .collect();
+        match resp.decision() {
+            Decision::Allow => format!(
+                "ALLOW {src_node} -> {dst_node}{portstr}  (permitted by: {})",
+                if reasons.is_empty() { "default reach".into() } else { reasons.join(", ") }
+            ),
+            Decision::Deny => format!(
+                "DENY  {src_node} -> {dst_node}{portstr}  (no matching permit — default-deny)"
+            ),
+        }
+    }
+
+    fn request(&self, src_node: &str, dst_node: &str, port: Option<u16>) -> Option<Request> {
+        let principal = format!(r#"Peer::"{src_node}""#).parse::<EntityUid>().ok()?;
+        let action = r#"Action::"connect""#.parse::<EntityUid>().ok()?;
+        let resource = format!(r#"Host::"{dst_node}""#).parse::<EntityUid>().ok()?;
+        let context = match port {
+            Some(p) => Context::from_json_value(serde_json::json!({ "port": p as i64 }), None).ok()?,
+            None => Context::empty(),
         };
-        let Ok(resource) = format!(r#"Host::"{dst_node}""#).parse::<EntityUid>() else {
-            return Decision::Deny;
-        };
-        let req = match Request::new(principal, action, resource, Context::empty(), None) {
-            Ok(r) => r,
-            Err(_) => return Decision::Deny,
-        };
-        self.authorizer
-            .is_authorized(&req, &self.policies, &self.entities)
-            .decision()
+        Request::new(principal, action, resource, context, None).ok()
     }
 }
 
