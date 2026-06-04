@@ -64,6 +64,25 @@ if [[ "${SITE_ONLY}" == false ]]; then
   check_cmd docker
   check_cmd strip
 
+  # Release branch guard (security-audit P2): a release publishes signed-by-
+  # nothing artifacts to the production bucket and tags the repo, so it must be
+  # cut from the intended branch with a clean tree — never accidentally from a
+  # half-finished feature branch. Expected branch defaults to 'main'; override
+  # with HOP_RELEASE_BRANCH=<name>, or bypass entirely with HOP_RELEASE_ALLOW_DIRTY=1.
+  EXPECTED_BRANCH="${HOP_RELEASE_BRANCH:-main}"
+  CURRENT_BRANCH="$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  if [[ "${HOP_RELEASE_ALLOW_DIRTY:-0}" != "1" ]]; then
+    if [[ "${CURRENT_BRANCH}" != "${EXPECTED_BRANCH}" ]]; then
+      echo "Error: releasing from '${CURRENT_BRANCH}', expected '${EXPECTED_BRANCH}'."
+      echo "  Switch to ${EXPECTED_BRANCH}, set HOP_RELEASE_BRANCH=${CURRENT_BRANCH}, or HOP_RELEASE_ALLOW_DIRTY=1 to override."
+      exit 1
+    fi
+    if [[ -n "$(git -C "${PROJECT_ROOT}" status --porcelain)" ]]; then
+      echo "Error: working tree is dirty — commit or stash before releasing (or HOP_RELEASE_ALLOW_DIRTY=1 to override)."
+      exit 1
+    fi
+  fi
+
   if ! docker info &>/dev/null; then
     echo "Error: Docker is not running."
     exit 1

@@ -139,8 +139,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   ACTUAL=$(shasum -a 256 "${TMPDIR_HOP}/hop" | awk '{print $1}')
 else
-  warn "No sha256sum or shasum found — skipping checksum verification"
-  ACTUAL="${EXPECTED}"
+  die "No sha256sum or shasum found — cannot verify the download. Install coreutils (sha256sum) or use a system with shasum, then retry."
 fi
 
 [[ "${ACTUAL}" == "${EXPECTED}" ]] || die "Checksum mismatch!\n  expected: ${EXPECTED}\n  got:      ${ACTUAL}"
@@ -216,7 +215,10 @@ if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOI
   if [[ -n "${JOIN_TICKET}" ]]; then
     CFG_DIR="$("${HOP_BIN}" config path)"
     mkdir -p "${CFG_DIR}"
-    printf '%s' "${JOIN_TICKET}" > "${CFG_DIR}/netdoc-join.ticket"
+    # 0600 — this is a warren *write* ticket; world-readable would let any
+    # local user gain warren write access (security-audit H7).
+    ( umask 077; printf '%s' "${JOIN_TICKET}" > "${CFG_DIR}/netdoc-join.ticket" )
+    chmod 600 "${CFG_DIR}/netdoc-join.ticket" 2>/dev/null || true
     info "Warren join ticket saved (federates on next 'hop host')"
   fi
 fi
