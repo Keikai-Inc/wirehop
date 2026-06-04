@@ -113,6 +113,13 @@ pub struct NetDoc {
     /// Active TUN device when the VPN is enabled (Phase 3, opt-in). `None` = off.
     #[cfg(unix)]
     vpn_tun: crate::vpn::TunSlot,
+    /// `endpoint-id-hex → vIP` for ingress authentication (security-audit C2),
+    /// shared with the `VpnInbound` handler; refreshed from the `vpn/` table.
+    #[cfg(unix)]
+    vpn_peer_ips: crate::vpn::VpnPeerIps,
+    /// This host's own vIP (the only legitimate ingress destination).
+    #[cfg(unix)]
+    vpn_local_ip: crate::vpn::VpnLocalIp,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -166,6 +173,11 @@ impl NetDoc {
 
         #[cfg(unix)]
         let vpn_tun: crate::vpn::TunSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        #[cfg(unix)]
+        let vpn_peer_ips: crate::vpn::VpnPeerIps =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        #[cfg(unix)]
+        let vpn_local_ip: crate::vpn::VpnLocalIp = std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_docs::ALPN, docs.clone())
@@ -173,10 +185,14 @@ impl NetDoc {
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
         // The VPN inbound handler is always registered so peers can establish the
         // hop/vpn/1 path, but it only forwards packets once the TUN slot is set
-        // (i.e. the VPN is explicitly enabled). Off by default → no-op.
+        // (i.e. the VPN is explicitly enabled). Off by default → no-op. It
+        // authenticates ingress against the shared peer-IP map (security-audit C2).
         #[cfg(unix)]
         {
-            builder = builder.accept(crate::vpn::VPN_ALPN, crate::vpn::VpnInbound::new(vpn_tun.clone()));
+            builder = builder.accept(
+                crate::vpn::VPN_ALPN,
+                crate::vpn::VpnInbound::new(vpn_tun.clone(), vpn_peer_ips.clone(), vpn_local_ip.clone()),
+            );
         }
         let router = builder.spawn();
 
@@ -190,6 +206,10 @@ impl NetDoc {
             federated,
             #[cfg(unix)]
             vpn_tun,
+            #[cfg(unix)]
+            vpn_peer_ips,
+            #[cfg(unix)]
+            vpn_local_ip,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
@@ -511,6 +531,30 @@ impl NetDoc {
         Ok(Some((pubkey, relay)))
     }
 
+    /// Refresh the `endpoint-id-hex → vIP` map used for VPN ingress
+    /// authentication (security-audit C2) from the replicated `vpn/` table.
+    #[cfg(unix)]
+    pub async fn refresh_vpn_peer_ips(&self) {
+        let query = Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build();
+        let Ok(stream) = self.doc.get_many(query).await else { return };
+        let mut stream = std::pin::pin!(stream);
+        let mut map = std::collections::HashMap::new();
+        while let Some(Ok(entry)) = stream.next().await {
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let key = String::from_utf8_lossy(entry.key());
+            let Some(addr_str) = key.strip_prefix(KEY_VPN_PREFIX) else { continue };
+            let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else { continue };
+            let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+            let value = String::from_utf8_lossy(&bytes);
+            if let Some(id) = value.split_whitespace().next() {
+                map.insert(id.to_string(), addr);
+            }
+        }
+        *self.vpn_peer_ips.write().await = map;
+    }
+
     // ── Host tags + role-derived reach (Steps 3 & 5) ─────────────────────
 
     /// Publish this host's tags (drives role→tag VPN reach + MagicDNS).
@@ -758,7 +802,21 @@ impl NetDoc {
         let addr = self.claim_virtual_ip(host_node_id).await?;
         let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
         *self.vpn_tun.write().await = Some(tun.clone());
+        // Ingress authentication state (security-audit C2): our own vIP (the only
+        // legitimate ingress destination) + the peer-IP map (refreshed below and
+        // periodically) used to reject spoofed source IPs.
+        *self.vpn_local_ip.write().await = Some(addr);
         self.register_vpn_endpoint(addr).await?;
+        self.refresh_vpn_peer_ips().await;
+        {
+            let me = std::sync::Arc::clone(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    me.refresh_vpn_peer_ips().await;
+                }
+            });
+        }
         // Publish this host's tags so other members' roles can resolve reach.
         if let Err(e) = self.register_host_tags(host_node_id, host_tags).await {
             tracing::warn!("vpn: host-tag registration failed: {e:#}");

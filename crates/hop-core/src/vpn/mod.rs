@@ -109,12 +109,26 @@ pub async fn create_tun(addr: Ipv4Addr) -> anyhow::Result<tun::AsyncDevice> {
     tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("create TUN device: {e}"))
 }
 
+/// `endpoint-id-hex → virtual IP` for every registered VPN node, shared with the
+/// `NetDoc` which refreshes it. Used by `VpnInbound` to authenticate ingress.
+#[cfg(unix)]
+pub type VpnPeerIps = std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Ipv4Addr>>>;
+/// This host's own virtual IP (the only legitimate destination for ingress).
+#[cfg(unix)]
+pub type VpnLocalIp = std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>;
+
 /// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
-/// packets) to the TUN device. Dropped silently when the VPN is off.
+/// packets) to the TUN device — **after authenticating ingress** (security-audit
+/// C2). A datagram is delivered only if (a) the connecting node is a registered
+/// VPN peer, (b) the packet's source virtual IP matches that node's registered
+/// IP (anti-spoofing), and (c) the destination is this host's own virtual IP.
+/// Dropped silently when the VPN is off.
 #[cfg(unix)]
 #[derive(Clone)]
 pub struct VpnInbound {
     tun: TunSlot,
+    peer_ips: VpnPeerIps,
+    local_ip: VpnLocalIp,
 }
 
 #[cfg(unix)]
@@ -126,8 +140,8 @@ impl std::fmt::Debug for VpnInbound {
 
 #[cfg(unix)]
 impl VpnInbound {
-    pub fn new(tun: TunSlot) -> Self {
-        Self { tun }
+    pub fn new(tun: TunSlot, peer_ips: VpnPeerIps, local_ip: VpnLocalIp) -> Self {
+        Self { tun, peer_ips, local_ip }
     }
 }
 
@@ -137,7 +151,23 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
         &self,
         conn: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
+        // The authenticated identity of the connecting node (QUIC/TLS-verified).
+        let remote = conn.remote_id().to_string();
+        // The source vIP this node is allowed to use. Unknown node → drop all.
+        let expected_src = self.peer_ips.read().await.get(&remote).copied();
         while let Ok(dg) = conn.read_datagram().await {
+            let Some(expected) = expected_src else { continue };
+            // Anti-spoofing: the packet's source vIP must be this node's vIP.
+            match parse_src_ipv4(&dg) {
+                Some(src) if src == expected => {}
+                _ => continue,
+            }
+            // The datagram must be destined for *us* (our virtual IP).
+            if let Some(local) = *self.local_ip.read().await
+                && parse_dest_ipv4(&dg) != Some(local)
+            {
+                continue;
+            }
             if let Some(tun) = self.tun.read().await.clone() {
                 let _ = tun.send(&dg).await;
             }
