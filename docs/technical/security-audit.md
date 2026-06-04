@@ -5,6 +5,11 @@ warren/VPN/ACL, sandbox/transfer/exec/MCP, installers/release/ops, and
 vestigial/dead code. Every finding cites `file:line` and a fix. **This is a
 working report to act on**, not a sign-off.
 
+> **Status:** the findings below describe the state at audit time (v0.6.36). Most
+> were remediated in **v0.6.37** — see [Remediation status](#remediation-status--v0637-2026-06-03)
+> at the end for exactly what shipped and what was deliberately **deferred** (C1
+> write-authorization, H8 secrets KDF, H10 root redeem) with the reasoning.
+
 > **Headline.** The cryptographic transport (iroh/QUIC, node-key auth), the
 > invite primitives (CSPRNG secret, constant-time Argon2, atomic single-use), and
 > the Cedar policy engine are sound *in isolation*. The serious problems are in
@@ -135,26 +140,107 @@ working report to act on**, not a sign-off.
 - **Doc drift** — orchestration.md `hop auth` marked Shipped; README already
   Shipped; VPN docstrings now accurate (off-by-default again).
 
-**Deferred (tracked, with rationale):**
-- **C1 full author-validated writes** — the keystone trust-model change (read-
-  ticket invites + per-author write authorization on the CRDT) is too large to
-  land safely in one pass. Interim mitigation shipped per the plan: VPN
-  off-by-default shrinks the blast radius (a bare host no longer joins a warren).
-- **H8 secrets KDF (HKDF + salt)** — a key-rotation migration risks rendering
-  deployed at-rest secrets permanently unreadable, and HKDF+salt adds ~no
-  protection against the actual threat (filesystem read of `identity.json`,
-  which already yields the identity secret to re-derive any key; a per-store
-  salt would sit in the same readable db). Net: high risk, negligible gain —
-  revisit only alongside a proven migration path.
-- **H10 root invite redeem** — inherent to the root-daemon + `curl|bash` install
-  model; the operator passing `--invite` *is* the authorization. Blast radius
-  reduced by VPN off-by-default. A real fix needs `warren join`'s privilege
-  split redesigned (redeem unprivileged, hand the validated ticket to the
-  daemon).
-- **H1/H2/H3/M6** — collapse into C1 (author-bound keys); revisit with C1.
-- **M1/M2/M3** — command allow/deny enforcement, broker arg restrictions,
-  transfer symlink/TOCTOU hardening: real but lower-severity; next pass.
-- **UNWIRED** — `set_authored_policy`, `RoleDefinition.capabilities`,
-  `active_sessions` remain inert (not security bugs); wire or document later.
+### Deferred items — why, and what mitigates them now
+
+Three findings were deliberately **not** fixed in v0.6.37. In each case the
+*correct* fix is a structural change with a credible way to break legitimate
+access or destroy data, while a cheaper interim mitigation already shrinks the
+exposure materially. hop's operating constraint — *it may be the only way into a
+system* — means a fix that risks lockout or data loss is worse than a documented,
+mitigated gap. Each is tracked here so the next pass starts with the context
+intact.
+
+#### C1 — Warren trust model (the keystone)
+
+**Finding.** Every invite embeds a `ShareMode::Write` iroh-docs `DocTicket` for
+the shared warren document. That document holds *all* security-relevant warren
+state: virtual-IP claims (`ip/`), VPN endpoint registrations (`vpn/`), MagicDNS
+names (`name/`), device posture, and peer/role records. Because every member
+holds a **write** ticket, any member can rewrite any of it — repoint
+`vpn/<victim>` at their own node to intercept traffic, spoof a MagicDNS name,
+claim another node's vIP, or forge posture to satisfy a posture-gated policy.
+Last-writer-wins conflict resolution only arbitrates *honest* races; it offers
+nothing against a malicious writer.
+
+**Why it's the keystone.** H1 (key overwrite), H2 (self-attested posture/admin),
+and M6 (DNS spoofing) are all *symptoms* of C1 — they collapse the moment writes
+are authorized per author.
+
+**Why deferred.** The real fix is structural and multi-layer: issue members
+**read-only** tickets, gate write/federation behind an explicit admin action,
+and validate on read that each entry's author matches the identity it claims to
+speak for (`vpn/<node>` is writable only by `<node>`). That touches ticket
+issuance, the replication-read path, admin gating, and migration of existing
+warrens. Landing it half-right could either lock legitimate nodes out of their
+own warren or silently leave the hole open; it needs its own focused pass with
+its own e2e coverage. (`set_authored_policy`/`get_authored_policy` are the
+inert scaffolding for the authored-policy half of this — see UNWIRED below.)
+
+**Mitigation shipped.** This is *why* P0a flipped the VPN off-by-default. With
+the warren/VPN dormant unless explicitly enabled (`--host` / `HOP_VPN=1` /
+`hop config set vpn on`), a bare `hop host` no longer joins a writable shared
+document at all — the blast radius shrinks to nodes that have deliberately
+opted in. P0b (ingress auth) independently blocks the *traffic-interception*
+exploitation path even when `vpn/` is tampered with: a forged registration
+still can't produce correctly-sourced, authenticated packets.
+
+#### H8 — Secrets-at-rest KDF
+
+**Finding.** The AEAD key for the encrypted secrets store is
+`SHA256("hop-secrets-v1" ‖ identity_secret)` — a single hash pass, no HKDF, no
+per-store salt, identical derivation for every user on the box. The recommended
+shape was HKDF-SHA256 with a random per-store salt and a domain-separated
+subkey.
+
+**Why deferred — two independent reasons:**
+1. **The fix risks destroying data.** Any change to the derivation changes the
+   *output* key, rendering every already-encrypted secret on every deployed host
+   undecryptable on upgrade. The only safe path is a key-rotation migration
+   (decrypt-with-old → re-encrypt-with-new → versioned marker) — real surface
+   that can't be validated against live field stores in this pass, and whose
+   failure mode is *permanently unreadable secrets*. That is the precise
+   opposite of "rock solid."
+2. **The benefit is near-zero against the real threat.** The threat is an
+   attacker who can read the filesystem. The key derives from `identity.json`,
+   so anyone who can read the ciphertext db can also read `identity.json` and
+   re-derive the key under *any* KDF. A per-store salt doesn't help either — it
+   would live in the same db the attacker is already reading. Domain separation,
+   the one property that genuinely matters here, is *already* present via the
+   `"hop-secrets-v1"` label.
+
+So: high risk of data loss, negligible security gain. Revisit only alongside a
+proven migration path. The actual protection for secrets-at-rest is filesystem
+permissions, which *were* hardened this pass — M11 pins the datastore to `0600`,
+M12 re-tightens `identity.json` to `0600` on load.
+
+#### H10 — Root invite redeem
+
+**Finding.** `install-daemon.sh` runs `sudo hop warren join "$INVITE"` — the
+root daemon redeems an operator-supplied invite, dials the inviting node, and
+imports a foreign namespace **as root**. A malicious invite points the root
+daemon at an attacker's relay/node.
+
+**Why deferred.** This is inherent to the install *model*, not a discrete bug.
+The daemon runs as root because it must `su` to arbitrary users, create the TUN
+device, and write `/etc/hop` — and the join ticket has to land in that
+root-owned config dir. A real fix means redesigning `warren join`'s privilege
+split: redeem as an unprivileged user, confirm host identity, then hand only the
+validated ticket to the daemon. And critically: an operator pasting `--invite`
+into a root install command *is* the authorization — a malicious invite here is
+a social-engineering vector that exists for any "paste this to join" UX, root or
+not.
+
+**Mitigation shipped.** Same lever as C1 — VPN off-by-default. A bare daemon
+install no longer auto-joins a warren; the foreign-namespace import happens only
+when the operator explicitly passes `--invite`/`--join`, making the trust
+decision explicit rather than implicit.
+
+#### Lower-severity / inert (next pass)
+- **H1 / H2 / H3 / M6** — all collapse into C1 (author-bound keys); revisit with C1.
+- **M1 / M2 / M3** — command allow/deny enforcement, broker argument
+  restrictions, transfer symlink/TOCTOU hardening: real but lower-severity.
+- **UNWIRED (not security bugs)** — `set_authored_policy` /
+  `RoleDefinition.capabilities` / `active_sessions` remain inert; wire or remove
+  in a later pass.
 
 *Last updated: v0.6.37*

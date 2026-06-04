@@ -102,20 +102,34 @@ rebooted node rejoins the *same* warren with the *same* address.
 
 ### VPN data plane (`hop/vpn/1`)
 
-When the VPN is enabled (default-on; see below), `NetDoc::enable_vpn`:
+When the VPN is enabled (off by default; see below), `NetDoc::enable_vpn`:
 
 1. claims a stable virtual IP in `100.64.0.0/10` (deterministic hash + doc claim),
 2. creates a TUN device (`vpn::create_tun`, utun on macOS / `/dev/net/tun` on
    Linux, MTU 1280, netmask `255.192.0.0` so the kernel routes the whole `/10`),
-3. registers the VPN endpoint + host tags in the document,
+3. registers the VPN endpoint + host tags in the document, and records its own
+   vIP + the peer-vIP map used for ingress authentication,
 4. spawns an outbound loop (TUN → reach-check → QUIC datagram to the destination's
-   VPN endpoint) and the `VpnInbound` handler (datagram → TUN).
+   VPN endpoint) and the `VpnInbound` handler (authenticated datagram → TUN).
 
-**Default-on, fail-safe.** Bringup is best-effort: if the TUN can't be created or
-`cgnat_range_in_use()` finds the `100.64.0.0/10` range already claimed by another
-interface (e.g. Tailscale), the VPN is skipped and the daemon serves normally.
-`HOP_VPN=0` / `vpn_enabled = false` opt out; `HOP_VPN=1` forces past the conflict
-guard.
+**Ingress authentication (v0.6.37).** `VpnInbound` writes a received datagram to
+the TUN only after three checks: (a) the connecting node (QUIC/TLS-verified
+`remote_id`) is a registered VPN peer, (b) the datagram's *source* virtual IP
+matches that node's registered vIP — anti-spoofing — and (c) the *destination* is
+this host's own vIP. The peer→vIP map is read per datagram and refreshed from the
+`vpn/` table every 5 s, plus on-demand (rate-limited) when a packet arrives from
+an as-yet-unknown peer, so a node that just rebooted reconverges quickly. This
+closes the prior gap where any node could inject packets with a spoofed source
+vIP.
+
+**Off by default, fail-safe.** As of v0.6.37 the VPN is off unless explicitly
+enabled (`--host` / `HOP_VPN=1` / `hop config set vpn on`) — the default was
+reverted while the warren's write-authorization trust model is hardened (see
+[p2p-network.md](p2p-network.md) and `security-audit.md` C1). Bringup is
+best-effort: if the TUN can't be created or `cgnat_range_in_use()` finds the
+`100.64.0.0/10` range already claimed by another interface (e.g. Tailscale), the
+VPN is skipped and the daemon serves normally. `HOP_VPN=1` forces past the
+conflict guard; `HOP_VPN=0` is a recovery escape hatch.
 
 ## Network Monitoring
 

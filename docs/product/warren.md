@@ -82,9 +82,11 @@ no `net init`, `add-server`, `tag`, or `up` commands — the network self-forms
 from the first daemon and grows through invites.
 
 > **(Mostly shipped.)** The commands below are the *target* experience. Today
-> `hop invite --role <named>` and the **default-on VPN** are shipped (opt out with
-> `HOP_VPN=0`); federation still joins via a namespace ticket
-> (`HOP_VPN_JOIN_TICKET`) rather than a `--join` installer flag. See **Status**
+> `hop invite --role <named>` and the **warren VPN** are shipped; the VPN is
+> **off by default** as of v0.6.37 (opt in with `--host` / `HOP_VPN=1` /
+> `hop config set vpn on`) while the warren write model is hardened. Federation
+> still joins via a namespace ticket (`HOP_VPN_JOIN_TICKET`) rather than a
+> `--join` installer flag. See **Status**
 > and **Roadmap** for what's shipped vs planned.
 
 ```
@@ -251,13 +253,13 @@ no token re-issue.
 
 ## Status
 
-### Shipped (default-on)
+### Shipped
 - **Decentralized membership** (iroh-docs) with doc-authoritative auth + a
   `peers.json` fallback that guarantees no lockout. *(0.6.26)*
 - **Virtual IP allocation** — every node claims a stable `100.64.0.0/10`
   address. *(0.6.27)*
 
-### Shipped — VPN default-on *(0.6.32)*
+### Shipped — VPN data plane *(opt-in; off by default since 0.6.37)*
 - **VPN data plane** — `hop/vpn/1` QUIC-datagram forwarding over a TUN device,
   federation via write ticket. *(0.6.28)*
 - **MagicDNS** resolver, configurable per-warren domain. *(0.6.28, 0.6.30)*
@@ -272,20 +274,26 @@ no token re-issue.
   ICMP over the TUN, role-gated, 0% loss (`tests/e2e/vpn-e2e.sh`). Joiners become
   role-bearing members by redeeming an invite; the namespace owner self-registers
   as `admin` so it can originate/return traffic (M4a).
-- **Default-on** *(0.6.32)*: the daemon brings up the VPN automatically.
-  `HostConfig.vpn_enabled` (default `true`) and the `HOP_VPN` env var
-  (`1`=force-on past the conflict guard, `0`=off) control it. Bringup is
-  best-effort: a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a host
-  already running Tailscale) only skips the VPN — **core access is never
-  affected**.
+- **Ingress authentication** *(0.6.37)*: inbound `hop/vpn/1` datagrams are
+  accepted only from a registered peer, with a source vIP matching that peer's
+  registration (anti-spoof) and a destination of this host's own vIP.
+- **Opt-in / off by default** *(0.6.37)*: the VPN was default-on in
+  0.6.32–0.6.36; the default was reverted to **off** while the warren write
+  model is hardened (see [security.md](security.md) and C1 in
+  [../technical/security-audit.md](../technical/security-audit.md)). Enable with
+  `--host`, `HOP_VPN=1`, or `hop config set vpn on`. `HostConfig.vpn_enabled`
+  (default `false`) and the `HOP_VPN` env var (`1`=force-on past the conflict
+  guard, `0`=off) control it. Bringup is best-effort: a TUN-creation failure or a
+  `100.64.0.0/10` conflict (e.g. a host already running Tailscale) only skips the
+  VPN — **core access is never affected**.
 
 Validated by unit/integration tests (role-reach, role-derived reach via doc,
 federation replication, federated additive reconcile, ACL, DNS codec, config
-default-on/opt-out), the **live multi-node TUN e2e**, and the 53-test regression
-e2e — which runs in TUN-less containers, so its green run is the standing proof
-that default-on degrades gracefully and the default daemon is unchanged. The live
-multi-node TUN packet flow is exercised by `tests/e2e/vpn-e2e.sh` (real ICMP over
-`hop/vpn/1`, role-gated, 0% loss).
+vpn-default-off), the **live multi-node TUN e2e** (including reboot
+reconvergence), and the 53-test regression e2e — which runs in TUN-less
+containers, so its green run is the standing proof that core access is unaffected
+whether or not the VPN is up. The live multi-node TUN packet flow is exercised by
+`tests/e2e/vpn-e2e.sh` (real ICMP over `hop/vpn/1`, role-gated, 0% loss).
 
 ### Planned (the warren product)
 See the roadmap below.
@@ -296,8 +304,8 @@ See the roadmap below.
 |-----------|--------|-------|
 | **Role cleanup** | ✅ Shipped (compat shim) | Converge `PeerRole` + `RoleDefinition` into one named role. Configurable least-privilege **org-default role** (`member`). **`hop admin <host> grant`** for post-invite elevation. |
 | **M1 — Invisible ACL** | ✅ Shipped | Role→tag→ACL derivation, resolved at enforcement time. Host tagging via role/invite. Turns the VPN from "default-deny, no way to open it" into "opens automatically by role." |
-| **M2 — Network membership** | ◑ Mostly | Invite-to-network-with-a-role, doc-replicated membership every node reads, receiver-side ACL enforcement — **shipped**. The cryptographic Owner/Admin write-capability is still **Planned** (ties to the trust root). |
-| **M3 — Usable end to end** | ◑ Mostly | `--join` brings up the VPN + the **live multi-node TUN e2e** that promoted the data plane to **default-on** — shipped. Client-vs-node redemption polish and MagicDNS OS auto-config (split-DNS) remain. |
+| **M2 — Network membership** | ◑ Mostly | Invite-to-network-with-a-role, doc-replicated membership every node reads, receiver-side ACL enforcement, and **data-plane ingress authentication** (source-vIP anti-spoof, v0.6.37) — **shipped**. The cryptographic Owner/Admin write-capability is still **deferred** (every member currently holds a *write* ticket to the shared doc; per-author write validation ties to the trust root — see C1 in [../technical/security-audit.md](../technical/security-audit.md)). |
+| **M3 — Usable end to end** | ◑ Mostly | `--join` brings up the VPN + the **live multi-node TUN e2e** (Cedar reach + reboot reconvergence) — shipped. The VPN is **off by default** (opt in via `--host`/`HOP_VPN=1`/`hop config set vpn on`) while M2's write model is hardened. Client-vs-node redemption polish and MagicDNS OS auto-config (split-DNS) remain. |
 | **M4 — One-line onboarding** | ◑ Partial | Installer `--join`/primer flags + the website command builder — **shipped**. Folding the warren ticket *into* the invite token, and the `install.sh`/node-installer rename, remain. |
 
 The only command a founder ever types remains `hop invite --role X`. Everything

@@ -73,16 +73,20 @@ items below are kept for the record.)*
 
 ## 🔧 Open technical work (now well-defined — this *is* the roadmap)
 
-- ✅ **VPN traffic flows by role and is default-on.** *(0.6.31–0.6.32)* The ACL
-  is derived from roles×tags and enforced on the forwarding path, validated by a
-  live multi-node TUN e2e (real ICMP, role-gated, 0% loss). The VPN is now
-  default-on with best-effort bringup (`HOP_VPN=0` / `vpn_enabled=false` to opt
-  out; `HOP_VPN=1` forces past the `100.64.0.0/10` conflict guard) — a TUN
-  failure or CGNAT conflict only skips the VPN, never core access.
-- 🔧 **Members get a *write* ticket → any member could rewrite membership/ACL.**
+- ✅ **VPN traffic flows by role; ingress is authenticated.** *(0.6.31–0.6.37)*
+  The ACL is derived from roles×tags and enforced on the forwarding path,
+  validated by a live multi-node TUN e2e (real ICMP, role-gated, 0% loss, plus
+  reboot reconvergence). Inbound datagrams are authenticated (source-vIP
+  anti-spoof, v0.6.37). The VPN is **off by default** as of v0.6.37 (opt in via
+  `--host` / `HOP_VPN=1` / `vpn_enabled=true`); a TUN failure or CGNAT conflict
+  only skips it, never core access.
+- 🔧 **Members get a *write* ticket → any member could rewrite membership/ACL/`vpn`/`name`.**
+  Tracked as **C1** in [../technical/security-audit.md](../technical/security-audit.md).
   The reconciliation says writes must be Owner/Admin-capability-gated and members
   get a **read** replica. *Fix:* split read vs write capability in the
-  invite/join path. (Prerequisite for safe federation.)
+  invite/join path + per-author write validation on read. (Prerequisite for safe
+  federation.) **Interim mitigation shipped (v0.6.37):** VPN off-by-default +
+  data-plane ingress authentication.
 - 🔧 **Federated membership reconcile would revoke other hosts' peers.**
   `reconcile` revokes "doc peers not in *my* peers.json" — safe per-host, breaks
   on a shared namespace (M2). The additive `ip`/`vpn`/`name` tables are

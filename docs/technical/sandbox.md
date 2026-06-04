@@ -6,9 +6,16 @@ The sandbox enforces restrictions on what connected peers can do. It has three d
 
 1. **Application-layer validator** (`validator.rs`): catches obvious violations before process spawn.
 2. **OS-native kernel sandbox**: the real security boundary.
-   - macOS: Apple Seatbelt / `sandbox-exec` with SBPL profiles
-   - Linux: Landlock filesystem ACL + `PR_SET_NO_NEW_PRIVS`
+   - macOS: Apple Seatbelt / `sandbox-exec` with SBPL profiles (paths escaped against profile injection — security-audit H4)
+   - Linux: Landlock filesystem ACL + Landlock TCP rules for `no_network` (ABI v4) + `PR_SET_NO_NEW_PRIVS`; enforcement is fatal-when-restricted (H5/H6)
 3. **Hardcoded safety net**: `PR_SET_NO_NEW_PRIVS` on Linux to prevent privilege escalation.
+
+The policy is enforced on **every peer-driven surface**, not just shell/exec:
+remote `exec`/shell and `hop.local()` (OS sandbox), **file transfer** (`hop cp`/`sync`
+honor `read_only` + `allowed_paths`; security-audit C3), and the **MCP JS bindings**
+(`hop.readFile`/`hop.writeFile` confined to `allowed_paths`; `hop.http` SSRF-blocked
+for restricted peers; C4). See [../product/transfer.md](../product/transfer.md) and
+[../product/js-api.md](../product/js-api.md).
 
 ## SandboxPolicy Struct
 
@@ -239,10 +246,20 @@ Without a user:
 
 ### apply_sandbox()
 
-Applied in the child process after fork, before exec:
+Applied in the child process after fork, before exec. **Returns `Result`** — and
+for a restricted policy a failure to enforce is **fatal** (the session is
+refused rather than running unsandboxed; security-audit H6):
 
 1. **`PR_SET_NO_NEW_PRIVS`**: prevents privilege escalation via setuid/setgid binaries. Always set via `prctl()`.
-2. **Landlock rules**: filesystem access control.
+2. **Landlock filesystem rules**: filesystem access control. If the kernel
+   doesn't support Landlock (< 5.13) and the policy is restricted, the
+   `RulesetStatus::NotEnforced` result is treated as fatal.
+3. **Landlock network rules** (when `no_network`): denies all TCP `bind`/`connect`
+   via Landlock ABI v4 (Linux 6.7+), best-effort. **Limitation:** Landlock can't
+   restrict UDP, so DNS and QUIC still function — this blocks TCP egress only.
+   On kernels without ABI v4 the restriction is unenforceable and is logged
+   loudly (not silently ignored). This replaced the prior **false** "seccomp-BPF"
+   claim, under which `no_network` was unenforced on Linux (security-audit H5).
 
 ### Landlock Rules
 

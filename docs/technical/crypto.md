@@ -142,6 +142,17 @@ pub fn derive_secrets_key(identity_key: &[u8; 32]) -> [u8; 32] {
 - **Deterministic**: the same identity always derives the same secrets key, so secrets survive daemon restarts without storing the AEAD key separately.
 - **Version tag**: the `v1` suffix allows future key derivation scheme upgrades without breaking existing secrets.
 
+> **Known limitation (security-audit H8, deferred).** This is a single SHA-256
+> pass — not an HKDF — with no per-store salt, so the same identity derives the
+> same key on every host. A move to HKDF-SHA256 + random per-store salt is
+> **deferred**: it would change the output key and so require a key-rotation
+> migration (risking unreadable secrets on upgrade), and it adds little against
+> the real threat — an attacker who can read the ciphertext db can also read
+> `identity.json` and re-derive the key under any KDF. The actual at-rest
+> protection is filesystem permissions: the datastore is `0600` and
+> `identity.json` is re-tightened to `0600` on load (v0.6.37). See
+> [security-audit.md](security-audit.md).
+
 ### Key Lifecycle
 
 1. Daemon starts, loads `identity.json` (Ed25519 secret key)

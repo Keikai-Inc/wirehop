@@ -15,8 +15,9 @@ hop embeds a QuickJS runtime that exposes the `hop.*` global object. Scripts run
 
 **Sandbox restrictions:** When a `SandboxPolicy` is active:
 - `hop.exec()` uses `exec_sandboxed` on the remote host
-- `hop.local()` validates commands against the policy and applies OS-level sandboxing (macOS sandbox-exec, Linux Landlock)
-- `hop.http()` throws if `no_network` is set in the policy
+- `hop.local()` validates commands against the policy and applies OS-level sandboxing (macOS sandbox-exec, Linux Landlock; `no_network` enforced via Landlock TCP rules on kernel 6.7+)
+- `hop.readFile()` / `hop.writeFile()` are confined to the policy's `allowed_paths`; `hop.writeFile()` additionally refuses to write under a `read_only` policy (v0.6.37)
+- `hop.http()` throws if `no_network` is set; for any restricted (non-empty) policy it also blocks SSRF to internal/metadata addresses and does not follow redirects (see [`hop.http`](#hophttpurl-options) below)
 
 **Removed globals:** `require`, `process`, `Deno`, `Bun` are removed from the JS context.
 
@@ -448,6 +449,21 @@ Make an HTTP request.
 **Returns:** `{ status: number, headers: object, body: string, json: function }`
 
 **Requires:** nothing (blocked if `no_network` sandbox policy)
+
+**SSRF protection (restricted peers, v0.6.37):** when the caller runs under any
+restricted (non-empty) `SandboxPolicy`, `hop.http` is hardened against
+server-side request forgery:
+- Only `http`/`https` URLs are allowed.
+- The request is **rejected** if the host resolves to a loopback
+  (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`, IPv6 ULA
+  `fc00::/7`), link-local (`169.254.0.0/16` incl. the `169.254.169.254` cloud
+  metadata endpoint, IPv6 `fe80::/10`), CGNAT (`100.64.0.0/10`, hop's own VPN
+  range), or unspecified address — including IPv4-mapped IPv6 forms.
+- Redirects are **not** followed (a redirect could otherwise escape the
+  destination check).
+
+Unrestricted (owner/full-access) automation is unchanged and may still reach
+internal services intentionally.
 
 #### Options
 

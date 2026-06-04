@@ -174,13 +174,28 @@ you assign one role and both are set coherently. See
 
 ### Warren VPN security posture
 
-The VPN data plane is **default-on** but **fail-safe**: bringup is best-effort,
-so a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a host already
-running Tailscale) only skips the VPN — `hop exec`/shell/transfer over the
-existing authenticated channels are never affected. The VPN can be disabled with
-`HOP_VPN=0`, `vpn_enabled = false`, or the installer `--no-vpn`; `HOP_VPN=1`
-forces bringup past the conflict guard. Forwarding is default-deny: nothing flows
-until a role grants reach.
+The VPN data plane is **off by default** (since v0.6.37) and **fail-safe** when
+enabled. Opt in with `--host`, `HOP_VPN=1`, or `hop config set vpn on`; the
+installer's node path (`--host`) enables it, and `--no-vpn` keeps it off. Bringup
+is best-effort, so a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a
+host already running Tailscale) only skips the VPN — `hop exec`/shell/transfer
+over the existing authenticated channels are never affected. `HOP_VPN=1` forces
+bringup past the conflict guard; `HOP_VPN=0` is a recovery escape hatch.
+
+**Why off by default.** The warren's shared document is currently a *write-open*
+trust model — every member holds a `ShareMode::Write` ticket, so per-author write
+authorization is not yet enforced (tracked as **C1** in
+[../technical/security-audit.md](../technical/security-audit.md)). Defaulting the
+VPN off shrinks the blast radius to nodes that have deliberately opted in while
+that trust model is hardened.
+
+**Ingress is authenticated (v0.6.37).** Independent of the write model, inbound
+`hop/vpn/1` datagrams are dropped unless (a) the connecting node is a registered
+VPN peer, (b) the packet's source virtual IP matches *that node's* registered
+vIP (anti-spoofing), and (c) the destination is this host's own vIP. This blocks
+source-vIP spoofing and traffic interception even if a `vpn/` registration is
+tampered with. Forwarding remains default-deny: nothing flows until a role grants
+reach (`role_reaches` / the Cedar engine).
 
 ---
 

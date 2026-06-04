@@ -16,7 +16,7 @@ hop is a single-binary CLI tool that provides secure shell access, file transfer
 > **hop's defining guarantee is decentralization, not minimalism.** The wedge is
 > that hop runs **independent of any third party or central control plane** —
 > not that it avoids a background process. As hop grows into a full private
-> network (the **[warren](warren.md)** — now shipped, default-on), members run a
+> network (the **[warren](warren.md)** — shipped; VPN opt-in/off by default), members run a
 > local daemon (like Tailscale's, but with no coordination server behind it).
 > "Single binary, no central anything" is the promise; a per-member daemon is
 > fully in keeping with it.
@@ -89,15 +89,19 @@ hop mcp                 # start MCP server on stdio
 
 ```bash
 hop invite --role developer       # role decides reach over the VPN
-hop config set vpn off            # opt out of the default-on VPN
+hop config set vpn on             # opt into the warren VPN (off by default)
 hop admin myhost grant abc123 ops # change a member's reach later
 ```
 
-Every daemon brings up a built-in P2P VPN (**default-on**): a virtual IP in
-`100.64.0.0/10`, MagicDNS (`*.hop`), and role→tag reach (default-deny). Bringup is
-fail-safe — if a TUN can't be created or the CGNAT range conflicts (e.g.
-Tailscale), it's skipped and shell/exec/transfer are unaffected. See
-[warren.md](warren.md).
+A daemon can bring up a built-in P2P VPN: a virtual IP in `100.64.0.0/10`,
+MagicDNS (`*.hop`), and role→tag reach (default-deny). The VPN is **off by
+default** (since v0.6.37) — opt in with `--host`, `HOP_VPN=1`, or `hop config set
+vpn on`. (It was default-on in v0.6.32–0.6.36; the default was reverted while the
+warren's write-authorization trust model is hardened — see [security.md](security.md)
+and the warren trust note in
+[../technical/p2p-network.md](../technical/p2p-network.md).) Bringup is fail-safe
+— if a TUN can't be created or the CGNAT range conflicts (e.g. Tailscale), it's
+skipped and shell/exec/transfer are unaffected. See [warren.md](warren.md).
 
 ## Architecture
 

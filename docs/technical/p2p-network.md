@@ -1,17 +1,30 @@
 # Peer-to-Peer Private Network (Design)
 
-> **Status: MVP shipped — VPN default-on, as of v0.6.32.** The role-based warren
-> MVP (all 8 build-plan steps below) is implemented and validated by a live
-> multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`) plus the 53-test regression suite.
-> The VPN data plane is now **default-on**: the daemon brings up the TUN
-> automatically, but bringup is **always best-effort** — if a TUN can't be
-> created (no privilege / no `/dev/net/tun`) or `100.64.0.0/10` is already in use
-> by another overlay (e.g. Tailscale), it degrades gracefully and keeps serving
-> exec/shell/transfer untouched. Opt out with `HOP_VPN=0` or `vpn_enabled = false`
-> in host config; `HOP_VPN=1` forces bringup past the conflict guard. Sections
-> marked **(Commercial, deferred)** are planned for later phases and are
-> documented here only so the schema and trust model don't have to be reworked
-> when we get there.
+> **Status: MVP shipped — VPN off by default, as of v0.6.37.** The role-based
+> warren MVP (all 8 build-plan steps below) is implemented and validated by a
+> live multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`, including reboot
+> reconvergence) plus the 53-test regression suite. The VPN data plane was
+> default-on in v0.6.32–0.6.36; **v0.6.37 reverted the default to off** while the
+> warren's write-authorization trust model is hardened (see the **Trust model**
+> note below and `security-audit.md` C1). Enable it with `--host`, `HOP_VPN=1`,
+> or `hop config set vpn on`. Bringup is **always best-effort** — if a TUN can't
+> be created (no privilege / no `/dev/net/tun`) or `100.64.0.0/10` is already in
+> use by another overlay (e.g. Tailscale), it degrades gracefully and keeps
+> serving exec/shell/transfer untouched; `HOP_VPN=0` is a recovery escape hatch.
+> Inbound `hop/vpn/1` datagrams are **ingress-authenticated** (source-vIP
+> anti-spoof; v0.6.37). Sections marked **(Commercial, deferred)** are planned
+> for later phases and are documented here only so the schema and trust model
+> don't have to be reworked when we get there.
+
+> **Trust model (current limitation).** The warren shared document is still
+> **write-open**: every member's invite carries an iroh-docs *write* ticket, so
+> per-author write validation is not yet enforced. A malicious member could
+> rewrite `vpn/`/`name/`/`ip/`/role entries in the doc. This is tracked as **C1**
+> in `security-audit.md`; the v0.6.37 mitigations are (1) VPN off-by-default
+> (only opted-in nodes join a writable doc) and (2) data-plane ingress
+> authentication (a forged `vpn/` registration still can't source authenticated
+> packets). Per-author write authorization (read-ticket members + author-bound
+> keys) is the next major hardening pass.
 
 ## Goal
 
@@ -299,8 +312,8 @@ the proving ground for the doc and addressing before any commercial work.
 |-------|-------|-------------------|
 | **1. Decentralize state** ✅ *(per-host)* | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
 | **2. Virtual IPs** ✅ | Deterministic-proposal + doc-claim allocation (#2). Claimed per host on startup. | Tests conflict resolution without TUN complexity. |
-| **3. VPN packet plane** ✅ *(default-on, best-effort)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket. Default-on; skips gracefully on TUN failure / CGNAT conflict (`HOP_VPN=0` to opt out, `HOP_VPN=1` to force). | Actual P2P LAN reachability. |
-| **4. DNS + ACL** ✅ *(default-on)* | MagicDNS resolver for `*.hop` (#7); role→tag→ACL filter on the forwarding path (#8, default-deny). Active with the default-on VPN. | Friendly names + safe service exposure. |
+| **3. VPN packet plane** ✅ *(opt-in, best-effort)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket, **ingress authentication** (source-vIP anti-spoof, v0.6.37). Off by default (`--host`/`HOP_VPN=1`/`hop config set vpn on` to enable); skips gracefully on TUN failure / CGNAT conflict (`HOP_VPN=0` escape hatch). | Actual P2P LAN reachability. |
+| **4. DNS + ACL** ✅ *(active when VPN enabled)* | MagicDNS resolver for `*.hop` (#7); role→tag→ACL filter on the forwarding path (#8, default-deny). Active whenever the VPN is enabled. | Friendly names + safe service exposure. |
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |
 
@@ -333,11 +346,17 @@ model doesn't:
   is **additive-only** — it no longer revokes "doc peers not in *my* `peers.json`",
   so one host can't cross-revoke another's members. The additive `ip`/`vpn`/`name`
   tables are federation-safe by construction (each host writes only its own).
-- **Read vs write capability (Planned — ties to the commercial trust root, #9).**
-  Today the join path hands out an iroh-docs **write** ticket, so a member could
-  in principle rewrite membership/roles. Cryptographically gating writes behind an
-  Owner/Admin-signed capability (members get a read replica) is the remaining
-  hardening, deferred to the trust-root work.
+- **Read vs write capability (Deferred — security-audit C1, ties to the
+  commercial trust root, #9).** Today the join path hands out an iroh-docs
+  **write** ticket, so a member can rewrite membership/roles/`vpn`/`name`/`ip`
+  entries in the shared doc. Cryptographically gating writes behind an
+  Owner/Admin-signed capability (members get a read replica) plus per-author
+  write validation on read is the remaining hardening. It is **deferred**
+  (tracked as C1) because it's a multi-layer change with a real risk of locking
+  legitimate nodes out of their own warren; the interim mitigations shipped in
+  v0.6.37 are **VPN off-by-default** (only opted-in nodes join the writable doc)
+  and **data-plane ingress authentication** (a forged `vpn/` entry can't source
+  authenticated packets). See `security-audit.md` for the full rationale.
 
 ### Phase 1 implementation status
 
@@ -363,17 +382,20 @@ to Phase 4's default-deny ACLs (#8)** rather than shipped in Phase 1. The
 federation primitives exist (`NetDoc::read_ticket`, `Bootstrap::Import`,
 `reconcile`'s per-host-ownership caveat) and are ready for that phase.
 
-## Next-stage build plan — the role-based warren MVP ✅ *(shipped; default-on v0.6.32)*
+## Next-stage build plan — the role-based warren MVP ✅ *(shipped; VPN off-by-default since v0.6.37)*
 
 All 8 steps below are implemented and validated (live multi-node TUN e2e
-`tests/e2e/vpn-e2e.sh` — real ICMP over `hop/vpn/1`, role-gated, 0% loss — plus
-the 53-test regression suite green). As of v0.6.32 the VPN data plane is
-**default-on** with best-effort bringup: a TUN-creation failure or a
-`100.64.0.0/10` conflict (e.g. a host already running Tailscale) only skips the
-VPN — core access (exec/shell/transfer) is never affected. Opt out with
-`HOP_VPN=0` / `vpn_enabled = false`; `HOP_VPN=1` forces past the conflict guard.
-The 53-test regression suite runs in TUN-less containers, so its green run is the
-standing proof that default-on degrades gracefully.
+`tests/e2e/vpn-e2e.sh` — real ICMP over `hop/vpn/1`, role-gated, 0% loss, plus
+reboot reconvergence — and the 53-test regression suite green). The VPN data
+plane was **default-on** in v0.6.32–0.6.36; **v0.6.37 reverted it to off** (opt
+in via `--host` / `HOP_VPN=1` / `hop config set vpn on`) while the warren write
+model is hardened (Trust-model note at the top; C1 in `security-audit.md`).
+Bringup is best-effort: a TUN-creation failure or a `100.64.0.0/10` conflict
+(e.g. a host already running Tailscale) only skips the VPN — core access
+(exec/shell/transfer) is never affected. `HOP_VPN=1` forces past the conflict
+guard; `HOP_VPN=0` is a recovery escape hatch. The 53-test regression suite runs
+in TUN-less containers, so its green run is the standing proof that VPN bringup
+(or its absence) never affects core access.
 
 This stage turned the previously inert VPN into a working role-driven warren:
 **role unification + federation safety + role→ACL derivation + a live multi-node
@@ -413,14 +435,18 @@ stage, sequenced so each step compiled and tested.
    `role_derived_reach_via_doc`). **Live multi-node TUN e2e**
    (`tests/e2e/vpn-e2e.sh`, `NET_ADMIN` + `/dev/net/tun`): two federated nodes
    join one warren (host-b imports host-a's namespace ticket + redeems the admin
-   creator invite); both run the VPN (now default-on); host-b pings host-a's
-   virtual IP over the real `hop/vpn/1` TUN — role-gated forwarding (admin/`*`
-   reach both directions), **0% packet loss**. The live harness exercises the
-   allow path + the full data plane (TUN bringup, `100.64.0.0/10` routing,
-   federation replication, MagicDNS vIPs); the tag-based deny path is covered by
-   the unit tests above. Plus the existing 53-test regression suite green.
-   ✅ Phase 3-4 has since been promoted to **default-on** (v0.6.32), with an
-   install-time / runtime opt-out (`--no-vpn`, `HOP_VPN=0`, `vpn_enabled=false`).
+   creator invite); both run the VPN (enabled via `HOP_VPN=1` in the harness);
+   host-b pings host-a's virtual IP over the real `hop/vpn/1` TUN — role-gated
+   forwarding (admin/`*` reach both directions), **0% packet loss** — and the
+   harness then restarts host-b and re-pings to prove reboot reconvergence. The
+   live harness exercises the allow path + the full data plane (TUN bringup,
+   `100.64.0.0/10` routing, ingress authentication, federation replication,
+   MagicDNS vIPs); the tag-based deny path is covered by the unit tests above.
+   Plus the existing 53-test regression suite green.
+   ✅ Phase 3-4 was default-on in v0.6.32–0.6.36; **v0.6.37 reverted the default
+   to off** (opt in via `--host` / `HOP_VPN=1` / `hop config set vpn on`) while
+   the warren write model is hardened. `HOP_VPN=0` / `--no-vpn` / `vpn_enabled=false`
+   keep it off.
 
 **Rollout order within the stage (as executed):** role unification + `member`
 default first (auth-semantics change, guarded by the `peers.json` fallback so
@@ -491,8 +517,11 @@ the namespace). Fold the second into the first:
 node must write to claim its virtual IP / register its endpoint, so a read-only
 ticket can't power the node path with today's self-claim architecture. It inherits
 the invite's protection (single-use, expiring, secret) and additive-only
-reconcile. Cryptographic write-gating (members get read; writes need an
-Owner/Admin-signed capability) remains the trust-root hardening (#9).
+reconcile. **This is the C1 limitation** (`security-audit.md`): a write ticket
+lets a member rewrite any doc entry, and per-author validation isn't yet enforced.
+Cryptographic write-gating (members get read; writes need an Owner/Admin-signed
+capability) remains the trust-root hardening (#9); until then v0.6.37 mitigates
+with VPN off-by-default + data-plane ingress authentication.
 
 **Main engineering risk / bridge:** redeeming is a client/connect action
 (`hop connect`), but joining the namespace as a node is a `hop host` action

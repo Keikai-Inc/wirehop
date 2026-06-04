@@ -144,4 +144,21 @@ File transfers show real-time progress by default:
 
 When the hop daemon runs as root and a session is bound to a Unix user, file transfers are executed via a privilege-separated helper process (`__transfer-helper`). The helper runs as the target user, ensuring all file I/O uses kernel-enforced user permissions. This applies to all transfer modes: copy push, copy pull, sync push, and sync pull.
 
-*Last updated: v0.6.33*
+## Sandbox enforcement
+
+Transfers honor the connecting peer's `SandboxPolicy` (the same policy that
+gates shell/exec). As of v0.6.37 the policy is enforced on the transfer data
+plane itself — previously it was not, so a restricted peer could read or write
+any path regardless of its role:
+
+- **Read-only policy** (e.g. the `monitor`/`audit` presets) — a push (peer →
+  host write) is rejected before any I/O; pulls are still allowed.
+- **`allowed_paths` scope** — both directions are confined to the policy's
+  allowed roots. The base path is canonicalized (resolving symlinks and `..`,
+  including for not-yet-existing write targets) and must lie under an allowed
+  root, so a transfer can't escape its scope.
+
+Unrestricted peers (no policy / full-access roles) are unaffected. Rejections
+are surfaced to the client as a transfer error.
+
+*Last updated: v0.6.37*
