@@ -117,6 +117,13 @@ pub type VpnPeerIps = std::sync::Arc<tokio::sync::RwLock<std::collections::HashM
 #[cfg(unix)]
 pub type VpnLocalIp = std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>;
 
+/// Shared notifier that asks the `NetDoc` to refresh `peer_ips` from the
+/// document. `VpnInbound` fires it when a datagram arrives from a peer whose
+/// registered vIP it doesn't yet know (e.g. just after that peer rebooted), so
+/// reconvergence doesn't have to wait for the periodic refresh tick.
+#[cfg(unix)]
+pub type VpnRefresh = std::sync::Arc<tokio::sync::Notify>;
+
 /// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
 /// packets) to the TUN device — **after authenticating ingress** (security-audit
 /// C2). A datagram is delivered only if (a) the connecting node is a registered
@@ -129,6 +136,7 @@ pub struct VpnInbound {
     tun: TunSlot,
     peer_ips: VpnPeerIps,
     local_ip: VpnLocalIp,
+    refresh: VpnRefresh,
 }
 
 #[cfg(unix)]
@@ -140,8 +148,8 @@ impl std::fmt::Debug for VpnInbound {
 
 #[cfg(unix)]
 impl VpnInbound {
-    pub fn new(tun: TunSlot, peer_ips: VpnPeerIps, local_ip: VpnLocalIp) -> Self {
-        Self { tun, peer_ips, local_ip }
+    pub fn new(tun: TunSlot, peer_ips: VpnPeerIps, local_ip: VpnLocalIp, refresh: VpnRefresh) -> Self {
+        Self { tun, peer_ips, local_ip, refresh }
     }
 }
 
@@ -153,14 +161,27 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
     ) -> Result<(), iroh::protocol::AcceptError> {
         // The authenticated identity of the connecting node (QUIC/TLS-verified).
         let remote = conn.remote_id().to_string();
-        // The source vIP this node is allowed to use. Unknown node → drop all.
-        let expected_src = self.peer_ips.read().await.get(&remote).copied();
         while let Ok(dg) = conn.read_datagram().await {
-            let Some(expected) = expected_src else { continue };
-            // Anti-spoofing: the packet's source vIP must be this node's vIP.
+            // Look up the peer's authorized vIP *per datagram* (not once up front)
+            // so a refresh mid-connection — e.g. after the peer reboots and
+            // re-registers — takes effect without dropping the connection.
+            let expected_src = self.peer_ips.read().await.get(&remote).copied();
+            let Some(expected) = expected_src else {
+                // Unknown peer: ask the NetDoc to refresh from the document. The
+                // notify coalesces and the consumer is rate-limited, so a packet
+                // flood can't amplify into excessive doc reads.
+                self.refresh.notify_one();
+                continue;
+            };
+            // Anti-spoofing: the packet's source vIP must be this node's vIP. A
+            // mismatch can mean the peer changed vIP — refresh and re-check next
+            // datagram rather than blackholing it indefinitely.
             match parse_src_ipv4(&dg) {
                 Some(src) if src == expected => {}
-                _ => continue,
+                _ => {
+                    self.refresh.notify_one();
+                    continue;
+                }
             }
             // The datagram must be destined for *us* (our virtual IP).
             if let Some(local) = *self.local_ip.read().await

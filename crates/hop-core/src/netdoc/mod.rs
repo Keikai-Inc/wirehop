@@ -124,6 +124,11 @@ pub struct NetDoc {
     /// This host's own vIP (the only legitimate ingress destination).
     #[cfg(unix)]
     vpn_local_ip: crate::vpn::VpnLocalIp,
+    /// Signalled by `VpnInbound` when a datagram arrives from a peer whose vIP
+    /// isn't in `vpn_peer_ips` yet; the consumer in `enable_vpn` refreshes the
+    /// map so a just-rebooted peer reconverges fast (rate-limited).
+    #[cfg(unix)]
+    vpn_refresh: crate::vpn::VpnRefresh,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -180,6 +185,8 @@ impl NetDoc {
             std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         #[cfg(unix)]
         let vpn_local_ip: crate::vpn::VpnLocalIp = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        #[cfg(unix)]
+        let vpn_refresh: crate::vpn::VpnRefresh = std::sync::Arc::new(tokio::sync::Notify::new());
 
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_docs::ALPN, docs.clone())
@@ -193,7 +200,12 @@ impl NetDoc {
         {
             builder = builder.accept(
                 crate::vpn::VPN_ALPN,
-                crate::vpn::VpnInbound::new(vpn_tun.clone(), vpn_peer_ips.clone(), vpn_local_ip.clone()),
+                crate::vpn::VpnInbound::new(
+                    vpn_tun.clone(),
+                    vpn_peer_ips.clone(),
+                    vpn_local_ip.clone(),
+                    vpn_refresh.clone(),
+                ),
             );
         }
         let router = builder.spawn();
@@ -212,6 +224,8 @@ impl NetDoc {
             vpn_peer_ips,
             #[cfg(unix)]
             vpn_local_ip,
+            #[cfg(unix)]
+            vpn_refresh,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
@@ -794,6 +808,22 @@ impl NetDoc {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     me.refresh_vpn_peer_ips().await;
+                }
+            });
+        }
+        // On-demand refresh: `VpnInbound` signals when a packet arrives from a
+        // peer it can't yet authenticate (e.g. just after that peer rebooted and
+        // re-registered). Refresh immediately so reconvergence doesn't wait for
+        // the 5s tick, rate-limited to once per second so a spoofed-source flood
+        // can't amplify into a doc-read storm.
+        {
+            let me = std::sync::Arc::clone(self);
+            let notify = self.vpn_refresh.clone();
+            tokio::spawn(async move {
+                loop {
+                    notify.notified().await;
+                    me.refresh_vpn_peer_ips().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
         }

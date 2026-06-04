@@ -38,11 +38,13 @@ DOCKERFILE
 docker network create "$NET" >/dev/null
 docker volume create "$VOL" >/dev/null
 
-# Note: HOP_VPN is intentionally NOT set — this proves the VPN comes up by
-# DEFAULT (v0.6.32 default-on). The containers grant TUN + NET_ADMIN so the
-# auto path succeeds; the conflict guard finds no existing 100.64.0.0/10.
+# HOP_VPN=1 opts these nodes into the warren VPN. As of v0.6.37 the VPN is
+# off-by-default (security-audit P0a) — a real node install opts in via
+# `--host` / `hop config set vpn on` / HOP_VPN=1, which this mirrors. The
+# containers grant TUN + NET_ADMIN so bring-up succeeds; the conflict guard
+# finds no existing 100.64.0.0/10.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
-        -v "$VOL:/shared" -e RUST_LOG=hop=info,hop_core=info --user root)
+        -v "$VOL:/shared" -e RUST_LOG=hop=info,hop_core=info -e HOP_VPN=1 --user root)
 
 echo "=== starting host-a (warren owner) ==="
 docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
