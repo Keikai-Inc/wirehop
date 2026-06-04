@@ -452,11 +452,15 @@ pub struct HostConfig {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Whether the warren VPN data plane is enabled. Default: `true` (default-on,
-    /// auto). The daemon brings up the TUN unless a `100.64.0.0/10` conflict is
-    /// detected or TUN creation fails — in either case it degrades gracefully and
-    /// keeps serving exec/shell/transfer. The `HOP_VPN` env var overrides this:
-    /// `HOP_VPN=1` forces on (past the conflict guard), `HOP_VPN=0` forces off.
+    /// Whether the warren VPN data plane is enabled. Default: `false`
+    /// (**off by default**, opt-in). A bare `hop host` does not bring up the TUN;
+    /// the VPN is enabled deliberately — by `--host` install (which sets this),
+    /// `hop config set vpn on`, or `HOP_VPN=1`. This off-by-default posture is the
+    /// interim mitigation for the warren write-capability trust gap (see
+    /// `docs/technical/security-audit.md`, C1) until per-author write
+    /// authorization lands. When enabled, bringup is best-effort (skips on a
+    /// `100.64.0.0/10` conflict or TUN failure; core access is unaffected).
+    /// `HOP_VPN=1` forces on (past the conflict guard); `HOP_VPN=0` forces off.
     #[serde(default = "default_vpn_enabled")]
     pub vpn_enabled: bool,
 }
@@ -466,7 +470,7 @@ fn default_role_name() -> String {
 }
 
 fn default_vpn_enabled() -> bool {
-    true
+    false
 }
 
 fn default_session_timeout() -> u64 {
@@ -539,19 +543,19 @@ mod tests {
     }
 
     #[test]
-    fn host_config_vpn_default_on() {
-        // Default-on: a fresh config enables the VPN.
-        assert!(HostConfig::default().vpn_enabled);
+    fn host_config_vpn_default_off() {
+        // Off by default (security: opt-in until the warren write-capability
+        // trust gap is closed). A fresh config does NOT enable the VPN.
+        assert!(!HostConfig::default().vpn_enabled);
     }
 
     #[test]
-    fn host_config_backward_compat_vpn_default_on() {
-        // Existing host_config.json files predate `vpn_enabled` — they must
-        // deserialize to default-on so upgrading flips the VPN on without
-        // re-writing config.
+    fn host_config_backward_compat_vpn_default_off() {
+        // Configs predating `vpn_enabled` deserialize to off (opt-in), so an
+        // upgrade never silently brings up the VPN on a bare host.
         let json = r#"{ "session_timeout_secs": 3600, "max_sessions": 5 }"#;
         let cfg: HostConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.vpn_enabled);
+        assert!(!cfg.vpn_enabled);
         assert_eq!(cfg.default_role, "member");
     }
 

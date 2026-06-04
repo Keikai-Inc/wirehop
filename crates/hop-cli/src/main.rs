@@ -421,12 +421,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     }
                     net.spawn_sync_keepalive(std::time::Duration::from_secs(300));
 
-                    // Phase 3: the warren VPN data plane is default-on. The env
-                    // var overrides config: HOP_VPN=1 forces on (past the CGNAT
-                    // guard), HOP_VPN=0 forces off; otherwise the config flag
-                    // (default true) decides. Bringup is ALWAYS best-effort — a
-                    // TUN-creation failure or a 100.64.0.0/10 conflict only skips
-                    // the VPN; exec/shell/transfer keep working untouched.
+                    // Phase 3: the warren VPN data plane is OFF BY DEFAULT
+                    // (opt-in; see security-audit.md C1). HOP_VPN=1 forces on
+                    // (past the CGNAT guard), HOP_VPN=0 forces off; otherwise the
+                    // config flag (default false) decides — a `--host` install or
+                    // `hop config set vpn on` opts a node in. Bringup is ALWAYS
+                    // best-effort — a TUN-creation failure or a 100.64.0.0/10
+                    // conflict only skips the VPN; exec/shell/transfer keep working.
                     #[cfg(unix)]
                     {
                         let host_cfg = hop_core::config::HostConfig::load(&cfg).unwrap_or_default();

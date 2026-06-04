@@ -39,8 +39,14 @@ done
 # Apply warren primers to the daemon's host config dir ($1). Best-effort; fixes
 # ownership/perms on Linux so the daemon (root) and the hop group can read.
 apply_daemon_primers() {
-  local cfg_dir="$1" applied=false
-  [[ "${NO_VPN}" == "true" ]]   && sudo "${HOP_BIN}" config set vpn off --config "${cfg_dir}" >/dev/null && applied=true && info "Warren VPN disabled"
+  local cfg_dir="$1" applied=true
+  # A node install opts INTO the warren VPN (off by default for a bare host);
+  # --no-vpn keeps the host without the VPN data plane.
+  if [[ "${NO_VPN}" == "true" ]]; then
+    sudo "${HOP_BIN}" config set vpn off --config "${cfg_dir}" >/dev/null && info "Warren VPN disabled"
+  else
+    sudo "${HOP_BIN}" config set vpn on --config "${cfg_dir}" >/dev/null && info "Warren VPN enabled (this machine is a node on the warren)"
+  fi
   [[ -n "${TAGS}" ]]            && sudo "${HOP_BIN}" config set tags "${TAGS}" --config "${cfg_dir}" >/dev/null && applied=true && info "Host tags: ${TAGS}"
   [[ -n "${DEFAULT_ROLE}" ]]    && sudo "${HOP_BIN}" config set default_role "${DEFAULT_ROLE}" --config "${cfg_dir}" >/dev/null && applied=true && info "Default invite role: ${DEFAULT_ROLE}"
   # Unified invite: redeems for membership + writes the namespace join ticket.
@@ -142,7 +148,7 @@ if [[ "${OS}" == "Darwin" ]]; then
   printf "\n${BOLD}hop v${VERSION}${RESET} daemon installed!\n"
 
   # Apply warren primers to the daemon config, then restart so they take effect.
-  if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" || -n "${INVITE}" ]]; then
+  if true; then  # node install always applies VPN opt-in + primers
     apply_daemon_primers "/Library/Application Support/hop"
     sudo launchctl kickstart -k system/com.hop.daemon >/dev/null 2>&1 || true
   fi
@@ -196,8 +202,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   ACTUAL=$(shasum -a 256 "${TMPDIR_HOP}/hop" | awk '{print $1}')
 else
-  warn "No sha256sum or shasum found — skipping checksum verification"
-  ACTUAL="${EXPECTED}"
+  die "No sha256sum or shasum found — cannot verify the download. Install coreutils and retry."
 fi
 
 [[ "${ACTUAL}" == "${EXPECTED}" ]] || die "Checksum mismatch!\n  expected: ${EXPECTED}\n  got:      ${ACTUAL}"
@@ -269,7 +274,7 @@ if command -v hop >/dev/null 2>&1; then
 fi
 
 # Apply warren primers to /etc/hop before first start so the daemon picks them up.
-if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOIN_TICKET}" || -n "${INVITE}" ]]; then
+if true; then  # node install always applies VPN opt-in + primers
   apply_daemon_primers "/etc/hop"
 fi
 
