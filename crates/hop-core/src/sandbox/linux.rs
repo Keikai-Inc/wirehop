@@ -162,7 +162,7 @@ fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
 fn apply_landlock_net() {
     #[cfg(target_os = "linux")]
     {
-        use landlock::{AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus};
+        use landlock::{AccessNet, Ruleset, RulesetAttr, RulesetStatus};
 
         let result = (|| -> Result<RulesetStatus, String> {
             // Handle bind+connect but add no allow rules → all TCP denied.

@@ -580,8 +580,8 @@ fn run_local_command_sync(
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
-                        hop_core::sandbox::linux::apply_sandbox(&policy_clone);
-                        Ok(())
+                        hop_core::sandbox::linux::apply_sandbox(&policy_clone)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
                     });
                 }
                 cmd.output()
@@ -636,8 +636,8 @@ fn run_local_command_sync(
                 unsafe {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(move || {
-                        hop_core::sandbox::linux::apply_sandbox(&policy_clone);
-                        Ok(())
+                        hop_core::sandbox::linux::apply_sandbox(&policy_clone)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
                     });
                 }
                 cmd.output()
