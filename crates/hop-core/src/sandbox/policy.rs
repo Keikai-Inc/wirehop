@@ -41,6 +41,28 @@ impl SandboxPolicy {
         Self::default()
     }
 
+    /// Whether `path` is within the policy's filesystem scope. An empty
+    /// `allowed_paths` means unrestricted (any path). Otherwise the path is
+    /// canonicalized (resolving symlinks and `..`) and must lie under one of
+    /// the allowed roots. For paths that don't exist yet (e.g. a file about to
+    /// be written), the parent directory is canonicalized and the final
+    /// component appended, so a write can't escape via a non-existent name.
+    ///
+    /// Used to confine peer-driven file access (transfer + JS `readFile`/
+    /// `writeFile`) — security-audit C3/C4.
+    pub fn path_in_scope(&self, path: &std::path::Path) -> bool {
+        if self.allowed_paths.is_empty() {
+            return true;
+        }
+        let canon = canonicalize_lexical(path);
+        let roots: Vec<PathBuf> = self
+            .allowed_paths
+            .iter()
+            .map(|p| canonicalize_lexical(p))
+            .collect();
+        roots.iter().any(|root| canon.starts_with(root))
+    }
+
     /// Returns true if any sandbox restriction is active.
     pub fn is_restricted(&self) -> bool {
         self.read_only
@@ -216,6 +238,67 @@ impl SandboxPolicy {
     }
 }
 
+/// Resolve `path` to an absolute, symlink-free form for scope comparison.
+/// If the path exists, `fs::canonicalize` it. Otherwise canonicalize the
+/// nearest existing ancestor and re-append the remaining components, then
+/// drop any `.`/`..` lexically so a non-existent name can't be used to
+/// `..`-escape an allowed root.
+fn canonicalize_lexical(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    // Walk up to the first existing ancestor and canonicalize that.
+    let mut ancestor = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(ancestor) {
+            let mut base = c;
+            for comp in tail.iter().rev() {
+                base.push(comp);
+            }
+            return normalize_dotdot(&base);
+        }
+        match ancestor.parent() {
+            Some(p) if p != ancestor => {
+                if let Some(name) = ancestor.file_name() {
+                    tail.push(name);
+                }
+                ancestor = p;
+            }
+            _ => break,
+        }
+    }
+    // Nothing in the path exists — normalize lexically against root.
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Collapse `..`/`.` components lexically (no filesystem access).
+fn normalize_dotdot(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Commands that should always be denied in any sandboxed context.
 pub fn default_denied_commands() -> Vec<String> {
     [
@@ -238,6 +321,31 @@ mod tests {
         assert!(!p.is_restricted());
         assert!(!p.read_only);
         assert!(!p.no_network);
+    }
+
+    #[test]
+    fn path_in_scope_unrestricted_allows_anything() {
+        let p = SandboxPolicy::default();
+        assert!(p.path_in_scope(std::path::Path::new("/etc/shadow")));
+        assert!(p.path_in_scope(std::path::Path::new("/anything/at/all")));
+    }
+
+    #[test]
+    fn path_in_scope_confines_to_allowed_roots() {
+        let dir = std::env::temp_dir();
+        let p = SandboxPolicy {
+            allowed_paths: vec![dir.join("hop-scope-test")],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(dir.join("hop-scope-test/sub")).unwrap();
+        // Inside the allowed root (existing and not-yet-existing children).
+        assert!(p.path_in_scope(&dir.join("hop-scope-test/sub")));
+        assert!(p.path_in_scope(&dir.join("hop-scope-test/new-file.txt")));
+        // Outside the root.
+        assert!(!p.path_in_scope(std::path::Path::new("/etc/passwd")));
+        // `..` escape from a non-existent child must not slip out of the root.
+        assert!(!p.path_in_scope(&dir.join("hop-scope-test/../../etc/passwd")));
+        let _ = std::fs::remove_dir_all(dir.join("hop-scope-test"));
     }
 
     #[test]

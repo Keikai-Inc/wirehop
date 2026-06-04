@@ -102,10 +102,20 @@ pub fn install_hop_bindings(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // hop.writeFile(path, content) — write a string to a file (for temp files, prompts, etc.)
+    // hop.writeFile(path, content) — gated by the sandbox policy (security-audit
+    // C4): refused when the policy is read-only, and confined to allowed_paths.
+    let write_policy = sandbox.cloned();
     hop.set(
         "writeFile",
-        Function::new(ctx.clone(), |_ctx: Ctx<'_>, path: String, content: String| -> rquickjs::Result<()> {
+        Function::new(ctx.clone(), move |_ctx: Ctx<'_>, path: String, content: String| -> rquickjs::Result<()> {
+            if let Some(p) = &write_policy {
+                if p.read_only {
+                    return Err(js_err(format!("hop.writeFile({path}) denied: read-only sandbox")));
+                }
+                if !p.path_in_scope(std::path::Path::new(&path)) {
+                    return Err(js_err(format!("hop.writeFile({path}) denied: outside sandbox scope")));
+                }
+            }
             std::fs::write(&path, content.as_bytes())
                 .map_err(|e| js_err(format!("hop.writeFile({path}) failed: {e}")))
         })
@@ -113,10 +123,16 @@ pub fn install_hop_bindings(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // hop.readFile(path) — read a file as a string
+    // hop.readFile(path) — confined to allowed_paths when the sandbox is scoped.
+    let read_policy = sandbox.cloned();
     hop.set(
         "readFile",
-        Function::new(ctx.clone(), |_ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+        Function::new(ctx.clone(), move |_ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+            if let Some(p) = &read_policy
+                && !p.path_in_scope(std::path::Path::new(&path))
+            {
+                return Err(js_err(format!("hop.readFile({path}) denied: outside sandbox scope")));
+            }
             std::fs::read_to_string(&path)
                 .map_err(|e| js_err(format!("hop.readFile({path}) failed: {e}")))
         })
@@ -766,6 +782,72 @@ fn run_local_script_sync(
 ///
 /// Uses `reqwest::blocking` — safe because JS runs on a plain OS thread, not
 /// inside the tokio runtime. Respects `SandboxPolicy.no_network`.
+/// Whether an IP is off-limits for SSRF protection: loopback, private (RFC1918),
+/// link-local (incl. the `169.254.169.254` cloud-metadata endpoint), the CGNAT
+/// range (`100.64.0.0/10`, which hop's own VPN uses), unspecified, plus the IPv6
+/// equivalents (loopback, ULA `fc00::/7`, link-local `fe80::/10`).
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            // A v4-mapped v6 address (::ffff:a.b.c.d) is really a v4 target.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Reject URLs that resolve to internal/metadata addresses (SSRF). Only http(s)
+/// schemes are allowed; every resolved address for the host must be public.
+fn ssrf_guard(url: &str) -> std::result::Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("hop.http: invalid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("hop.http: scheme '{other}' not allowed")),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "hop.http: URL has no host".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    // If the host is an IP literal, check it directly; else resolve it.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(format!("hop.http: destination {ip} is blocked (SSRF)"));
+        }
+        return Ok(());
+    }
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("hop.http: cannot resolve {host}: {e}"))?;
+    let mut any = false;
+    for sa in addrs {
+        any = true;
+        if is_blocked_ip(sa.ip()) {
+            return Err(format!("hop.http: {host} resolves to blocked address {} (SSRF)", sa.ip()));
+        }
+    }
+    if !any {
+        return Err(format!("hop.http: {host} did not resolve"));
+    }
+    Ok(())
+}
+
 fn install_http_binding(ctx: &Ctx<'_>, sandbox: Option<&SandboxPolicy>) -> Result<()> {
     let globals = ctx.globals();
 
@@ -779,20 +861,34 @@ fn install_http_binding(ctx: &Ctx<'_>, sandbox: Option<&SandboxPolicy>) -> Resul
         return Ok(());
     }
 
+    // For restricted peers, block SSRF to internal/metadata endpoints and don't
+    // follow redirects (a redirect could escape the destination check) —
+    // security-audit C4. Unrestricted (owner) automation is left unchanged so it
+    // can still reach internal services intentionally.
+    let restrict_ssrf = sandbox.is_some_and(|s| s.is_restricted());
+
     // Raw binding: __hop_http(url, method, headersJson, body?) → JSON string
     globals
         .set(
             "__hop_http",
             Function::new(
                 ctx.clone(),
-                |_ctx: Ctx<'_>,
+                move |_ctx: Ctx<'_>,
                  url: String,
                  method: String,
                  headers_json: String,
                  body: rquickjs::function::Opt<String>|
                  -> rquickjs::Result<String> {
+                    if restrict_ssrf {
+                        ssrf_guard(&url).map_err(js_err)?;
+                    }
                     let client = reqwest::blocking::Client::builder()
                         .timeout(std::time::Duration::from_secs(30))
+                        .redirect(if restrict_ssrf {
+                            reqwest::redirect::Policy::none()
+                        } else {
+                            reqwest::redirect::Policy::default()
+                        })
                         .build()
                         .map_err(|e| js_err(format!("http client error: {e}")))?;
 
@@ -1781,4 +1877,46 @@ fn remove_dangerous_globals(ctx: &Ctx<'_>) -> Result<()> {
         let _ = globals.remove::<String>(name.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::{is_blocked_ip, ssrf_guard};
+    use std::net::IpAddr;
+
+    #[test]
+    fn blocks_internal_and_metadata_addresses() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // hop VPN / CGNAT
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:127.0.0.1", // v4-mapped loopback
+        ] {
+            assert!(is_blocked_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(!is_blocked_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_metadata_literal_and_bad_scheme() {
+        assert!(ssrf_guard("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(ssrf_guard("http://127.0.0.1:8080/").is_err());
+        assert!(ssrf_guard("file:///etc/passwd").is_err());
+        assert!(ssrf_guard("gopher://10.0.0.1/").is_err());
+        // A public literal passes the guard.
+        assert!(ssrf_guard("https://1.1.1.1/").is_ok());
+    }
 }

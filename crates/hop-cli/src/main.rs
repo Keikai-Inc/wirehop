@@ -908,7 +908,7 @@ async fn dispatch_session(
                 return Err(e);
             }
             tracing::info!("Starting transfer session: {:?} (v{})", req.mode, protocol_version);
-            transfer::host_transfer_session(conn, send, recv, req, username, protocol_version).await?;
+            transfer::host_transfer_session(conn, send, recv, req, username, protocol_version, sandbox).await?;
         }
         Some(ClientMessage::RequestExec { command }) => {
             tracing::info!("Starting exec session: {command}");

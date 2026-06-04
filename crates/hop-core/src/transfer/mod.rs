@@ -85,9 +85,21 @@ pub async fn host_transfer_session(
     request: TransferRequest,
     username: Option<&str>,
     protocol_version: u8,
+    sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<()> {
     // Resolve the remote path to an absolute path on the host filesystem.
     let base_path = resolve_host_path(&request.remote_path, username)?;
+
+    // Enforce the peer's sandbox policy on the data plane (security-audit C3).
+    // Transfer previously ran with full host privileges regardless of the
+    // policy attached to the invite, nullifying read-only and path scope for
+    // every restricted peer.
+    let is_write = matches!(request.direction, TransferDirection::Push);
+    if let Err(e) = enforce_transfer_policy(sandbox, &base_path, is_write) {
+        let _ = proto::write_message(&mut send, &TransferMsg::Error(format!("{e:#}"))).await;
+        let _ = send.finish();
+        return Err(e);
+    }
 
     let progress = SilentProgress;
 
@@ -1015,6 +1027,29 @@ pub async fn negotiate_client(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Enforce the peer's sandbox policy on a transfer (security-audit C3).
+/// A push (peer → host) is a write, rejected when the policy is read-only.
+/// Both directions are confined to the policy's `allowed_paths` scope.
+fn enforce_transfer_policy(
+    sandbox: &crate::sandbox::SandboxPolicy,
+    base_path: &Path,
+    is_write: bool,
+) -> Result<()> {
+    if is_write && sandbox.read_only {
+        anyhow::bail!(
+            "transfer denied: read-only sandbox does not permit writing to {}",
+            base_path.display()
+        );
+    }
+    if !sandbox.path_in_scope(base_path) {
+        anyhow::bail!(
+            "transfer denied: {} is outside the sandbox's allowed paths",
+            base_path.display()
+        );
+    }
+    Ok(())
+}
 
 /// Resolve `~/...` and relative paths to absolute paths on the host.
 fn resolve_host_path(remote_path: &str, username: Option<&str>) -> Result<PathBuf> {
