@@ -52,12 +52,15 @@ pub struct StreamHandle {
     pub frames: mpsc::UnboundedReceiver<StreamFrameKind>,
 }
 
+/// Map of in-flight request_id → reply channel carrying `(ok, payload)`.
+type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<(bool, Vec<u8>)>>>>;
+
 /// Async dispatcher for `PeerRequest::Extension*` variants.
 #[derive(Clone)]
 pub struct ExtensionDispatcher {
     registry: ExtensionRegistry,
     next_request_id: Arc<AtomicU64>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<(bool, Vec<u8>)>>>>,
+    pending: PendingReplies,
     /// Stream-open requests awaiting `StreamOpened`. Keyed by the
     /// request_id used in the outbound `ExtMessage::StreamOpen`.
     /// On arrival of a matching `StreamOpened`, the oneshot delivers
@@ -301,7 +304,7 @@ impl ExtensionDispatcher {
 async fn run_demux(
     ext_id: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ExtMessage>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<(bool, Vec<u8>)>>>>,
+    pending: PendingReplies,
     pending_stream_open: Arc<Mutex<HashMap<u64, PendingStreamOpen>>>,
     streams: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<StreamFrameKind>>>>,
 ) {

@@ -147,6 +147,7 @@ impl JsRuntime {
 }
 
 /// Synchronous JS execution (runs on a dedicated thread).
+#[allow(clippy::too_many_arguments)] // cohesive execution context; a struct would just shuffle the args
 fn execute_js_sync(
     code: &str,
     memory_limit: usize,

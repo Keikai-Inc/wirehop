@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use super::types::{CronJob, KvEntry, MetricPoint, TimeSeriesQuery};
 
 /// Request from a client to the daemon's datastore.
+// Variants vary in size, but this is a short-lived IPC message serialized by
+// value over a Unix socket — boxing would add indirection for no real benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 pub enum DsRequest {
     KvGet { ns: String, key: String },

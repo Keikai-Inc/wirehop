@@ -194,19 +194,19 @@ hop myserver kv get/set/list                 # read/write KV
 hop myserver cron list/get                   # inspect cron jobs
 ```
 
-## Planned Features
+## OAuth Proxy Flow (`hop auth`) — Shipped
 
-### 5. OAuth Proxy Flow (`hop auth`) (Planned)
-
-Initiates OAuth on the client machine (where there is a browser) and stores resulting tokens on the remote daemon. hop ships with its own registered Google OAuth app — users don't need to create their own Google Cloud project.
+Initiates OAuth on the client machine (where there is a browser) and stores resulting tokens on the remote daemon.
 
 ```bash
 hop myserver auth gmail
-# → Opens browser locally for Google OAuth consent
+# → Opens browser locally for OAuth consent
 # → Tokens sent to myserver via QUIC
 # → Stored encrypted in daemon's secrets store
 # → "Authenticated with Gmail on myserver."
 ```
+
+## Planned Features
 
 ### 6. `hop.ai()` Convenience Binding (Planned)
 
@@ -239,7 +239,7 @@ hop myserver cap setup email-monitor
 | 2 | Native `hop.http()` in JS | **Shipped** (v0.4.3) | reqwest::blocking, sandbox-aware |
 | 3 | Email monitor capability | **Shipped** (v0.4.4) | AI triage, briefing, selective mark-as-read |
 | 4 | Remote peer operations | **Shipped** (v0.4.4) | `hop myhost secrets/cap/kv/cron` over QUIC |
-| 5 | OAuth proxy (`hop auth`) | Planned | Embedded Google OAuth app, browser flow |
+| 5 | OAuth proxy (`hop auth`) | **Shipped** | Browser flow on the client, tokens stored on the daemon |
 | 6 | `hop.ai()` convenience | Planned | Sugar over hop.http + hop.secrets |
 | 7 | Interactive setup wizard | Planned | `hop myhost cap setup email-monitor` |
 

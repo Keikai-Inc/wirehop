@@ -1,5 +1,4 @@
 //! OAuth and API key authentication flows for `hop auth`.
-#![allow(dead_code)] // Legacy credential detection functions kept for reference
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -272,57 +271,6 @@ fn extract_token_from_output(output: &str) -> Option<String> {
     None
 }
 
-// ── Legacy Functions (kept for reference, may be cleaned up later) ──
-
-const MIN_CLAUDE_VERSION: (u32, u32) = (2, 1);
-
-fn is_claude_logged_in() -> bool {
-    // Check version first — old versions don't have `auth status`
-    let version_output = match shell_command("claude --version").output() {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-    let version_str = String::from_utf8_lossy(&version_output.stdout);
-    if !check_claude_version(&version_str) {
-        // Extract version for the error message
-        let ver = version_str.trim().lines().next().unwrap_or("unknown");
-        eprintln!("  Claude Code {ver} is too old (need >= {}.{}.x).", MIN_CLAUDE_VERSION.0, MIN_CLAUDE_VERSION.1);
-        eprintln!("  Update with: npm install -g @anthropic-ai/claude-code@latest");
-        return false;
-    }
-
-    // Now safe to call auth status
-    let output = match shell_command("claude auth status").output() {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Find JSON in output (may have shell profile noise before it)
-    let json_str = if let Some(start) = stdout.find('{') { &stdout[start..] } else { &stdout };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return false;
-    };
-    json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false)
-}
-
-/// Check if the claude version string meets the minimum requirement.
-/// Expects format like "2.1.89 (Claude Code)" or similar.
-fn check_claude_version(version_output: &str) -> bool {
-    let line = version_output.trim().lines().next().unwrap_or("");
-    // Extract version numbers from "2.1.89 (Claude Code)" or "2.1.89"
-    let version_part = line.split_whitespace().next().unwrap_or("");
-    let parts: Vec<&str> = version_part.split('.').collect();
-    if parts.len() < 2 {
-        return false;
-    }
-    let Ok(major) = parts[0].parse::<u32>() else { return false };
-    let Ok(minor) = parts[1].parse::<u32>() else { return false };
-    (major, minor) >= MIN_CLAUDE_VERSION
-}
-
 /// Run a command through the user's login shell so PATH includes
 /// nvm, brew, cargo, and other shell-initialized tools.
 /// Stdin is set to null to prevent interactive TUI launches.
@@ -341,102 +289,6 @@ fn shell_command_interactive(cmd: &str) -> std::process::Command {
     let mut command = std::process::Command::new(&shell);
     command.args(["-lc", cmd]);
     command
-}
-
-struct ClaudeCredentials {
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-    expires_display: String,
-}
-
-/// Detect existing Claude Code OAuth credentials.
-///
-/// Tries two sources:
-/// 1. ~/.claude/.credentials.json (file cache, may not exist on all setups)
-/// 2. `claude auth status --json` + keychain (Claude Code manages its own auth)
-///
-/// Returns the full credential set if found and not expired.
-fn detect_claude_credentials() -> Option<ClaudeCredentials> {
-    // Try 1: credentials file (fast, no subprocess)
-    if let Some(creds) = detect_claude_credentials_file() {
-        return Some(creds);
-    }
-
-    // Try 2: ask Claude CLI to export credentials via setup-token or auth status
-    detect_claude_credentials_cli()
-}
-
-fn detect_claude_credentials_file() -> Option<ClaudeCredentials> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(home).join(".claude/.credentials.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
-
-    let oauth = json.get("claudeAiOauth")?;
-    parse_claude_oauth(oauth)
-}
-
-fn detect_claude_credentials_cli() -> Option<ClaudeCredentials> {
-    // On macOS, npm-installed Claude Code stores credentials in the Keychain
-    // under service "Claude Code-credentials". Try reading it directly.
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(creds) = detect_claude_credentials_keychain() {
-            return Some(creds);
-        }
-    }
-
-    None
-}
-
-/// Read Claude Code credentials from macOS Keychain.
-/// npm-installed Claude Code uses service name "Claude Code-credentials".
-#[cfg(target_os = "macos")]
-fn detect_claude_credentials_keychain() -> Option<ClaudeCredentials> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
-    let oauth = json.get("claudeAiOauth")?;
-    parse_claude_oauth(oauth)
-}
-
-fn parse_claude_oauth(oauth: &serde_json::Value) -> Option<ClaudeCredentials> {
-    let access_token = oauth.get("accessToken")?.as_str()?.to_string();
-    let refresh_token = oauth.get("refreshToken")?.as_str().unwrap_or("").to_string();
-    let expires_at = oauth.get("expiresAt")?.as_u64()?;
-
-    // Check if token is still valid (with 5 min buffer)
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
-
-    if now_ms > expires_at.saturating_sub(300_000) {
-        return None; // expired
-    }
-
-    let remaining_hours = (expires_at - now_ms) / 3_600_000;
-    let expires_display = if remaining_hours > 24 {
-        format!("in {} days", remaining_hours / 24)
-    } else {
-        format!("in {} hours", remaining_hours)
-    };
-
-    Some(ClaudeCredentials {
-        access_token,
-        refresh_token,
-        expires_at,
-        expires_display,
-    })
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────

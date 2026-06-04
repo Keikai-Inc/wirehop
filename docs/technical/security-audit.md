@@ -109,4 +109,52 @@ working report to act on**, not a sign-off.
 4. **P1 — Harden:** ticket/identity/secrets file perms (H7, H8, M11, M12), SBPL injection (H4), Linux no_network + fatal Landlock (H5, H6), revocation latency (H3), artifact signing + die-on-no-checksum (H9), un-root the redeem (H10).
 5. **P2/P3 — Consistency & hygiene:** enforce or drop command allow/deny lists (M1), broker arg restrictions (M2), symlink/TOCTOU (M3), doc-revocation override (M5), audit-log JSON (M8), systemd hardening (M9), release branch guard, dead-code removals, doc-drift fixes.
 
-*Last updated: v0.6.36*
+## Remediation status — v0.6.37 (2026-06-03)
+
+**Fixed:**
+- **P0a** — VPN flipped off-by-default (`vpn_enabled` default false; `--host` /
+  `HOP_VPN=1` / `hop config set vpn on` opt in); docstrings corrected; installer
+  primers opt a node back in only on explicit `--host`/node install.
+- **P0b** — VPN data-plane ingress authentication: `VpnInbound` delivers a
+  datagram only when the connecting node is a registered peer, the source vIP
+  matches that node's registered vIP, and the destination is our own vIP.
+- **P0c (C3/C4)** — transfer now enforces the peer's `SandboxPolicy`
+  (read-only + `allowed_paths`); JS `readFile`/`writeFile` confined to scope and
+  read-only-aware; `hop.http` blocks SSRF (loopback/private/link-local/CGNAT/
+  IMDS + v6 equivalents) and disables redirects for restricted peers.
+- **P1/P2** — H4 (SBPL escaping), H5/H6 (Landlock fatal-when-restricted +
+  no_network via Landlock TCP rules + honest docs), H7 (ticket files 0600),
+  H9 (install.sh die-on-no-checksum + ticket umask 077), M5 (doc-revocation
+  overrides a local allow), M8 (audit-log via serde_json), M9 (systemd note +
+  LockPersonality; heavier sandboxing intentionally omitted — sessions are
+  children of the unit), M11/M12 (datastore 0600, identity re-tighten),
+  release branch guard.
+- **Dead code** — removed `AclPolicy`/`Action`/`Rule` + `get/set_acl_policy`,
+  `suggested_tier`+`Tier`, `test_endpoint_with_key`, `manifest_dir`, and the
+  legacy `oauth.rs` credential-detection family (+ blanket `allow(dead_code)`).
+- **Doc drift** — orchestration.md `hop auth` marked Shipped; README already
+  Shipped; VPN docstrings now accurate (off-by-default again).
+
+**Deferred (tracked, with rationale):**
+- **C1 full author-validated writes** — the keystone trust-model change (read-
+  ticket invites + per-author write authorization on the CRDT) is too large to
+  land safely in one pass. Interim mitigation shipped per the plan: VPN
+  off-by-default shrinks the blast radius (a bare host no longer joins a warren).
+- **H8 secrets KDF (HKDF + salt)** — a key-rotation migration risks rendering
+  deployed at-rest secrets permanently unreadable, and HKDF+salt adds ~no
+  protection against the actual threat (filesystem read of `identity.json`,
+  which already yields the identity secret to re-derive any key; a per-store
+  salt would sit in the same readable db). Net: high risk, negligible gain —
+  revisit only alongside a proven migration path.
+- **H10 root invite redeem** — inherent to the root-daemon + `curl|bash` install
+  model; the operator passing `--invite` *is* the authorization. Blast radius
+  reduced by VPN off-by-default. A real fix needs `warren join`'s privilege
+  split redesigned (redeem unprivileged, hand the validated ticket to the
+  daemon).
+- **H1/H2/H3/M6** — collapse into C1 (author-bound keys); revisit with C1.
+- **M1/M2/M3** — command allow/deny enforcement, broker arg restrictions,
+  transfer symlink/TOCTOU hardening: real but lower-severity; next pass.
+- **UNWIRED** — `set_authored_policy`, `RoleDefinition.capabilities`,
+  `active_sessions` remain inert (not security bugs); wire or document later.
+
+*Last updated: v0.6.37*

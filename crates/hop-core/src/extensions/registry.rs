@@ -144,8 +144,6 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct ExtensionRegistry {
     inner: Arc<Mutex<RegistryInner>>,
-    #[allow(dead_code)]
-    manifest_dir: PathBuf,
 }
 
 struct RegistryInner {
@@ -198,7 +196,6 @@ impl ExtensionRegistry {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(RegistryInner { extensions })),
-            manifest_dir,
         })
     }
 

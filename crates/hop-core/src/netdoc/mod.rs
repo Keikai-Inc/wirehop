@@ -94,6 +94,10 @@ pub enum Bootstrap {
     Import(Box<DocTicket>),
 }
 
+/// Cached Cedar reach engine paired with the instant it was built.
+type ReachCache =
+    std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<crate::vpn::cedar::AclEngine>)>>>;
+
 /// The network document handle: an open replicated namespace plus the iroh-docs
 /// protocol stack (docs + gossip + blobs) running on a `Router`.
 pub struct NetDoc {
@@ -123,9 +127,7 @@ pub struct NetDoc {
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
-    reach_cache: std::sync::Arc<
-        tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<crate::vpn::cedar::AclEngine>)>>,
-    >,
+    reach_cache: ReachCache,
 }
 
 /// How long a built reach engine is reused before a rebuild. Membership changes
@@ -767,28 +769,6 @@ impl NetDoc {
         Ok(())
     }
 
-    /// Read the network's ACL policy from the document (default-deny if unset).
-    pub async fn get_acl_policy(&self) -> Result<crate::vpn::acl::AclPolicy> {
-        let query = Query::single_latest_per_key().key_exact(b"acl/policy").build();
-        match self.doc.get_one(query).await.context("get_one acl")? {
-            Some(e) if e.content_len() > 0 => {
-                let bytes = self.fs_store.get_bytes(e.content_hash()).await?;
-                Ok(serde_json::from_slice(&bytes).unwrap_or_default())
-            }
-            _ => Ok(crate::vpn::acl::AclPolicy::default_deny()),
-        }
-    }
-
-    /// Write the network's ACL policy to the document (replicates to all nodes).
-    pub async fn set_acl_policy(&self, policy: &crate::vpn::acl::AclPolicy) -> Result<()> {
-        let value = serde_json::to_vec(policy).context("serializing acl policy")?;
-        self.doc
-            .set_bytes(self.author, b"acl/policy".to_vec(), value)
-            .await
-            .context("writing acl policy")?;
-        Ok(())
-    }
-
     /// Enable the VPN data plane (Phase 3, opt-in): claim a virtual IP, register
     /// this host's tags + endpoint, create the TUN device, and start forwarding
     /// under **role-derived reach** (Step 5; default-deny). Off unless explicitly
@@ -1139,18 +1119,6 @@ mod tests {
     use super::*;
     use crate::config::PeerRole;
     use crate::sandbox::SandboxPolicy;
-
-    async fn test_endpoint_with_key(sk: iroh::SecretKey) -> Endpoint {
-        // A node keeps a stable netdoc identity across restarts (production uses
-        // `derive_netdoc_secret_key`); reopening its persisted store under a
-        // *different* key is not a real scenario. Tests that reopen must reuse
-        // the same key, or the blobs store rejects content written under another.
-        iroh::endpoint::Builder::empty()
-            .secret_key(sk)
-            .bind()
-            .await
-            .expect("bind test endpoint")
-    }
 
     async fn test_endpoint() -> Endpoint {
         // Empty builder: no relay, no discovery — purely local, fine for a

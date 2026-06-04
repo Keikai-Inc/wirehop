@@ -62,8 +62,7 @@ impl VtScreen {
     /// Create an empty screen of `rows × cols`. Scrollback off.
     pub fn new(rows: u16, cols: u16) -> Self {
         let dims = FixedDims::new(rows, cols);
-        let mut config = Config::default();
-        config.scrolling_history = 0;
+        let config = Config { scrolling_history: 0, ..Default::default() };
         let term = Term::new(config, &dims, VoidListener);
         Self {
             term,
@@ -147,7 +146,7 @@ impl VtScreen {
     /// rather than left wherever the last cell-write landed.
     pub fn render(&self, vp_rows: u16, vp_cols: u16, prelude: Prelude) -> Vec<u8> {
         let grid_rows = self.dims.lines as i32;
-        let grid_cols = self.dims.cols as usize;
+        let grid_cols = self.dims.cols;
         let vp_rows = vp_rows.max(1) as i32;
         let vp_cols = vp_cols.max(1) as usize;
         let render_rows = grid_rows.min(vp_rows);
