@@ -116,6 +116,25 @@ pub fn load_or_generate_identity(config_dir: &Path) -> Result<SecretKey> {
     let path = config_dir.join("identity.json");
 
     if path.exists() {
+        // The identity secret is the root of trust for the node *and* the
+        // secrets-at-rest key. If a pre-existing file has looser-than-0600
+        // permissions (e.g. created before this check, or via a sloppy copy),
+        // re-tighten it to 0600 when we own it (security-audit M12).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let owned_by_us = meta.uid() == unsafe { libc::geteuid() };
+                if owned_by_us && meta.mode() & 0o077 != 0 {
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
+
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let file: IdentityFile =

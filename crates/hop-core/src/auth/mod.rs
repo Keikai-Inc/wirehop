@@ -181,12 +181,26 @@ pub async fn authenticate_client(
         | ClientMessage::RequestExec { .. }
         | ClientMessage::RequestExecV2 { .. }
         | ClientMessage::RequestAdmin(_) => {
-            // Authorization order, designed so the network document can never
-            // lock out a locally-authorized peer:
-            //   1. peers.json authorizes  -> ALWAYS allow (trusted local truth;
-            //      doc state is never allowed to reject a local peer).
+            // Authorization order:
+            //   0. An *explicit* doc revocation (tombstone) rejects even a
+            //      locally-authorized peer. Revocation is an intentional admin
+            //      action and must take effect on every host without first
+            //      requiring the local peers.json entry to be deleted
+            //      (security-audit M5). Doc errors/absence still fall through to
+            //      the local allow, preserving the no-lockout property.
+            //   1. peers.json authorizes -> allow (trusted local truth).
             //   2. otherwise consult the replicated doc: revoked -> reject;
             //      present -> allow (federated / inviter-offline peer); else reject.
+            if let Some(nd) = netdoc
+                && nd.is_revoked(&remote_id.to_string()).await.unwrap_or(false)
+            {
+                proto::write_message(send, &HostMessage::AuthResult { authorized: false }).await?;
+                tracing::warn!(
+                    "Peer {} rejected: revoked in network document (overrides local entry)",
+                    remote_id.fmt_short()
+                );
+                return Ok((AuthOutcome::Rejected, None));
+            }
             if peers.is_authorized(remote_id) {
                 let username = peers.peer_username(remote_id).map(String::from);
                 let role = peers.peer_role(remote_id);

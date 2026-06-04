@@ -111,8 +111,8 @@ fn build_exec_command(
                 .stderr(Stdio::piped());
             unsafe {
                 command.pre_exec(move || {
-                    linux::apply_sandbox(&policy_clone);
-                    Ok(())
+                    linux::apply_sandbox(&policy_clone)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
                 });
             }
             command

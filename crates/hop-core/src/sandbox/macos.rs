@@ -10,6 +10,28 @@ use super::policy::SandboxPolicy;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+/// Escape a path for embedding inside an SBPL Scheme double-quoted string.
+/// Backslash and double-quote are escaped. Paths containing a newline, NUL, or
+/// other control character are rejected (`None`) — they can't be represented
+/// safely and a path should never legitimately contain them, so the caller
+/// drops the rule rather than risk profile injection (security-audit H4).
+fn sbpl_escape(path: &str) -> Option<String> {
+    if path.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// Generate an SBPL profile string from a `SandboxPolicy`.
 ///
 /// If `broker_config_dir` is provided, the broker directory is added to the
@@ -67,10 +89,17 @@ pub fn generate_sbpl_profile_with_broker(
         for path in &policy.allowed_paths {
             let canon = std::fs::canonicalize(path)
                 .unwrap_or_else(|_| path.clone());
-            p.push_str(&format!(
-                "(allow file-read* (subpath \"{}\"))\n",
-                canon.display()
-            ));
+            // Escape the path for the SBPL Scheme string. A path containing a
+            // newline/NUL (or that won't round-trip) is dropped rather than
+            // emitted — fail closed, never grant a broader rule than intended
+            // (security-audit H4: SBPL injection via crafted allowed_paths).
+            match sbpl_escape(&canon.to_string_lossy()) {
+                Some(esc) => p.push_str(&format!("(allow file-read* (subpath \"{esc}\"))\n")),
+                None => tracing::warn!(
+                    "sandbox: dropping un-escapable allowed_path {:?} from SBPL profile",
+                    canon
+                ),
+            }
         }
 
         // Allow reads to broker directory so shim symlinks + socket are accessible

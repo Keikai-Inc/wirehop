@@ -448,9 +448,21 @@ fn log_admin_action(config_dir: &Path, action: &str, details: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let entry = format!(
-        "{{\"timestamp\":{timestamp},\"action\":\"{action}\",\"details\":\"{details}\"}}\n"
-    );
+    // Serialize with serde_json so `action`/`details` (which can contain
+    // attacker-influenced role names or node-id fragments) are properly escaped
+    // — raw interpolation allowed `"`/`\` to forge or inject log entries
+    // (security-audit M8).
+    let entry = match serde_json::to_string(&serde_json::json!({
+        "timestamp": timestamp,
+        "action": action,
+        "details": details,
+    })) {
+        Ok(mut s) => {
+            s.push('\n');
+            s
+        }
+        Err(_) => return,
+    };
     // Best-effort append
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()

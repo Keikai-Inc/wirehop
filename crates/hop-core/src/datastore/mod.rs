@@ -86,23 +86,27 @@ impl Datastore {
         let db = redb::Database::create(path)
             .with_context(|| format!("Failed to open datastore at {}", path.display()))?;
 
-        // If the parent directory has the setgid bit, make the file group-writable
-        // so unprivileged users in the same group can open it. Ignore errors —
-        // non-owners can't chmod, but a prior daemon run will have fixed it.
+        // Tighten the on-disk permissions of the (encrypted) datastore. By
+        // default `redb::Database::create` honors the umask, often leaving the
+        // ciphertext+nonces group/other-readable (security-audit M11). We pin
+        // it to 0600 when daemon-owned, widening to 0660 only when the parent
+        // directory is setgid (the explicit "shared between daemon and CLI
+        // group" convention). Errors are ignored — a non-owner can't chmod, and
+        // a prior daemon run will have set it.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             use std::os::unix::fs::PermissionsExt;
             if let Some(parent) = path.parent()
                 && let Ok(dir_meta) = std::fs::metadata(parent)
-                && dir_meta.mode() & 0o2000 != 0
                 && let Ok(file_meta) = std::fs::metadata(path)
             {
-                let current = file_meta.mode() & 0o777;
-                if current != 0o660 {
+                let shared = dir_meta.mode() & 0o2000 != 0; // parent setgid
+                let desired = if shared { 0o660 } else { 0o600 };
+                if file_meta.mode() & 0o777 != desired {
                     let _ = std::fs::set_permissions(
                         path,
-                        std::fs::Permissions::from_mode(0o660),
+                        std::fs::Permissions::from_mode(desired),
                     );
                 }
             }

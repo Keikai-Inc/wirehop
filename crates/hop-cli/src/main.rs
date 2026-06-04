@@ -389,7 +389,8 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     // (federation). Written to <config>/netdoc.ticket.
                     if let Ok(ticket) = net.write_ticket().await {
                         let ticket_str = ticket.to_string();
-                        let _ = std::fs::write(cfg.join("netdoc.ticket"), &ticket_str);
+                        // 0600 — this is a warren *write* ticket (security-audit H7).
+                        let _ = config::write_secret_file(&cfg.join("netdoc.ticket"), &ticket_str);
                         // The creator invite is generated at startup, before the
                         // netdoc namespace exists, so it can't embed the ticket
                         // up front. Augment it now (same secret) so the founder's
@@ -1228,9 +1229,11 @@ fn cmd_sandbox_shell(policy_json: &str, shell_args: &[String]) -> Result<()> {
     let policy: hop_core::sandbox::SandboxPolicy = serde_json::from_str(policy_json)
         .context("invalid sandbox policy JSON")?;
 
-    // Apply sandbox restrictions to this process
+    // Apply sandbox restrictions to this process. A restricted policy that the
+    // kernel can't enforce is fatal — refuse rather than exec unsandboxed.
     #[cfg(target_os = "linux")]
-    hop_core::sandbox::linux::apply_sandbox(&policy);
+    hop_core::sandbox::linux::apply_sandbox(&policy)
+        .map_err(|e| anyhow::anyhow!("sandbox enforcement failed: {e}"))?;
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -4119,7 +4122,9 @@ async fn cmd_warren(
 
             // Write the join ticket so `hop host` imports the warren namespace on
             // its next start (this is what makes the machine a node on the VPN).
-            std::fs::write(config_dir.join("netdoc-join.ticket"), &ticket)
+            // 0600 — warren *write* ticket; any local reader gains warren write
+            // access if this is world-readable (security-audit H7).
+            config::write_secret_file(&config_dir.join("netdoc-join.ticket"), &ticket)
                 .context("writing warren join ticket")?;
 
             // Redeem the invite for membership (auth handshake → the inviting host

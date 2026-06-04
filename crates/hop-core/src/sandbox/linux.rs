@@ -1,10 +1,17 @@
-//! Linux sandbox enforcement via Landlock, seccomp-BPF, and process hardening.
+//! Linux sandbox enforcement via Landlock and process hardening.
 //!
 //! Layer 2 (kernel-enforced) sandbox for Linux:
-//! - Landlock: filesystem access control (restrict read/write paths)
-//! - PR_SET_NO_NEW_PRIVS: prevent privilege escalation via setuid/setgid
+//! - Landlock filesystem access control (restrict read/write paths) — Linux 5.13+.
+//! - Landlock network rules (deny TCP bind/connect for `no_network`) — Linux 6.7+
+//!   (ABI v4). **Limitation:** Landlock cannot restrict UDP, so DNS and QUIC
+//!   still function under `no_network`; this blocks TCP egress only. On kernels
+//!   without ABI v4 the network restriction is unenforceable and is logged.
+//! - `PR_SET_NO_NEW_PRIVS`: prevent privilege escalation via setuid/setgid.
 //!
-//! Applied *after* fork, *before* exec in the child process.
+//! Applied *after* fork, *before* exec in the child process. When the policy is
+//! restricted, a failure to enforce the filesystem ruleset is **fatal** (the
+//! session is refused) rather than silently running unsandboxed — see
+//! `apply_sandbox` (security-audit H5/H6).
 
 use super::policy::SandboxPolicy;
 use std::path::PathBuf;
@@ -12,19 +19,28 @@ use std::process::Stdio;
 
 /// Apply Linux sandbox restrictions to the current process.
 ///
-/// This should be called in the child process after fork, before exec.
-/// It sets `PR_SET_NO_NEW_PRIVS` and applies Landlock rules if available.
+/// Called in the child process after fork, before exec (or in the
+/// `__sandbox-shell` self-exec wrapper). Sets `PR_SET_NO_NEW_PRIVS`, then
+/// applies the Landlock filesystem ruleset and — for `no_network` — the
+/// Landlock TCP rules.
 ///
-/// Failures are logged but not fatal — the sandbox is best-effort on older
-/// kernels that lack Landlock support.
-pub fn apply_sandbox(policy: &SandboxPolicy) {
+/// Returns `Err` when a restricted policy cannot be enforced (e.g. the kernel
+/// lacks Landlock): the caller must refuse the session rather than run the peer
+/// unsandboxed. Network-rule unavailability is logged but not fatal, because it
+/// degrades to "no TCP isolation" which the caller documents, whereas a missing
+/// filesystem boundary would silently expose the whole host.
+pub fn apply_sandbox(policy: &SandboxPolicy) -> Result<(), String> {
     // Layer 3: Always set no_new_privs to prevent privilege escalation
     set_no_new_privs();
 
-    // Layer 2: Landlock filesystem restrictions
-    if let Err(e) = apply_landlock(policy) {
-        tracing::warn!("Landlock sandbox not applied: {e}");
+    // Layer 2: Landlock filesystem restrictions (fatal when restricted).
+    apply_landlock(policy)?;
+
+    // Layer 2b: Landlock network restriction for no_network (best-effort).
+    if policy.no_network {
+        apply_landlock_net();
     }
+    Ok(())
 }
 
 /// Set `PR_SET_NO_NEW_PRIVS` to prevent the child from gaining privileges
@@ -117,8 +133,16 @@ fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
             }
         }
 
-        ruleset.restrict_self()
+        let status = ruleset.restrict_self()
             .map_err(|e| format!("landlock restrict_self: {e}"))?;
+
+        // H6: a restricted policy that the kernel won't enforce is fatal — the
+        // caller refuses the session rather than running the peer unsandboxed.
+        if matches!(status.ruleset, landlock::RulesetStatus::NotEnforced) {
+            return Err(
+                "Landlock unavailable (kernel < 5.13); refusing restricted session".to_string(),
+            );
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -127,6 +151,40 @@ fn apply_landlock(policy: &SandboxPolicy) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Deny TCP bind/connect for `no_network` policies via Landlock network rules
+/// (ABI v4, Linux 6.7+). Best-effort: on kernels without network-Landlock this
+/// can't be enforced and is logged loudly. **Does not** restrict UDP (DNS/QUIC
+/// remain reachable) — that is a Landlock limitation, documented at module level
+/// (security-audit H5).
+#[allow(unused_variables)]
+fn apply_landlock_net() {
+    #[cfg(target_os = "linux")]
+    {
+        use landlock::{AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus};
+
+        let result = (|| -> Result<RulesetStatus, String> {
+            // Handle bind+connect but add no allow rules → all TCP denied.
+            // Default BestEffort compat degrades to NotEnforced on kernels < 6.7.
+            let status = Ruleset::default()
+                .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)
+                .map_err(|e| format!("landlock net handle_access: {e}"))?
+                .create()
+                .map_err(|e| format!("landlock net create: {e}"))?
+                .restrict_self()
+                .map_err(|e| format!("landlock net restrict_self: {e}"))?;
+            Ok(status.ruleset)
+        })();
+        match result {
+            Ok(RulesetStatus::NotEnforced) => tracing::error!(
+                "no_network requested but Landlock network rules are unenforceable \
+                 (kernel < 6.7 / ABI < v4): TCP egress is NOT isolated"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!("no_network: failed to apply Landlock network rules: {e}"),
+        }
+    }
 }
 
 /// Build a `tokio::process::Command` that applies sandbox restrictions.
@@ -147,8 +205,8 @@ pub fn sandboxed_command(cmd: &str, policy: &SandboxPolicy) -> tokio::process::C
         let policy_clone = policy.clone();
         unsafe {
             command.pre_exec(move || {
-                apply_sandbox(&policy_clone);
-                Ok(())
+                apply_sandbox(&policy_clone)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
             });
         }
     }
