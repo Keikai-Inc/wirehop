@@ -23,6 +23,21 @@
     <key>ThrottleInterval</key>
     <integer>5</integer>
 
+    <!-- Raise the file-descriptor ceiling. launchd's default soft NOFILE is
+         256, which a long-running multi-session daemon (each shell holds PTY
+         fds) exhausts; once hit, every new session fails to spawn a shell with
+         EMFILE. 65536 gives ample headroom. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/var/log/hop-stdout.log</string>
 

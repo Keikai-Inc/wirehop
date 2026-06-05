@@ -450,6 +450,7 @@ fn spawn_persistent_pty(
     watch::Sender<PtySize>,                                          // resize_tx (current size)
     watch::Receiver<Option<i32>>,                                     // exit_rx
     Arc<std::sync::Mutex<hop_vt::VtScreen>>,                          // screen
+    Option<u32>,                                                     // child pid (for kill-on-removal)
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -604,7 +605,10 @@ fn spawn_persistent_pty(
         }
     });
 
-    // Child exit watcher
+    // Child exit watcher. Capture the pid first so the registry can terminate
+    // the shell on removal (the master-drop SIGHUP path doesn't fire — the
+    // reader task holds a clone of the master; see session_registry).
+    let child_pid = child.process_id();
     let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
     tokio::task::spawn_blocking(move || {
         if let Ok(status) = child.wait() {
@@ -613,7 +617,7 @@ fn spawn_persistent_pty(
         }
     });
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -765,13 +769,14 @@ pub async fn host_shell_session_persistent(
                 )
             } else {
                 // Session gone or exited — spawn new
-                let (sid, itx, output_route, rtx, erx, scr) =
+                let (sid, itx, output_route, rtx, erx, scr, child_pid) =
                     spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
                     session_id: sid.clone(),
                     peer_id: peer_id.to_string(),
                     username: username.map(String::from),
+                    child_pid,
                     input_tx: itx.clone(),
                     output_route,
                     resize_tx: rtx.clone(),
@@ -787,13 +792,14 @@ pub async fn host_shell_session_persistent(
             }
         } else {
             // New connection — always spawn a new PTY
-            let (sid, itx, output_route, rtx, erx, scr) =
+            let (sid, itx, output_route, rtx, erx, scr, child_pid) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
                 session_id: sid.clone(),
                 peer_id: peer_id.to_string(),
                 username: username.map(String::from),
+                child_pid,
                 input_tx: itx.clone(),
                 output_route,
                 resize_tx: rtx.clone(),

@@ -15,9 +15,16 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// A persistent PTY session that survives client disconnects.
 ///
 /// The PTY master handle lives in a background task (spawned by `spawn_pty_session`)
-/// that keeps the PTY alive and handles resize commands. Dropping this struct closes
-/// the resize channel, which causes the background task to exit and drop the master,
-/// sending SIGHUP to the shell.
+/// that keeps the PTY alive and handles resize commands.
+///
+/// **Cleanup contract:** removing a session from the registry must call
+/// [`DetachedSession::kill_child`] so the shell process is terminated and the
+/// PTY's `/dev/ptmx` master is reclaimed. Dropping the struct alone is *not*
+/// enough: although dropping it closes the resize channel (which drops the
+/// master-owning task's handle), the PTY reader task holds a `try_clone_reader`
+/// clone of the master, so the kernel never hangs up the shell — the shell
+/// keeps running and that cloned master fd leaks. Every evicted/reaped detached
+/// session would otherwise leak a descriptor and orphan a shell.
 pub struct DetachedSession {
     /// Random 16-byte hex session identifier (also the registry key).
     pub session_id: String,
@@ -25,6 +32,10 @@ pub struct DetachedSession {
     pub peer_id: String,
     /// Unix username the session runs as.
     pub username: Option<String>,
+    /// OS pid of the shell child (process-group leader; the PTY puts it in its
+    /// own session via `setsid`). Used by [`kill_child`](Self::kill_child) to
+    /// terminate the shell when the session leaves the registry.
+    pub child_pid: Option<u32>,
     /// Send input bytes to the PTY writer task. Unbounded so the host's
     /// shell select-loop never blocks on send when a fast paste fills the
     /// PTY's kernel input buffer — blocking the loop would starve
@@ -70,6 +81,31 @@ impl DetachedSession {
     /// Check if the child process has exited.
     pub fn has_exited(&self) -> bool {
         (*self.exit_rx.borrow()).is_some()
+    }
+
+    /// Terminate the session's shell so its PTY closes and the `/dev/ptmx`
+    /// master is reclaimed. Required on every removal path — see the struct
+    /// docs for why dropping the session is not sufficient.
+    ///
+    /// No-op if the child has already exited (which also avoids signalling a
+    /// reused pid). Signals the whole process group (`-pid`): the PTY shell is
+    /// a session/group leader (`setsid`), so this also reaps any foreground job
+    /// still holding the slave open, which is what actually lets the reader
+    /// task hit EOF and drop its cloned master fd.
+    pub fn kill_child(&self) {
+        if self.has_exited() {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.child_pid {
+            // SIGHUP first (the natural terminal-hangup; lets a well-behaved
+            // shell run its EXIT traps), then SIGKILL to guarantee reclamation.
+            unsafe {
+                let gpid = -(pid as i32);
+                libc::kill(gpid, libc::SIGHUP);
+                libc::kill(gpid, libc::SIGKILL);
+            }
+        }
     }
 
     /// Attach a client: route output to the given sender.
@@ -144,9 +180,15 @@ impl SessionRegistry {
         }
     }
 
-    /// Remove a session and return it (dropping it will close the PTY).
+    /// Remove a session and return it. Kills the shell child first so the PTY
+    /// master is reclaimed (a no-op when the child has already exited, which is
+    /// the usual case for the cleanup-on-exit path).
     pub fn remove(&mut self, session_id: &str) -> Option<DetachedSession> {
-        self.sessions.remove(session_id)
+        let session = self.sessions.remove(session_id);
+        if let Some(ref s) = session {
+            s.kill_child();
+        }
+        session
     }
 
     /// Number of sessions currently in the registry.
@@ -165,12 +207,14 @@ impl SessionRegistry {
         self.sessions.retain(|_id, session| {
             if session.has_exited() && !session.attached {
                 tracing::debug!("Reaping exited session {} (peer: {})", &session.session_id[..8], &session.peer_id[..10.min(session.peer_id.len())]);
+                session.kill_child(); // no-op (already exited); keeps the contract uniform
                 return false;
             }
             if let Some(detached_at) = session.detached_at
                 && !session.attached && detached_at.elapsed() > self.timeout
             {
                 tracing::debug!("Reaping expired session {} (peer: {})", &session.session_id[..8], &session.peer_id[..10.min(session.peer_id.len())]);
+                session.kill_child(); // detached past timeout but still running → terminate, reclaim the PTY
                 return false;
             }
             true
@@ -189,7 +233,12 @@ impl SessionRegistry {
 
         if let Some(id) = oldest {
             tracing::info!("Evicting oldest detached session {} (at capacity)", &id[..8.min(id.len())]);
-            self.sessions.remove(&id);
+            if let Some(session) = self.sessions.remove(&id) {
+                // The evicted session's shell is still running (it's detached,
+                // not exited) — kill it so its PTY master is reclaimed instead
+                // of leaking until the process happens to die on its own.
+                session.kill_child();
+            }
         }
     }
 }
@@ -426,6 +475,7 @@ mod tests {
             session_id: id.into(),
             peer_id: peer.into(),
             username: None,
+            child_pid: None,
             input_tx,
             output_route,
             resize_tx,
@@ -502,6 +552,55 @@ mod tests {
 
         let session_error = make_session("error", "peer1", true, Some(1));
         assert!(session_error.has_exited(), "session with non-zero exit should be exited");
+    }
+
+    /// Regression (PTY fd leak): removing a session must terminate its shell
+    /// child, so the PTY master is reclaimed instead of leaking. Spawns a real
+    /// child in its own session (mirroring the PTY shell's `setsid`) so the
+    /// group-kill can't touch the test runner, then asserts removal killed it.
+    #[cfg(unix)]
+    #[test]
+    fn kill_child_terminates_the_shell_on_removal() {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        // setsid() in the child → its own session/process group, exactly like
+        // portable-pty's PTY shell. Without this, kill_child's `-pid` group
+        // signal would hit the test process's own group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        // Don't let std's Child reap it on drop — we reap manually below.
+        std::mem::forget(child);
+
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "child should be alive before removal"
+        );
+
+        let mut reg = SessionRegistry::new(Duration::from_secs(3600), 10);
+        let mut session = make_session("leaky", "peer1", false, None);
+        session.child_pid = Some(pid);
+        reg.insert(session);
+
+        let removed = reg.remove("leaky");
+        assert!(removed.is_some(), "session should have been removed");
+
+        // Reap the killed child, then confirm the pid is gone.
+        std::thread::sleep(Duration::from_millis(250));
+        unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+        let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(
+            !still_alive,
+            "removing the session must have killed the shell child (PTY reclaimed)"
+        );
     }
 
     #[test]
