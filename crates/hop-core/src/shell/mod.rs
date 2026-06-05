@@ -431,6 +431,89 @@ async fn read_setup_messages(
     (initial_size, env_vars, leftover_msg)
 }
 
+/// Spawn the cancellable PTY-output reader (security: PTY fd-leak hardening).
+///
+/// Owns a `dup`'d, non-blocking clone of the PTY master `master_fd`, wrapped in
+/// an `AsyncFd`, and feeds each chunk into `screen` and (when a client is
+/// attached) the route channel. The task ends — dropping the master clone and
+/// reclaiming the `/dev/ptmx` — on **either** EOF (the slave fully closed) or a
+/// `cancel` notification. Cancellation is what makes fd reclamation independent
+/// of the child: the registry fires `cancel` on removal, so the daemon releases
+/// its master fd even if a backgrounded/`nohup`'d survivor still holds the slave
+/// open and EOF never comes.
+#[cfg(unix)]
+fn spawn_cancellable_pty_reader(
+    master_fd: std::os::unix::io::RawFd,
+    screen: Arc<std::sync::Mutex<hop_vt::VtScreen>>,
+    route_rx: watch::Receiver<Option<mpsc::Sender<Vec<u8>>>>,
+    cancel: Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Dup the master so the reader owns an independent fd it can close on cancel
+    // without disturbing the master handle held by the resize task.
+    let dup = unsafe { libc::dup(master_fd) };
+    if dup < 0 {
+        return Err(anyhow::anyhow!("dup PTY master: {}", std::io::Error::last_os_error()));
+    }
+    // AsyncFd requires the fd be non-blocking.
+    unsafe {
+        let flags = libc::fcntl(dup, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(dup, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(dup);
+            return Err(anyhow::anyhow!("set PTY master non-blocking: {e}"));
+        }
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+    let async_fd = tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE)
+        .context("register PTY master with reactor")?;
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.notified() => break,
+                readable = async_fd.readable() => {
+                    let mut guard = match readable {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let read_res = guard.try_io(|afd| {
+                        let raw = afd.get_ref().as_raw_fd();
+                        let n = unsafe {
+                            libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(n as usize)
+                        }
+                    });
+                    match read_res {
+                        Ok(Ok(0)) => break,            // EOF: slave fully closed
+                        Ok(Ok(n)) => {
+                            let data = buf[..n].to_vec();
+                            { screen.lock().unwrap().advance(&data); }
+                            // Clone the sender out of the watch borrow *before*
+                            // awaiting, so we never hold the Ref across .await.
+                            let tx = route_rx.borrow().clone();
+                            if let Some(tx) = tx {
+                                let _ = tx.send(data).await;
+                            }
+                        }
+                        Ok(Err(_)) => break,           // read error (e.g. EIO on hangup)
+                        Err(_would_block) => continue, // readiness cleared; re-poll
+                    }
+                }
+            }
+        }
+        // async_fd drops here → the dup'd master fd closes.
+    });
+    Ok(())
+}
+
 /// Spawn a new PTY session with all persistent infrastructure.
 ///
 /// The PTY master lives in a background task that handles resize commands
@@ -451,6 +534,7 @@ fn spawn_persistent_pty(
     watch::Receiver<Option<i32>>,                                     // exit_rx
     Arc<std::sync::Mutex<hop_vt::VtScreen>>,                          // screen
     Option<u32>,                                                     // child pid (for kill-on-removal)
+    Arc<tokio::sync::Notify>,                                        // reader cancel (release master fd on removal)
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -526,26 +610,54 @@ fn spawn_persistent_pty(
     )));
 
     // Persistent PTY reader — feeds VtScreen, routes to client if attached.
-    let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-    let route_rx = output_route_rx.clone();
-    let reader_screen = screen.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match pty_reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    { reader_screen.lock().unwrap().advance(&data); }
-                    // Route to client if attached
-                    if let Some(tx) = route_rx.borrow().clone() {
-                        let _ = tx.blocking_send(data);
+    //
+    // The reader is *cancellable* (security: PTY fd-leak hardening): it owns a
+    // dup'd, non-blocking clone of the master wrapped in an `AsyncFd` and
+    // selects on a `reader_cancel` signal. On session removal the registry
+    // fires that signal, so the task drops its master fd **immediately** and
+    // the `/dev/ptmx` is reclaimed — even if a survivor process (a backgrounded
+    // or `nohup`'d job) still holds the slave open and EOF never arrives.
+    // Killing the shell alone isn't enough in that case; this is what makes
+    // reclamation independent of what the child or its leftover jobs do.
+    let reader_cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    #[cfg(unix)]
+    {
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .context("PTY master exposes no raw fd")?;
+        spawn_cancellable_pty_reader(
+            master_fd,
+            screen.clone(),
+            output_route_rx.clone(),
+            reader_cancel.clone(),
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-unix is not a shipped target; fall back to the blocking reader
+        // (no cancellation — `reader_cancel` is inert here).
+        let _ = &reader_cancel;
+        let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+        let route_rx = output_route_rx.clone();
+        let reader_screen = screen.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty_reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        { reader_screen.lock().unwrap().advance(&data); }
+                        if let Some(tx) = route_rx.borrow().clone() {
+                            let _ = tx.blocking_send(data);
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
+    }
 
     // Input writer task. Unbounded so the shell select-loop never blocks on
     // send: if the PTY's small kernel input buffer fills mid-paste, bytes
@@ -617,7 +729,7 @@ fn spawn_persistent_pty(
         }
     });
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -769,7 +881,7 @@ pub async fn host_shell_session_persistent(
                 )
             } else {
                 // Session gone or exited — spawn new
-                let (sid, itx, output_route, rtx, erx, scr, child_pid) =
+                let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
                     spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
@@ -777,6 +889,7 @@ pub async fn host_shell_session_persistent(
                     peer_id: peer_id.to_string(),
                     username: username.map(String::from),
                     child_pid,
+                    reader_cancel,
                     input_tx: itx.clone(),
                     output_route,
                     resize_tx: rtx.clone(),
@@ -792,7 +905,7 @@ pub async fn host_shell_session_persistent(
             }
         } else {
             // New connection — always spawn a new PTY
-            let (sid, itx, output_route, rtx, erx, scr, child_pid) =
+            let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
@@ -800,6 +913,7 @@ pub async fn host_shell_session_persistent(
                 peer_id: peer_id.to_string(),
                 username: username.map(String::from),
                 child_pid,
+                reader_cancel,
                 input_tx: itx.clone(),
                 output_route,
                 resize_tx: rtx.clone(),
@@ -1451,6 +1565,62 @@ pub async fn client_exec_session(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod reader_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The cancellable PTY reader must stop on `cancel` **without** an EOF —
+    /// proving the daemon releases its master fd even when a survivor process
+    /// keeps the slave open (a backgrounded/`nohup`'d job). Uses a plain pipe as
+    /// a stand-in PTY whose write-end is held open the entire test.
+    #[tokio::test]
+    async fn cancellable_reader_stops_on_cancel_without_eof() {
+        // pipe(): read-end = what the reader consumes, write-end = the "shell".
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        let screen = Arc::new(std::sync::Mutex::new(hop_vt::VtScreen::new(24, 80)));
+        let (route_tx, mut route_rx_chan) = mpsc::channel::<Vec<u8>>(16);
+        // The reader takes a watch::Receiver<Option<Sender>>; seed it attached.
+        let (_route_set, route_get) = watch::channel(Some(route_tx));
+        let cancel = Arc::new(tokio::sync::Notify::new());
+
+        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone())
+            .expect("spawn reader");
+
+        // 1) Data flows through before cancel.
+        let n = unsafe { libc::write(write_fd, b"hi".as_ptr() as *const libc::c_void, 2) };
+        assert_eq!(n, 2);
+        let first = tokio::time::timeout(Duration::from_secs(2), route_rx_chan.recv())
+            .await
+            .expect("reader should route data")
+            .expect("route channel open");
+        assert_eq!(first, b"hi");
+
+        // 2) Cancel — the write-end is STILL open, so there is no EOF.
+        cancel.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 3) A subsequent write must NOT be routed: the reader stopped and
+        //    dropped its master fd despite no EOF.
+        let n = unsafe { libc::write(write_fd, b"after".as_ptr() as *const libc::c_void, 5) };
+        assert_eq!(n, 5);
+        let after = tokio::time::timeout(Duration::from_millis(500), route_rx_chan.recv()).await;
+        assert!(
+            after.is_err(),
+            "reader must have stopped after cancel (nothing routed despite no EOF)"
+        );
+
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
         }
     }
 }
