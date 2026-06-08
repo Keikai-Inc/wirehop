@@ -103,7 +103,11 @@ pub enum InviteTier { #[default] Client, WarrenOnly, Node, Admin }
 | *(none)* | `client` (reach-only — current default behavior) |
 | `--warren` | `node` (mesh + session reach) |
 | `--warren-only` | `warren-only` (mesh, no host sessions) |
-| `--admin` (replaces/aliases `--creator`) | `admin` |
+| `--admin` | `admin` |
+
+Flag names confirmed (decision 2): `--warren` / `--warren-only` / `--admin`.
+`--creator` is kept as a **deprecated, hidden alias** for `--admin` so existing
+scripts and the auto-generated `creator_invite` keep working.
 
 `--role`, `--user`, `--read-only`, `--no-network`, `--scope`, `--allow-command`,
 `--preset` continue to apply orthogonally (they shape reach/confinement/identity
@@ -117,8 +121,9 @@ present + `PeerRole::Creator` → `Admin`; `warren_ticket` present → `Node`; e
 ## 5. Install model — one install, self-upgrade
 
 **There is one install.** Everyone runs the same command; it installs the binary
-as a **client** (no sudo — one-time `sudo` only to write `/usr/local/bin`, or
-none with `--dir ~/.local/bin`):
+as a **client** into a **user-writable** dir (`~/.local/bin`) with **zero sudo**
+(decision 7). A pure client only ever runs as the user, so a user-owned binary
+has no escalation surface:
 
 ```
 curl -fsSL https://hop.keikai.ai/install.sh | bash
@@ -154,19 +159,42 @@ This is precisely the **H10** remediation: the invite is decoded and the trust
 decision is shown **before** any root is acquired, instead of today's
 `sudo hop warren join <attacker-influenceable-invite>` which dials out as root.
 
+### Binary location — the root-owned invariant (decision 7 security)
+
+> **A root daemon must only ever execute a root-owned, root-only-writable
+> binary. It must never run one from a user-writable path** (`~/.local/bin`,
+> `~/bin`, …).
+
+If the always-on root daemon ran a user-writable file, anything in that user's
+account (a bug, a bad dependency, malware) could overwrite it and execute
+arbitrary code **as root** on the next start — a privilege-escalation hole.
+
+`~/.local/bin/hop` (zero-sudo) is fine for a **pure client** — it only ever runs
+as the user. But the self-upgrade to a root daemon must **verify-then-promote**:
+
+1. **Verify** the binary against the published release checksum/signature (this
+   is the natural home for artifact signing, security-audit H9).
+2. **Promote** the verified bytes into a root-owned path (`/usr/local/bin/hop`,
+   `root:wheel`, `0755`) under the one upgrade-time `sudo`.
+3. Point the LaunchDaemon/systemd unit at **that** path — never at `~/.local/bin`.
+
+The upgrade never `sudo`s the user-writable binary; it verifies a clean copy and
+lays it down root-owned. "Become a server" is a sudo moment anyway, so zero-sudo
+applies only to the pure-client lifetime — which is correct.
+
 ### How the binary performs the privileged install
-**Recommended:** a hidden `hop __install-daemon` subcommand that drops the
+**Decision 1 — embedded.** A hidden `hop __install-daemon` subcommand drops the
 LaunchDaemon plist / systemd unit from **embedded templates** and registers the
-service, invoked by the parent `hop` via `sudo`. Rationale:
-- No network round-trip at upgrade time (works offline / air-gapped).
-- Uses the already-trusted local binary — no re-fetch of `install-daemon.sh`
-  (avoids a fresh supply-chain + TOCTOU surface mid-upgrade).
+service. It runs from the **promoted, root-owned** `/usr/local/bin/hop` (per the
+invariant above), invoked under the upgrade `sudo`. Rationale:
+- No network round-trip for the *setup logic* (works offline / air-gapped).
+- Runs a verified, root-owned binary — not the user-writable one.
 - Testable in-process; one code path for macOS (launchd) and Linux (systemd).
 
-**Lighter alternative (interim):** `hop` shells out to
-`sudo bash <(curl … install-daemon.sh) …`. Less new Rust, but re-downloads and
-depends on the network + CDN integrity at the worst moment. Use only as a
-stop-gap.
+(The verify-and-promote step in the invariant may fetch a fresh verified binary
+from the CDN, or verify the local binary against the published `.sha256` and copy
+it — either is fine; the small checksum fetch avoids re-downloading the whole
+binary.)
 
 ### Keep the up-front path for automation
 `--host` and the fleet `--register` (aggregate-invite) paths stay as the
@@ -191,35 +219,46 @@ not the default.
 
 ## 7. Sequencing
 
-Ordered so each phase ships independent value and the security-critical work is
-isolated:
+**Security first (decision 5).** The C1 trust-model fix is Phase 0 — the tiers
+are *born* on the read/write split, so we never ship an over-powered interim
+"node" running on a write ticket.
 
-- **Phase 0 — Install UX + tier scaffolding (no security change).**
-  One-command install + copy fixes on the site. Add `InviteTier` to
-  `InviteToken` (back-compat inference for old invites) and the `hop invite`
-  flags. Implement the self-upgrade flow + `hop __install-daemon` (this alone
-  delivers the **H10** improvement: decode-as-user → consent → escalate). Node
-  invites still carry today's write ticket for now.
-- **Phase 1 — C1 read/write ticket split.** `node`/`warren-only` invites carry a
-  **read-scoped** membership ticket; **write** is reserved for `admin`; the doc
-  enforces author-validated writes (read replicas can't rewrite `vpn`/`name`/
-  `ip`/role entries). This is what makes "node, not admin" *trustworthy* and
-  closes C1 — building the tier system and fixing C1 are the same work.
-- **Phase 2 — warren-only enforcement + fleet.** A role flag that **denies host
-  sessions** while still allowing L3 reach (so `warren-only` truly can't `hop`
-  into a box). Aggregate/fleet invites carry an explicit tier.
+- **Phase 0 — Close C1 (the keystone).** Read-scoped membership tickets vs. a
+  write ticket reserved for admin; the doc enforces **author-validated writes**
+  (a read replica cannot rewrite another node's `vpn`/`name`/`ip`/role entries).
+  After this the warren is trustworthy and a "node, not admin" membership is a
+  real, safe thing to grant. (Subsumes the deferred C1 work in
+  [security-audit.md](security-audit.md); H1/H2/M6 collapse with it.)
+- **Phase 1 — Tiers + unified install + self-upgrade (built on the secure base).**
+  Add `InviteTier` to `InviteToken` (+ back-compat inference) and the `hop
+  invite` flags; node/warren tiers issue **read** tickets, admin issues **write**.
+  One-command zero-sudo client install; the self-upgrade flow with the
+  verify-then-promote root-owned-binary invariant (§5) and `hop __install-daemon`
+  (delivers the **H10** fix: decode-as-user → consent → escalate). Website
+  rebuild: one command + optional invite-paste **tier preview** (decision 3) +
+  the advanced "provision now" disclosure. **warren-only ships in this phase**
+  (decision 4), including the role flag that **denies host sessions** while
+  allowing L3 reach.
+- **Phase 2 — Fleet + polish.** Aggregate/fleet invites carry an explicit tier;
+  artifact signing wired into verify-then-promote (H9); any remaining
+  warren-only / capability-preview refinements.
 
-Rationale: Phase 0 is pure UX + a security *improvement* (H10) with no risky
-trust-model change; Phase 1 carries the security weight (C1) and unlocks the
-node-without-admin tier; Phase 2 completes warren-only and fleet coverage.
+**Can land anytime (no trust-model change):** the website **copy fixes** — delete
+every "VPN on by default" (`index.html:627/881/341/534`); the VPN has been
+opt-in/off-by-default since 0.6.37.
 
-## 8. Open decisions
+## 8. Decisions (resolved)
 
-- Final CLI flag spelling (`--warren` vs `--node`; keep `--creator` as an alias
-  for `--admin`?).
-- Whether the website decodes the invite to preview the tier (nice, but the page
-  then parses a token — keep it read-only/no-network).
-- Whether `warren-only` ships in v1 or waits for Phase 2 (it needs the
-  session-deny role enforcement to be meaningful).
-- `hop __install-daemon` embedded templates vs. shelling to the installer — the
-  spec recommends embedded; confirm before building.
+| # | Decision | Resolution |
+|---|---|---|
+| 1 | Daemon-install mechanism | **Embedded** `hop __install-daemon` (offline-capable, runs the verified root-owned binary). |
+| 2 | Invite flag names | **`--warren` / `--warren-only` / `--admin`**; `--creator` kept as a deprecated hidden alias. |
+| 3 | Website previews the invite tier? | **Yes** — decode the token **in-browser only** (no network, read-only). |
+| 4 | Ship `warren-only` in v1? | **Yes** — in Phase 1, with the session-deny role enforcement. |
+| 5 | Order vs. the C1 security fix | **Security first** — C1 is Phase 0; tiers/install build on it. |
+| 6 | Self-upgrade default + keep up-front for automation | **Confirmed** — client-first for humans; `--host`/`--register` stay for non-interactive provisioning. |
+| 7 | Client binary location | **`~/.local/bin`, zero sudo** for the pure client — **but** the root daemon must run a **verified, root-owned** binary, so self-upgrade *verifies-then-promotes* to `/usr/local/bin` (§5 invariant). |
+
+Remaining to confirm before building Phase 1: exact `InviteTier` wire shape and
+whether the verify-then-promote step re-fetches the binary or checksum-verifies
+the local one (both acceptable; pick when artifact signing lands).
