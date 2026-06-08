@@ -883,6 +883,20 @@ async fn handle_incoming_inner(
     Ok(())
 }
 
+/// Whether a hop system daemon (LaunchDaemon on macOS, systemd unit on Linux)
+/// is already installed — used by the self-upgrade flow to decide whether to
+/// offer setup or just tell the user to restart the existing daemon.
+fn system_daemon_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/Library/LaunchDaemons/com.hop.daemon.plist").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::path::Path::new("/etc/systemd/system/hop.service").exists()
+    }
+}
+
 /// Whether the peer's named role is `network_only` (warren-only tier): on the
 /// mesh for L3 reach, but barred from host sessions. Resolves peers.json →
 /// role_name → the role definition. Best-effort: a missing role/peer = not
@@ -4203,11 +4217,51 @@ async fn cmd_warren(
                 }
             }
 
+            // Self-upgrade (install-and-invite-tiers.md Phase 1b): the invite was
+            // decoded + redeemed as *this user* above (no root yet — the H10 fix).
+            // Becoming a warren node needs a system daemon (root). Offer to set it
+            // up now, reusing the battle-tested installer (which verifies the
+            // download and promotes the binary to a root-owned path — §5 invariant).
+            let cdn = std::env::var("HOP_CDN_URL").unwrap_or_else(|_| "https://hop.keik.ai".to_string());
             println!();
-            println!("This machine will join the warren VPN on the next host start.");
-            println!("  • Already a host/daemon?  restart it (the join ticket is now in place).");
-            println!("  • Client-only right now?  put it on the VPN with:");
-            println!("      curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --host");
+            if system_daemon_installed() {
+                println!("Joined. A system daemon is already installed — restart it to pick up the");
+                println!("warren (the join ticket is now in place):");
+                #[cfg(target_os = "macos")]
+                println!("      sudo launchctl kickstart -k system/com.hop.daemon");
+                #[cfg(not(target_os = "macos"))]
+                println!("      sudo systemctl restart hop");
+            } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                println!("To put this machine on the warren VPN it must run as a system daemon");
+                println!("(root). Set it up now? This runs the official installer with sudo.");
+                print!("  Proceed? [y/N] ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut answer = String::new();
+                let _ = std::io::stdin().read_line(&mut answer);
+                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    // No --invite here: the join ticket is already written, so the
+                    // daemon installer must not redeem a second time.
+                    let cmd = format!("curl -fsSL {cdn}/install.sh | bash -s -- --host");
+                    println!("Running: sudo bash -c \"{cmd}\"");
+                    let status = std::process::Command::new("sudo")
+                        .args(["bash", "-c", &cmd])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => println!("Daemon set up — this machine is now on the warren."),
+                        _ => {
+                            println!("Daemon setup did not complete. The join ticket is saved; finish later with:");
+                            println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
+                        }
+                    }
+                } else {
+                    println!("Skipped. The join ticket is saved; put this machine on the VPN anytime with:");
+                    println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
+                }
+            } else {
+                // Non-interactive (scripts): never prompt — print the explicit step.
+                println!("Joined. This machine will be on the warren once it runs as a system daemon:");
+                println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
+            }
             Ok(())
         }
         WarrenAction::Status => {
