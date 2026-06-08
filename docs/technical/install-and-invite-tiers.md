@@ -1,9 +1,11 @@
 # Install Model & Invite Capability Tiers (Design)
 
-> **Status: Design / Planned.** This specifies a unified install convention and
-> an explicit invite-capability model. None of it is implemented yet. It is
-> sequenced against the C1 warren write-authorization work in
-> [security-audit.md](security-audit.md); see [§7 Sequencing](#7-sequencing).
+> **Status: Design / Planned (with a code-level implementation plan).** This
+> specifies a unified install convention and an explicit invite-capability
+> model. None of it is implemented yet. Decisions are resolved in [§8](#8-decisions-resolved);
+> the phase-by-phase, file-level build plan is in [§9](#9-implementation-plan-code-level).
+> It is sequenced against the C1 warren write-authorization work in
+> [security-audit.md](security-audit.md) (now Phase 0).
 
 ## 1. Problem
 
@@ -262,3 +264,151 @@ opt-in/off-by-default since 0.6.37.
 Remaining to confirm before building Phase 1: exact `InviteTier` wire shape and
 whether the verify-then-promote step re-fetches the binary or checksum-verifies
 the local one (both acceptable; pick when artifact signing lands).
+
+---
+
+## 9. Implementation plan (code-level)
+
+Grounding facts from the current code (`crates/hop-core/src/netdoc/mod.rs` unless
+noted):
+- `read_ticket()` (`ShareMode::Read`) and `write_ticket()` (`ShareMode::Write`)
+  **already exist**; today every invite ships the **write** ticket.
+- The doc author is **per-host** (`docs.author_default()`, stored as
+  `NetDoc::author`); the netdoc endpoint key is derived from the host secret
+  (`net::derive_netdoc_secret_key`), so it's stable across restarts.
+- `iroh_docs::Entry` exposes `.author()` (iroh-docs 0.97) but the read path
+  (`decode_entry`/`list_prefix`, `reconcile`, `resume_sync`,
+  `refresh_vpn_peer_ips`, `list_virtual_ips`, `lookup_*`, `vpn_reach_allowed`,
+  `get_peer`, `is_revoked`) **never checks it**.
+- Doc keys: admin-owned → `peer/<node>`, `role/<name>`, `revocation/<node>`,
+  `acl/cedar`, `network/domain`; self-owned → `vpn/<addr>`, `ip/<addr>`,
+  `tag/<node>`, `posture/<node>`, `name/<n>`.
+- Federated joiners already **don't** self-write `peer/<node>` — the inviter
+  writes it (`enable_vpn` self-registers only when `!self.federated`).
+
+### Phase 0 — Close C1
+
+The exploit (a member forging `vpn/<victim>` etc.) is closed by **validating the
+author on read**; read-only tickets are the follow-on hardening.
+
+**0a — Author-validated reads (closes the exploit; keep write tickets for now).**
+1. *Identity binding.* Add `netdoc_author: Option<String>` (and `netdoc_node`)
+   to the `Peer` doc entry (`config`/`proto` Peer type) and to the redeem
+   handshake. The redeem already runs (`cmd_warren` → `cmd_exec` to the inviting
+   host, consumed in `auth/mod.rs`); extend the client→host auth message to carry
+   the joiner's **netdoc** NodeId/author, and have the inviting host record it
+   when it writes the admin-authored `peer/<node>` (`put_peer`). The admin is
+   vouching: "node N's doc author is A_N."
+2. *Admin author set.* The namespace **creator's** author is the root admin
+   (it created the namespace). Persist the admin author set in an admin-authored
+   `admin/<author>` entry; v1 = just the founder, with room to promote co-admins
+   later. Expose `NetDoc::is_admin_author(&AuthorId)`.
+3. *Central validator.* Add `fn entry_author_ok(key: &[u8], value_node: Option<&str>, author: &AuthorId) -> bool`:
+   - admin keys (`peer/ role/ revocation/ acl/ network/ admin/`) → `is_admin_author`.
+   - self keys (`vpn/ ip/ tag/ posture/ name/`) → `author == vouched_author_for(owning_node)` **and** the owning node matches the admin-authored ownership (`ip/<addr>`→node, `peer/<node>` exists). Unknown/unbound author → reject.
+   Call it in `decode_entry`/`list_prefix` and each consume site listed above;
+   **ignore** (don't act on) entries that fail. Log at `debug`.
+4. *Tests* (netdoc, two authors): a `vpn/<victim>` written by a non-owner author
+   is ignored; a legit self-entry passes; a `peer/`/`role/` from a non-admin
+   author is ignored; revocation by a non-admin is ignored.
+
+**0b — Read-ticket members (remove the write capability).**
+5. Invites for the **node / warren-only** tiers carry `read_ticket()`; **admin**
+   carries `write_ticket()`. (Change the `main.rs` creator-invite augmentation +
+   `generate_invite_with_role` to pick the ticket by tier — depends on 1a.)
+6. Members can no longer self-write `vpn/ ip/ tag/ posture/ name/`. Replace with a
+   **node-announce**: on join and periodically, the member sends its endpoint /
+   desired tags / posture / name to an admin over an authenticated RPC; an admin
+   writes the (now author-valid) entries. vIP allocation moves admin-side
+   (`claim_virtual_ip` keyed by the member's node, written by admin). This is the
+   larger change; 0a already makes the warren safe, so 0b can land second.
+
+**Migration (important):** existing warrens have self-authored entries with no
+admin-vouched binding. On upgrade, run a one-time **founder re-vouch**: the admin
+writes `netdoc_author` bindings for every current `peer/<node>`, and a bounded
+**grace window** accepts unbound self-entries (with a warning) until bindings
+replicate. Gate the strict-reject behavior behind a version flag in
+`network/config` so a half-upgraded warren doesn't partition.
+
+Files: `netdoc/mod.rs` (validator + read sites + ticket selection + announce
+writes), `proto/mod.rs` + `config/mod.rs` (Peer binding fields, announce msg),
+`auth/mod.rs` (record binding on consume), `main.rs` (ticket-by-tier).
+
+### Phase 1 — Tiers + unified install + self-upgrade + warren-only + website
+
+**1a — `InviteTier` in the wire model.** Add to `invite/mod.rs`:
+```rust
+#[derive(Default, Serialize, Deserialize)]
+pub enum InviteTier { #[default] Client, WarrenOnly, Node, Admin }
+```
+field `tier: InviteTier` on `InviteToken` (`#[serde(default)]`); legacy decode
+inference (`decode_invite`): warren_ticket+Creator→Admin, warren_ticket→Node,
+else Client. `hop invite` flags (`cli.rs` + `cmd_invite`): `--warren`,
+`--warren-only`, `--admin` (+ hidden `--creator` alias → Admin). Ticket scope
+follows tier (read vs write, from 0b).
+
+**1b — Self-upgrade install.**
+- New hidden subcommand `hop __install-daemon` (`cli.rs` + `main.rs`): embed the
+  LaunchDaemon plist (`pkg/com.hop.daemon.plist`) and systemd unit
+  (`pkg/hop.service`) as templates via `include_str!`; write/`chown`/enable the
+  service; apply primers (`vpn on/off`, tags, default_role); write
+  `netdoc-join.ticket`; start. One Rust path replacing `install-daemon.sh`'s
+  platform logic.
+- **Verify-then-promote** (the §5 invariant): before installing the service,
+  verify the running binary against the published checksum and copy it to
+  root-owned `/usr/local/bin/hop` (`root:wheel 0755`); point the unit there.
+- Redeem/`hop host` self-upgrade (`cmd_warren`, `cmd_host`): decode the invite
+  **as the user**, show host identity + tier + warren; if the tier needs the
+  daemon, prompt and run `sudo hop __install-daemon …`; on decline/non-interactive,
+  stash `netdoc-join.ticket` (0600) + print the finish-later command. (This is
+  the **H10** fix.)
+- `install.sh`: default `INSTALL_DIR=~/.local/bin` (zero sudo, decision 7); keep
+  `--host`/`--register` as the explicit up-front path (now invoking
+  `hop __install-daemon` after the binary lands).
+
+**1c — warren-only enforcement.** Add `network_only: bool` to `RoleDefinition`
+(`proto/mod.rs`); when set, `auth/mod.rs` refuses `RequestShell*/Exec*/Transfer`
+for that role (returns a clear error) while the VPN L3 ACL (`vpn_reach_allowed`)
+still applies. Seed a `warren-only` default role (`fleet/mod.rs::seed_defaults`).
+
+**1d — Website** (`site/index.html`): default to one client command; optional
+invite paste → **in-browser** `decode_invite` (base64 JSON) → preview tier;
+"Advanced: provision as a server now (sudo)" disclosure; **delete** the "VPN on
+by default" copy at lines 341, 534, 627, 695, 881.
+
+Files: `invite/mod.rs`, `cli.rs`, `main.rs`, `proto/mod.rs`, `auth/mod.rs`,
+`fleet/mod.rs`, `install.sh`, `pkg/*` (templates), `site/index.html`.
+
+### Phase 2 — Fleet + signing
+
+- Aggregate invites carry an explicit `tier`; complete the per-host invite
+  issuance the redemption handler currently stubs (`fleet/mod.rs`
+  `RedeemAggregateInvite`). `--register` maps to the Node tier.
+- Wire **artifact signing** (minisign/cosign) into verify-then-promote and the
+  release script (closes H9); the self-upgrade then checks a signature, not just
+  a co-located hash.
+
+### Test & rollout
+
+- **Unit:** author-validator (forged vs legit, admin vs non-admin); `InviteTier`
+  inference + encode/decode round-trip; `hop __install-daemon` templating
+  (render plist/unit to a temp dir, assert contents); `network_only` session
+  refusal.
+- **e2e (`tests/e2e/`):** extend `vpn-e2e.sh` with (a) a **forged-entry** test —
+  a second node writes `vpn/<victim>` and the victim/others must ignore it; (b) a
+  **warren-only** node that can ping a service vIP but is refused a shell; (c) a
+  **self-upgrade** smoke. Add a **macOS** run for the daemon-install path — the
+  one combination today's Linux-container e2e doesn't cover.
+- **Back-compat:** old invites → Client; old creator invites → Admin; the
+  migration grace window (above) keeps existing warrens from partitioning during
+  the Phase 0 rollout.
+
+### Risk register
+
+| Risk | Mitigation |
+|---|---|
+| Author-binding migration partitions an existing warren | Version flag in `network/config` + bounded grace window accepting unbound entries with a warning; founder re-vouch on upgrade |
+| `hop __install-daemon` is new platform code (launchd/systemd) | Port from the proven `install-daemon.sh`; unit-test template rendering; macOS + Linux e2e before release |
+| Self-upgrade interactive sudo / half-states | Graceful client fallback (stash ticket, print finish command); never leave a partial daemon |
+| 0b node-announce adds an RPC + admin write loop | Land 0a first (already closes the exploit); 0b can iterate without re-opening the hole |
+| Read-validation in the per-packet path adds cost | Validate at reconcile/refresh time and cache the vouched-author map (reuse the existing reach-cache pattern), not per datagram |
