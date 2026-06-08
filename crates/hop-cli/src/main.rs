@@ -401,9 +401,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                             && tok.warren_ticket.is_none()
                         {
                             tok.warren_ticket = Some(ticket_str);
+                            // Pin the founder's doc author as the C1 trust anchor:
+                            // a joining node records this as the trusted admin
+                            // author for validating admin-owned doc entries.
+                            tok.founder_author = Some(net.author_hex());
                             if let Ok(reencoded) = hop_core::invite::encode_invite(&tok) {
                                 let _ = config::write_shared_file(&ci_path, &reencoded);
-                                tracing::info!("creator invite augmented with warren ticket");
+                                tracing::info!("creator invite augmented with warren ticket + founder author");
                             }
                         }
                     }
@@ -4102,21 +4106,21 @@ async fn cmd_warren(
         WarrenAction::Join { invite } => {
             // Resolve the warren namespace ticket: from the invite (which now
             // carries it), or from the ticket stored when we connected as a client.
-            let (ticket, redeem) = match invite {
+            let (ticket, founder_author, redeem) = match invite {
                 Some(tok) => {
                     let decoded = hop_core::invite::decode_invite(&tok)
                         .context("invalid invite token")?;
                     let t = decoded.warren_ticket.clone().context(
                         "this invite does not carry a warren — the host has no VPN/warren enabled",
                     )?;
-                    (t, Some(tok))
+                    (t, decoded.founder_author.clone(), Some(tok))
                 }
                 None => {
                     let stored = std::fs::read_to_string(config_dir.join("warren-ticket"))
                         .context("no invite given and no stored warren ticket — run `hop warren join <invite>` first")?;
                     let t = stored.trim().to_string();
                     anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
-                    (t, None)
+                    (t, None, None)
                 }
             };
 
@@ -4126,6 +4130,13 @@ async fn cmd_warren(
             // access if this is world-readable (security-audit H7).
             config::write_secret_file(&config_dir.join("netdoc-join.ticket"), &ticket)
                 .context("writing warren join ticket")?;
+
+            // Persist the founder's doc author (C1 trust anchor) so the daemon
+            // records it as the trusted admin on next start. Plain (non-secret)
+            // — it's a public author id, but keep it owner-readable for tidiness.
+            if let Some(fa) = founder_author {
+                let _ = config::write_secret_file(&config_dir.join("netdoc-founder.author"), &fa);
+            }
 
             // Redeem the invite for membership (auth handshake → the inviting host
             // records us in the warren directory with our role).

@@ -269,6 +269,14 @@ impl NetDoc {
         self.namespace
     }
 
+    /// This host's iroh-docs author id, hex-encoded. The founder pins this in
+    /// its invites (`InviteToken::founder_author`) as the C1 trust anchor;
+    /// every node conveys its own to an admin so its self-owned entries can be
+    /// author-validated.
+    pub fn author_hex(&self) -> String {
+        hex::encode(self.author.to_bytes())
+    }
+
     /// Open the host's network namespace, creating it on first run.
     ///
     /// The namespace id is persisted to `meta_path` so subsequent starts re-open

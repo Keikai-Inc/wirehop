@@ -49,6 +49,12 @@ pub struct InviteToken {
     /// Old invites have no `tier`; `tier()` infers one for them.
     #[serde(default, skip_serializing_if = "InviteTier::is_default")]
     pub tier: InviteTier,
+    /// The founder's iroh-docs author id (hex), pinned alongside `warren_ticket`.
+    /// A joining node records this as the **trusted admin author** — the C1
+    /// trust anchor used (in enforce mode) to validate admin-owned doc entries
+    /// (`peer/ role/ revocation/ …`). `None` for non-warren invites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub founder_author: Option<String>,
 }
 
 /// Capability tier carried by an invite. Orthogonal axes — session reach,
@@ -298,6 +304,7 @@ pub fn generate_invite_with_role(
         // Explicit tiers aren't emitted yet (pending the C1 read/write split);
         // `effective_tier()` infers from warren_ticket+role for now.
         tier: InviteTier::default(),
+        founder_author: None,
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -372,6 +379,7 @@ mod tests {
             sandbox: SandboxPolicy::default(),
             warren_ticket: None,
             tier: InviteTier::default(),
+            founder_author: None,
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(!json.contains("role"), "Peer role should not be serialized: {json}");
@@ -390,6 +398,7 @@ mod tests {
             sandbox: SandboxPolicy::default(),
             warren_ticket: None,
             tier: InviteTier::default(),
+            founder_author: None,
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(json.contains(r#""role":"creator""#), "Creator role should be serialized: {json}");
@@ -415,6 +424,7 @@ mod tests {
             sandbox: SandboxPolicy::default(),
             warren_ticket: None,
             tier: InviteTier::default(),
+            founder_author: None,
         };
         // No warren ticket → Client.
         assert_eq!(t.effective_tier(), InviteTier::Client);
@@ -442,6 +452,7 @@ mod tests {
             sandbox: SandboxPolicy::default(),
             warren_ticket: Some("docticketblob".into()),
             tier: InviteTier::default(),
+            founder_author: None,
         };
         let json = serde_json::to_string(&token).unwrap();
         let back: InviteToken = serde_json::from_str(&json).unwrap();
