@@ -134,9 +134,10 @@ pub struct NetDoc {
     /// the policy/entity set inline.
     reach_cache: ReachCache,
     /// Author-validation mode (security-audit C1, Phase 0a). `Observe` (default)
-    /// only logs anomalies; `Off` disables; `Enforce` (not yet wired) would
-    /// reject. Set via `HOP_NETDOC_VALIDATION`.
-    validation_mode: ValidationMode,
+    /// only logs anomalies; `Off` disables; `Enforce` rejects forged entries.
+    /// Set via `HOP_NETDOC_VALIDATION`; interior-mutable so tests can override
+    /// per instance without global env races.
+    validation_mode: std::sync::Mutex<ValidationMode>,
     /// First-seen iroh-docs author per doc key, used to detect an entry whose
     /// author changed — the signature of a member forging/hijacking another
     /// node's `vpn`/`name`/`ip` registration (C1). Log-only in `Observe` mode.
@@ -264,7 +265,7 @@ impl NetDoc {
             #[cfg(unix)]
             vpn_refresh,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            validation_mode: ValidationMode::from_env(),
+            validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
             founder_author: std::sync::Mutex::new(None),
         })
@@ -308,6 +309,18 @@ impl NetDoc {
     /// The trusted admin author, if known.
     fn founder_author(&self) -> Option<AuthorId> {
         *self.founder_author.lock().unwrap()
+    }
+
+    /// Current author-validation mode.
+    fn validation_mode(&self) -> ValidationMode {
+        *self.validation_mode.lock().unwrap()
+    }
+
+    /// Override the validation mode (used by tests to exercise enforce on a
+    /// specific instance without a process-global env var).
+    #[cfg(test)]
+    pub fn set_validation_mode(&self, mode: ValidationMode) {
+        *self.validation_mode.lock().unwrap() = mode;
     }
 
     /// `node_id → vouched netdoc author` from the (admin-owned, already
@@ -649,7 +662,7 @@ impl NetDoc {
     #[cfg(unix)]
     pub async fn refresh_vpn_peer_ips(&self) {
         use std::collections::HashMap;
-        let mode = self.validation_mode;
+        let mode = self.validation_mode();
         // C1 self-key enforce: bind each vIP/endpoint registration to its owning
         // node's vouched author, so a member can't forge `vpn/<victim>` to
         // intercept the victim's traffic. Built at refresh time (not per packet).
@@ -1306,7 +1319,7 @@ impl NetDoc {
     ///   would risk false rejects) until the per-member binding lands.
     #[must_use]
     fn validate_entry(&self, key: &[u8], author: AuthorId) -> bool {
-        if self.validation_mode == ValidationMode::Off {
+        if self.validation_mode() == ValidationMode::Off {
             return true;
         }
         if is_admin_owned_key(key) {
@@ -1318,9 +1331,9 @@ impl NetDoc {
                     String::from_utf8_lossy(key),
                     author,
                     founder,
-                    if self.validation_mode == ValidationMode::Enforce { "REJECTED" } else { "honored (observe)" },
+                    if self.validation_mode() == ValidationMode::Enforce { "REJECTED" } else { "honored (observe)" },
                 );
-                return self.validation_mode != ValidationMode::Enforce;
+                return self.validation_mode() != ValidationMode::Enforce;
             }
             return true;
         }
@@ -1690,6 +1703,65 @@ mod tests {
     /// Federation: a VPN endpoint registration written on host A must replicate
     /// to host B after it imports A's write ticket. Validates the multi-node
     /// doc-sync path (gossip + reconciliation) the VPN routing depends on.
+    ///
+    /// C1 self-key enforce, end to end: a member with a write ticket forges
+    /// `vpn/<founder_addr>` to point the founder's vIP at the member's own
+    /// endpoint (traffic interception). In Observe the forgery replicates and is
+    /// honored; flipping the founder to Enforce drops it while keeping the
+    /// founder's legitimate registration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enforce_rejects_forged_vpn_entry() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None); // founder = A's own author
+
+        // A claims a vIP, vouches its own author binding (peer/node_a), and
+        // registers its endpoint — all authored by A.
+        let node_a = "nodeAAAAAAAA";
+        let addr = a.claim_virtual_ip(node_a).await.unwrap();
+        let mut peer = sample_peer(node_a, "A");
+        peer.netdoc_author = Some(a.author_hex());
+        a.put_peer(&peer).await.unwrap();
+        a.register_vpn_endpoint(addr).await.unwrap();
+
+        // Member B (write ticket) forges A's vpn entry → A's addr → B's endpoint.
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        b.register_vpn_endpoint(addr).await.unwrap();
+
+        let a_id = a.endpoint.id().to_string();
+        let b_id = b.endpoint.id().to_string();
+
+        // Phase 1 (Observe, the default): poll until B's forgery replicates and is
+        // honored — proving the attack would work without enforcement.
+        let mut replicated = false;
+        for _ in 0..50 {
+            a.refresh_vpn_peer_ips().await;
+            if a.vpn_peer_ips.read().await.contains_key(&b_id) {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(replicated, "forged vpn entry did not replicate A<-B within 10s (test setup)");
+
+        // Phase 2 (Enforce): the forgery must be dropped; A's own entry kept.
+        a.set_validation_mode(ValidationMode::Enforce);
+        a.refresh_vpn_peer_ips().await;
+        let map = a.vpn_peer_ips.read().await.clone();
+        assert_eq!(map.get(&a_id), Some(&addr), "founder's own endpoint must remain mapped");
+        assert!(
+            !map.contains_key(&b_id),
+            "enforce must reject the forged vpn entry (member's endpoint on the founder's vIP)"
+        );
+    }
+
     #[tokio::test]
     async fn federation_replicates_vpn_registration() {
         let dir_a = tempfile::tempdir().unwrap();

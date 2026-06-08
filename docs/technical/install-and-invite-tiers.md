@@ -428,6 +428,7 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 0a** — C1 founder-author anchor (`founder_author` pinned in invites; persisted on join; recorded in `NetDoc`) | ✅ shipped | 0.6.41 |
 | **Phase 0a** — C1 **admin-key enforce** (`peer/ role/ revocation/ acl/ network/` honored only from the founder author; complete across `list_prefix` + `get_peer`/`is_revoked`/`get_authored_policy`) | ✅ shipped, behind `HOP_NETDOC_VALIDATION=enforce` (default Observe) | 0.6.42 |
 | **Phase 1c** — warren-only tier (`network_only` role flag + session-dispatch refusal + seeded `warren-only` role) | ✅ shipped | 0.6.42 |
+| **Phase 0a** — C1 **self-key enforce LOGIC** (`Peer.netdoc_author` binding + `vouched_authors` + `vpn/`/`ip/` validated against the owner's vouched author in `refresh_vpn_peer_ips`; `self_entry_author_ok` unit-tested) | ✅ logic shipped, flag-gated; founder self-vouches | 0.6.44 |
 | **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
@@ -437,12 +438,17 @@ Consistent with the rock-solid mandate (and how C1-full/H8/H10 were deferred
 earlier): these are big enough that rushing them would risk lockout, data loss,
 or a privilege-escalation hole. Each needs test infrastructure we don't have yet.
 
-- **C1 enforce — production flip.** Admin-key enforce is implemented and safe to
-  test, but **stays opt-in** until: (a) the per-member **self-key binding**
-  (`peer.netdoc_author` conveyed at redeem / node-announce) so `vpn/ name/ ip`
-  self-entries validate too, and (b) a **forged-entry multi-node e2e** proves
-  honest nodes ignore forgeries without partitioning. Self-keys currently use
-  the observe-mode hijack *detector*, not enforcement.
+- **C1 enforce — production flip.** Both admin-key *and* self-key (`vpn/`/`ip/`)
+  enforce **logic** is now implemented, unit-tested, and flag-gated (default
+  Observe). The founder self-vouches, so its entries enforce immediately.
+  Remaining before `enforce` is safe to **default-on**: (a) the **member-node
+  binding** — running nodes must populate `peer.netdoc_author` via an
+  **authenticated announce** to an admin (chosen over the deterministic-author
+  approach precisely because it needs **no author-derivation migration**, so it
+  can't break a live warren's membership); until a node announces it's in
+  migration *grace* (honored). (b) a **two-NetDoc forged-entry test** proving a
+  forged `vpn/<victim>` from a member's author is dropped while legit traffic
+  flows. `name/` self-keys still use the observe detector, not enforcement.
 - **Phase 0b — read-ticket members + node-announce.** Switching members from
   write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
   needs the migration grace window exercised on a real multi-node warren.
