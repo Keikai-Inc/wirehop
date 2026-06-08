@@ -1,11 +1,15 @@
 # Install Model & Invite Capability Tiers (Design)
 
-> **Status: Design / Planned (with a code-level implementation plan).** This
-> specifies a unified install convention and an explicit invite-capability
-> model. None of it is implemented yet. Decisions are resolved in [§8](#8-decisions-resolved);
-> the phase-by-phase, file-level build plan is in [§9](#9-implementation-plan-code-level).
-> It is sequenced against the C1 warren write-authorization work in
-> [security-audit.md](security-audit.md) (now Phase 0).
+> **Status: in progress, shipping incrementally.** This specifies a unified
+> install convention and an explicit invite-capability model. Decisions are
+> resolved in [§8](#8-decisions-resolved); the file-level build plan is in
+> [§9](#9-implementation-plan-code-level); **what has actually shipped (and what
+> is deferred, with rationale) is tracked in [§10](#10-implementation-status-shipped-incrementally)**.
+> As of 0.6.43: the C1 trust anchor + admin-key enforce (flag-gated), the
+> warren-only tier, the InviteTier model, and the self-upgrade consent flow are
+> shipped; the embedded daemon installer, C1 self-key binding/read-ticket
+> members, and signing remain dedicated follow-ups. Sequenced against the C1
+> work in [security-audit.md](security-audit.md) (Phase 0).
 
 ## 1. Problem
 
@@ -412,3 +416,43 @@ Files: `invite/mod.rs`, `cli.rs`, `main.rs`, `proto/mod.rs`, `auth/mod.rs`,
 | Self-upgrade interactive sudo / half-states | Graceful client fallback (stash ticket, print finish command); never leave a partial daemon |
 | 0b node-announce adds an RPC + admin write loop | Land 0a first (already closes the exploit); 0b can iterate without re-opening the hole |
 | Read-validation in the per-packet path adds cost | Validate at reconcile/refresh time and cache the vouched-author map (reuse the existing reach-cache pattern), not per datagram |
+
+## 10. Implementation status (shipped incrementally)
+
+Built in safe, individually-released increments, security-first per decision 5.
+
+| Piece | Status | Released |
+|---|---|---|
+| **Phase 1a** — `InviteTier` enum + field + legacy inference | ✅ shipped (inert; ticket-scope still legacy) | 0.6.40 |
+| **Phase 0a** — C1 observe-mode author-stability detector | ✅ shipped (default `Observe`, log-only) | 0.6.40 |
+| **Phase 0a** — C1 founder-author anchor (`founder_author` pinned in invites; persisted on join; recorded in `NetDoc`) | ✅ shipped | 0.6.41 |
+| **Phase 0a** — C1 **admin-key enforce** (`peer/ role/ revocation/ acl/ network/` honored only from the founder author; complete across `list_prefix` + `get_peer`/`is_revoked`/`get_authored_policy`) | ✅ shipped, behind `HOP_NETDOC_VALIDATION=enforce` (default Observe) | 0.6.42 |
+| **Phase 1c** — warren-only tier (`network_only` role flag + session-dispatch refusal + seeded `warren-only` role) | ✅ shipped | 0.6.42 |
+| **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
+| Website "VPN opt-in" copy fixes | ✅ live | site deploy |
+
+### Deferred — major subsystems needing dedicated, validated passes
+
+Consistent with the rock-solid mandate (and how C1-full/H8/H10 were deferred
+earlier): these are big enough that rushing them would risk lockout, data loss,
+or a privilege-escalation hole. Each needs test infrastructure we don't have yet.
+
+- **C1 enforce — production flip.** Admin-key enforce is implemented and safe to
+  test, but **stays opt-in** until: (a) the per-member **self-key binding**
+  (`peer.netdoc_author` conveyed at redeem / node-announce) so `vpn/ name/ ip`
+  self-entries validate too, and (b) a **forged-entry multi-node e2e** proves
+  honest nodes ignore forgeries without partitioning. Self-keys currently use
+  the observe-mode hijack *detector*, not enforcement.
+- **Phase 0b — read-ticket members + node-announce.** Switching members from
+  write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
+  needs the migration grace window exercised on a real multi-node warren.
+- **Phase 1b — embedded `hop __install-daemon` (decision 1A).** The self-upgrade
+  *consent* ships now via the proven shell installer; porting launchd/systemd
+  setup into the binary needs **macOS daemon-install e2e** that doesn't exist yet.
+- **Phase 1a — wire `--warren`/`--warren-only` flags to read-scoped tickets.**
+  Gated on the C1 read/write split so a node invite is never an over-powered
+  write ticket.
+- **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
+  verify-then-promote; both are release-pipeline + infra work.
+
+*Last updated: 0.6.43*
