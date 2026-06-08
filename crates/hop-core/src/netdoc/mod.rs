@@ -310,6 +310,25 @@ impl NetDoc {
         *self.founder_author.lock().unwrap()
     }
 
+    /// `node_id → vouched netdoc author` from the (admin-owned, already
+    /// author-validated) `peer/` entries. The basis for self-key validation
+    /// (C1 enforce): a self-owned entry for node N is legitimate only if
+    /// authored by N's vouched author. Because peer entries are admin-owned, a
+    /// forged peer can't inject a fake binding in enforce mode.
+    pub async fn vouched_authors(&self) -> std::collections::HashMap<String, AuthorId> {
+        self.list_peers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| {
+                p.netdoc_author
+                    .as_deref()
+                    .and_then(parse_author_hex)
+                    .map(|a| (p.node_id, a))
+            })
+            .collect()
+    }
+
     /// Open the host's network namespace, creating it on first run.
     ///
     /// The namespace id is persisted to `meta_path` so subsequent starts re-open
@@ -934,6 +953,9 @@ impl NetDoc {
                 username: None,
                 role: crate::config::PeerRole::Creator,
                 role_name: Some("admin".to_string()),
+                // The founder vouches its own doc author, so its self-owned
+                // entries validate under enforce.
+                netdoc_author: Some(self.author_hex()),
                 sandbox: crate::sandbox::SandboxPolicy::default(),
             };
             if let Err(e) = self.put_peer(&me).await {
@@ -1385,6 +1407,7 @@ mod tests {
             username: None,
             role: PeerRole::Peer,
             role_name: None,
+            netdoc_author: None,
             sandbox: SandboxPolicy::default(),
         }
     }

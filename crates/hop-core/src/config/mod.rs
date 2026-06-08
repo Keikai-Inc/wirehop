@@ -235,6 +235,12 @@ pub struct Peer {
     /// confinement). `None` = legacy peer governed only by `role`/`sandbox`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_name: Option<String>,
+    /// The peer's iroh-docs author id (hex), vouched by the admin that admitted
+    /// it (C1 trust binding). In enforce mode, self-owned doc entries
+    /// (`vpn/ ip/ name/ tag/ posture/`) belonging to this node are honored only
+    /// when authored by this author. `None` = not yet bound (announce pending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netdoc_author: Option<String>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -280,6 +286,7 @@ impl PeersStore {
                 username,
                 role,
                 role_name: None,
+                netdoc_author: None,
                 sandbox,
             });
         }
