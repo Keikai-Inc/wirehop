@@ -391,6 +391,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         ),
                         Err(e) => tracing::warn!("netdoc: startup reconcile failed: {e:#}"),
                     }
+                    // Build the trusted-admin-author set (founder + vouched
+                    // co-admins) so enforce honors federated admins' entries.
+                    net.refresh_admin_authors().await;
                     // Phase 2: claim this host's stable virtual IP in the doc.
                     match net.claim_virtual_ip(&host_node_id).await {
                         Ok(ip) => tracing::info!("netdoc: virtual IP {ip} (100.64.0.0/10)"),
@@ -1209,6 +1212,8 @@ async fn dispatch_session(
                 if let Err(e) = nd.reconcile(&peers, &roles).await {
                     tracing::warn!("netdoc: reconcile after admin request failed: {e:#}");
                 }
+                // A grant/revoke of admin role changes the trusted-admin set.
+                nd.refresh_admin_authors().await;
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }

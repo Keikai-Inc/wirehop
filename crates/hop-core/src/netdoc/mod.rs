@@ -147,6 +147,13 @@ pub struct NetDoc {
     /// `founder_author`. In enforce mode, admin-owned entries (`peer/ role/
     /// revocation/ acl/ network/`) are honored only if authored by it.
     founder_author: std::sync::Mutex<Option<AuthorId>>,
+    /// The set of authors trusted to write admin-owned keys under enforce: the
+    /// founder plus every co-admin author the founder has vouched (a
+    /// founder-authored `peer/` entry with the admin/creator role whose
+    /// `netdoc_author` binding is known). Refreshed from founder-authored peer
+    /// entries (see `refresh_admin_authors`), so a co-admin can't elevate itself
+    /// — only the founder grants admin authority. Always contains the founder.
+    admin_authors: std::sync::Mutex<std::collections::HashSet<AuthorId>>,
 }
 
 /// Author-validation enforcement level for replicated doc entries (C1).
@@ -268,6 +275,7 @@ impl NetDoc {
             validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
             founder_author: std::sync::Mutex::new(None),
+            admin_authors: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -297,6 +305,9 @@ impl NetDoc {
         };
         if let Some(a) = resolved {
             *self.founder_author.lock().unwrap() = Some(a);
+            // The founder is always an admin author; co-admins are added by
+            // refresh_admin_authors once their vouched bindings replicate.
+            self.admin_authors.lock().unwrap().insert(a);
             tracing::info!("netdoc C1: trusted admin author = {a}");
         } else if self.federated {
             tracing::warn!(
@@ -309,6 +320,46 @@ impl NetDoc {
     /// The trusted admin author, if known.
     fn founder_author(&self) -> Option<AuthorId> {
         *self.founder_author.lock().unwrap()
+    }
+
+    /// True if `author` is trusted to write admin-owned keys (founder or a
+    /// founder-vouched co-admin). Used by `validate_entry` under enforce.
+    fn is_admin_author(&self, author: &AuthorId) -> bool {
+        self.admin_authors.lock().unwrap().contains(author)
+    }
+
+    /// Rebuild the trusted-admin-author set from FOUNDER-authored `peer/` entries
+    /// with the admin (creator) role whose `netdoc_author` binding is known.
+    ///
+    /// Only the founder grants admin authority: we read peer entries authored by
+    /// the founder *only*, so a co-admin can't vouch a third author as admin and
+    /// there's no validation cycle (this never calls `validate_entry`). The
+    /// founder is always retained. Call after reconcile / on a refresh tick.
+    pub async fn refresh_admin_authors(&self) {
+        let Some(founder) = self.founder_author() else { return };
+        let mut set = std::collections::HashSet::new();
+        set.insert(founder);
+        if let Ok(stream) = self
+            .doc
+            .get_many(Query::key_prefix(KEY_PEER_PREFIX.as_bytes()).build())
+            .await
+        {
+            let mut stream = std::pin::pin!(stream);
+            while let Some(Ok(entry)) = stream.next().await {
+                // Only the founder confers admin authority.
+                if entry.author() != founder || entry.content_len() == 0 {
+                    continue;
+                }
+                let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+                let Ok(peer) = serde_json::from_slice::<Peer>(&bytes) else { continue };
+                if peer.role == crate::config::PeerRole::Creator
+                    && let Some(a) = peer.netdoc_author.as_deref().and_then(parse_author_hex)
+                {
+                    set.insert(a);
+                }
+            }
+        }
+        *self.admin_authors.lock().unwrap() = set;
     }
 
     /// Current author-validation mode.
@@ -378,6 +429,8 @@ impl NetDoc {
             &author_hex[..8.min(author_hex.len())],
             &node_id[..8.min(node_id.len())]
         );
+        // A newly-vouched co-admin must enter the trusted-admin set immediately.
+        self.refresh_admin_authors().await;
         Ok(true)
     }
 
@@ -651,6 +704,9 @@ impl NetDoc {
                     Ok(_) => {}
                     Err(e) => tracing::debug!("netdoc: periodic re-sync failed: {e:#}"),
                 }
+                // Pick up co-admin author bindings that replicated since startup
+                // so a federated node validates other admins' entries correctly.
+                me.refresh_admin_authors().await;
             }
         });
     }
@@ -1362,14 +1418,15 @@ impl NetDoc {
             return true;
         }
         if is_admin_owned_key(key) {
-            if let Some(founder) = self.founder_author()
-                && author != founder
-            {
+            // Admin keys are honored from the founder OR any founder-vouched
+            // co-admin author (multi-admin / federated warrens). When no founder
+            // anchor is known (legacy join) the set is empty → honor (no
+            // partition); enforcement only kicks in once an anchor exists.
+            if self.founder_author().is_some() && !self.is_admin_author(&author) {
                 tracing::warn!(
-                    "netdoc C1: admin key {:?} authored by {} ≠ founder {} — {}",
+                    "netdoc C1: admin key {:?} authored by {} ∉ vouched admins — {}",
                     String::from_utf8_lossy(key),
                     author,
-                    founder,
                     if self.validation_mode() == ValidationMode::Enforce { "REJECTED" } else { "honored (observe)" },
                 );
                 return self.validation_mode() != ValidationMode::Enforce;
@@ -1876,6 +1933,62 @@ mod tests {
         assert!(
             !map.contains_key(&c_id),
             "enforce must reject a forgery against a vouched member's vIP"
+        );
+    }
+
+    /// Vouched-admin-authors: a co-admin's federated `peer/` entry is rejected
+    /// under Enforce until the founder vouches that co-admin's author (a
+    /// founder-authored peer entry with the Creator role + a netdoc_author
+    /// binding); afterwards it's honored. This is what makes enforce safe for
+    /// multi-admin / federated warrens (and unblocks default-on).
+    #[tokio::test]
+    async fn enforce_honors_vouched_co_admin_peer_entry() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None); // founder = A
+
+        // Co-admin B imports the warren and invites C — i.e. B authors peer/C.
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+        b.put_peer(&sample_peer("nodeCCCCCCCC", "C")).await.unwrap();
+
+        // Wait until B's peer/C replicates to A (Observe default — honored).
+        let mut replicated = false;
+        for _ in 0..50 {
+            if a.get_peer("nodeCCCCCCCC").await.unwrap().is_some() {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(replicated, "B's peer/C did not replicate A<-B within 10s (test setup)");
+
+        // Enforce, B NOT yet a vouched admin → A rejects B-authored peer/C.
+        a.set_validation_mode(ValidationMode::Enforce);
+        a.refresh_admin_authors().await;
+        assert!(
+            a.get_peer("nodeCCCCCCCC").await.unwrap().is_none(),
+            "enforce must reject a non-admin author's peer entry"
+        );
+
+        // Founder admits B as a co-admin (Creator role) and vouches its author —
+        // a founder-authored peer/B entry, the only way to confer admin authority.
+        let mut admin_b = sample_peer(&b_id, "B");
+        admin_b.role = PeerRole::Creator;
+        admin_b.netdoc_author = Some(b.author_hex());
+        a.put_peer(&admin_b).await.unwrap();
+        a.refresh_admin_authors().await;
+
+        // Now B is a vouched admin → its peer/C entry is honored under enforce.
+        assert!(
+            a.get_peer("nodeCCCCCCCC").await.unwrap().is_some(),
+            "enforce must honor a vouched co-admin's peer entry"
         );
     }
 

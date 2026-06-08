@@ -430,6 +430,7 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 1c** — warren-only tier (`network_only` role flag + session-dispatch refusal + seeded `warren-only` role) | ✅ shipped | 0.6.42 |
 | **Phase 0a** — C1 **self-key enforce LOGIC** (`Peer.netdoc_author` binding + `vouched_authors` + `vpn/`/`ip/` validated against the owner's vouched author in `refresh_vpn_peer_ips`; `self_entry_author_ok` unit-tested) | ✅ logic shipped, flag-gated; founder self-vouches | 0.6.44 |
 | **Phase 0a** — C1 **member-node binding** (`AnnounceNetdocAuthor` daemon-outbound announce → founder records `peer/N.netdoc_author`; `record_peer_author` trust-anchor-only + idempotent; unit-tested by `enforce_rejects_forgery_against_vouched_member`; **multi-node enforce e2e** runs both nodes under `HOP_NETDOC_VALIDATION=enforce` + asserts the binding) | ✅ shipped | 0.6.46 |
+| **Phase 0a** — C1 **vouched-admin-authors** (`admin_authors` = founder ∪ founder-vouched co-admin authors; `validate_entry` honors admin keys from any vouched admin; refreshed at startup / on vouch / on keepalive; unit-tested by `enforce_honors_vouched_co_admin_peer_entry`). Makes opt-in enforce safe for federated multi-admin warrens | ✅ shipped, flag-gated | 0.6.47 |
 | **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
@@ -461,23 +462,31 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
     migration *grace* (unbound owner), so enforce never partitions a fresh join.
   - `name/` self-keys still use the observe-mode detector, not enforcement
     (needs an addr→name owner resolution on top of the now-shipped binding).
-  - **Default-on is blocked on a vouched-admin-authors model.** `reconcile`
-    runs on every node and writes `peer/`/`role/` entries authored by *that
-    node*; on a federated multi-admin warren a co-admin legitimately authors
-    admin keys. Admin-key enforce currently honors only the **founder** author,
-    so flipping `ValidationMode::default()` to `Enforce` globally would reject a
-    co-admin's federated peer entries — breaking the "inviter-offline /
-    federated peer" auth path (auth still falls back to local `peers.json`, so a
-    locally-known peer is unaffected; the risk is purely federated reach). The
-    fix mirrors the member binding: the founder vouches co-admin authors (e.g. a
-    `peer/N.is_admin` + author binding, or an admin-author set in the doc), and
-    `validate_entry` accepts admin keys from any vouched admin author. Until
-    then enforce is **safe to opt into** (single-admin warrens, or
-    federated ones where only the founder mutates membership) but **not** the
-    global default. Self-key enforce (the shipped binding) has no such blocker —
-    members never author admin keys. Legacy warrens with no founder anchor honor
-    admin keys unconditionally under enforce (`validate_entry`), so they are
-    never partitioned regardless.
+  - **Vouched-admin-authors — SHIPPED (0.6.47).** `reconcile` runs on every node
+    and writes `peer/`/`role/` entries authored by *that* node; on a federated
+    multi-admin warren a co-admin legitimately authors admin keys. `validate_entry`
+    now honors admin keys from the founder **or any founder-vouched co-admin
+    author**: `admin_authors` = the founder ∪ the `netdoc_author` of every
+    **founder-authored** `peer/` entry with the Creator role. Only the founder
+    confers admin authority (the set is built from founder-authored entries
+    only — no elevation, no validation cycle), refreshed at startup, on the
+    founder's own vouch, and on each sync keepalive. Unit-proven by
+    `enforce_honors_vouched_co_admin_peer_entry` (a co-admin's `peer/C` is
+    rejected under enforce until B is vouched, then honored). Legacy warrens with
+    no founder anchor honor admin keys unconditionally (never partitioned).
+  - **The global default flip is the last, deliberately-gated step.** Opt-in
+    enforce (`HOP_NETDOC_VALIDATION=enforce`) is now production-safe for **all**
+    topologies: single-admin, federated multi-admin (vouched), and anchor-less
+    legacy (honored). What still gates flipping `ValidationMode::default()` to
+    `Enforce` globally is a *mixed-version* propagation window: on a warren where
+    co-admins run pre-0.6.46 builds (can't announce) the founder can't yet vouch
+    them, so during the upgrade their federated `peer/` entries would be rejected
+    until every node is upgraded + announced (auth still falls back to local
+    `peers.json`, so this is a transient loss of *federated* reach, never local
+    access or a lockout). Prereqs for the flip: (a) a 3-node federated e2e
+    (founder + vouched co-admin + a peer the co-admin invited, all under enforce);
+    (b) shorten the co-admin-author refresh (currently startup + 300 s keepalive)
+    or make it replication-event-driven so the window closes fast.
 - **Phase 0b — read-ticket members + node-announce.** Switching members from
   write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
   needs the migration grace window exercised on a real multi-node warren.
@@ -490,4 +499,4 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
 - **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
   verify-then-promote; both are release-pipeline + infra work.
 
-*Last updated: 0.6.46*
+*Last updated: 0.6.47*
