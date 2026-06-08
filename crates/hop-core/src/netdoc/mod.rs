@@ -648,20 +648,53 @@ impl NetDoc {
     /// authentication (security-audit C2) from the replicated `vpn/` table.
     #[cfg(unix)]
     pub async fn refresh_vpn_peer_ips(&self) {
-        let query = Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build();
-        let Ok(stream) = self.doc.get_many(query).await else { return };
-        let mut stream = std::pin::pin!(stream);
-        let mut map = std::collections::HashMap::new();
-        while let Some(Ok(entry)) = stream.next().await {
-            if !self.validate_entry(entry.key(), entry.author()) {
-                continue;
+        use std::collections::HashMap;
+        let mode = self.validation_mode;
+        // C1 self-key enforce: bind each vIP/endpoint registration to its owning
+        // node's vouched author, so a member can't forge `vpn/<victim>` to
+        // intercept the victim's traffic. Built at refresh time (not per packet).
+        let bindings = self.vouched_authors().await;
+
+        // Validated addr → owning node, from the `ip/` allocation table. An
+        // `ip/<addr> = node` entry counts only if authored by that node's vouched
+        // author (enforce); unbound owners pass during migration grace.
+        let mut ip_owner: HashMap<std::net::Ipv4Addr, String> = HashMap::new();
+        if let Ok(s) = self.doc.get_many(Query::key_prefix(KEY_IP_PREFIX.as_bytes()).build()).await {
+            let mut s = std::pin::pin!(s);
+            while let Some(Ok(entry)) = s.next().await {
+                if entry.content_len() == 0 { continue; }
+                let key = String::from_utf8_lossy(entry.key());
+                let Some(addr_str) = key.strip_prefix(KEY_IP_PREFIX) else { continue };
+                let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else { continue };
+                let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+                let node = String::from_utf8_lossy(&bytes).trim().to_string();
+                if self_entry_author_ok(Some(&node), &entry.author(), &bindings, mode) {
+                    ip_owner.insert(addr, node);
+                } else {
+                    tracing::warn!("netdoc C1: ip/{addr} author ≠ owner binding — REJECTED (forged vIP claim)");
+                }
             }
+        }
+
+        // vpn/ table → endpoint-id → vIP, each validated against the owner's
+        // vouched author.
+        let Ok(stream) = self.doc.get_many(Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build()).await else { return };
+        let mut stream = std::pin::pin!(stream);
+        let mut map = HashMap::new();
+        while let Some(Ok(entry)) = stream.next().await {
             if entry.content_len() == 0 {
                 continue;
             }
             let key = String::from_utf8_lossy(entry.key());
             let Some(addr_str) = key.strip_prefix(KEY_VPN_PREFIX) else { continue };
             let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else { continue };
+            let owner = ip_owner.get(&addr).map(|s| s.as_str());
+            if !self_entry_author_ok(owner, &entry.author(), &bindings, mode) {
+                tracing::warn!("netdoc C1: vpn/{addr} author ≠ owner binding — REJECTED (forged endpoint/interception attempt)");
+                continue;
+            }
+            // Observe-mode author-change telemetry (no-op gate; logs hijacks).
+            let _ = self.validate_entry(entry.key(), entry.author());
             let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
             let value = String::from_utf8_lossy(&bytes);
             if let Some(id) = value.split_whitespace().next() {
@@ -1328,6 +1361,28 @@ fn is_admin_owned_key(key: &[u8]) -> bool {
     ADMIN_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
+/// Decide whether a self-owned entry whose claimed owner is `owner` and whose
+/// writer is `author` should be honored, given the vouched `node → author`
+/// bindings and the validation `mode` (C1 self-key enforce). In `Off`/`Observe`
+/// → always honor (the caller logs anomalies in observe). In `Enforce` → honor
+/// only when the owner has no binding yet (migration grace) or the author equals
+/// the owner's vouched author. A forged entry (author ≠ the owner's binding) is
+/// rejected.
+fn self_entry_author_ok(
+    owner: Option<&str>,
+    author: &AuthorId,
+    bindings: &std::collections::HashMap<String, AuthorId>,
+    mode: ValidationMode,
+) -> bool {
+    if mode != ValidationMode::Enforce {
+        return true;
+    }
+    match owner.and_then(|n| bindings.get(n)) {
+        Some(expected) => author == expected,
+        None => true, // owner unbound (migration grace) — honor
+    }
+}
+
 /// Parse a 64-char hex iroh-docs author id.
 fn parse_author_hex(hex_str: &str) -> Option<AuthorId> {
     let bytes = hex::decode(hex_str.trim()).ok()?;
@@ -1377,6 +1432,27 @@ mod tests {
         for k in [&b"peer/x"[..], b"vpn/x", b"role/x", b"name/x"] {
             assert!(!(is_admin_owned_key(k) && is_self_owned_key(k)));
         }
+    }
+
+    #[test]
+    fn self_entry_author_validation() {
+        use std::collections::HashMap;
+        let owner_author = AuthorId::from(&[1u8; 32]);
+        let attacker_author = AuthorId::from(&[2u8; 32]);
+        let mut bindings = HashMap::new();
+        bindings.insert("nodeN".to_string(), owner_author);
+
+        // Off / Observe: always honor (no enforcement).
+        for mode in [ValidationMode::Off, ValidationMode::Observe] {
+            assert!(self_entry_author_ok(Some("nodeN"), &attacker_author, &bindings, mode));
+        }
+        // Enforce: the owner's own author is honored…
+        assert!(self_entry_author_ok(Some("nodeN"), &owner_author, &bindings, ValidationMode::Enforce));
+        // …a forged author for a bound node is rejected (the C1 attack).
+        assert!(!self_entry_author_ok(Some("nodeN"), &attacker_author, &bindings, ValidationMode::Enforce));
+        // An unbound owner (migration grace) is honored even in enforce.
+        assert!(self_entry_author_ok(Some("unknown"), &attacker_author, &bindings, ValidationMode::Enforce));
+        assert!(self_entry_author_ok(None, &attacker_author, &bindings, ValidationMode::Enforce));
     }
 
     #[test]
