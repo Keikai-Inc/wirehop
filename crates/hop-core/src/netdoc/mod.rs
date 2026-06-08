@@ -818,7 +818,7 @@ impl NetDoc {
     pub async fn get_authored_policy(&self) -> Option<String> {
         let query = Query::single_latest_per_key().key_exact(b"acl/cedar").build();
         match self.doc.get_one(query).await {
-            Ok(Some(e)) if e.content_len() > 0 => self
+            Ok(Some(e)) if e.content_len() > 0 && self.validate_entry(e.key(), e.author()) => self
                 .fs_store
                 .get_bytes(e.content_hash())
                 .await
@@ -1133,6 +1133,11 @@ impl NetDoc {
         let Some(entry) = self.doc.get_one(query).await.context("get_one peer")? else {
             return Ok(None);
         };
+        // Membership grants are admin-owned: a peer entry forged by a non-admin
+        // is ignored in enforce mode (C1).
+        if !self.validate_entry(entry.key(), entry.author()) {
+            return Ok(None);
+        }
         self.decode_entry(&entry).await
     }
 
@@ -1187,7 +1192,12 @@ impl NetDoc {
     pub async fn is_revoked(&self, node_id: &str) -> Result<bool> {
         let key = format!("{KEY_REVOCATION_PREFIX}{node_id}");
         let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
-        Ok(self.doc.get_one(query).await.context("get_one revocation")?.is_some())
+        // A revocation only counts if it passes author validation — in enforce
+        // mode a revocation forged by a non-admin must not lock anyone out (C1).
+        match self.doc.get_one(query).await.context("get_one revocation")? {
+            Some(entry) => Ok(self.validate_entry(entry.key(), entry.author())),
+            None => Ok(false),
+        }
     }
 
     // ── Internals ────────────────────────────────────────────────────────
