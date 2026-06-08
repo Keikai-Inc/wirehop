@@ -342,6 +342,45 @@ impl NetDoc {
             .collect()
     }
 
+    /// True if this node is the warren's C1 trust anchor (its doc author is the
+    /// recorded founder/admin author). Only the trust anchor records vouched
+    /// author bindings, since `peer/` entries are admin-owned.
+    pub fn is_trust_anchor(&self) -> bool {
+        self.founder_author()
+            .map(|fa| fa == self.author)
+            .unwrap_or(false)
+    }
+
+    /// Record (or refresh) the admin-owned `peer/<node_id>.netdoc_author`
+    /// binding announced by a member. No-op (returns `Ok(false)`) unless this
+    /// node is the trust anchor and the peer entry already exists — we vouch an
+    /// author only for an already-admitted member, never mint membership. The
+    /// binding is the basis for that member's self-key validation (C1 enforce).
+    pub async fn record_peer_author(&self, node_id: &str, author_hex: &str) -> Result<bool> {
+        if !self.is_trust_anchor() {
+            return Ok(false);
+        }
+        // Reject a malformed author up front so we never store junk.
+        if parse_author_hex(author_hex).is_none() {
+            anyhow::bail!("invalid netdoc author hex");
+        }
+        let Some(mut peer) = self.get_peer(node_id).await? else {
+            // Not an admitted member — ignore (don't create membership).
+            return Ok(false);
+        };
+        if peer.netdoc_author.as_deref() == Some(author_hex) {
+            return Ok(true); // already bound; idempotent
+        }
+        peer.netdoc_author = Some(author_hex.to_string());
+        self.put_peer(&peer).await?;
+        tracing::info!(
+            "netdoc C1: vouched author {} for member {}",
+            &author_hex[..8.min(author_hex.len())],
+            &node_id[..8.min(node_id.len())]
+        );
+        Ok(true)
+    }
+
     /// Open the host's network namespace, creating it on first run.
     ///
     /// The namespace id is persisted to `meta_path` so subsequent starts re-open
@@ -1760,6 +1799,102 @@ mod tests {
             !map.contains_key(&b_id),
             "enforce must reject the forged vpn entry (member's endpoint on the founder's vIP)"
         );
+    }
+
+    /// C1 self-key enforce, the binding's teeth: once the founder vouches member
+    /// B's author via `record_peer_author` (the `AnnounceNetdocAuthor`
+    /// mechanism), a forged `vpn/<B's vIP>` from a *different* author is rejected
+    /// under Enforce while B's own registration is honored. Before the vouch the
+    /// owner is unbound (migration grace) and the forgery would be honored —
+    /// proving the binding, not mere membership, is what authorizes the entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enforce_rejects_forgery_against_vouched_member() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None); // founder = A
+
+        let ticket = a.write_ticket().await.unwrap();
+        // Member B (legitimate) and attacker C both import the warren.
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket.clone())))
+            .await
+            .expect("spawn B");
+        let dir_c = tempfile::tempdir().unwrap();
+        let c = NetDoc::spawn(test_endpoint().await, dir_c.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn C");
+        let b_id = b.endpoint.id().to_string();
+        let c_id = c.endpoint.id().to_string();
+
+        // A admits B (admin-owned peer entry). B claims its own stable vIP and
+        // registers its endpoint (both self-owned, authored by B). Attacker C
+        // forges the same vIP -> C's endpoint (authored by C).
+        a.put_peer(&sample_peer(&b_id, "B")).await.unwrap();
+        let addr_b = b.claim_virtual_ip(&b_id).await.unwrap();
+        b.register_vpn_endpoint(addr_b).await.unwrap();
+        c.register_vpn_endpoint(addr_b).await.unwrap();
+
+        // Wait until both B's legit registration and C's forgery replicate to A
+        // (Observe default — both honored, proving the attack works unguarded).
+        let mut replicated = false;
+        for _ in 0..50 {
+            a.refresh_vpn_peer_ips().await;
+            let m = a.vpn_peer_ips.read().await;
+            if m.contains_key(&c_id) && m.contains_key(&b_id) {
+                replicated = true;
+                break;
+            }
+            drop(m);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(replicated, "B+C vpn entries did not replicate to A within 10s (test setup)");
+
+        // Founder vouches B's author (the announce mechanism). Idempotent + only
+        // for an already-admitted member.
+        assert!(
+            a.record_peer_author(&b_id, &b.author_hex()).await.unwrap(),
+            "trust anchor must record the binding for an admitted member"
+        );
+        assert!(
+            a.record_peer_author(&b_id, &b.author_hex()).await.unwrap(),
+            "record_peer_author must be idempotent"
+        );
+        assert_eq!(
+            a.vouched_authors().await.get(&b_id).copied(),
+            parse_author_hex(&b.author_hex()),
+            "vouched binding must be visible to the validator"
+        );
+
+        // Enforce: B's own endpoint stays mapped; C's forgery is dropped.
+        a.set_validation_mode(ValidationMode::Enforce);
+        a.refresh_vpn_peer_ips().await;
+        let map = a.vpn_peer_ips.read().await.clone();
+        assert_eq!(map.get(&b_id), Some(&addr_b), "vouched member's own entry must be honored");
+        assert!(
+            !map.contains_key(&c_id),
+            "enforce must reject a forgery against a vouched member's vIP"
+        );
+    }
+
+    /// Only the trust anchor records bindings, and only for admitted members.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn record_peer_author_guards() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        // No founder anchor yet → not the trust anchor → no-op.
+        assert!(!a.record_peer_author("nodeZZZZ", &a.author_hex()).await.unwrap());
+        a.record_founder_anchor(None);
+        // Trust anchor, but the node was never admitted → still no-op (never mints membership).
+        assert!(!a.record_peer_author("nodeZZZZ", &a.author_hex()).await.unwrap());
+        // Malformed author is rejected outright.
+        a.put_peer(&sample_peer("nodeZZZZ", "Z")).await.unwrap();
+        assert!(a.record_peer_author("nodeZZZZ", "not-hex").await.is_err());
     }
 
     #[tokio::test]

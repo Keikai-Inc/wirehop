@@ -1350,7 +1350,9 @@ async fn client_shell_loop(
                     Ok(HostMessage::SessionInfo { .. }) => {
                         // Late SessionInfo — ignore
                     }
-                    Ok(HostMessage::AdminResponse(_)) | Ok(HostMessage::PeerResponse(_)) => {
+                    Ok(HostMessage::AdminResponse(_))
+                    | Ok(HostMessage::PeerResponse(_))
+                    | Ok(HostMessage::NetdocAuthorAck { .. }) => {
                         // Unexpected admin/peer response during shell session — ignore
                     }
                     Ok(HostMessage::SessionError(msg)) => {

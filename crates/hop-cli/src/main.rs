@@ -335,6 +335,10 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         let cell = netdoc_cell.clone();
         let cfg = config_dir.to_path_buf();
         let host_node_id = public_key.to_string();
+        // The C1 member-binding announce goes out over the *main* hop endpoint
+        // (the founder authenticates the sender by its main NodeId), so hand the
+        // netdoc task a clone of it alongside the isolated netdoc endpoint.
+        let main_endpoint = endpoint.clone();
         tokio::spawn(async move {
             let endpoint = match net::create_netdoc_endpoint(netdoc_key).await {
                 Ok(ep) => ep,
@@ -474,6 +478,25 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                                     "vpn: bringup failed, continuing without it (core access unaffected): {e:#}"
                                 ),
                             }
+                        }
+                    }
+
+                    // C1 self-key binding: a warren member announces its doc
+                    // author to the founder so the founder can vouch it in the
+                    // member's (admin-owned) peer entry. Without this, the
+                    // member's self-owned vpn/ip entries can't be validated under
+                    // enforce. Best-effort with retry; the founder skips its own
+                    // announce (it's the trust anchor). Never blocks serving.
+                    if !net.is_trust_anchor()
+                        && let Ok(fnode) = std::fs::read_to_string(cfg.join("netdoc-founder.node"))
+                    {
+                        let fnode = fnode.trim().to_string();
+                        let author = net.author_hex();
+                        if !fnode.is_empty() && fnode != host_node_id {
+                            let ep = main_endpoint.clone();
+                            tokio::spawn(async move {
+                                announce_netdoc_author_with_retry(ep, &fnode, &author).await;
+                            });
                         }
                     }
 
@@ -916,6 +939,69 @@ fn peer_is_network_only(config_dir: &std::path::Path, peer_id: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Announce this node's netdoc author to the founder so it can vouch the
+/// member's self-key binding (C1 enforce). Best-effort with exponential
+/// backoff — the founder may be briefly offline, or not yet have admitted us.
+async fn announce_netdoc_author_with_retry(
+    endpoint: iroh::Endpoint,
+    founder_node_hex: &str,
+    author_hex: &str,
+) {
+    let founder_id: iroh::PublicKey = match founder_node_hex.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("netdoc announce: invalid founder node id {founder_node_hex:?}: {e}");
+            return;
+        }
+    };
+    let mut delay = std::time::Duration::from_secs(5);
+    for attempt in 1..=8u32 {
+        match announce_netdoc_author_once(&endpoint, founder_id, author_hex).await {
+            Ok(true) => {
+                tracing::info!("netdoc announce: founder recorded our author binding");
+                return;
+            }
+            Ok(false) => tracing::debug!(
+                "netdoc announce: acked but not yet recorded (attempt {attempt}); retrying"
+            ),
+            Err(e) => tracing::debug!("netdoc announce: attempt {attempt} failed: {e:#}"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(300));
+    }
+    tracing::warn!(
+        "netdoc announce: gave up; this member's self-keys may be unvalidated under enforce"
+    );
+}
+
+/// One announce round-trip over the main endpoint.
+async fn announce_netdoc_author_once(
+    endpoint: &iroh::Endpoint,
+    founder_id: iroh::PublicKey,
+    author_hex: &str,
+) -> Result<bool> {
+    let (conn, _) = hop_core::net::connect_to_host_with_alpn(
+        endpoint,
+        founder_id,
+        None,
+        hop_core::proto::ALPN_V3,
+    )
+    .await?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open_bi for announce")?;
+    proto::write_message(
+        &mut send,
+        &ClientMessage::AnnounceNetdocAuthor { author: author_hex.to_string() },
+    )
+    .await?;
+    let resp: proto::HostMessage = proto::read_message(&mut recv).await?;
+    let _ = send.finish();
+    match resp {
+        proto::HostMessage::NetdocAuthorAck { recorded } => Ok(recorded),
+        other => anyhow::bail!("unexpected announce response: {other:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_session(
     msg: Option<ClientMessage>,
     conn: iroh::endpoint::Connection,
@@ -1125,6 +1211,28 @@ async fn dispatch_session(
                 }
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
+        }
+        Some(ClientMessage::AnnounceNetdocAuthor { author }) => {
+            // A warren member announced its doc author. Only the founder/admin
+            // (the C1 trust anchor) records the admin-owned binding; any other
+            // receiver acks without recording so the member keeps retrying until
+            // it reaches the anchor. Best-effort — never errors the session.
+            let recorded = if let Some(nd) = &netdoc {
+                match nd.record_peer_author(peer_id, &author).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("netdoc: record_peer_author for {peer_id} failed: {e:#}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let _ = proto::write_message(
+                &mut send,
+                &proto::HostMessage::NetdocAuthorAck { recorded },
+            )
+            .await;
         }
         Some(other) => {
             tracing::warn!("Expected RequestShell/Transfer/Exec/Admin/PeerOp, got: {:?}", other);
@@ -4173,21 +4281,21 @@ async fn cmd_warren(
         WarrenAction::Join { invite } => {
             // Resolve the warren namespace ticket: from the invite (which now
             // carries it), or from the ticket stored when we connected as a client.
-            let (ticket, founder_author, redeem) = match invite {
+            let (ticket, founder_author, founder_node, redeem) = match invite {
                 Some(tok) => {
                     let decoded = hop_core::invite::decode_invite(&tok)
                         .context("invalid invite token")?;
                     let t = decoded.warren_ticket.clone().context(
                         "this invite does not carry a warren — the host has no VPN/warren enabled",
                     )?;
-                    (t, decoded.founder_author.clone(), Some(tok))
+                    (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok))
                 }
                 None => {
                     let stored = std::fs::read_to_string(config_dir.join("warren-ticket"))
                         .context("no invite given and no stored warren ticket — run `hop warren join <invite>` first")?;
                     let t = stored.trim().to_string();
                     anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
-                    (t, None, None)
+                    (t, None, None, None)
                 }
             };
 
@@ -4203,6 +4311,11 @@ async fn cmd_warren(
             // — it's a public author id, but keep it owner-readable for tidiness.
             if let Some(fa) = founder_author {
                 let _ = config::write_secret_file(&config_dir.join("netdoc-founder.author"), &fa);
+            }
+            // Persist the founder's main node id so the daemon knows whom to send
+            // its `AnnounceNetdocAuthor` to on startup (C1 self-key binding).
+            if let Some(fnode) = founder_node {
+                let _ = config::write_shared_file(&config_dir.join("netdoc-founder.node"), &fnode);
             }
 
             // Redeem the invite for membership (auth handshake → the inviting host

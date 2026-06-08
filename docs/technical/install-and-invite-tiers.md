@@ -429,6 +429,7 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 0a** — C1 **admin-key enforce** (`peer/ role/ revocation/ acl/ network/` honored only from the founder author; complete across `list_prefix` + `get_peer`/`is_revoked`/`get_authored_policy`) | ✅ shipped, behind `HOP_NETDOC_VALIDATION=enforce` (default Observe) | 0.6.42 |
 | **Phase 1c** — warren-only tier (`network_only` role flag + session-dispatch refusal + seeded `warren-only` role) | ✅ shipped | 0.6.42 |
 | **Phase 0a** — C1 **self-key enforce LOGIC** (`Peer.netdoc_author` binding + `vouched_authors` + `vpn/`/`ip/` validated against the owner's vouched author in `refresh_vpn_peer_ips`; `self_entry_author_ok` unit-tested) | ✅ logic shipped, flag-gated; founder self-vouches | 0.6.44 |
+| **Phase 0a** — C1 **member-node binding** (`AnnounceNetdocAuthor` daemon-outbound announce → founder records `peer/N.netdoc_author`; `record_peer_author` trust-anchor-only + idempotent; unit-tested by `enforce_rejects_forgery_against_vouched_member`; **multi-node enforce e2e** runs both nodes under `HOP_NETDOC_VALIDATION=enforce` + asserts the binding) | ✅ shipped | 0.6.46 |
 | **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
@@ -444,24 +445,25 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   forged `vpn/<founder_addr>` is honored in Observe, dropped in Enforce). Shipped
   flag-gated (default Observe). The founder self-vouches, so **the founder is
   fully protected under enforce today**.
-  - **Final remaining piece — the member-node binding.** Non-founder nodes are
-    in migration *grace* (honored) until `peer.netdoc_author` is populated for
-    them. The specified mechanism (recommended of the three considered, because
-    it needs **no author-derivation migration** and so can't break a live
-    warren's membership):
-    > **Daemon-outbound announce.** New `ClientMessage::AnnounceNetdocAuthor
-    > { author }`. On `hop host` startup (after `enable_vpn`, when it has its
-    > author), a federated node opens an authenticated session to an admin (the
-    > founder, whose main NodeId is persisted from the invite as
-    > `netdoc-founder.node`) and announces its author. The admin, on receiving it
-    > from authenticated peer N, records `peer/N.netdoc_author` (admin-authored,
-    > so it's a valid binding). Best-effort + retry; idempotent. Alternatives:
-    > deterministic-author-at-redeem (needs the re-vouch migration) and
-    > heavy-redeem-init (spin the netdoc up during `hop warren join`).
+  - **Member-node binding — SHIPPED (0.6.46).** `ClientMessage::AnnounceNetdocAuthor
+    { author }`: on `hop host` startup (after `enable_vpn`, once it has its
+    author) a federated node opens an authenticated session to the founder —
+    whose main NodeId is persisted from the invite as `netdoc-founder.node` —
+    over the **main** hop endpoint and announces its doc author. The founder,
+    receiving it from authenticated peer N, calls `record_peer_author` which
+    (trust-anchor-only, member-must-exist, idempotent) writes
+    `peer/N.netdoc_author`. Best-effort with exponential backoff. The chosen
+    design needs **no author-derivation migration**, so it can't break a live
+    warren's membership. The multi-node e2e (`tests/e2e/vpn-e2e.sh`) now runs
+    both nodes under `HOP_NETDOC_VALIDATION=enforce` and asserts host-a records
+    the binding — bind → enforce → reconverge on a real warren. Until the
+    announce lands a member's self-owned `ip/`/`vpn/` entries pass under
+    migration *grace* (unbound owner), so enforce never partitions a fresh join.
   - `name/` self-keys still use the observe-mode detector, not enforcement
-    (needs the same binding + an addr→name owner resolution).
-  - **Default-on** should follow once the announce lands and a multi-node e2e
-    exercises bind → enforce → reconverge across a real warren.
+    (needs an addr→name owner resolution on top of the now-shipped binding).
+  - **Default-on** is the remaining flip: change `ValidationMode::default()` to
+    `Enforce` (or ship operator guidance) now that the binding + multi-node
+    enforce e2e are green.
 - **Phase 0b — read-ticket members + node-announce.** Switching members from
   write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
   needs the migration grace window exercised on a real multi-node warren.
@@ -474,4 +476,4 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
 - **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
   verify-then-promote; both are release-pipeline + infra work.
 
-*Last updated: 0.6.43*
+*Last updated: 0.6.46*

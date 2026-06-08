@@ -83,6 +83,8 @@ pub enum HostMessage {
     },
     AdminResponse(AdminResponse),         // Admin command result (hop/2+)
     SessionError(String),                 // Session setup failure
+    PeerResponse(PeerResponse),           // Peer-op result (secrets/kv/cap/cron/ext/tap)
+    NetdocAuthorAck { recorded: bool },   // Ack for AnnounceNetdocAuthor; recorded=true on the trust anchor
 }
 ```
 
@@ -112,6 +114,10 @@ pub enum ClientMessage {
     },
     SetEnv { vars: HashMap<String, String> },  // Client env (TERM, LANG, etc.)
     RequestAdmin(AdminRequest),           // Admin request (hop/2+)
+    RequestPeerOp(PeerRequest),           // Peer op: secrets/kv/cap/cron/ext/tap (any authed peer)
+    AnnounceNetdocAuthor { author: String },   // Warren member -> founder: announce doc author for the
+                                          //   peer/<node>.netdoc_author binding (C1 self-key enforce).
+                                          //   Authorized by NodeId (existing peer); best-effort.
 }
 ```
 

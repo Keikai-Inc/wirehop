@@ -43,8 +43,15 @@ docker volume create "$VOL" >/dev/null
 # `--host` / `hop config set vpn on` / HOP_VPN=1, which this mirrors. The
 # containers grant TUN + NET_ADMIN so bring-up succeeds; the conflict guard
 # finds no existing 100.64.0.0/10.
+# HOP_NETDOC_VALIDATION=enforce runs the C1 author-validation in full enforce on
+# BOTH nodes from the start — the real multi-node bind→enforce→reconverge test.
+# host-b announces its doc author to host-a (AnnounceNetdocAuthor); until that
+# binding lands, host-b's self-owned ip/vpn entries pass under migration grace
+# (unbound owner), so enforce can't partition a freshly-joined node. If routing
+# works here, enforce is safe to default on.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
-        -v "$VOL:/shared" -e RUST_LOG=hop=info,hop_core=info -e HOP_VPN=1 --user root)
+        -v "$VOL:/shared" -e RUST_LOG=hop=info,hop_core=info -e HOP_VPN=1
+        -e HOP_NETDOC_VALIDATION=enforce --user root)
 
 echo "=== starting host-a (warren owner) ==="
 docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
@@ -113,11 +120,36 @@ docker exec hop-vpn-a grep -o 'namespace [0-9a-f]*' /cfg/log | head -1 || true
 docker exec hop-vpn-b grep -o 'namespace [0-9a-f]*' /cfg/log | head -1 || true
 echo "--- host-a peers (did host-b's redeem register?) ---"; docker exec hop-vpn-a cat /cfg/peers.json 2>/dev/null | head -20 || true
 
-echo "=== TEST: ping host-a virtual IP ($VIP_A) from host-b over the TUN ==="
+echo "=== TEST: C1 member-binding announce (AnnounceNetdocAuthor) ==="
+# host-b's daemon announces its doc author to host-a on startup; host-a (the
+# trust anchor) records the peer/<host-b>.netdoc_author binding. Allow a few
+# seconds for the best-effort announce + retry to land.
+BIND_OK=0
+for i in $(seq 1 30); do
+  if docker exec hop-vpn-a sh -c 'grep -q "netdoc C1: vouched author" /cfg/log' 2>/dev/null; then
+    BIND_OK=1; break
+  fi
+  sleep 1
+done
+if [ "$BIND_OK" = "1" ]; then
+  echo "BINDING PASSED: host-a recorded host-b's announced netdoc author."
+  docker exec hop-vpn-a grep "vouched author" /cfg/log | tail -1 || true
+else
+  echo "BINDING WARN: host-a did not log a vouched author within 30s"
+  echo "--- host-b log (announce attempts) ---"; docker exec hop-vpn-b grep -i 'announce' /cfg/log | tail -10 || true
+  echo "--- host-a log tail ---"; docker exec hop-vpn-a cat /cfg/log | tail -15 || true
+fi
+
+echo "=== TEST: ping host-a virtual IP ($VIP_A) from host-b over the TUN (enforce mode) ==="
 if docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
     echo ""
-    echo "VPN E2E PASSED: role-gated packet flow over TUN works."
-    RC=0
+    echo "VPN E2E PASSED: role-gated packet flow over TUN works under enforce."
+    if [ "$BIND_OK" != "1" ]; then
+        echo "VPN E2E FAILED: routing works but the C1 binding was never recorded."
+        RC=1
+    else
+        RC=0
+    fi
 else
     echo ""
     echo "VPN E2E FAILED: ping over TUN did not succeed."

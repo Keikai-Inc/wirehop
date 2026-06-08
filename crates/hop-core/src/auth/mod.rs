@@ -180,6 +180,7 @@ pub async fn authenticate_client(
         | ClientMessage::RequestTransfer(_)
         | ClientMessage::RequestExec { .. }
         | ClientMessage::RequestExecV2 { .. }
+        | ClientMessage::AnnounceNetdocAuthor { .. }
         | ClientMessage::RequestAdmin(_) => {
             // Authorization order:
             //   0. An *explicit* doc revocation (tombstone) rejects even a

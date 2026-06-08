@@ -45,6 +45,10 @@ pub enum HostMessage {
     SessionError(String),
     /// Response to a peer operation.
     PeerResponse(PeerResponse),
+    /// Acknowledge an `AnnounceNetdocAuthor`. `recorded` is true when the
+    /// receiver is the founder/admin and wrote the binding; false when it
+    /// accepted the announce but is not the trust anchor (member retries later).
+    NetdocAuthorAck { recorded: bool },
 }
 
 /// Messages sent from the client to the host.
@@ -91,6 +95,12 @@ pub enum ClientMessage {
     RequestAdmin(AdminRequest),
     /// Peer operation (any authenticated peer). Secrets, KV, cap, cron.
     RequestPeerOp(PeerRequest),
+    /// Announce this node's network-document author so the founder/admin can
+    /// record the `peer/<node>.netdoc_author` binding (C1 self-key enforce).
+    /// Sent daemon-outbound on startup by a warren member to its founder; the
+    /// founder authenticates the sender by NodeId (existing peer) and writes the
+    /// admin-owned binding. Best-effort — never gates membership or reach.
+    AnnounceNetdocAuthor { author: String },
 }
 
 // --- Admin protocol (hop/2+) ---
