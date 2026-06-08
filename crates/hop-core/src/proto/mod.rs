@@ -257,6 +257,11 @@ pub struct RoleDefinition {
     pub groups: Vec<String>,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Warren-only tier (install-and-invite-tiers.md): the peer may have L3 reach
+    /// to services on the mesh (per `host_tags`) but **cannot open host sessions**
+    /// (shell/exec/transfer). Enforced at session dispatch. Default false.
+    #[serde(default)]
+    pub network_only: bool,
     /// Sandbox policy enforced for peers with this role.
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: SandboxPolicy,
@@ -287,6 +292,7 @@ pub struct RoleUpdates {
     pub groups: Option<Vec<String>>,
     pub shell: Option<Option<String>>,
     pub user_mode: Option<UserMode>,
+    pub network_only: Option<bool>,
     pub sandbox: Option<SandboxPolicy>,
 }
 

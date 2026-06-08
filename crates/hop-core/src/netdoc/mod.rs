@@ -1457,6 +1457,7 @@ mod tests {
             user_mode: UserMode::Individual,
             sudo: false,
             admin: false,
+            network_only: false,
             groups: vec![],
             shell: None,
             sandbox: SandboxPolicy::default(),

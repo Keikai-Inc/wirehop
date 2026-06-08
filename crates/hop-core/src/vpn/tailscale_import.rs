@@ -197,6 +197,7 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
             user_mode: UserMode::default(),
             sudo: false,
             admin: false,
+            network_only: false,
             groups: vec![],
             shell: None,
             sandbox: Default::default(),

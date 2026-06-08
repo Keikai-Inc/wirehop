@@ -883,6 +883,24 @@ async fn handle_incoming_inner(
     Ok(())
 }
 
+/// Whether the peer's named role is `network_only` (warren-only tier): on the
+/// mesh for L3 reach, but barred from host sessions. Resolves peers.json →
+/// role_name → the role definition. Best-effort: a missing role/peer = not
+/// network-only (fail open to normal authorization, which still applies).
+fn peer_is_network_only(config_dir: &std::path::Path, peer_id: &str) -> bool {
+    let Ok(peers) = hop_core::config::PeersStore::load(config_dir) else { return false };
+    let Some(role_name) = peers
+        .peers
+        .iter()
+        .find(|p| p.node_id == peer_id)
+        .and_then(|p| p.role_name.clone())
+    else {
+        return false;
+    };
+    let Ok(roles) = hop_core::fleet::RolesStore::load(config_dir) else { return false };
+    roles.roles.iter().any(|r| r.name == role_name && r.network_only)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_session(
     msg: Option<ClientMessage>,
@@ -900,6 +918,31 @@ async fn dispatch_session(
     ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
     netdoc: Option<std::sync::Arc<hop_core::netdoc::NetDoc>>,
 ) -> Result<()> {
+    // Warren-only tier: a peer whose role is `network_only` is on the mesh for
+    // L3 reach but must not open host sessions (shell/exec/transfer). Refuse
+    // those up front; datastore/admin requests are governed separately.
+    let is_session_req = matches!(
+        msg,
+        Some(
+            ClientMessage::RequestShell
+                | ClientMessage::RequestShellV2 { .. }
+                | ClientMessage::RequestShellV3 { .. }
+                | ClientMessage::RequestTransfer(_)
+                | ClientMessage::RequestExec { .. }
+                | ClientMessage::RequestExecV2 { .. }
+        )
+    );
+    if is_session_req && peer_is_network_only(config_dir, peer_id) {
+        tracing::info!("Refusing host session for warren-only peer {}", &peer_id[..10.min(peer_id.len())]);
+        let _ = proto::write_message(
+            &mut send,
+            &proto::HostMessage::SessionError(
+                "this peer's role is warren-only (VPN reach, no host sessions)".to_string(),
+            ),
+        )
+        .await;
+        return Ok(());
+    }
     match msg {
         Some(ClientMessage::RequestShell) => {
             tracing::info!("Starting shell session");
@@ -2169,6 +2212,7 @@ async fn cmd_admin(
                     user_mode: if *shared { UserMode::Shared } else { UserMode::Individual },
                     sudo: *sudo,
                     admin: *admin,
+                    network_only: false,
                     groups: groups.clone(),
                     shell: shell.clone(),
                     sandbox: hop_core::sandbox::SandboxPolicy::default(),

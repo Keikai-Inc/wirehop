@@ -105,6 +105,7 @@ impl RolesStore {
                     host_tags: vec![],
                     sudo: false,
                     admin: false,
+                    network_only: false,
                     user_mode: UserMode::Individual,
                     groups: vec![],
                     shell: None,
@@ -116,6 +117,7 @@ impl RolesStore {
                     host_tags: vec!["*".into()],
                     sudo: true,
                     admin: true,
+                    network_only: false,
                     user_mode: UserMode::Individual,
                     groups: vec!["docker".into()],
                     shell: None,
@@ -127,8 +129,23 @@ impl RolesStore {
                     host_tags: vec!["*".into()],
                     sudo: true,
                     admin: false,
+                    network_only: false,
                     user_mode: UserMode::Individual,
                     groups: vec!["docker".into()],
+                    shell: None,
+                    sandbox: SandboxPolicy::default(),
+                    capabilities: Default::default(),
+                },
+                // Warren-only: on the mesh with L3 reach to services it's tagged
+                // for, but cannot open host sessions (shell/exec/transfer).
+                RoleDefinition {
+                    name: "warren-only".into(),
+                    host_tags: vec![],
+                    sudo: false,
+                    admin: false,
+                    network_only: true,
+                    user_mode: UserMode::Individual,
+                    groups: vec![],
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
@@ -138,6 +155,7 @@ impl RolesStore {
                     host_tags: vec!["developer".into(), "staging".into()],
                     sudo: false,
                     admin: false,
+                    network_only: false,
                     user_mode: UserMode::Individual,
                     groups: vec![],
                     shell: None,
@@ -149,6 +167,7 @@ impl RolesStore {
                     host_tags: vec!["production".into(), "staging".into()],
                     sudo: false,
                     admin: false,
+                    network_only: false,
                     user_mode: UserMode::Individual,
                     groups: vec![],
                     shell: None,
@@ -160,6 +179,7 @@ impl RolesStore {
                     host_tags: vec!["build".into()],
                     sudo: false,
                     admin: false,
+                    network_only: false,
                     user_mode: UserMode::Shared,
                     groups: vec![],
                     shell: None,
@@ -412,6 +432,9 @@ pub fn handle_update_role(config_dir: &Path, name: &str, updates: RoleUpdates) -
                 }
                 if let Some(admin) = updates.admin {
                     role.admin = admin;
+                }
+                if let Some(network_only) = updates.network_only {
+                    role.network_only = network_only;
                 }
                 if let Some(groups) = updates.groups {
                     role.groups = groups;
@@ -702,6 +725,7 @@ mod tests {
             user_mode,
             sudo,
             admin,
+            network_only: false,
             groups,
             shell,
             sandbox: SandboxPolicy::default(),
@@ -980,7 +1004,7 @@ mod tests {
     fn seed_defaults_creates_default_roles() {
         let dir = tempfile::tempdir().unwrap();
         let store = RolesStore::seed_defaults(dir.path()).unwrap();
-        assert_eq!(store.roles.len(), 6);
+        assert_eq!(store.roles.len(), 7);
         // Least-privilege default exists with no reach.
         let member = store.find_role("member").unwrap();
         assert!(member.host_tags.is_empty());
@@ -1038,7 +1062,7 @@ mod tests {
         RolesStore::seed_defaults(dir.path()).unwrap();
 
         let loaded = RolesStore::load(dir.path()).unwrap();
-        assert_eq!(loaded.roles.len(), 6);
+        assert_eq!(loaded.roles.len(), 7);
         // member is seeded first; named lookups are order-independent.
         assert_eq!(loaded.roles[0].name, "member");
         assert!(loaded.find_role("admin").is_some());
