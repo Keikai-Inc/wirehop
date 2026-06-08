@@ -3,7 +3,7 @@ members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/h
 resolver = "2"
 
 [workspace.package]
-version = "0.6.39"
+version = "0.6.40"
 edition = "2024"
 license = "LicenseRef-Proprietary"
 
