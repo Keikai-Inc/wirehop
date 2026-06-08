@@ -461,9 +461,23 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
     migration *grace* (unbound owner), so enforce never partitions a fresh join.
   - `name/` self-keys still use the observe-mode detector, not enforcement
     (needs an addr→name owner resolution on top of the now-shipped binding).
-  - **Default-on** is the remaining flip: change `ValidationMode::default()` to
-    `Enforce` (or ship operator guidance) now that the binding + multi-node
-    enforce e2e are green.
+  - **Default-on is blocked on a vouched-admin-authors model.** `reconcile`
+    runs on every node and writes `peer/`/`role/` entries authored by *that
+    node*; on a federated multi-admin warren a co-admin legitimately authors
+    admin keys. Admin-key enforce currently honors only the **founder** author,
+    so flipping `ValidationMode::default()` to `Enforce` globally would reject a
+    co-admin's federated peer entries — breaking the "inviter-offline /
+    federated peer" auth path (auth still falls back to local `peers.json`, so a
+    locally-known peer is unaffected; the risk is purely federated reach). The
+    fix mirrors the member binding: the founder vouches co-admin authors (e.g. a
+    `peer/N.is_admin` + author binding, or an admin-author set in the doc), and
+    `validate_entry` accepts admin keys from any vouched admin author. Until
+    then enforce is **safe to opt into** (single-admin warrens, or
+    federated ones where only the founder mutates membership) but **not** the
+    global default. Self-key enforce (the shipped binding) has no such blocker —
+    members never author admin keys. Legacy warrens with no founder anchor honor
+    admin keys unconditionally under enforce (`validate_entry`), so they are
+    never partitioned regardless.
 - **Phase 0b — read-ticket members + node-announce.** Switching members from
   write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
   needs the migration grace window exercised on a real multi-node warren.
