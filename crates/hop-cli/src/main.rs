@@ -361,6 +361,15 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 });
             match hop_core::netdoc::NetDoc::open_or_create(endpoint, &store_dir, &meta_path, join).await {
                 Ok((net, _created)) => {
+                    // Record the C1 trust anchor (founder/admin author). The
+                    // founder (namespace creator) is its own admin; a federated
+                    // node reads the founder author persisted by `hop warren join`.
+                    let founder_hex = std::fs::read_to_string(cfg.join("netdoc-founder.author"))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    net.record_founder_anchor(founder_hex.as_deref());
+
                     // Reconcile the document with the host's peers.json/roles.json
                     // on every start (initial migration on first run, drift
                     // correction afterwards). Best-effort.

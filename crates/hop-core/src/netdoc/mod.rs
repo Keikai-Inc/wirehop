@@ -141,6 +141,11 @@ pub struct NetDoc {
     /// author changed — the signature of a member forging/hijacking another
     /// node's `vpn`/`name`/`ip` registration (C1). Log-only in `Observe` mode.
     entry_authors: std::sync::Mutex<std::collections::HashMap<Vec<u8>, AuthorId>>,
+    /// The trusted admin (founder) author — the C1 trust anchor. For the founder
+    /// this is its own author; a federated node sets it from the invite's
+    /// `founder_author`. In enforce mode, admin-owned entries (`peer/ role/
+    /// revocation/ acl/ network/`) are honored only if authored by it.
+    founder_author: std::sync::Mutex<Option<AuthorId>>,
 }
 
 /// Author-validation enforcement level for replicated doc entries (C1).
@@ -261,6 +266,7 @@ impl NetDoc {
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             validation_mode: ValidationMode::from_env(),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
+            founder_author: std::sync::Mutex::new(None),
         })
     }
 
@@ -275,6 +281,33 @@ impl NetDoc {
     /// author-validated.
     pub fn author_hex(&self) -> String {
         hex::encode(self.author.to_bytes())
+    }
+
+    /// Record the C1 trust anchor (the founder/admin author). Call after spawn:
+    /// the founder (namespace creator, not federated) is its own admin; a
+    /// federated node passes the `founder_author` hex from the invite it joined
+    /// with. Inert until `ValidationMode::Enforce`.
+    pub fn record_founder_anchor(&self, from_invite_hex: Option<&str>) {
+        let resolved = if !self.federated {
+            // The host that created the namespace is the founder/admin.
+            Some(self.author)
+        } else {
+            from_invite_hex.and_then(parse_author_hex)
+        };
+        if let Some(a) = resolved {
+            *self.founder_author.lock().unwrap() = Some(a);
+            tracing::info!("netdoc C1: trusted admin author = {a}");
+        } else if self.federated {
+            tracing::warn!(
+                "netdoc C1: no founder author available (legacy join) — enforce mode \
+                 would reject admin entries; staying in observe is recommended"
+            );
+        }
+    }
+
+    /// The trusted admin author, if known.
+    fn founder_author(&self) -> Option<AuthorId> {
+        *self.founder_author.lock().unwrap()
     }
 
     /// Open the host's network namespace, creating it on first run.
@@ -466,7 +499,9 @@ impl NetDoc {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry.context("reading ip entry")?;
-            self.note_entry_author(entry.key(), entry.author());
+            if !self.validate_entry(entry.key(), entry.author()) {
+                continue;
+            }
             if entry.content_len() == 0 {
                 continue;
             }
@@ -599,7 +634,9 @@ impl NetDoc {
         let mut stream = std::pin::pin!(stream);
         let mut map = std::collections::HashMap::new();
         while let Some(Ok(entry)) = stream.next().await {
-            self.note_entry_author(entry.key(), entry.author());
+            if !self.validate_entry(entry.key(), entry.author()) {
+                continue;
+            }
             if entry.content_len() == 0 {
                 continue;
             }
@@ -1180,7 +1217,9 @@ impl NetDoc {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry.context("reading entry from stream")?;
-            self.note_entry_author(entry.key(), entry.author());
+            if !self.validate_entry(entry.key(), entry.author()) {
+                continue;
+            }
             if let Some(value) = self.decode_entry::<T>(&entry).await? {
                 out.push(value);
             }
@@ -1188,33 +1227,57 @@ impl NetDoc {
         Ok(out)
     }
 
-    /// Record the author that wrote `key`; in `Observe` mode, warn when an
-    /// existing key's author changes — the signature of a member forging or
-    /// hijacking another node's registration (security-audit C1). Bounded to
-    /// the self-owned tables (`vpn/ ip/ name/ tag/ posture/`); admin tables
-    /// (`peer/ role/ revocation/`) are legitimately rewritten by the admin and
-    /// aren't author-stable, so we skip them until the founder anchor lands.
-    fn note_entry_author(&self, key: &[u8], author: AuthorId) {
-        if self.validation_mode == ValidationMode::Off || !is_self_owned_key(key) {
-            return;
+    /// Validate a replicated entry's author (security-audit C1). Returns whether
+    /// the entry should be **honored**:
+    /// - `Off` → always honor.
+    /// - **Admin-owned keys** (`peer/ role/ revocation/ acl/ network/`): honored
+    ///   only when authored by the founder anchor. In `Observe`, a mismatch is
+    ///   logged but still honored; in `Enforce` it's rejected (skipped). If the
+    ///   anchor is unknown, the entry is honored (can't validate) — which is why
+    ///   `Enforce` should only be enabled once `record_founder_anchor` has set it.
+    /// - **Self-owned keys** (`vpn/ ip/ name/ tag/ posture/`): tracked for
+    ///   author *stability*; an author change is logged as a likely
+    ///   forgery/hijack. These stay honored even in `Enforce` (first-seen TOFU
+    ///   would risk false rejects) until the per-member binding lands.
+    #[must_use]
+    fn validate_entry(&self, key: &[u8], author: AuthorId) -> bool {
+        if self.validation_mode == ValidationMode::Off {
+            return true;
         }
-        let mut map = self.entry_authors.lock().unwrap();
-        match map.get(key) {
-            Some(prev) if *prev != author => {
+        if is_admin_owned_key(key) {
+            if let Some(founder) = self.founder_author()
+                && author != founder
+            {
                 tracing::warn!(
-                    "netdoc C1: author changed for key {:?} ({} → {}) — possible forgery/hijack",
+                    "netdoc C1: admin key {:?} authored by {} ≠ founder {} — {}",
                     String::from_utf8_lossy(key),
-                    prev,
                     author,
+                    founder,
+                    if self.validation_mode == ValidationMode::Enforce { "REJECTED" } else { "honored (observe)" },
                 );
-                // Observe-only: record the new author so we warn once per change.
-                map.insert(key.to_vec(), author);
+                return self.validation_mode != ValidationMode::Enforce;
             }
-            None => {
-                map.insert(key.to_vec(), author);
-            }
-            _ => {}
+            return true;
         }
+        if is_self_owned_key(key) {
+            let mut map = self.entry_authors.lock().unwrap();
+            match map.get(key) {
+                Some(prev) if *prev != author => {
+                    tracing::warn!(
+                        "netdoc C1: author changed for key {:?} ({} → {}) — possible forgery/hijack",
+                        String::from_utf8_lossy(key),
+                        prev,
+                        author,
+                    );
+                    map.insert(key.to_vec(), author);
+                }
+                None => {
+                    map.insert(key.to_vec(), author);
+                }
+                _ => {}
+            }
+        }
+        true
     }
 }
 
@@ -1224,6 +1287,20 @@ impl NetDoc {
 fn is_self_owned_key(key: &[u8]) -> bool {
     const SELF_PREFIXES: &[&[u8]] = &[b"vpn/", b"ip/", b"name/", b"tag/", b"posture/"];
     SELF_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Admin-owned keys — membership, roles, revocations, network policy. In enforce
+/// mode these are honored only when authored by the founder/admin anchor.
+fn is_admin_owned_key(key: &[u8]) -> bool {
+    const ADMIN_PREFIXES: &[&[u8]] = &[b"peer/", b"role/", b"revocation/", b"acl/", b"network/"];
+    ADMIN_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Parse a 64-char hex iroh-docs author id.
+fn parse_author_hex(hex_str: &str) -> Option<AuthorId> {
+    let bytes = hex::decode(hex_str.trim()).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(AuthorId::from(&arr))
 }
 
 #[cfg(test)]
@@ -1254,6 +1331,30 @@ mod tests {
     fn validation_mode_from_env_defaults_observe() {
         // Default (unset / unknown) is the safe Observe.
         assert_eq!(ValidationMode::default(), ValidationMode::Observe);
+    }
+
+    #[test]
+    fn admin_owned_key_classification() {
+        for k in [&b"peer/abc"[..], b"role/admin", b"revocation/abc", b"acl/cedar", b"network/domain"] {
+            assert!(is_admin_owned_key(k), "{:?} should be admin-owned", String::from_utf8_lossy(k));
+        }
+        for k in [&b"vpn/100.64.0.1"[..], b"ip/x", b"name/h", b"tag/x", b"posture/x"] {
+            assert!(!is_admin_owned_key(k));
+        }
+        // A key is never both classes.
+        for k in [&b"peer/x"[..], b"vpn/x", b"role/x", b"name/x"] {
+            assert!(!(is_admin_owned_key(k) && is_self_owned_key(k)));
+        }
+    }
+
+    #[test]
+    fn author_hex_roundtrips() {
+        let arr = [7u8; 32];
+        let a = AuthorId::from(&arr);
+        let hex = hex::encode(a.to_bytes());
+        assert_eq!(parse_author_hex(&hex), Some(a));
+        assert_eq!(parse_author_hex("not-hex"), None);
+        assert_eq!(parse_author_hex("00"), None); // wrong length
     }
 
     async fn test_endpoint() -> Endpoint {
