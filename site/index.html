@@ -338,7 +338,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 7.5l3 8M16.5 7.5l-3 8M8 6h8"/></svg>
           </div>
           <h3>Private Network &mdash; the Warren</h3>
-          <p>Every machine joins your <strong>warren</strong>: a private peer-to-peer mesh with its own virtual IPs (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">100.64.x.x</code>) and MagicDNS names (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">myhost.hop</code>). On by default, reach is role-based &mdash; and there's <strong>no coordination server</strong>: membership lives in a replicated document, not someone else's cloud.</p>
+          <p>Opt a machine into your <strong>warren</strong>: a private peer-to-peer mesh with its own virtual IPs (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">100.64.x.x</code>) and MagicDNS names (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">myhost.hop</code>). Reach is role-based &mdash; and there's <strong>no coordination server</strong>: membership lives in a replicated document, not someone else's cloud.</p>
         </div>
 
         <div class="card card-green">
@@ -531,7 +531,7 @@
       <div class="steps">
         <div class="step">
           <h3>Start a host</h3>
-          <p>Run <code>hop host</code> on the machine you want to access. It generates an identity, starts listening, and joins your warren with its own virtual IP.</p>
+          <p>Run <code>hop host</code> on the machine you want to access. It generates an identity and starts listening; opt it onto the warren (a virtual IP + <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code>) when you want it on the mesh.</p>
         </div>
         <div class="step">
           <h3>Share an invite</h3>
@@ -624,7 +624,7 @@
               <input id="b-invite" type="text" placeholder="paste invite token" autocomplete="off" spellcheck="false">
             </div>
             <div class="builder-row node-only">
-              <label>Warren VPN <span class="hint-tag">on by default</span></label>
+              <label>Warren VPN <span class="hint-tag">opt-in</span></label>
               <div class="seg" id="seg-vpn">
                 <button type="button" class="active" data-val="on">On</button>
                 <button type="button" data-val="off">Off</button>
@@ -692,7 +692,7 @@
             <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
             <li>Registers a native service (LaunchDaemon on macOS, systemd on Linux)</li>
             <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot, on the warren with a virtual IP + MagicDNS</li>
-            <li>Built-in P2P VPN is on by default &mdash; and fail-safe: shell/exec/transfer keep working even if it can't come up</li>
+            <li>Built-in P2P VPN is opt-in &mdash; and fail-safe: shell/exec/transfer keep working whether or not it's enabled</li>
             <li>Automatic restarts on crash</li>
             <li>Works on macOS (Apple Silicon &amp; Intel) and Linux (x86_64, ARM64, ARMv7)</li>
           </ul>
@@ -878,7 +878,7 @@
       var hint = document.getElementById('builder-hint');
       if (hint) {
         hint.innerHTML = isNode
-          ? "<strong>On the warren:</strong> sudo daemon, a virtual IP + <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">name.hop</code>, role-based reach. The VPN is on by default and fail-safe. Default-deny until you hand out invites."
+          ? "<strong>On the warren:</strong> sudo daemon, a virtual IP + <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">name.hop</code>, role-based reach. The VPN is opt-in (this is the opt-in) and fail-safe. Default-deny until you hand out invites."
           : "<strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">hop warren join</code>.";
       }
     }

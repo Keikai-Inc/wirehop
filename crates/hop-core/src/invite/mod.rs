@@ -43,6 +43,57 @@ pub struct InviteToken {
     /// that have no warren yet (degrades to direct-session access only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warren_ticket: Option<String>,
+    /// Explicit capability tier (see `docs/technical/install-and-invite-tiers.md`).
+    /// Decides whether redeeming this invite stays a client or self-upgrades to a
+    /// warren node, and (once the C1 read/write split lands) the ticket scope.
+    /// Old invites have no `tier`; `tier()` infers one for them.
+    #[serde(default, skip_serializing_if = "InviteTier::is_default")]
+    pub tier: InviteTier,
+}
+
+/// Capability tier carried by an invite. Orthogonal axes — session reach,
+/// warren membership, admin — collapsed into the four useful combinations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteTier {
+    /// Reach the inviting host(s); no warren node, no daemon, no sudo.
+    #[default]
+    Client,
+    /// On the warren VPN (vIP/MagicDNS/L3 reach), but cannot open host sessions.
+    WarrenOnly,
+    /// On the warren AND reachable/hostable; not an admin.
+    Node,
+    /// Node + warren write + mint/grant.
+    Admin,
+}
+
+impl InviteTier {
+    fn is_default(&self) -> bool {
+        *self == InviteTier::Client
+    }
+
+    /// Whether redeeming this tier makes the machine a warren node (needs the
+    /// daemon → the self-upgrade / sudo path). `Client` does not.
+    pub fn is_warren_node(&self) -> bool {
+        !matches!(self, InviteTier::Client)
+    }
+}
+
+impl InviteToken {
+    /// The effective tier, inferring one for legacy invites that predate the
+    /// explicit `tier` field: a warren ticket + Creator role → `Admin`; a warren
+    /// ticket alone → `Node`; otherwise `Client`. New invites carry `tier`
+    /// directly, so this just returns it.
+    pub fn effective_tier(&self) -> InviteTier {
+        if self.tier != InviteTier::Client {
+            return self.tier;
+        }
+        match (&self.warren_ticket, &self.role) {
+            (Some(_), PeerRole::Creator) => InviteTier::Admin,
+            (Some(_), _) => InviteTier::Node,
+            (None, _) => InviteTier::Client,
+        }
+    }
 }
 
 fn is_default_peer_role(role: &PeerRole) -> bool {
@@ -244,6 +295,9 @@ pub fn generate_invite_with_role(
         role_name: role_name.clone(),
         sandbox,
         warren_ticket,
+        // Explicit tiers aren't emitted yet (pending the C1 read/write split);
+        // `effective_tier()` infers from warren_ticket+role for now.
+        tier: InviteTier::default(),
     };
     let json = serde_json::to_string(&token)?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -317,6 +371,7 @@ mod tests {
             role_name: None,
             sandbox: SandboxPolicy::default(),
             warren_ticket: None,
+            tier: InviteTier::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(!json.contains("role"), "Peer role should not be serialized: {json}");
@@ -334,6 +389,7 @@ mod tests {
             role_name: None,
             sandbox: SandboxPolicy::default(),
             warren_ticket: None,
+            tier: InviteTier::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
         assert!(json.contains(r#""role":"creator""#), "Creator role should be serialized: {json}");
@@ -344,6 +400,33 @@ mod tests {
         let json = r#"{"secret_hash":"$argon2id$...","created_at":1700000000}"#;
         let invite: PendingInvite = serde_json::from_str(json).unwrap();
         assert_eq!(invite.role, PeerRole::Peer);
+    }
+
+    #[test]
+    fn effective_tier_infers_from_legacy_fields() {
+        let mut t = InviteToken {
+            node_id: "abc".into(),
+            secret: "def".into(),
+            relay_url: None,
+            username: None,
+            host_name: None,
+            role: PeerRole::Peer,
+            role_name: None,
+            sandbox: SandboxPolicy::default(),
+            warren_ticket: None,
+            tier: InviteTier::default(),
+        };
+        // No warren ticket → Client.
+        assert_eq!(t.effective_tier(), InviteTier::Client);
+        // Warren ticket + Peer → Node.
+        t.warren_ticket = Some("blob".into());
+        assert_eq!(t.effective_tier(), InviteTier::Node);
+        // Warren ticket + Creator → Admin.
+        t.role = PeerRole::Creator;
+        assert_eq!(t.effective_tier(), InviteTier::Admin);
+        // An explicit tier wins over inference.
+        t.tier = InviteTier::WarrenOnly;
+        assert_eq!(t.effective_tier(), InviteTier::WarrenOnly);
     }
 
     #[test]
@@ -358,6 +441,7 @@ mod tests {
             role_name: None,
             sandbox: SandboxPolicy::default(),
             warren_ticket: Some("docticketblob".into()),
+            tier: InviteTier::default(),
         };
         let json = serde_json::to_string(&token).unwrap();
         let back: InviteToken = serde_json::from_str(&json).unwrap();
