@@ -133,6 +133,38 @@ pub struct NetDoc {
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
     reach_cache: ReachCache,
+    /// Author-validation mode (security-audit C1, Phase 0a). `Observe` (default)
+    /// only logs anomalies; `Off` disables; `Enforce` (not yet wired) would
+    /// reject. Set via `HOP_NETDOC_VALIDATION`.
+    validation_mode: ValidationMode,
+    /// First-seen iroh-docs author per doc key, used to detect an entry whose
+    /// author changed — the signature of a member forging/hijacking another
+    /// node's `vpn`/`name`/`ip` registration (C1). Log-only in `Observe` mode.
+    entry_authors: std::sync::Mutex<std::collections::HashMap<Vec<u8>, AuthorId>>,
+}
+
+/// Author-validation enforcement level for replicated doc entries (C1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidationMode {
+    /// No author checks (legacy behavior).
+    Off,
+    /// Log author anomalies; take no action. The safe default — it cannot
+    /// partition a warren, only surface forgery attempts.
+    #[default]
+    Observe,
+    /// Reject entries that fail author validation. **Not yet wired** — needs the
+    /// founder-author trust anchor; see install-and-invite-tiers.md §9.
+    Enforce,
+}
+
+impl ValidationMode {
+    fn from_env() -> Self {
+        match std::env::var("HOP_NETDOC_VALIDATION").as_deref() {
+            Ok("off") => ValidationMode::Off,
+            Ok("enforce") => ValidationMode::Enforce,
+            _ => ValidationMode::Observe,
+        }
+    }
 }
 
 /// How long a built reach engine is reused before a rebuild. Membership changes
@@ -227,6 +259,8 @@ impl NetDoc {
             #[cfg(unix)]
             vpn_refresh,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            validation_mode: ValidationMode::from_env(),
+            entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -424,6 +458,7 @@ impl NetDoc {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry.context("reading ip entry")?;
+            self.note_entry_author(entry.key(), entry.author());
             if entry.content_len() == 0 {
                 continue;
             }
@@ -556,6 +591,7 @@ impl NetDoc {
         let mut stream = std::pin::pin!(stream);
         let mut map = std::collections::HashMap::new();
         while let Some(Ok(entry)) = stream.next().await {
+            self.note_entry_author(entry.key(), entry.author());
             if entry.content_len() == 0 {
                 continue;
             }
@@ -1136,12 +1172,50 @@ impl NetDoc {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry.context("reading entry from stream")?;
+            self.note_entry_author(entry.key(), entry.author());
             if let Some(value) = self.decode_entry::<T>(&entry).await? {
                 out.push(value);
             }
         }
         Ok(out)
     }
+
+    /// Record the author that wrote `key`; in `Observe` mode, warn when an
+    /// existing key's author changes — the signature of a member forging or
+    /// hijacking another node's registration (security-audit C1). Bounded to
+    /// the self-owned tables (`vpn/ ip/ name/ tag/ posture/`); admin tables
+    /// (`peer/ role/ revocation/`) are legitimately rewritten by the admin and
+    /// aren't author-stable, so we skip them until the founder anchor lands.
+    fn note_entry_author(&self, key: &[u8], author: AuthorId) {
+        if self.validation_mode == ValidationMode::Off || !is_self_owned_key(key) {
+            return;
+        }
+        let mut map = self.entry_authors.lock().unwrap();
+        match map.get(key) {
+            Some(prev) if *prev != author => {
+                tracing::warn!(
+                    "netdoc C1: author changed for key {:?} ({} → {}) — possible forgery/hijack",
+                    String::from_utf8_lossy(key),
+                    prev,
+                    author,
+                );
+                // Observe-only: record the new author so we warn once per change.
+                map.insert(key.to_vec(), author);
+            }
+            None => {
+                map.insert(key.to_vec(), author);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Keys that a single node owns and should keep one stable author. The C1
+/// forgery vectors (traffic interception, vIP theft, MagicDNS spoofing) all
+/// hijack one of these.
+fn is_self_owned_key(key: &[u8]) -> bool {
+    const SELF_PREFIXES: &[&[u8]] = &[b"vpn/", b"ip/", b"name/", b"tag/", b"posture/"];
+    SELF_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 #[cfg(test)]
@@ -1149,6 +1223,30 @@ mod tests {
     use super::*;
     use crate::config::PeerRole;
     use crate::sandbox::SandboxPolicy;
+
+    #[test]
+    fn self_owned_key_classification() {
+        // The C1 forgery vectors — each must be tracked for author stability.
+        for k in [
+            &b"vpn/100.64.0.1"[..],
+            b"ip/100.64.0.1",
+            b"name/myhost",
+            b"tag/abcdef",
+            b"posture/abcdef",
+        ] {
+            assert!(is_self_owned_key(k), "{:?} should be self-owned", String::from_utf8_lossy(k));
+        }
+        // Admin-owned tables are legitimately rewritten by the admin → not tracked.
+        for k in [&b"peer/abc"[..], b"role/admin", b"revocation/abc", b"acl/cedar", b"network/domain"] {
+            assert!(!is_self_owned_key(k), "{:?} should not be self-owned", String::from_utf8_lossy(k));
+        }
+    }
+
+    #[test]
+    fn validation_mode_from_env_defaults_observe() {
+        // Default (unset / unknown) is the safe Observe.
+        assert_eq!(ValidationMode::default(), ValidationMode::Observe);
+    }
 
     async fn test_endpoint() -> Endpoint {
         // Empty builder: no relay, no discovery — purely local, fine for a
