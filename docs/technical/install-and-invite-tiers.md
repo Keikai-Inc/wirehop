@@ -5,7 +5,7 @@
 > resolved in [§8](#8-decisions-resolved); the file-level build plan is in
 > [§9](#9-implementation-plan-code-level); **what has actually shipped (and what
 > is deferred, with rationale) is tracked in [§10](#10-implementation-status-shipped-incrementally)**.
-> As of 0.6.43: the C1 trust anchor + admin-key enforce (flag-gated), the
+> As of 0.6.45: the C1 trust anchor + admin+self-key enforce (flag-gated, proven by a forged-entry test), the
 > warren-only tier, the InviteTier model, and the self-upgrade consent flow are
 > shipped; the embedded daemon installer, C1 self-key binding/read-ticket
 > members, and signing remain dedicated follow-ups. Sequenced against the C1
@@ -439,16 +439,29 @@ earlier): these are big enough that rushing them would risk lockout, data loss,
 or a privilege-escalation hole. Each needs test infrastructure we don't have yet.
 
 - **C1 enforce — production flip.** Both admin-key *and* self-key (`vpn/`/`ip/`)
-  enforce **logic** is now implemented, unit-tested, and flag-gated (default
-  Observe). The founder self-vouches, so its entries enforce immediately.
-  Remaining before `enforce` is safe to **default-on**: (a) the **member-node
-  binding** — running nodes must populate `peer.netdoc_author` via an
-  **authenticated announce** to an admin (chosen over the deterministic-author
-  approach precisely because it needs **no author-derivation migration**, so it
-  can't break a live warren's membership); until a node announces it's in
-  migration *grace* (honored). (b) a **two-NetDoc forged-entry test** proving a
-  forged `vpn/<victim>` from a member's author is dropped while legit traffic
-  flows. `name/` self-keys still use the observe detector, not enforcement.
+  enforce **logic** is implemented, unit-tested, **and proven end-to-end by a
+  two-NetDoc forged-entry test** (`enforce_rejects_forged_vpn_entry`: a member's
+  forged `vpn/<founder_addr>` is honored in Observe, dropped in Enforce). Shipped
+  flag-gated (default Observe). The founder self-vouches, so **the founder is
+  fully protected under enforce today**.
+  - **Final remaining piece — the member-node binding.** Non-founder nodes are
+    in migration *grace* (honored) until `peer.netdoc_author` is populated for
+    them. The specified mechanism (recommended of the three considered, because
+    it needs **no author-derivation migration** and so can't break a live
+    warren's membership):
+    > **Daemon-outbound announce.** New `ClientMessage::AnnounceNetdocAuthor
+    > { author }`. On `hop host` startup (after `enable_vpn`, when it has its
+    > author), a federated node opens an authenticated session to an admin (the
+    > founder, whose main NodeId is persisted from the invite as
+    > `netdoc-founder.node`) and announces its author. The admin, on receiving it
+    > from authenticated peer N, records `peer/N.netdoc_author` (admin-authored,
+    > so it's a valid binding). Best-effort + retry; idempotent. Alternatives:
+    > deterministic-author-at-redeem (needs the re-vouch migration) and
+    > heavy-redeem-init (spin the netdoc up during `hop warren join`).
+  - `name/` self-keys still use the observe-mode detector, not enforcement
+    (needs the same binding + an addr→name owner resolution).
+  - **Default-on** should follow once the announce lands and a multi-node e2e
+    exercises bind → enforce → reconverge across a real warren.
 - **Phase 0b — read-ticket members + node-announce.** Switching members from
   write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
   needs the migration grace window exercised on a real multi-node warren.
