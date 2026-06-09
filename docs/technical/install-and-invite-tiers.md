@@ -514,9 +514,15 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   `member_self_doc` import — unit-tested (`member_self_doc_roundtrips`) +
   asserted in vpn-e2e. **Remaining:** flip reads to self-doc-preferred, then drop
   the shared-doc write for full physical isolation (`docs/technical/per-member-self-docs.md`).
-- **Phase 1b — embedded `hop __install-daemon` (decision 1A).** The self-upgrade
-  *consent* ships now via the proven shell installer; porting launchd/systemd
-  setup into the binary needs **macOS daemon-install e2e** that doesn't exist yet.
+- **Phase 1b — embedded `hop __install-daemon` SHIPPED inert (0.6.53).** A hidden
+  subcommand installs + starts the daemon from **embedded** launchd/systemd
+  templates (`include_str!` of `pkg/com.hop.daemon.plist` / `pkg/hop.service`),
+  root-required, no network round-trip. Template validity is unit-tested
+  (`embedded_daemon_templates_present`). **Not yet wired into the self-upgrade**
+  — `hop warren join` still uses the proven shell installer (`install.sh --host`)
+  — because invoking this privileged path needs a **macOS daemon-install e2e**
+  that doesn't exist on the dev host. Inert until that harness exists, then the
+  upgrade flow swaps to it (verify-then-promote → `__install-daemon`).
 - **Phase 1a — tier *capability* flag SHIPPED (0.6.48); read/write ticket
   *scope* still pending.** `hop invite --tier client|warren-only|node|admin` now
   sets the explicit `InviteTier`: `client` strips the warren ticket (can't

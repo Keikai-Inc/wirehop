@@ -219,6 +219,9 @@ async fn main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
+        Command::InstallDaemon => {
+            cmd_install_daemon()
+        }
         Command::TransferHelper { mode, dest, compression, chunk_size } => {
             cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
         }
@@ -1578,6 +1581,61 @@ async fn cmd_transfer_helper(mode: &str, dest: &str, compression: Option<&str>, 
 /// macOS sandbox-exec strips the setuid bit from child processes, so
 /// /bin/ps (which is setuid) cannot run. This uses libproc to enumerate
 /// PIDs, then KERN_PROCARGS2 sysctl to get full command lines.
+/// Install + start the hop system daemon from **embedded** templates (launchd on
+/// macOS, systemd on Linux) — no network round-trip for the setup logic. Must run
+/// as root; it writes a system service file and (re)starts the daemon.
+///
+/// RESERVED FOR THE SELF-UPGRADE PATH AND NOT YET WIRED IN: `hop warren join`
+/// still self-upgrades via the proven shell installer (`install.sh --host`).
+/// Wiring this in is gated on a macOS daemon-install e2e (install-and-invite-tiers.md
+/// §10), so this privileged path stays inert until it can be end-to-end tested.
+#[allow(unused_variables, unreachable_code)]
+fn cmd_install_daemon() -> Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("__install-daemon is only supported on macOS and Linux");
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        anyhow::ensure!(
+            hop_core::unix_user::is_running_as_root(),
+            "__install-daemon must run as root (it installs a system service)"
+        );
+        let run = |cmd: &str, args: &[&str]| -> Result<()> {
+            let status = std::process::Command::new(cmd)
+                .args(args)
+                .status()
+                .with_context(|| format!("running {cmd}"))?;
+            anyhow::ensure!(status.success(), "{cmd} {} failed ({status})", args.join(" "));
+            Ok(())
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            const PLIST: &str = include_str!("../../../pkg/com.hop.daemon.plist");
+            const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hop.daemon.plist";
+            std::fs::write(PLIST_PATH, PLIST)
+                .with_context(|| format!("writing {PLIST_PATH}"))?;
+            // bootstrap/enable are idempotent-ish; only kickstart must succeed.
+            let _ = run("launchctl", &["bootstrap", "system", PLIST_PATH]);
+            let _ = run("launchctl", &["enable", "system/com.hop.daemon"]);
+            run("launchctl", &["kickstart", "-k", "system/com.hop.daemon"])?;
+            println!("hop daemon installed + started (launchd: com.hop.daemon).");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const SERVICE: &str = include_str!("../../../pkg/hop.service");
+            const UNIT_PATH: &str = "/etc/systemd/system/hop.service";
+            let _ = run("groupadd", &["--system", "hop"]); // ignore "already exists"
+            std::fs::create_dir_all("/etc/hop").context("creating /etc/hop")?;
+            std::fs::write(UNIT_PATH, SERVICE).with_context(|| format!("writing {UNIT_PATH}"))?;
+            run("systemctl", &["daemon-reload"])?;
+            run("systemctl", &["enable", "--now", "hop"])?;
+            println!("hop daemon installed + started (systemd: hop.service).");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_ps() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -4734,6 +4792,19 @@ mod tests {
     use super::*;
     use hop_core::proto::ClientMessage;
     use hop_core::sandbox::SandboxPolicy;
+
+    #[test]
+    fn embedded_daemon_templates_present() {
+        // The embedded launchd/systemd templates must exist and target the
+        // root-owned binary path; this guards `__install-daemon` against an
+        // accidental template move/rename.
+        let plist = include_str!("../../../pkg/com.hop.daemon.plist");
+        assert!(plist.contains("com.hop.daemon"), "plist label missing");
+        assert!(plist.contains("/usr/local/bin/hop"), "plist binary path missing");
+        let service = include_str!("../../../pkg/hop.service");
+        assert!(service.contains("ExecStart="), "systemd ExecStart missing");
+        assert!(service.contains("/usr/local/bin/hop host"), "systemd binary path missing");
+    }
 
     #[test]
     fn parse_invite_tier_values() {

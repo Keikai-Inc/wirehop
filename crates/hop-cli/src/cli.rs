@@ -296,6 +296,12 @@ pub enum Command {
     #[command(name = "__ps", hide = true)]
     Ps,
 
+    /// Internal: install + start the hop system daemon from embedded templates
+    /// (launchd on macOS, systemd on Linux). Must run as root. Reserved for the
+    /// self-upgrade path; not yet wired in (see install-and-invite-tiers.md §10).
+    #[command(name = "__install-daemon", hide = true)]
+    InstallDaemon,
+
     /// Internal: privilege-separated transfer helper (runs as target user)
     #[command(name = "__transfer-helper", hide = true)]
     TransferHelper {
