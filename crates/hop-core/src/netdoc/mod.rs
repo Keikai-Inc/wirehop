@@ -841,28 +841,49 @@ impl NetDoc {
         Ok(())
     }
 
-    /// Resolve a virtual `addr` to the VPN endpoint serving it.
+    /// The node that owns `addr` per the admin-allocated `peer/N.vip` authority
+    /// (`None` if no peer holds it). `list_peers` is admin-owned + validated
+    /// under enforce, so a member can't forge ownership of another's addr.
+    async fn vip_owner(&self, addr: std::net::Ipv4Addr) -> Option<String> {
+        let target = addr.to_string();
+        self.list_peers()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|p| p.vip.as_deref() == Some(target.as_str()))
+            .map(|p| p.node_id)
+    }
+
+    /// Resolve a virtual `addr` to the VPN endpoint serving it. #3b: prefer the
+    /// owning member's isolated self-doc (keyed by the admin-allocated
+    /// `peer/N.vip`); fall back to the shared `vpn/` table for legacy members.
     pub async fn lookup_vpn_endpoint(
         &self,
         addr: std::net::Ipv4Addr,
     ) -> Result<Option<(iroh::PublicKey, Option<iroh::RelayUrl>)>> {
         let key = format!("{KEY_VPN_PREFIX}{addr}");
-        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
-        let Some(entry) = self.doc.get_one(query).await.context("get_one vpn")? else {
+        let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+
+        // Preferred: the addr owner's self-doc (the isolated endpoint source).
+        if let Some(owner) = self.vip_owner(addr).await
+            && let Some(sd) = self.member_self_doc(&owner).await
+            && let Ok(Some(entry)) = sd.get_one(mk_query()).await
+            && entry.content_len() > 0
+            && let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await
+            && let Some(v) = parse_vpn_endpoint_value(&bytes)
+        {
+            return Ok(Some(v));
+        }
+
+        // Fallback: the shared `vpn/` table (legacy / self-doc not yet imported).
+        let Some(entry) = self.doc.get_one(mk_query()).await.context("get_one vpn")? else {
             return Ok(None);
         };
         if entry.content_len() == 0 {
             return Ok(None);
         }
         let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
-        let value = String::from_utf8_lossy(&bytes);
-        let mut parts = value.split_whitespace();
-        let id_hex = parts.next().unwrap_or_default();
-        let Ok(pubkey) = id_hex.parse::<iroh::PublicKey>() else {
-            return Ok(None);
-        };
-        let relay = parts.next().and_then(|s| s.parse::<iroh::RelayUrl>().ok());
-        Ok(Some((pubkey, relay)))
+        Ok(parse_vpn_endpoint_value(&bytes))
     }
 
     /// Refresh the `endpoint-id-hex → vIP` map used for VPN ingress
@@ -894,6 +915,16 @@ impl NetDoc {
                 } else {
                     tracing::warn!("netdoc C1: ip/{addr} author ≠ owner binding — REJECTED (forged vIP claim)");
                 }
+            }
+        }
+
+        // #3b: the admin-allocated `peer/N.vip` is the AUTHORITATIVE addr→owner
+        // map — it's admin-owned (validated under enforce, so a member can't
+        // forge another's), so it overrides the shared `ip/` table (which remains
+        // the fallback for legacy members that have no `vip` yet).
+        for peer in self.list_peers().await.unwrap_or_default() {
+            if let Some(vip) = peer.vip.as_deref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()) {
+                ip_owner.insert(vip, peer.node_id);
             }
         }
 
@@ -1775,6 +1806,16 @@ fn parse_author_hex(hex_str: &str) -> Option<AuthorId> {
     Some(AuthorId::from(&arr))
 }
 
+/// Parse a `vpn/` entry value (`"<endpoint_id_hex> <relay_url?>"`) into the
+/// endpoint pubkey + optional relay.
+fn parse_vpn_endpoint_value(bytes: &[u8]) -> Option<(iroh::PublicKey, Option<iroh::RelayUrl>)> {
+    let value = String::from_utf8_lossy(bytes);
+    let mut parts = value.split_whitespace();
+    let pubkey = parts.next()?.parse::<iroh::PublicKey>().ok()?;
+    let relay = parts.next().and_then(|s| s.parse::<iroh::RelayUrl>().ok());
+    Some((pubkey, relay))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2413,6 +2454,59 @@ mod tests {
 
         // A malformed self-doc ticket is rejected.
         assert!(a.record_peer_self_doc(&b_id, "not-a-ticket").await.is_err());
+    }
+
+    /// #3b Phase 2: egress resolution (`lookup_vpn_endpoint`) resolves a
+    /// member's endpoint from its self-doc, keyed by the admin-allocated
+    /// `peer/N.vip`, with NO shared-doc `vpn/` entry present.
+    #[tokio::test]
+    async fn lookup_vpn_endpoint_prefers_self_doc() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+        let bep = b.endpoint.id();
+
+        // A admits B with an admin-allocated vIP.
+        let addr: std::net::Ipv4Addr = "100.64.7.7".parse().unwrap();
+        let mut peer_b = sample_peer(&b_id, "B");
+        peer_b.vip = Some(addr.to_string());
+        a.put_peer(&peer_b).await.unwrap();
+
+        // B writes its endpoint ONLY to its self-doc (no shared vpn/ entry).
+        b.self_doc()
+            .await
+            .unwrap()
+            .set_bytes(
+                b.author,
+                format!("{KEY_VPN_PREFIX}{addr}").into_bytes(),
+                format!("{bep} ").into_bytes(),
+            )
+            .await
+            .unwrap();
+        // A records B's self-doc ticket so it can import it.
+        a.record_peer_self_doc(&b_id, &b.self_doc_read_ticket().await.unwrap()).await.unwrap();
+
+        // Egress: A resolves addr → B's endpoint via peer.vip + B's self-doc.
+        let mut found = false;
+        for _ in 0..150 {
+            if let Ok(Some((pk, _))) = a.lookup_vpn_endpoint(addr).await
+                && pk == bep
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(found, "lookup_vpn_endpoint did not resolve B's self-doc endpoint via peer.vip");
     }
 
     /// The data-plane self-doc override: `refresh_vpn_peer_ips` resolves a
