@@ -115,8 +115,16 @@ pub struct NetDoc {
     doc: Doc,
     /// This node's own self-doc (member-owned — this node is the sole writer).
     /// Self-state (`ip/ vpn/ name/ tag/ posture/`) is published here, physically
-    /// isolated from other members. Created/opened at startup.
-    self_doc: Doc,
+    /// isolated from other members. Created **lazily** on first self-state write
+    /// or read-ticket request, so a pure client / non-VPN node never mints one
+    /// (and tests that don't use self-state pay no gossip overhead).
+    self_doc: tokio::sync::RwLock<Option<Doc>>,
+    /// The self-doc namespace id, persisted across restarts (`None` until the
+    /// self-doc is first created).
+    self_ns: std::sync::Mutex<Option<NamespaceId>>,
+    /// Path to the persisted `NetDocMeta`, so lazy self-doc creation can record
+    /// its namespace. `None` for test/`spawn` instances (no persistence).
+    meta_path: Option<std::path::PathBuf>,
     /// Lazily-imported, read-only member self-docs keyed by node_id (lazy/on-
     /// demand sync). Populated by `member_self_doc` on first reach; cached here.
     member_docs: tokio::sync::RwLock<std::collections::HashMap<String, Doc>>,
@@ -250,17 +258,6 @@ impl NetDoc {
         };
         let namespace = doc.id();
 
-        // This node's own self-doc: open the persisted namespace, or mint a fresh
-        // one. This node holds its write key; other members only ever read it.
-        let self_doc = match self_ns {
-            Some(id) => docs
-                .open(id)
-                .await
-                .context("opening self-doc")?
-                .with_context(|| format!("self-doc namespace {id} not found in local store"))?,
-            None => docs.create().await.context("creating self-doc")?,
-        };
-
         #[cfg(unix)]
         let vpn_tun: crate::vpn::TunSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         #[cfg(unix)]
@@ -298,7 +295,9 @@ impl NetDoc {
             fs_store,
             docs,
             doc,
-            self_doc,
+            self_doc: tokio::sync::RwLock::new(None),
+            self_ns: std::sync::Mutex::new(self_ns),
+            meta_path: None,
             member_docs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             author,
             namespace,
@@ -516,20 +515,61 @@ impl NetDoc {
         if let Some(meta) = &existing {
             net.federated = meta.federated;
         }
+        // Remember where to persist meta so lazy self-doc creation can record its
+        // namespace later.
+        net.meta_path = Some(meta_path.to_path_buf());
 
-        // Persist meta when first created, or when the self-doc namespace was
-        // newly minted (older stores have no self_namespace → write it now).
-        if created || self_ns != Some(net.self_doc.id()) {
-            let meta = NetDocMeta {
-                namespace: net.namespace,
-                federated: net.federated,
-                self_namespace: Some(net.self_doc.id()),
-            };
-            let json = serde_json::to_string_pretty(&meta).context("serializing netdoc meta")?;
-            std::fs::write(meta_path, json)
-                .with_context(|| format!("writing netdoc meta to {}", meta_path.display()))?;
+        if created {
+            net.persist_meta()?;
         }
         Ok((net, created))
+    }
+
+    /// Persist `NetDocMeta` (namespace + federation + self-doc namespace) to the
+    /// meta path, if one is set (production). No-op for test instances.
+    fn persist_meta(&self) -> Result<()> {
+        let Some(meta_path) = &self.meta_path else { return Ok(()) };
+        let meta = NetDocMeta {
+            namespace: self.namespace,
+            federated: self.federated,
+            self_namespace: *self.self_ns.lock().unwrap(),
+        };
+        let json = serde_json::to_string_pretty(&meta).context("serializing netdoc meta")?;
+        std::fs::write(meta_path, json)
+            .with_context(|| format!("writing netdoc meta to {}", meta_path.display()))?;
+        Ok(())
+    }
+
+    /// This node's own self-doc, created (or reopened) **lazily** on first use.
+    /// Creating a fresh one persists its namespace to meta. The write key never
+    /// leaves this node.
+    async fn self_doc(&self) -> Result<Doc> {
+        if let Some(d) = self.self_doc.read().await.clone() {
+            return Ok(d);
+        }
+        let mut guard = self.self_doc.write().await;
+        if let Some(d) = guard.clone() {
+            return Ok(d); // raced
+        }
+        let existing_ns = *self.self_ns.lock().unwrap();
+        let doc = match existing_ns {
+            Some(id) => self
+                .docs
+                .open(id)
+                .await
+                .context("opening self-doc")?
+                .with_context(|| format!("self-doc namespace {id} not found"))?,
+            None => {
+                let d = self.docs.create().await.context("creating self-doc")?;
+                *self.self_ns.lock().unwrap() = Some(d.id());
+                if let Err(e) = self.persist_meta() {
+                    tracing::warn!("netdoc: persisting self-doc namespace failed: {e:#}");
+                }
+                d
+            }
+        };
+        *guard = Some(doc.clone());
+        Ok(doc)
     }
 
     /// Idempotently migrate peers into the doc (skips ones already present or
@@ -883,7 +923,7 @@ impl NetDoc {
         let local_ip = *self.vpn_local_ip.read().await;
         for (addr, owner) in ip_owner.iter() {
             let sd = if Some(*addr) == local_ip {
-                Some(self.self_doc.clone()) // our own addr → our own self-doc
+                self.self_doc().await.ok() // our own addr → our own self-doc
             } else {
                 self.member_self_doc(owner).await
             };
@@ -1417,7 +1457,8 @@ impl NetDoc {
     /// never shared — only this node can write its self-doc.
     pub async fn self_doc_read_ticket(&self) -> Result<String> {
         let ticket = self
-            .self_doc
+            .self_doc()
+            .await?
             .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await
             .context("sharing self-doc read ticket")?;
@@ -1485,7 +1526,8 @@ impl NetDoc {
     /// is what upgraded readers prefer. Once self-docs are universal the
     /// shared-doc write is dropped, leaving self-state physically isolated.
     async fn put_self(&self, key: &str, value: Vec<u8>) -> Result<()> {
-        self.self_doc
+        self.self_doc()
+            .await?
             .set_bytes(self.author, key.as_bytes().to_vec(), value.clone())
             .await
             .context("writing self-doc entry")?;
@@ -2355,7 +2397,9 @@ mod tests {
 
         // B's endpoint is written ONLY to B's self-doc (no shared vpn/ entry).
         let bep = b.endpoint.id();
-        b.self_doc
+        b.self_doc()
+            .await
+            .unwrap()
             .set_bytes(
                 b.author,
                 format!("{KEY_VPN_PREFIX}{addr}").into_bytes(),
