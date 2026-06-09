@@ -203,6 +203,7 @@ mod tests {
             role_name: Some(role_name.into()),
             netdoc_author: None,
             self_doc: None,
+            vip: None,
             sandbox: SandboxPolicy::default(),
         }
     }

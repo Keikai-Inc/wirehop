@@ -617,7 +617,18 @@ impl NetDoc {
         // Adds: present locally, missing from the doc, not already revoked.
         for p in peers {
             if !self.is_revoked(&p.node_id).await? && self.get_peer(&p.node_id).await?.is_none() {
-                self.put_peer(p).await?;
+                // #3b: the trust anchor allocates each admitted member's vIP once
+                // and records it (admin-owned addr→owner authority). claim probes
+                // + resolves collisions in the shared ip/ table. Members never
+                // allocate. Best-effort — a failed claim never blocks admission.
+                let mut p = p.clone();
+                if p.vip.is_none() && self.is_trust_anchor() {
+                    match self.claim_virtual_ip(&p.node_id).await {
+                        Ok(addr) => p.vip = Some(addr.to_string()),
+                        Err(e) => tracing::warn!("netdoc #3b: vIP claim for {} failed: {e:#}", &p.node_id[..8.min(p.node_id.len())]),
+                    }
+                }
+                self.put_peer(&p).await?;
             }
         }
         // Removals: in the doc but no longer present locally → revoke. Skipped
@@ -1227,6 +1238,8 @@ impl NetDoc {
                 // Record the founder's own self-doc read ticket so other nodes
                 // import its self-state from the isolated self-doc.
                 self_doc: self.self_doc_read_ticket().await.ok(),
+                // The founder's admin-allocated vIP (its own claim, #3b).
+                vip: Some(addr.to_string()),
                 sandbox: crate::sandbox::SandboxPolicy::default(),
             };
             if let Err(e) = self.put_peer(&me).await {
@@ -1857,6 +1870,7 @@ mod tests {
             role_name: None,
             netdoc_author: None,
             self_doc: None,
+            vip: None,
             sandbox: SandboxPolicy::default(),
         }
     }
@@ -1888,6 +1902,36 @@ mod tests {
         assert!(net.is_revoked("aaaa").await.unwrap());
         assert!(net.get_peer("aaaa").await.unwrap().is_none());
         assert_eq!(net.list_peers().await.unwrap().len(), 1);
+    }
+
+    /// #3b Phase 1: the trust anchor allocates + records each admitted member's
+    /// vIP (`peer/N.vip`); a non-anchor does not.
+    #[tokio::test]
+    async fn reconcile_allocates_member_vip() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None); // A is the trust anchor
+
+        // Admit member B via reconcile (B present in A's local peers.json).
+        let peers = vec![sample_peer("nodeBBBBBBBB", "B")];
+        a.reconcile(&peers, &[]).await.unwrap();
+        let p = a.get_peer("nodeBBBBBBBB").await.unwrap().unwrap();
+        let vip: std::net::Ipv4Addr = p.vip.as_deref().expect("anchor allocates vIP").parse().unwrap();
+        assert!(crate::vpn::is_virtual_addr(vip), "vIP must be in the CGNAT range");
+        // Idempotent: re-reconcile leaves it unchanged (peer already in doc).
+        a.reconcile(&peers, &[]).await.unwrap();
+        assert_eq!(a.get_peer("nodeBBBBBBBB").await.unwrap().unwrap().vip, Some(vip.to_string()));
+
+        // A non-anchor node does NOT allocate vIPs.
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Create)
+            .await
+            .expect("spawn B");
+        // no record_founder_anchor → not the trust anchor
+        b.reconcile(&[sample_peer("nodeCCCCCCCC", "C")], &[]).await.unwrap();
+        assert!(b.get_peer("nodeCCCCCCCC").await.unwrap().unwrap().vip.is_none());
     }
 
     #[tokio::test]

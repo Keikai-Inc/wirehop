@@ -247,6 +247,14 @@ pub struct Peer {
     /// the member has no self-doc yet (legacy member → shared-doc fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_doc: Option<String>,
+    /// The peer's admin-allocated virtual IP (per-member self-document model,
+    /// #3b). The admin claims it once at admission and records it here
+    /// (admin-owned ⇒ the addr→owner authority readers trust); the member then
+    /// self-writes only its *endpoint* for this addr in its self-doc. Static, so
+    /// no admin-online coupling for endpoint updates. `None` = legacy member
+    /// (falls back to the shared `ip/` table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip: Option<String>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -294,6 +302,7 @@ impl PeersStore {
                 role_name: None,
                 netdoc_author: None,
                 self_doc: None,
+                vip: None,
                 sandbox,
             });
         }
