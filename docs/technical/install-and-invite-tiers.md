@@ -432,6 +432,8 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 0a** — C1 **member-node binding** (`AnnounceNetdocAuthor` daemon-outbound announce → founder records `peer/N.netdoc_author`; `record_peer_author` trust-anchor-only + idempotent; unit-tested by `enforce_rejects_forgery_against_vouched_member`; **multi-node enforce e2e** runs both nodes under `HOP_NETDOC_VALIDATION=enforce` + asserts the binding) | ✅ shipped | 0.6.46 |
 | **Phase 0a** — C1 **vouched-admin-authors** (`admin_authors` = founder ∪ founder-vouched co-admin authors; `validate_entry` honors admin keys from any vouched admin; refreshed at startup / on vouch / on keepalive; unit-tested by `enforce_honors_vouched_co_admin_peer_entry`). Makes opt-in enforce safe for federated multi-admin warrens | ✅ shipped, flag-gated | 0.6.47 |
 | **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
+| **Phase 1 (decision 7)** — `install.sh` default client install → `~/.local/bin` (zero-sudo); existing `/usr/local/bin/hop` updated in place; `--host` promotes to root-owned `/usr/local/bin`. `--site-only` now redeploys `install.sh` too | ✅ shipped | site deploy |
+| **Phase 1d** — website builder **invite tier-preview** (client-side base64url-JSON decode → "joins host X as a node/admin/warren-only", auto-selects the node tier) | ✅ live | site deploy |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
 ### Deferred — major subsystems needing dedicated, validated passes

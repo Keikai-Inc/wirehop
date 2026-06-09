@@ -623,6 +623,10 @@
               <label for="b-invite">Your invite <span class="hint-tag">optional — it carries the warren</span></label>
               <input id="b-invite" type="text" placeholder="paste invite token" autocomplete="off" spellcheck="false">
             </div>
+            <div class="builder-row" id="invite-preview-row" style="display: none;">
+              <label></label>
+              <p id="invite-preview" style="margin: 0; font-size: 0.82rem; color: var(--color-accent-teal);"></p>
+            </div>
             <div class="builder-row node-only">
               <label>Warren VPN <span class="hint-tag">opt-in</span></label>
               <div class="seg" id="seg-vpn">
@@ -855,6 +859,42 @@
       var invite = (document.getElementById('b-invite').value || '').trim();
       var isNode = mode === 'node';
 
+      // Client-side preview of a pasted invite: decode the base64url-JSON token
+      // and show which host + tier it grants. Purely informational — nothing
+      // leaves the browser. Auto-selects the node tier when the invite is a
+      // warren/node/admin invite so the generated command matches.
+      var inv = invite ? decodeInvite(invite) : null;
+      var prevRow = document.getElementById('invite-preview-row');
+      var prev = document.getElementById('invite-preview');
+      if (invite && inv) {
+        var t = inviteTier(inv);
+        var host = inv.host_name ? (' <strong>' + escapeHtml(inv.host_name) + '</strong>') : ' a host';
+        var msg;
+        if (t === 'client') {
+          msg = '✓ Reaches' + host + ' — client access, no warren.';
+        } else if (t === 'warren_only') {
+          msg = '✓ Joins the warren of' + host + ' — VPN reach only (no host sessions).';
+        } else if (t === 'admin') {
+          msg = '✓ Joins as an <strong>admin node</strong> on the warren of' + host + '.';
+        } else {
+          msg = '✓ Joins as a <strong>node</strong> on the warren of' + host + '.';
+        }
+        prev.innerHTML = msg;
+        prevRow.style.display = '';
+        // A warren-bearing invite implies the node tier; reflect it in the toggle.
+        if (t !== 'client' && mode !== 'node') {
+          var nodeBtn = document.querySelector('#seg-mode button[data-val="node"]');
+          var clientBtn = document.querySelector('#seg-mode button[data-val="client"]');
+          if (nodeBtn && clientBtn) { nodeBtn.classList.add('active'); clientBtn.classList.remove('active'); }
+          mode = 'node'; isNode = true;
+        }
+      } else if (invite) {
+        prev.innerHTML = '<span style="color: var(--color-text-tertiary);">… not a recognizable invite token yet</span>';
+        prevRow.style.display = '';
+      } else {
+        prevRow.style.display = 'none';
+      }
+
       // Node-only controls are hidden for the client tier (no VPN there).
       document.querySelectorAll('.builder-row.node-only').forEach(function (el) {
         el.style.display = isNode ? '' : 'none';
@@ -881,6 +921,27 @@
           ? "<strong>On the warren:</strong> sudo daemon, a virtual IP + <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">name.hop</code>, role-based reach. The VPN is opt-in (this is the opt-in) and fail-safe. Default-deny until you hand out invites."
           : "<strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">hop warren join</code>.";
       }
+    }
+
+    // Decode a base64url-JSON invite token (matches encode_invite in
+    // crates/hop-core/src/invite). Returns the parsed object or null.
+    function decodeInvite(tok) {
+      try {
+        var b64 = tok.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        var obj = JSON.parse(decodeURIComponent(escape(atob(b64))));
+        if (obj && typeof obj === 'object' && obj.node_id && obj.secret) return obj;
+      } catch (e) {}
+      return null;
+    }
+
+    // The invite's effective tier, mirroring InviteToken::effective_tier:
+    // an explicit `tier` wins; otherwise infer from legacy fields.
+    function inviteTier(inv) {
+      if (inv.tier) return inv.tier;                 // client | warren_only | node | admin
+      var isAdmin = inv.role === 'creator' || inv.role_name === 'admin';
+      if (inv.warren_ticket) return isAdmin ? 'admin' : 'node';
+      return 'client';
     }
 
     // Quote a value for the shell if it contains spaces or shell-special chars.

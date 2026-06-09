@@ -8,7 +8,10 @@
 #
 # Tiers:
 #   (default)              Client — reach hosts you're invited to. No sudo, no VPN.
+#                          Installs to ~/.local/bin (zero sudo); an existing
+#                          /usr/local/bin/hop is updated in place.
 #   --host                 Node — put this machine on the warren VPN (sudo, daemon).
+#                          Installs to a root-owned /usr/local/bin (decision 7).
 #
 # Warren options (forwarded to the --host path):
 #   --invite <token>       Redeem an invite (it carries the warren) — join the network
@@ -41,7 +44,7 @@ trap 'rm -rf "${TMPDIR_HOP}"' EXIT
 
 # --- Parse arguments ---------------------------------------------------------
 
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR=""          # empty = auto (resolved below per decision 7)
 VERSION=""
 DAEMON=false
 # Warren primers — applied to host config after install (see apply_primers).
@@ -64,6 +67,22 @@ while [[ $# -gt 0 ]]; do
     *)              die "Unknown option: $1" ;;
   esac
 done
+
+# --- Resolve install dir (decision 7: root-owned-binary invariant) -----------
+# A pure client only ever runs as the user, so it installs zero-sudo into
+# ~/.local/bin. Becoming a node (--host) runs an always-on root daemon, which
+# must execute a root-owned, root-only-writable binary — so it promotes to
+# /usr/local/bin under sudo. An existing /usr/local/bin/hop is updated in place
+# so upgrades never fragment across two PATH entries. An explicit --dir wins.
+if [[ -z "${INSTALL_DIR}" ]]; then
+  if [[ "${DAEMON}" == true ]]; then
+    INSTALL_DIR="/usr/local/bin"
+  elif [[ -x /usr/local/bin/hop ]]; then
+    INSTALL_DIR="/usr/local/bin"          # keep an existing system install in place
+  else
+    INSTALL_DIR="${HOME}/.local/bin"      # new pure-client install — no sudo
+  fi
+fi
 
 # --- HTTP helper (curl or wget) ----------------------------------------------
 

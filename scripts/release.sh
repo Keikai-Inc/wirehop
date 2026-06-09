@@ -151,6 +151,15 @@ if [[ "${SITE_ONLY}" == true ]]; then
   aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
     --content-type "application/javascript"
 
+  # install.sh / install-daemon.sh are deployed site assets too — keep them in
+  # sync on a site-only redeploy (e.g. install-location or copy changes).
+  aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
+    --content-type "text/x-shellscript"
+  if [[ -f "${PROJECT_ROOT}/install-daemon.sh" ]]; then
+    aws s3 cp "${PROJECT_ROOT}/install-daemon.sh" "s3://${BUCKET}/install-daemon.sh" \
+      --content-type "text/x-shellscript"
+  fi
+
   for asset in favicon.ico favicon-32x32.png apple-touch-icon.png icon-192.png hop-icon.png; do
     if [[ -f "${PROJECT_ROOT}/site/${asset}" ]]; then
       content_type="image/png"
@@ -164,6 +173,7 @@ if [[ "${SITE_ONLY}" == true ]]; then
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
     --paths "/" "/index.html" "/fleet.html" "/orchestration.html" "/shared.css" "/shared.js" \
+      "/install.sh" "/install-daemon.sh" \
       "/favicon.ico" "/favicon-32x32.png" \
       "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" \
     --output text --query 'Invalidation.Id'
