@@ -779,6 +779,13 @@ impl NetDoc {
             .unwrap_or_default();
         let value = format!("{} {relay}", self.endpoint.id());
         let key = format!("{KEY_VPN_PREFIX}{addr}");
+        // Dual-write (migration): the endpoint goes to this node's isolated
+        // self-doc AND the shared doc. `refresh_vpn_peer_ips` already prefers the
+        // self-doc copy (keyed by the validated ip/ owner), so the data-plane read
+        // path is live and exercised; the shared copy keeps not-yet-upgraded
+        // readers + lookup_vpn_endpoint working. The final isolation step drops
+        // the shared write here (and migrates lookup_vpn_endpoint + the vpn/
+        // forgery tests to the self-doc model). See per-member-self-docs.md.
         self.put_self(&key, value.into_bytes()).await.context("registering vpn endpoint")?;
         Ok(())
     }
@@ -864,6 +871,37 @@ impl NetDoc {
                 map.insert(id.to_string(), addr);
             }
         }
+
+        // Per-member self-doc override (C1 write-isolation): take each owner's
+        // endpoint from its OWN isolated self-doc, keyed by the addr it holds per
+        // the validated `ip/` table above. A member can only set its own
+        // endpoint for the addr it owns — it can't forge another's, since the
+        // addr→owner binding is the validated `ip/` table, not the self-doc.
+        // This is what carries the data plane once the shared-doc endpoint write
+        // is dropped (it is, in `register_vpn_endpoint`); the shared scan above
+        // still serves not-yet-upgraded members.
+        let local_ip = *self.vpn_local_ip.read().await;
+        for (addr, owner) in ip_owner.iter() {
+            let sd = if Some(*addr) == local_ip {
+                Some(self.self_doc.clone()) // our own addr → our own self-doc
+            } else {
+                self.member_self_doc(owner).await
+            };
+            let Some(sd) = sd else { continue };
+            let key = format!("{KEY_VPN_PREFIX}{addr}");
+            let q = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+            let Ok(Some(entry)) = sd.get_one(q).await else { continue };
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+            if let Some(id) = String::from_utf8_lossy(&bytes).split_whitespace().next() {
+                // Replace any stale shared-doc endpoint for this addr, then bind ours.
+                map.retain(|_, a| a != addr);
+                map.insert(id.to_string(), *addr);
+            }
+        }
+
         *self.vpn_peer_ips.write().await = map;
     }
 
@@ -2289,6 +2327,58 @@ mod tests {
 
         // A malformed self-doc ticket is rejected.
         assert!(a.record_peer_self_doc(&b_id, "not-a-ticket").await.is_err());
+    }
+
+    /// The data-plane self-doc override: `refresh_vpn_peer_ips` resolves a
+    /// member's endpoint from its OWN self-doc (keyed by the addr it owns per the
+    /// validated `ip/` table), even when there is NO shared-doc `vpn/` entry for
+    /// it — proving self-docs can carry the data plane (the isolation target).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_prefers_self_doc_endpoint() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+
+        // A admits B and owns the addr→B binding via the shared ip/ table.
+        a.put_peer(&sample_peer(&b_id, "B")).await.unwrap();
+        let addr = a.claim_virtual_ip(&b_id).await.unwrap();
+
+        // B's endpoint is written ONLY to B's self-doc (no shared vpn/ entry).
+        let bep = b.endpoint.id();
+        b.self_doc
+            .set_bytes(
+                b.author,
+                format!("{KEY_VPN_PREFIX}{addr}").into_bytes(),
+                format!("{bep} ").into_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // A records B's self-doc read ticket so the override can import it.
+        let b_self = b.self_doc_read_ticket().await.unwrap();
+        a.record_peer_self_doc(&b_id, &b_self).await.unwrap();
+
+        // Refresh: the override must surface B's endpoint from its self-doc.
+        let mut found = false;
+        for _ in 0..150 {
+            a.refresh_vpn_peer_ips().await;
+            if a.vpn_peer_ips.read().await.get(&bep.to_string()) == Some(&addr) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(found, "refresh did not resolve B's self-doc-only endpoint via the override");
     }
 
     /// Only the trust anchor records bindings, and only for admitted members.

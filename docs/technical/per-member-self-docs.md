@@ -100,13 +100,28 @@ self-doc yet.
 5. ✅ **Lazy import + cache**: `member_self_doc(node_id)` resolves
    `peer/N.self_doc`, imports read-only on first reach, caches; `evict_member_self_doc`.
 
-**Remaining (the read-flip + full isolation):**
-6. **Additive reads**: prefer the member self-doc, fall back to shared-doc, in
-   `refresh_vpn_peer_ips`/`lookup_name`/tags/posture. (Reads still use the shared
-   doc; dual-write keeps them correct meanwhile.)
-7. **Drop the shared-doc write** once self-docs are universal → self-state becomes
-   physically isolated. `ip/` also moves to the self-doc (it stays shared now for
-   cross-node vIP-dedup; that resolves with deterministic allocation).
+6. ✅ **Data-plane read override**: `refresh_vpn_peer_ips` now resolves each
+   member's **endpoint** from its own self-doc, keyed by the addr it owns per the
+   validated `ip/` table (so a member can only set its own endpoint — the
+   addr→owner authority stays the validated `ip/` table, not the self-doc). The
+   shared-doc scan remains the base for not-yet-upgraded members. Unit-tested by
+   `refresh_prefers_self_doc_endpoint` (resolves an endpoint present ONLY in a
+   self-doc); vpn-e2e still routes under enforce with the override live.
+
+**Remaining (the final isolation flip):**
+7. **Drop the shared-doc `vpn/` write** (`register_vpn_endpoint` → self-doc only)
+   so the endpoint is physically isolated; migrate `lookup_vpn_endpoint` (egress
+   resolution) to the self-doc; and rewrite the `vpn/` forgery tests
+   (`enforce_rejects_forged_vpn_entry`, federation) for the self-doc model (a
+   member can't intercept another's addr — the override ignores `vpn/<other>` in
+   a member's self-doc). `name/ tag/ posture/` and `ip/` follow the same pattern
+   (`ip/` stays shared for cross-node vIP-dedup until deterministic allocation).
 8. **Tier ticket scope (#3b)**: `node`/`warren-only` invites carry the admin doc's
    **read** ticket (not write); `admin` carries write — safe once members write
    only their own self-doc.
+
+> **Test note:** the eager per-node self-doc namespace adds gossip load that can
+> make single-process, many-`NetDoc` replication tests flaky (>30s). Production
+> (separate processes) converges fast (vpn-e2e). A clean fix is **lazy** self-doc
+> creation — a pure client / non-VPN node shouldn't mint one. Tracked as a
+> follow-up.
