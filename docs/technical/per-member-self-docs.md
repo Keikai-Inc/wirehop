@@ -108,6 +108,28 @@ self-doc yet.
    `refresh_prefers_self_doc_endpoint` (resolves an endpoint present ONLY in a
    self-doc); vpn-e2e still routes under enforce with the override live.
 
+### The addr→owner authority (the key #3b decision)
+
+Dropping *all* shared self-state writes (required so `node`/`warren-only` members
+can hold **read-only** admin-doc tickets) means the **addr→owner authority** must
+leave the shared `ip/` table too. Two options:
+
+- **Admin-allocated vIP (recommended).** When the admin admits a member it runs
+  `claim_virtual_ip` (which probes + resolves collisions) and records
+  `peer/N.vip` in the admin doc (admin-authored ⇒ trusted, validated under
+  enforce). Readers take addr→owner from `peer/N.vip`; the member self-writes
+  only its *endpoint* (`vpn/<peer.vip>`) in its self-doc. The vIP is **static**
+  (allocated once at admission) so there's no ongoing admin-online coupling — the
+  member still self-updates its dynamic endpoint with no admin involved.
+- **Deterministic vIP.** Readers compute `deterministic_ip(node_id)`. Simple, no
+  authority entry — but it **breaks under collisions** that today's probing
+  resolves (two node_ids → same /10 slot), so a member's actual vIP can differ
+  from the deterministic guess. Rejected unless paired with a collision registry.
+
+`peer/N.vip` (admin-allocated) is the chosen direction: it preserves collision
+handling, keeps the authority admin-validated (no interception — a member can't
+claim another's addr), and adds no runtime coupling.
+
 **Remaining (the final isolation flip):**
 7. **Drop the shared-doc `vpn/` write** (`register_vpn_endpoint` → self-doc only)
    so the endpoint is physically isolated; migrate `lookup_vpn_endpoint` (egress
