@@ -704,8 +704,21 @@ impl NetDoc {
                     Ok(_) => {}
                     Err(e) => tracing::debug!("netdoc: periodic re-sync failed: {e:#}"),
                 }
-                // Pick up co-admin author bindings that replicated since startup
-                // so a federated node validates other admins' entries correctly.
+            }
+        });
+    }
+
+    /// Spawn a fast, lightweight loop that refreshes the trusted-admin-author set
+    /// from replicated (founder-authored) peer entries. Decoupled from the
+    /// heavier sync keepalive so a federated node converges on co-admin authority
+    /// in seconds, not minutes — shrinking the window where a co-admin's entries
+    /// would be rejected under enforce right after joining (the default-on
+    /// mixed-version concern). Cheap: it only re-reads `peer/` entries.
+    pub fn spawn_admin_author_refresh(self: &std::sync::Arc<Self>, interval: std::time::Duration) {
+        let me = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
                 me.refresh_admin_authors().await;
             }
         });
@@ -1131,6 +1144,12 @@ impl NetDoc {
     }
 
     /// Resolve a host `name` to its virtual IP via the document.
+    ///
+    /// C1 `name/` self-key enforce: a `name/<name> = <vIP>` entry is honored only
+    /// if its author is the vouched author of the node that owns that vIP (the
+    /// `ip/` table), so a member can't forge a MagicDNS name to point at its own
+    /// endpoint (DNS spoofing). An unbound owner passes under migration grace.
+    /// Off/Observe resolve straight from the doc (current behaviour).
     pub async fn lookup_name(&self, name: &str) -> Result<Option<std::net::Ipv4Addr>> {
         let key = format!("name/{}", name.to_lowercase());
         let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
@@ -1141,7 +1160,49 @@ impl NetDoc {
             return Ok(None);
         }
         let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
-        Ok(String::from_utf8_lossy(&bytes).parse().ok())
+        let Some(addr) = String::from_utf8_lossy(&bytes).trim().parse::<std::net::Ipv4Addr>().ok()
+        else {
+            return Ok(None);
+        };
+        if self.validation_mode() == ValidationMode::Enforce
+            && !self.name_author_ok(addr, &entry.author()).await
+        {
+            tracing::warn!(
+                "netdoc C1: name/{} author ≠ owner binding — REJECTED (MagicDNS spoof attempt)",
+                name.to_lowercase()
+            );
+            return Ok(None);
+        }
+        Ok(Some(addr))
+    }
+
+    /// Whether `name_author` is allowed to bind a name to `addr`: it must be the
+    /// vouched author of the node that owns `addr` (from the author-validated
+    /// `ip/` table). An unbound owner (or no valid `ip/` claim) → grace (allow).
+    async fn name_author_ok(&self, addr: std::net::Ipv4Addr, name_author: &AuthorId) -> bool {
+        let bindings = self.vouched_authors().await;
+        // Resolve addr → owning node from the ip/ table, honoring only a
+        // self-author-valid ip/ entry (a forged vIP claim confers no ownership).
+        let ip_key = format!("{KEY_IP_PREFIX}{addr}");
+        let owner = match self
+            .doc
+            .get_one(Query::single_latest_per_key().key_exact(ip_key.as_bytes()).build())
+            .await
+        {
+            Ok(Some(e)) if e.content_len() > 0 => match self.fs_store.get_bytes(e.content_hash()).await {
+                Ok(b) => {
+                    let node = String::from_utf8_lossy(&b).trim().to_string();
+                    if self_entry_author_ok(Some(&node), &e.author(), &bindings, ValidationMode::Enforce) {
+                        Some(node)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        self_entry_author_ok(owner.as_deref(), name_author, &bindings, ValidationMode::Enforce)
     }
 
     /// MagicDNS server: answer `A` queries for `*.hop` on the virtual interface.
@@ -1989,6 +2050,65 @@ mod tests {
         assert!(
             a.get_peer("nodeCCCCCCCC").await.unwrap().is_some(),
             "enforce must honor a vouched co-admin's peer entry"
+        );
+    }
+
+    /// C1 `name/` self-key enforce: a MagicDNS name bound by a non-owner author
+    /// (spoof) is dropped under Enforce, while the legitimate owner's binding
+    /// resolves. Mirrors the vpn/ forgery test but via `lookup_name`.
+    #[tokio::test]
+    async fn enforce_rejects_spoofed_name() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None); // founder = A, vouched for its own author
+
+        // A (the founder) owns vIP addr and binds name "web" → addr. A vouches its
+        // own author, so under enforce A's own ip/name entries validate.
+        let node_a = a.endpoint.id().to_string();
+        let mut peer = sample_peer(&node_a, "A");
+        peer.netdoc_author = Some(a.author_hex());
+        a.put_peer(&peer).await.unwrap();
+        let addr = a.claim_virtual_ip(&node_a).await.unwrap();
+        a.register_name("web", addr).await.unwrap();
+
+        // Observe (default): the legit name resolves.
+        assert_eq!(a.lookup_name("web").await.unwrap(), Some(addr));
+
+        // Enforce: the founder-owned, founder-authored name still resolves.
+        a.set_validation_mode(ValidationMode::Enforce);
+        assert_eq!(
+            a.lookup_name("web").await.unwrap(),
+            Some(addr),
+            "enforce must keep a legitimately-owned MagicDNS name"
+        );
+
+        // A member B forges name "evil" → A's addr from B's own author (a spoof:
+        // B doesn't own addr). Under enforce it must not resolve.
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        b.register_name("evil", addr).await.unwrap();
+        // Wait for B's spoof to replicate to A.
+        let mut replicated = false;
+        for _ in 0..50 {
+            // Read in Observe to confirm arrival (author check off).
+            a.set_validation_mode(ValidationMode::Observe);
+            if a.lookup_name("evil").await.unwrap() == Some(addr) {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(replicated, "B's spoofed name did not replicate within 10s (test setup)");
+        a.set_validation_mode(ValidationMode::Enforce);
+        assert_eq!(
+            a.lookup_name("evil").await.unwrap(),
+            None,
+            "enforce must drop a MagicDNS name bound by a non-owner (spoof)"
         );
     }
 

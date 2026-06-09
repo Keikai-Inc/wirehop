@@ -442,6 +442,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         Err(e) => tracing::warn!("netdoc: resume sync failed: {e:#}"),
                     }
                     net.spawn_sync_keepalive(std::time::Duration::from_secs(300));
+                    // Converge on co-admin authority fast (enforce default-on
+                    // readiness) — far lighter than a full re-sync.
+                    net.spawn_admin_author_refresh(std::time::Duration::from_secs(20));
 
                     // Phase 3: the warren VPN data plane is OFF BY DEFAULT
                     // (opt-in; see security-audit.md C1). HOP_VPN=1 forces on

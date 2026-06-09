@@ -435,6 +435,7 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 1 (decision 7)** — `install.sh` default client install → `~/.local/bin` (zero-sudo); existing `/usr/local/bin/hop` updated in place; `--host` promotes to root-owned `/usr/local/bin`. `--site-only` now redeploys `install.sh` too | ✅ shipped | site deploy |
 | **Phase 1d** — website builder **invite tier-preview** (client-side base64url-JSON decode → "joins host X as a node/admin/warren-only", auto-selects the node tier) | ✅ live | site deploy |
 | **Phase 1a** — `hop invite --tier client\|warren-only\|node\|admin` (sets explicit `InviteTier`: client strips warren ticket, warren-only pins `network_only` role, admin → creator; warren tiers pin founder anchor). Ticket *scope* split still pending (Phase 0b) | ✅ shipped (capability tier) | 0.6.48 |
+| **Phase 0a** — C1 `name/` self-key enforce (`lookup_name` drops a MagicDNS name authored by a non-owner; migration grace for unbound owners; `enforce_rejects_spoofed_name`) + 20 s co-admin-author refresh (`spawn_admin_author_refresh`) | ✅ shipped, flag-gated | 0.6.49 |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
 ### Deferred — major subsystems needing dedicated, validated passes
@@ -463,8 +464,10 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
     the binding — bind → enforce → reconverge on a real warren. Until the
     announce lands a member's self-owned `ip/`/`vpn/` entries pass under
     migration *grace* (unbound owner), so enforce never partitions a fresh join.
-  - `name/` self-keys still use the observe-mode detector, not enforcement
-    (needs an addr→name owner resolution on top of the now-shipped binding).
+  - `name/` self-keys are **enforced (0.6.49)**: `lookup_name` drops a MagicDNS
+    name whose author isn't the vouched author of the node owning the vIP it
+    points to (spoof), with migration grace for unbound owners. Unit-tested
+    (`enforce_rejects_spoofed_name`).
   - **Vouched-admin-authors — SHIPPED (0.6.47).** `reconcile` runs on every node
     and writes `peer/`/`role/` entries authored by *that* node; on a federated
     multi-admin warren a co-admin legitimately authors admin keys. `validate_entry`
@@ -488,11 +491,25 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
     `peers.json`, so this is a transient loss of *federated* reach, never local
     access or a lockout). Prereqs for the flip: (a) a 3-node federated e2e
     (founder + vouched co-admin + a peer the co-admin invited, all under enforce);
-    (b) shorten the co-admin-author refresh (currently startup + 300 s keepalive)
-    or make it replication-event-driven so the window closes fast.
-- **Phase 0b — read-ticket members + node-announce.** Switching members from
-  write to read tickets + admin-writes-on-behalf is a live-warren CRDT migration;
-  needs the migration grace window exercised on a real multi-node warren.
+    (b) the co-admin-author refresh is now **20 s** (0.6.49,
+    `spawn_admin_author_refresh`, decoupled from the 300 s sync keepalive) so the
+    window closes fast. The 3-node federated e2e is folded into the per-member
+    self-doc migration harness (Phase 0b below).
+- **Phase 0b — per-member self-documents (chosen design, in progress).** Instead
+  of read-ticket members + admin-writes-on-behalf (which couples a member's
+  VPN-reachability to an admin being online), each member owns its **own**
+  iroh-docs namespace and holds the only write key to it; it self-writes `ip/
+  vpn/ name/ tag/ posture/` there. The admin doc (write-restricted to vouched
+  admins) keeps `peer/ role/ acl/ revocation/ network/` and records
+  `peer/N.self_doc = <read ticket>` (admin-authored ⇒ trusted; reuses the
+  `AnnounceNetdocAuthor` channel, generalized to announce the self-doc ticket).
+  Forgery becomes **physically impossible** (no write key for others' docs), with
+  **no admin-online coupling**. Decisions: **lazy/on-demand** self-doc sync (sync
+  the admin doc always; import a member's self-doc on first reach, then cache);
+  **additive migration** (read self-state from the self-doc if present, else the
+  shared-doc self-keys; keep the shipped self-key enforce as defense-in-depth
+  during overlap). Build order: multi-node migration harness first (also covers
+  the 3-node federated/vouched-admin scenario), then implement.
 - **Phase 1b — embedded `hop __install-daemon` (decision 1A).** The self-upgrade
   *consent* ships now via the proven shell installer; porting launchd/systemd
   setup into the binary needs **macOS daemon-install e2e** that doesn't exist yet.
@@ -508,4 +525,4 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
 - **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
   verify-then-promote; both are release-pipeline + infra work.
 
-*Last updated: 0.6.48*
+*Last updated: 0.6.49*
