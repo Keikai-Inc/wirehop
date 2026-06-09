@@ -241,6 +241,12 @@ pub struct Peer {
     /// when authored by this author. `None` = not yet bound (announce pending).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub netdoc_author: Option<String>,
+    /// The peer's self-doc **read** ticket (per-member self-document model),
+    /// recorded by the admin that admitted it. Other nodes import this read-only
+    /// to learn the member's self-state (`ip/ vpn/ name/ tag/ posture/`). `None` =
+    /// the member has no self-doc yet (legacy member → shared-doc fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_doc: Option<String>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -287,6 +293,7 @@ impl PeersStore {
                 role,
                 role_name: None,
                 netdoc_author: None,
+                self_doc: None,
                 sandbox,
             });
         }

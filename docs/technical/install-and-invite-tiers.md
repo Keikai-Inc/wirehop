@@ -508,8 +508,12 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   the admin doc always; import a member's self-doc on first reach, then cache);
   **additive migration** (read self-state from the self-doc if present, else the
   shared-doc self-keys; keep the shipped self-key enforce as defense-in-depth
-  during overlap). Build order: multi-node migration harness first (also covers
-  the 3-node federated/vouched-admin scenario), then implement.
+  during overlap). **Infrastructure + mechanism shipped:** retained `Docs`
+  engine, per-node self-doc lifecycle (`NetDocMeta.self_namespace`), dual-write
+  (`put_self`), `AnnounceNetdocAuthor.self_doc` + `record_peer_self_doc`, lazy
+  `member_self_doc` import — unit-tested (`member_self_doc_roundtrips`) +
+  asserted in vpn-e2e. **Remaining:** flip reads to self-doc-preferred, then drop
+  the shared-doc write for full physical isolation (`docs/technical/per-member-self-docs.md`).
 - **Phase 1b — embedded `hop __install-daemon` (decision 1A).** The self-upgrade
   *consent* ships now via the proven shell installer; porting launchd/systemd
   setup into the binary needs **macOS daemon-install e2e** that doesn't exist yet.

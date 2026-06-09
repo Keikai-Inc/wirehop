@@ -83,22 +83,30 @@ self-doc yet.
 - No flag-day: old warrens keep routing on shared-doc self-keys; self-docs take
   over as nodes upgrade.
 
-## Implementation plan
+## Implementation status
 
-1. **Multi-node migration harness first** (also covers the 3-node
-   founder + vouched-co-admin + co-admin-invited-peer federated/enforce scenario).
-   Must prove: a member updates its endpoint and stays reachable with **no admin
-   online**; a forged self-state write is impossible (no write key).
-2. **Retain `Docs`** in `NetDoc` (currently `spawn` discards the engine after
-   opening one `doc`) to allow runtime `create`/`open`/`import` of namespaces.
-3. **Self-doc lifecycle**: create-or-open this node's self-doc; persist its
-   namespace id in `NetDocMeta`; route self-state writes there.
-4. **Announce + record**: extend `AnnounceNetdocAuthor` with `self_doc`;
-   `record_peer_self_doc` on the admin.
-5. **Lazy import + cache**: `member_self_doc(node_id)` resolves `peer/N.self_doc`,
-   imports read-only, caches; evict on revoke.
-6. **Additive reads**: self-doc first, shared-doc fallback, in
-   `refresh_vpn_peer_ips`, `lookup_name`, tags, posture.
-7. **Tier ticket scope (#3b)**: `node`/`warren-only` invites carry the admin doc's
-   **read** ticket (not write); `admin` carries write. Now safe because members
-   write only their own self-doc.
+**Shipped (infrastructure + mechanism):**
+1. ✅ **Retain `Docs`** in `NetDoc` (`spawn`/`spawn_inner`) for runtime
+   `create`/`open`/`import` of namespaces.
+2. ✅ **Self-doc lifecycle**: each node creates-or-opens its own self-doc;
+   namespace id persisted in `NetDocMeta.self_namespace`.
+3. ✅ **Dual-write** (`put_self`): self-state (`vpn/ name/ tag/ posture/`) is
+   written to the self-doc AND the shared doc, so the unchanged shared-doc read
+   path keeps routing while the self-doc path goes live (migration-safe).
+4. ✅ **Announce + record**: `AnnounceNetdocAuthor` extended with `self_doc`
+   (serde-default, back-compatible); the daemon announces its self-doc read
+   ticket; `record_peer_self_doc` records `peer/N.self_doc` (trust-anchor-only,
+   idempotent). Unit-tested (`member_self_doc_roundtrips`) + asserted in vpn-e2e.
+5. ✅ **Lazy import + cache**: `member_self_doc(node_id)` resolves
+   `peer/N.self_doc`, imports read-only on first reach, caches; `evict_member_self_doc`.
+
+**Remaining (the read-flip + full isolation):**
+6. **Additive reads**: prefer the member self-doc, fall back to shared-doc, in
+   `refresh_vpn_peer_ips`/`lookup_name`/tags/posture. (Reads still use the shared
+   doc; dual-write keeps them correct meanwhile.)
+7. **Drop the shared-doc write** once self-docs are universal → self-state becomes
+   physically isolated. `ip/` also moves to the self-doc (it stays shared now for
+   cross-node vIP-dedup; that resolves with deterministic allocation).
+8. **Tier ticket scope (#3b)**: `node`/`warren-only` invites carry the admin doc's
+   **read** ticket (not write); `admin` carries write — safe once members write
+   only their own self-doc.

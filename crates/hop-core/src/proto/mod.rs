@@ -95,12 +95,19 @@ pub enum ClientMessage {
     RequestAdmin(AdminRequest),
     /// Peer operation (any authenticated peer). Secrets, KV, cap, cron.
     RequestPeerOp(PeerRequest),
-    /// Announce this node's network-document author so the founder/admin can
-    /// record the `peer/<node>.netdoc_author` binding (C1 self-key enforce).
-    /// Sent daemon-outbound on startup by a warren member to its founder; the
-    /// founder authenticates the sender by NodeId (existing peer) and writes the
-    /// admin-owned binding. Best-effort — never gates membership or reach.
-    AnnounceNetdocAuthor { author: String },
+    /// Announce this node's network-document author (and, optionally, its
+    /// per-member self-doc read ticket) so the founder/admin can record the
+    /// `peer/<node>.netdoc_author` binding (C1 self-key enforce) and
+    /// `peer/<node>.self_doc` (per-member self-document model). Sent
+    /// daemon-outbound on startup by a warren member to its founder; the founder
+    /// authenticates the sender by NodeId (existing peer) and writes the
+    /// admin-owned entries. Best-effort — never gates membership or reach.
+    /// `self_doc` is `#[serde(default)]` so pre-self-doc senders still decode.
+    AnnounceNetdocAuthor {
+        author: String,
+        #[serde(default)]
+        self_doc: Option<String>,
+    },
 }
 
 // --- Admin protocol (hop/2+) ---

@@ -140,12 +140,32 @@ else
   echo "--- host-a log tail ---"; docker exec hop-vpn-a cat /cfg/log | tail -15 || true
 fi
 
+echo "=== TEST: per-member self-doc announce (peer/<host-b>.self_doc) ==="
+# The same announce carries host-b's self-doc read ticket; host-a records it so
+# other nodes can import host-b's self-state from its isolated self-doc.
+SELFDOC_OK=0
+for i in $(seq 1 30); do
+  if docker exec hop-vpn-a sh -c 'grep -q "recorded self-doc for member" /cfg/log' 2>/dev/null; then
+    SELFDOC_OK=1; break
+  fi
+  sleep 1
+done
+if [ "$SELFDOC_OK" = "1" ]; then
+  echo "SELF-DOC PASSED: host-a recorded host-b's self-doc read ticket."
+else
+  echo "SELF-DOC WARN: host-a did not log a recorded self-doc within 30s"
+  echo "--- host-a log tail ---"; docker exec hop-vpn-a cat /cfg/log | tail -15 || true
+fi
+
 echo "=== TEST: ping host-a virtual IP ($VIP_A) from host-b over the TUN (enforce mode) ==="
 if docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
     echo ""
     echo "VPN E2E PASSED: role-gated packet flow over TUN works under enforce."
     if [ "$BIND_OK" != "1" ]; then
         echo "VPN E2E FAILED: routing works but the C1 binding was never recorded."
+        RC=1
+    elif [ "$SELFDOC_OK" != "1" ]; then
+        echo "VPN E2E FAILED: routing works but the per-member self-doc was never recorded."
         RC=1
     else
         RC=0

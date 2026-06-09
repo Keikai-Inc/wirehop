@@ -499,10 +499,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     {
                         let fnode = fnode.trim().to_string();
                         let author = net.author_hex();
+                        // Also announce this node's self-doc read ticket so the
+                        // founder records peer/N.self_doc (per-member self-docs).
+                        let self_doc = net.self_doc_read_ticket().await.ok();
                         if !fnode.is_empty() && fnode != host_node_id {
                             let ep = main_endpoint.clone();
                             tokio::spawn(async move {
-                                announce_netdoc_author_with_retry(ep, &fnode, &author).await;
+                                announce_netdoc_author_with_retry(ep, &fnode, &author, self_doc).await;
                             });
                         }
                     }
@@ -953,6 +956,7 @@ async fn announce_netdoc_author_with_retry(
     endpoint: iroh::Endpoint,
     founder_node_hex: &str,
     author_hex: &str,
+    self_doc: Option<String>,
 ) {
     let founder_id: iroh::PublicKey = match founder_node_hex.parse() {
         Ok(id) => id,
@@ -963,7 +967,7 @@ async fn announce_netdoc_author_with_retry(
     };
     let mut delay = std::time::Duration::from_secs(5);
     for attempt in 1..=8u32 {
-        match announce_netdoc_author_once(&endpoint, founder_id, author_hex).await {
+        match announce_netdoc_author_once(&endpoint, founder_id, author_hex, self_doc.as_deref()).await {
             Ok(true) => {
                 tracing::info!("netdoc announce: founder recorded our author binding");
                 return;
@@ -986,6 +990,7 @@ async fn announce_netdoc_author_once(
     endpoint: &iroh::Endpoint,
     founder_id: iroh::PublicKey,
     author_hex: &str,
+    self_doc: Option<&str>,
 ) -> Result<bool> {
     let (conn, _) = hop_core::net::connect_to_host_with_alpn(
         endpoint,
@@ -997,7 +1002,10 @@ async fn announce_netdoc_author_once(
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi for announce")?;
     proto::write_message(
         &mut send,
-        &ClientMessage::AnnounceNetdocAuthor { author: author_hex.to_string() },
+        &ClientMessage::AnnounceNetdocAuthor {
+            author: author_hex.to_string(),
+            self_doc: self_doc.map(String::from),
+        },
     )
     .await?;
     let resp: proto::HostMessage = proto::read_message(&mut recv).await?;
@@ -1221,19 +1229,26 @@ async fn dispatch_session(
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
-        Some(ClientMessage::AnnounceNetdocAuthor { author }) => {
-            // A warren member announced its doc author. Only the founder/admin
-            // (the C1 trust anchor) records the admin-owned binding; any other
-            // receiver acks without recording so the member keeps retrying until
-            // it reaches the anchor. Best-effort — never errors the session.
+        Some(ClientMessage::AnnounceNetdocAuthor { author, self_doc }) => {
+            // A warren member announced its doc author (+ self-doc read ticket).
+            // Only the founder/admin (the C1 trust anchor) records the admin-owned
+            // bindings; any other receiver acks without recording so the member
+            // keeps retrying until it reaches the anchor. Best-effort.
             let recorded = if let Some(nd) = &netdoc {
-                match nd.record_peer_author(peer_id, &author).await {
+                let r = match nd.record_peer_author(peer_id, &author).await {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!("netdoc: record_peer_author for {peer_id} failed: {e:#}");
                         false
                     }
+                };
+                // Record the member's self-doc ticket too (per-member self-docs).
+                if let Some(ticket) = self_doc.as_deref()
+                    && let Err(e) = nd.record_peer_self_doc(peer_id, ticket).await
+                {
+                    tracing::warn!("netdoc: record_peer_self_doc for {peer_id} failed: {e:#}");
                 }
+                r
             } else {
                 false
             };

@@ -115,9 +115,10 @@ pub enum ClientMessage {
     SetEnv { vars: HashMap<String, String> },  // Client env (TERM, LANG, etc.)
     RequestAdmin(AdminRequest),           // Admin request (hop/2+)
     RequestPeerOp(PeerRequest),           // Peer op: secrets/kv/cap/cron/ext/tap (any authed peer)
-    AnnounceNetdocAuthor { author: String },   // Warren member -> founder: announce doc author for the
-                                          //   peer/<node>.netdoc_author binding (C1 self-key enforce).
-                                          //   Authorized by NodeId (existing peer); best-effort.
+    AnnounceNetdocAuthor {                // Warren member -> founder: announce doc author (+ self-doc
+        author: String,                   //   read ticket) for peer/<node>.netdoc_author (C1 enforce)
+        self_doc: Option<String>,         //   and peer/<node>.self_doc (per-member self-document model).
+    },                                    //   Authorized by NodeId (existing peer); best-effort.
 }
 ```
 

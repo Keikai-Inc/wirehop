@@ -74,6 +74,10 @@ struct NetDocMeta {
     /// a rejoined host stays additive-only on reconcile across restarts.
     #[serde(default)]
     federated: bool,
+    /// This node's own self-doc namespace (per-member self-document model). `None`
+    /// for stores created before self-docs — a fresh one is minted + persisted.
+    #[serde(default)]
+    self_namespace: Option<NamespaceId>,
 }
 
 /// A revocation entry: marks a peer as no longer authorized network-wide.
@@ -105,7 +109,17 @@ pub struct NetDoc {
     _router: Router,
     /// Owns the persistent blobs backing store; also used to read entry values.
     fs_store: FsStore,
+    /// The docs engine, retained so member self-docs can be imported at runtime
+    /// (per-member self-document model, C1 write-isolation).
+    docs: Docs,
     doc: Doc,
+    /// This node's own self-doc (member-owned — this node is the sole writer).
+    /// Self-state (`ip/ vpn/ name/ tag/ posture/`) is published here, physically
+    /// isolated from other members. Created/opened at startup.
+    self_doc: Doc,
+    /// Lazily-imported, read-only member self-docs keyed by node_id (lazy/on-
+    /// demand sync). Populated by `member_self_doc` on first reach; cached here.
+    member_docs: tokio::sync::RwLock<std::collections::HashMap<String, Doc>>,
     author: AuthorId,
     namespace: NamespaceId,
     /// The endpoint the docs/vpn stack runs on (for opening VPN connections).
@@ -191,7 +205,20 @@ impl NetDoc {
     /// NOTE: this builds a dedicated `Router` over `endpoint`. Daemon
     /// integration (folding hop's own ALPNs into one Router) happens in a later
     /// Phase 1 step; until then this is used standalone and in tests.
+    /// Spawn with a fresh self-doc (no persistence) — the form tests use.
     pub async fn spawn(endpoint: Endpoint, store_dir: &Path, bootstrap: Bootstrap) -> Result<Self> {
+        Self::spawn_inner(endpoint, store_dir, bootstrap, None).await
+    }
+
+    /// Spawn, opening the given `self_ns` self-doc namespace if provided (else
+    /// minting a fresh one). `open_or_create` passes the persisted namespace so
+    /// the same self-doc is reused across restarts.
+    pub async fn spawn_inner(
+        endpoint: Endpoint,
+        store_dir: &Path,
+        bootstrap: Bootstrap,
+        self_ns: Option<NamespaceId>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(store_dir)
             .with_context(|| format!("creating netdoc store dir {}", store_dir.display()))?;
 
@@ -222,6 +249,17 @@ impl NetDoc {
             }
         };
         let namespace = doc.id();
+
+        // This node's own self-doc: open the persisted namespace, or mint a fresh
+        // one. This node holds its write key; other members only ever read it.
+        let self_doc = match self_ns {
+            Some(id) => docs
+                .open(id)
+                .await
+                .context("opening self-doc")?
+                .with_context(|| format!("self-doc namespace {id} not found in local store"))?,
+            None => docs.create().await.context("creating self-doc")?,
+        };
 
         #[cfg(unix)]
         let vpn_tun: crate::vpn::TunSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
@@ -258,7 +296,10 @@ impl NetDoc {
         Ok(Self {
             _router: router,
             fs_store,
+            docs,
             doc,
+            self_doc,
+            member_docs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             author,
             namespace,
             endpoint,
@@ -449,24 +490,25 @@ impl NetDoc {
             .ok()
             .and_then(|s| serde_json::from_str::<NetDocMeta>(&s).ok());
 
+        let self_ns = existing.as_ref().and_then(|m| m.self_namespace);
         let (mut net, created) = match &existing {
-            Some(meta) => match Self::spawn(endpoint.clone(), store_dir, Bootstrap::Open(meta.namespace)).await {
+            Some(meta) => match Self::spawn_inner(endpoint.clone(), store_dir, Bootstrap::Open(meta.namespace), self_ns).await {
                 Ok(net) => (net, false),
                 Err(e) => {
                     tracing::warn!(
                         "netdoc: saved namespace {} could not be opened ({e}); creating fresh",
                         meta.namespace
                     );
-                    (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true)
+                    (Self::spawn_inner(endpoint, store_dir, Bootstrap::Create, None).await?, true)
                 }
             },
             // First run: join an existing network if given a ticket, else create.
             None => match join {
                 Some(ticket) => {
                     tracing::info!("netdoc: joining network via import ticket");
-                    (Self::spawn(endpoint, store_dir, Bootstrap::Import(Box::new(ticket))).await?, true)
+                    (Self::spawn_inner(endpoint, store_dir, Bootstrap::Import(Box::new(ticket)), None).await?, true)
                 }
-                None => (Self::spawn(endpoint, store_dir, Bootstrap::Create).await?, true),
+                None => (Self::spawn_inner(endpoint, store_dir, Bootstrap::Create, None).await?, true),
             },
         };
 
@@ -475,10 +517,13 @@ impl NetDoc {
             net.federated = meta.federated;
         }
 
-        if created {
+        // Persist meta when first created, or when the self-doc namespace was
+        // newly minted (older stores have no self_namespace → write it now).
+        if created || self_ns != Some(net.self_doc.id()) {
             let meta = NetDocMeta {
                 namespace: net.namespace,
                 federated: net.federated,
+                self_namespace: Some(net.self_doc.id()),
             };
             let json = serde_json::to_string_pretty(&meta).context("serializing netdoc meta")?;
             std::fs::write(meta_path, json)
@@ -734,10 +779,7 @@ impl NetDoc {
             .unwrap_or_default();
         let value = format!("{} {relay}", self.endpoint.id());
         let key = format!("{KEY_VPN_PREFIX}{addr}");
-        self.doc
-            .set_bytes(self.author, key.into_bytes(), value.into_bytes())
-            .await
-            .context("registering vpn endpoint")?;
+        self.put_self(&key, value.into_bytes()).await.context("registering vpn endpoint")?;
         Ok(())
     }
 
@@ -831,10 +873,7 @@ impl NetDoc {
     pub async fn register_host_tags(&self, host_id: &str, tags: &[String]) -> Result<()> {
         let key = format!("tag/{host_id}");
         let value = serde_json::to_vec(tags).context("serializing host tags")?;
-        self.doc
-            .set_bytes(self.author, key.into_bytes(), value)
-            .await
-            .context("registering host tags")?;
+        self.put_self(&key, value).await.context("registering host tags")?;
         self.invalidate_reach_cache().await;
         Ok(())
     }
@@ -884,10 +923,7 @@ impl NetDoc {
     ) -> Result<()> {
         let key = format!("posture/{node_id}");
         let value = serde_json::to_vec(posture).context("serializing posture")?;
-        self.doc
-            .set_bytes(self.author, key.into_bytes(), value)
-            .await
-            .context("registering posture")?;
+        self.put_self(&key, value).await.context("registering posture")?;
         self.invalidate_reach_cache().await;
         Ok(())
     }
@@ -1110,6 +1146,9 @@ impl NetDoc {
                 // The founder vouches its own doc author, so its self-owned
                 // entries validate under enforce.
                 netdoc_author: Some(self.author_hex()),
+                // Record the founder's own self-doc read ticket so other nodes
+                // import its self-state from the isolated self-doc.
+                self_doc: self.self_doc_read_ticket().await.ok(),
                 sandbox: crate::sandbox::SandboxPolicy::default(),
             };
             if let Err(e) = self.put_peer(&me).await {
@@ -1136,10 +1175,7 @@ impl NetDoc {
     /// Register `name` → virtual `addr` for MagicDNS (replicates to all nodes).
     pub async fn register_name(&self, name: &str, addr: std::net::Ipv4Addr) -> Result<()> {
         let key = format!("name/{}", name.to_lowercase());
-        self.doc
-            .set_bytes(self.author, key.into_bytes(), addr.to_string().into_bytes())
-            .await
-            .context("registering name")?;
+        self.put_self(&key, addr.to_string().into_bytes()).await.context("registering name")?;
         Ok(())
     }
 
@@ -1334,6 +1370,92 @@ impl NetDoc {
             .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
             .await
             .context("sharing write ticket")
+    }
+
+    // ── Per-member self-doc (C1 write-isolation) ─────────────────────────────
+
+    /// A **read** ticket for this node's own self-doc, announced to an admin so
+    /// other nodes can import this node's self-state read-only. The write key is
+    /// never shared — only this node can write its self-doc.
+    pub async fn self_doc_read_ticket(&self) -> Result<String> {
+        let ticket = self
+            .self_doc
+            .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .context("sharing self-doc read ticket")?;
+        Ok(ticket.to_string())
+    }
+
+    /// Record an admitted member's self-doc read ticket in the admin doc
+    /// (`peer/N.self_doc`). Trust-anchor-only and member-must-exist, like
+    /// `record_peer_author`. Returns `Ok(false)` when not applicable.
+    pub async fn record_peer_self_doc(&self, node_id: &str, ticket: &str) -> Result<bool> {
+        if !self.is_trust_anchor() {
+            return Ok(false);
+        }
+        if ticket.parse::<DocTicket>().is_err() {
+            anyhow::bail!("invalid self-doc ticket");
+        }
+        let Some(mut peer) = self.get_peer(node_id).await? else {
+            return Ok(false);
+        };
+        if peer.self_doc.as_deref() == Some(ticket) {
+            return Ok(true);
+        }
+        peer.self_doc = Some(ticket.to_string());
+        self.put_peer(&peer).await?;
+        tracing::info!("netdoc: recorded self-doc for member {}", &node_id[..8.min(node_id.len())]);
+        Ok(true)
+    }
+
+    /// Resolve (and lazily import + cache) a member's read-only self-doc from the
+    /// admin doc's `peer/N.self_doc` binding. `None` when the member has no
+    /// self-doc (legacy → shared-doc fallback) or the ticket is unusable.
+    /// On-demand sync: the self-doc is imported the first time a member is
+    /// reached, then cached for the process lifetime.
+    pub async fn member_self_doc(&self, node_id: &str) -> Option<Doc> {
+        if let Some(doc) = self.member_docs.read().await.get(node_id).cloned() {
+            return Some(doc);
+        }
+        let peer = self.get_peer(node_id).await.ok().flatten()?;
+        let ticket: DocTicket = peer.self_doc.as_deref()?.parse().ok()?;
+        // Already syncing this namespace (e.g. our own)? open instead of re-import.
+        let ns = ticket.capability.id();
+        let doc = match self.docs.open(ns).await {
+            Ok(Some(d)) => d,
+            _ => match self.docs.import(ticket).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::debug!("netdoc: import self-doc for {} failed: {e:#}", &node_id[..8.min(node_id.len())]);
+                    return None;
+                }
+            },
+        };
+        self.member_docs.write().await.insert(node_id.to_string(), doc.clone());
+        Some(doc)
+    }
+
+    /// Drop a member's cached self-doc (on revoke).
+    pub async fn evict_member_self_doc(&self, node_id: &str) {
+        self.member_docs.write().await.remove(node_id);
+    }
+
+    /// Write a self-owned entry (`ip/ vpn/ name/ tag/ posture/`) to this node's
+    /// **self-doc** (the isolated, member-only-writable source) AND the shared
+    /// admin doc (migration dual-write). The shared-doc copy keeps not-yet-
+    /// upgraded readers — which only read the shared doc — working; the self-doc
+    /// is what upgraded readers prefer. Once self-docs are universal the
+    /// shared-doc write is dropped, leaving self-state physically isolated.
+    async fn put_self(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        self.self_doc
+            .set_bytes(self.author, key.as_bytes().to_vec(), value.clone())
+            .await
+            .context("writing self-doc entry")?;
+        self.doc
+            .set_bytes(self.author, key.as_bytes().to_vec(), value)
+            .await
+            .context("writing shared self entry")?;
+        Ok(())
     }
 
     // ── Peers ────────────────────────────────────────────────────────────
@@ -1654,6 +1776,7 @@ mod tests {
             role: PeerRole::Peer,
             role_name: None,
             netdoc_author: None,
+            self_doc: None,
             sandbox: SandboxPolicy::default(),
         }
     }
@@ -1811,7 +1934,7 @@ mod tests {
 
         // Wait for A's peer to replicate to B.
         let mut replicated = false;
-        for _ in 0..50 {
+        for _ in 0..150 {
             if b.get_peer("ownedbyA").await.unwrap().is_some() {
                 replicated = true;
                 break;
@@ -1898,7 +2021,7 @@ mod tests {
         // Phase 1 (Observe, the default): poll until B's forgery replicates and is
         // honored — proving the attack would work without enforcement.
         let mut replicated = false;
-        for _ in 0..50 {
+        for _ in 0..150 {
             a.refresh_vpn_peer_ips().await;
             if a.vpn_peer_ips.read().await.contains_key(&b_id) {
                 replicated = true;
@@ -1958,7 +2081,7 @@ mod tests {
         // Wait until both B's legit registration and C's forgery replicate to A
         // (Observe default — both honored, proving the attack works unguarded).
         let mut replicated = false;
-        for _ in 0..50 {
+        for _ in 0..150 {
             a.refresh_vpn_peer_ips().await;
             let m = a.vpn_peer_ips.read().await;
             if m.contains_key(&c_id) && m.contains_key(&b_id) {
@@ -2021,7 +2144,7 @@ mod tests {
 
         // Wait until B's peer/C replicates to A (Observe default — honored).
         let mut replicated = false;
-        for _ in 0..50 {
+        for _ in 0..150 {
             if a.get_peer("nodeCCCCCCCC").await.unwrap().is_some() {
                 replicated = true;
                 break;
@@ -2094,7 +2217,7 @@ mod tests {
         b.register_name("evil", addr).await.unwrap();
         // Wait for B's spoof to replicate to A.
         let mut replicated = false;
-        for _ in 0..50 {
+        for _ in 0..150 {
             // Read in Observe to confirm arrival (author check off).
             a.set_validation_mode(ValidationMode::Observe);
             if a.lookup_name("evil").await.unwrap() == Some(addr) {
@@ -2110,6 +2233,62 @@ mod tests {
             None,
             "enforce must drop a MagicDNS name bound by a non-owner (spoof)"
         );
+    }
+
+    /// Per-member self-doc round-trip: a member's self-state, written to its own
+    /// (member-only-writable) self-doc, is importable + readable by the founder
+    /// via the admin-recorded `peer/N.self_doc` read ticket — the core C1
+    /// write-isolation mechanism.
+    #[tokio::test]
+    async fn member_self_doc_roundtrips() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+
+        // A admits B; B publishes a vpn endpoint to its OWN self-doc (dual-write).
+        a.put_peer(&sample_peer(&b_id, "B")).await.unwrap();
+        let addr: std::net::Ipv4Addr = "100.64.5.5".parse().unwrap();
+        b.register_vpn_endpoint(addr).await.unwrap();
+
+        // B announces its self-doc read ticket → A records peer/B.self_doc.
+        let b_self_ticket = b.self_doc_read_ticket().await.unwrap();
+        assert!(
+            a.record_peer_self_doc(&b_id, &b_self_ticket).await.unwrap(),
+            "trust anchor must record an admitted member's self-doc ticket"
+        );
+        assert!(
+            a.record_peer_self_doc(&b_id, &b_self_ticket).await.unwrap(),
+            "record_peer_self_doc must be idempotent"
+        );
+
+        // A imports B's self-doc on demand and reads B's vpn/ entry FROM IT.
+        let bdoc = a.member_self_doc(&b_id).await.expect("import B's self-doc");
+        let key = format!("{KEY_VPN_PREFIX}{addr}");
+        let mut found = false;
+        for _ in 0..150 {
+            if let Ok(Some(entry)) = bdoc
+                .get_one(Query::single_latest_per_key().key_exact(key.as_bytes()).build())
+                .await
+                && entry.content_len() > 0
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(found, "B's vpn/ entry was not readable via its self-doc on A");
+
+        // A malformed self-doc ticket is rejected.
+        assert!(a.record_peer_self_doc(&b_id, "not-a-ticket").await.is_err());
     }
 
     /// Only the trust anchor records bindings, and only for admitted members.
@@ -2150,7 +2329,7 @@ mod tests {
         .expect("spawn B");
 
         // Poll for replication (gossip + set reconciliation over loopback).
-        for _ in 0..50 {
+        for _ in 0..150 {
             if let Ok(Some((pubkey, _))) = b.lookup_vpn_endpoint(addr).await {
                 assert_eq!(pubkey, a.endpoint.id());
                 return;

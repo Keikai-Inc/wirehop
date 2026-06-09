@@ -202,6 +202,7 @@ mod tests {
             role: PeerRole::Peer,
             role_name: Some(role_name.into()),
             netdoc_author: None,
+            self_doc: None,
             sandbox: SandboxPolicy::default(),
         }
     }
