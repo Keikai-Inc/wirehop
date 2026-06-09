@@ -90,6 +90,7 @@ Generate a one-time invite token/URL.
 |---|---|
 | `--user <USER>` | Unix username the invited peer will log in as |
 | `--role <ROLE>` | Named role for the invited peer (e.g. `developer`, `ops`). Defaults to the host's configured `default_role` (`member`) |
+| `--tier <TIER>` | Capability tier: `client`, `warren-only`, `node`, `admin`. Default: inferred (`node` if this host has a warren, else `client`). Warren tiers require a warren on this host |
 | `--name <NAME>` | Human-readable name for this host |
 | `--read-only` | Restrict to read-only filesystem access |
 | `--no-network` | Block outbound network access |
@@ -100,9 +101,21 @@ Generate a one-time invite token/URL.
 ```bash
 hop invite --user jason
 hop invite --role developer            # role decides warren reach (tags)
+hop invite --tier client               # reach this host only — no warren, no daemon, no sudo
+hop invite --tier warren-only          # VPN reach only — cannot open host sessions
+hop invite --tier node                 # warren member + reachable (self-upgrades to a daemon)
+hop invite --tier admin                # node + warren admin (mint/grant); redeems as creator
 hop invite --user guest --read-only --scope /var/log
 hop invite --preset monitor
 ```
+
+**Tiers** (orthogonal axes — session reach, warren membership, admin — collapsed
+into four): a `client` invite reaches only the issuing host and strips any warren
+ticket (it can never self-upgrade). `warren-only` puts the machine on the VPN
+(vIP/MagicDNS) but refuses host sessions (`network_only` role). `node` is a full
+warren member. `admin` redeems with creator access. Warren tiers pin the founder
+trust anchor (C1). (The read- vs write-scoped ticket split is tracked separately;
+see `docs/technical/install-and-invite-tiers.md` §10.)
 
 The invited peer joins with the given role; the role's host tags decide what it
 can reach over the warren VPN (default-deny). Elevate later with `hop admin

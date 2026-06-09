@@ -434,6 +434,7 @@ Built in safe, individually-released increments, security-first per decision 5.
 | **Phase 1b** — self-upgrade **consent** on `hop warren join` (decode-as-user → consent → reuse proven installer; the **H10** fix) | ✅ shipped | 0.6.43 |
 | **Phase 1 (decision 7)** — `install.sh` default client install → `~/.local/bin` (zero-sudo); existing `/usr/local/bin/hop` updated in place; `--host` promotes to root-owned `/usr/local/bin`. `--site-only` now redeploys `install.sh` too | ✅ shipped | site deploy |
 | **Phase 1d** — website builder **invite tier-preview** (client-side base64url-JSON decode → "joins host X as a node/admin/warren-only", auto-selects the node tier) | ✅ live | site deploy |
+| **Phase 1a** — `hop invite --tier client\|warren-only\|node\|admin` (sets explicit `InviteTier`: client strips warren ticket, warren-only pins `network_only` role, admin → creator; warren tiers pin founder anchor). Ticket *scope* split still pending (Phase 0b) | ✅ shipped (capability tier) | 0.6.48 |
 | Website "VPN opt-in" copy fixes | ✅ live | site deploy |
 
 ### Deferred — major subsystems needing dedicated, validated passes
@@ -495,10 +496,16 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
 - **Phase 1b — embedded `hop __install-daemon` (decision 1A).** The self-upgrade
   *consent* ships now via the proven shell installer; porting launchd/systemd
   setup into the binary needs **macOS daemon-install e2e** that doesn't exist yet.
-- **Phase 1a — wire `--warren`/`--warren-only` flags to read-scoped tickets.**
-  Gated on the C1 read/write split so a node invite is never an over-powered
-  write ticket.
+- **Phase 1a — tier *capability* flag SHIPPED (0.6.48); read/write ticket
+  *scope* still pending.** `hop invite --tier client|warren-only|node|admin` now
+  sets the explicit `InviteTier`: `client` strips the warren ticket (can't
+  self-upgrade), `warren-only` pins the `network_only` role, `admin` redeems as
+  creator, and warren tiers pin the founder anchor. What remains is the C1
+  read/write split — a `node`/`warren-only` invite still carries a **write**
+  ticket; it should carry a **read** ticket (Phase 0b) so a member is never
+  over-powered. Until then, enforce (vouched authors) is what bounds a write
+  member's effective reach.
 - **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
   verify-then-promote; both are release-pipeline + infra work.
 
-*Last updated: 0.6.47*
+*Last updated: 0.6.48*

@@ -83,6 +83,17 @@ impl InviteTier {
     pub fn is_warren_node(&self) -> bool {
         !matches!(self, InviteTier::Client)
     }
+
+    /// Stable lowercase name (matches the `--tier` flag values + the snake_case
+    /// serde encoding).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InviteTier::Client => "client",
+            InviteTier::WarrenOnly => "warren-only",
+            InviteTier::Node => "node",
+            InviteTier::Admin => "admin",
+        }
+    }
 }
 
 impl InviteToken {

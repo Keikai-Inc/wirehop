@@ -75,14 +75,15 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
-        Command::Invite { user, role, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Invite { user, role, tier, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             // Ensure dir exists and auto-generate identity if needed (no need to run `hop id` first)
             std::fs::create_dir_all(&config_dir)
                 .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
-            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), name.as_deref(), sandbox)
+            let tier = parse_invite_tier(tier.as_deref())?;
+            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), tier, name.as_deref(), sandbox)
         }
         Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -1249,15 +1250,85 @@ async fn dispatch_session(
     Ok(())
 }
 
+/// Parse the `--tier` flag into an `InviteTier`. `None` (flag absent) means
+/// "infer" — the legacy behaviour where `effective_tier()` derives the tier
+/// from `warren_ticket` + role.
+fn parse_invite_tier(s: Option<&str>) -> Result<Option<hop_core::invite::InviteTier>> {
+    use hop_core::invite::InviteTier;
+    let Some(s) = s else { return Ok(None) };
+    let t = match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "client" => InviteTier::Client,
+        "warren-only" | "warren" | "vpn" => InviteTier::WarrenOnly,
+        "node" => InviteTier::Node,
+        "admin" => InviteTier::Admin,
+        other => anyhow::bail!(
+            "unknown --tier {other:?} (expected: client, warren-only, node, admin)"
+        ),
+    };
+    Ok(Some(t))
+}
+
+/// One-line description of what redeeming a tier does, for the `hop invite` output.
+fn tier_summary(t: hop_core::invite::InviteTier) -> &'static str {
+    use hop_core::invite::InviteTier;
+    match t {
+        InviteTier::Client => "reach this host only; no warren, no daemon, no sudo",
+        InviteTier::WarrenOnly => "join the warren VPN (vIP/MagicDNS reach); cannot open host sessions",
+        InviteTier::Node => "join the warren as a reachable node (self-upgrades to a daemon)",
+        InviteTier::Admin => "node + warren admin (mint/grant); redeems with creator access",
+    }
+}
+
+/// Resolve this host's founder (trust-anchor) doc author. A federated node has
+/// it persisted (`netdoc-founder.author`); the founder itself carries it in its
+/// own augmented `creator_invite`. Used to pin C1 trust into issued invites.
+fn resolve_founder_author(config_dir: &std::path::Path) -> Option<String> {
+    if let Ok(s) = std::fs::read_to_string(config_dir.join("netdoc-founder.author")) {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let ci = std::fs::read_to_string(config_dir.join("creator_invite")).ok()?;
+    invite::decode_invite(ci.trim()).ok()?.founder_author
+}
+
 fn cmd_invite(
     secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     username: Option<&str>,
     role_name: Option<&str>,
+    tier: Option<hop_core::invite::InviteTier>,
     host_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
 ) -> Result<()> {
+    use hop_core::invite::InviteTier;
     let public_key = secret_key.public();
+
+    // A warren tier needs an actual warren on this host.
+    let has_warren = config_dir.join("netdoc.ticket").exists();
+    if matches!(tier, Some(InviteTier::WarrenOnly | InviteTier::Node | InviteTier::Admin))
+        && !has_warren
+    {
+        anyhow::bail!(
+            "--tier {} needs a warren, but this host has none. Enable the VPN first \
+             (`hop config set vpn on` or install with `--host`), then re-issue the invite.",
+            match tier { Some(t) => t.as_str(), None => "" }
+        );
+    }
+    // Tier decides the peer role recorded for redemption (must be set BEFORE the
+    // pending invite is stored): admin → Creator; everything else → Peer with a
+    // role name (warren-only pins the seeded `warren-only` network_only role).
+    let (peer_role, resolved_role_name): (PeerRole, Option<String>) = match tier {
+        Some(InviteTier::Admin) => (PeerRole::Creator, Some("admin".to_string())),
+        Some(InviteTier::WarrenOnly) => (PeerRole::Peer, Some("warren-only".to_string())),
+        _ => (
+            PeerRole::Peer,
+            role_name
+                .map(String::from)
+                .or_else(|| config::HostConfig::load(config_dir).ok().map(|c| c.default_role)),
+        ),
+    };
 
     // Default to current user when --user is not specified.
     // This ensures peers always have a bound username when the daemon runs as root.
@@ -1279,22 +1350,42 @@ fn cmd_invite(
     let relay_url = std::fs::read_to_string(config_dir.join("relay_url"))
         .ok()
         .or_else(|| Some(hop_core::net::HOP_RELAY_URL.to_string()));
-    // No --role → the host's configured default role (least-privilege `member`).
-    let resolved_role = role_name
-        .map(String::from)
-        .or_else(|| config::HostConfig::load(config_dir).ok().map(|c| c.default_role));
     let token = invite::generate_invite_with_role(
         &public_key,
         config_dir,
         relay_url.as_deref(),
         username,
         host_name,
-        PeerRole::Peer,
-        resolved_role,
+        peer_role,
+        resolved_role_name,
         15 * 60,
         sandbox.clone(),
     )?;
 
+    // Stamp the explicit tier (and, for warren tiers, the founder trust anchor)
+    // onto the token. Safe post-generation: the pending-invite store records
+    // only the secret/role/sandbox, never the tier or warren_ticket, so this
+    // can't desync redemption. A client-tier invite strips any warren_ticket so
+    // it can never self-upgrade into a node.
+    let token = if let Some(t) = tier {
+        let mut decoded = invite::decode_invite(&token)?;
+        decoded.tier = t;
+        if t == InviteTier::Client {
+            decoded.warren_ticket = None;
+            decoded.founder_author = None;
+        } else {
+            // Pin the founder author so a joining node anchors C1 trust.
+            decoded.founder_author = resolve_founder_author(config_dir);
+        }
+        invite::encode_invite(&decoded)?
+    } else {
+        token
+    };
+
+    if let Some(t) = tier {
+        println!("Tier: {} — {}", t.as_str(), tier_summary(t));
+        println!();
+    }
     println!("Invite token (share with the client):");
     println!();
     println!("  {token}");
@@ -4624,6 +4715,23 @@ mod tests {
     use super::*;
     use hop_core::proto::ClientMessage;
     use hop_core::sandbox::SandboxPolicy;
+
+    #[test]
+    fn parse_invite_tier_values() {
+        use hop_core::invite::InviteTier;
+        assert_eq!(parse_invite_tier(None).unwrap(), None);
+        assert_eq!(parse_invite_tier(Some("client")).unwrap(), Some(InviteTier::Client));
+        assert_eq!(parse_invite_tier(Some("warren-only")).unwrap(), Some(InviteTier::WarrenOnly));
+        assert_eq!(parse_invite_tier(Some("warren")).unwrap(), Some(InviteTier::WarrenOnly));
+        assert_eq!(parse_invite_tier(Some("node")).unwrap(), Some(InviteTier::Node));
+        assert_eq!(parse_invite_tier(Some("ADMIN")).unwrap(), Some(InviteTier::Admin));
+        assert_eq!(parse_invite_tier(Some("warren_only")).unwrap(), Some(InviteTier::WarrenOnly));
+        assert!(parse_invite_tier(Some("bogus")).is_err());
+        // Round-trips with as_str.
+        for t in [InviteTier::Client, InviteTier::WarrenOnly, InviteTier::Node, InviteTier::Admin] {
+            assert_eq!(parse_invite_tier(Some(t.as_str())).unwrap(), Some(t));
+        }
+    }
 
     #[test]
     fn rebuild_v3_preserves_sandbox() {

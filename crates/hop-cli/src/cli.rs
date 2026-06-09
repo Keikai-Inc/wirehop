@@ -34,6 +34,12 @@ pub enum Command {
         /// host's configured default role.
         #[arg(long)]
         role: Option<String>,
+        /// Capability tier: client (reach this host only), warren-only (VPN reach,
+        /// no host sessions), node (warren member + reachable), admin (node +
+        /// mint/grant). Default: inferred (node if this host has a warren, else
+        /// client). Warren tiers require this host to have a warren.
+        #[arg(long, value_name = "TIER")]
+        tier: Option<String>,
         /// Human-readable name for this host (defaults to system hostname)
         #[arg(long)]
         name: Option<String>,
