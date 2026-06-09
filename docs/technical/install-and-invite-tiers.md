@@ -522,7 +522,19 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   ticket; it should carry a **read** ticket (Phase 0b) so a member is never
   over-powered. Until then, enforce (vouched authors) is what bounds a write
   member's effective reach.
-- **Phase 2 — fleet-invite tiers + artifact signing (H9).** Signing plugs into
-  verify-then-promote; both are release-pipeline + infra work.
+- **Phase 2 — artifact signing (H9): plumbing SHIPPED, inert until keyed.**
+  `release.sh` signs each artifact with a detached `openssl dgst -sha256`
+  signature when `HOP_SIGNING_KEY` is set; `install.sh` verifies it against an
+  embedded `HOP_PUBKEY`, failing closed. RSA-via-openssl (not ed25519) so the
+  stock `openssl` on macOS LibreSSL can verify with no extra dependency.
+  `scripts/gen-signing-key.sh` mints the keypair. **Inert until the operator
+  generates a key, embeds the public key in `install.sh`, and releases with
+  `HOP_SIGNING_KEY` set** — `HOP_PUBKEY` empty ⇒ checksum-only (today's
+  behaviour, unchanged). Once the pubkey is embedded, every release must be
+  signed (install fails closed on a missing/bad signature).
+- **Phase 2 — fleet-invite tiers.** Aggregate (`hop admin <host> fleet-invite`)
+  tokens should carry an explicit `InviteTier` like `hop invite --tier` does
+  (currently always Creator/admin). Needs an `AdminRequest::CreateFleetInvite`
+  field + handler stamping. Still pending.
 
-*Last updated: 0.6.49*
+*Last updated: 0.6.49 (signing plumbing shipped unkeyed)*

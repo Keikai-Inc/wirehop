@@ -279,6 +279,32 @@ for f in hop-*; do
 done
 cd "${PROJECT_ROOT}"
 
+# --- Sign artifacts (optional, security-audit H9) ----------------------------
+# If HOP_SIGNING_KEY (path to an RSA private PEM, see scripts/gen-signing-key.sh)
+# is set, produce a detached `openssl dgst -sha256` signature next to each
+# binary. install.sh verifies these against the public key embedded in it.
+# Unset → unsigned release (current behaviour); install.sh then checksum-only.
+if [[ -n "${HOP_SIGNING_KEY:-}" ]]; then
+  if [[ ! -f "${HOP_SIGNING_KEY}" ]]; then
+    echo "Error: HOP_SIGNING_KEY=${HOP_SIGNING_KEY} not found" >&2
+    exit 1
+  fi
+  echo "==> Signing artifacts with ${HOP_SIGNING_KEY}"
+  cd "${DIST_DIR}"
+  for f in hop-*; do
+    case "${f}" in *.sha256|*.sig) continue ;; esac
+    openssl dgst -sha256 -sign "${HOP_SIGNING_KEY}" -out "${f}.sig" "${f}"
+    # Fail the release if our own signature doesn't verify (catches a bad key).
+    pub="$(mktemp)"; openssl rsa -in "${HOP_SIGNING_KEY}" -pubout -out "${pub}" 2>/dev/null
+    openssl dgst -sha256 -verify "${pub}" -signature "${f}.sig" "${f}" >/dev/null \
+      || { echo "Error: self-verify failed for ${f}" >&2; exit 1; }
+    rm -f "${pub}"
+  done
+  cd "${PROJECT_ROOT}"
+else
+  echo "==> HOP_SIGNING_KEY unset — unsigned release (install.sh verifies checksum only)"
+fi
+
 # --- macOS .pkg installer ----------------------------------------------------
 
 echo "==> Building macOS universal .pkg"

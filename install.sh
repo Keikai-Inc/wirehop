@@ -23,6 +23,16 @@ set -euo pipefail
 
 BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
 
+# Release signing public key (security-audit H9). Empty = unsigned releases →
+# checksum-only verification (current behaviour). To enable: generate a keypair
+# with scripts/gen-signing-key.sh, paste the PUBLIC key between the markers
+# below, and sign releases with HOP_SIGNING_KEY set. `openssl dgst -sha256
+# -verify` works on both OpenSSL and the LibreSSL shipped on macOS. Override for
+# testing with HOP_PUBKEY env.
+HOP_PUBKEY="${HOP_PUBKEY:-}"
+# -----BEGIN HOP_PUBKEY----- (paste -----BEGIN PUBLIC KEY----- … here)
+# -----END HOP_PUBKEY-----
+
 # --- Colour helpers (disabled when piped) ------------------------------------
 
 if [[ -t 1 ]]; then
@@ -162,6 +172,26 @@ else
 fi
 
 [[ "${ACTUAL}" == "${EXPECTED}" ]] || die "Checksum mismatch!\n  expected: ${EXPECTED}\n  got:      ${ACTUAL}"
+
+# --- Verify signature (optional, security-audit H9) --------------------------
+# When a public key is embedded (HOP_PUBKEY), require a valid detached signature
+# over the binary — checksums alone don't prove provenance if the CDN/bucket is
+# compromised. Fails closed: a missing or bad signature aborts the install.
+# When HOP_PUBKEY is empty (unsigned releases) this is skipped entirely.
+if [[ -n "${HOP_PUBKEY}" ]]; then
+  command -v openssl >/dev/null 2>&1 || die "Signature verification needs openssl, which was not found."
+  info "Verifying signature..."
+  if ! fetch "${BINARY_URL}.sig" "${TMPDIR_HOP}/hop.sig" 2>/dev/null; then
+    die "Signed releases expected, but no signature found for ${BINARY_NAME}. Aborting."
+  fi
+  printf '%s\n' "${HOP_PUBKEY}" > "${TMPDIR_HOP}/pub.pem"
+  if openssl dgst -sha256 -verify "${TMPDIR_HOP}/pub.pem" \
+        -signature "${TMPDIR_HOP}/hop.sig" "${TMPDIR_HOP}/hop" >/dev/null 2>&1; then
+    info "Signature verified."
+  else
+    die "Signature verification FAILED for ${BINARY_NAME}. Refusing to install."
+  fi
+fi
 
 # --- Install binary ----------------------------------------------------------
 
