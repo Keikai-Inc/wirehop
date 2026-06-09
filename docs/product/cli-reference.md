@@ -325,11 +325,17 @@ hop admin myhost create-user alice --groups docker,www-data
 | `--tags <TAGS>` | Tags for fleet members (comma-separated) |
 | `--max-uses <N>` | Maximum number of uses (0 = unlimited, default: 0) |
 | `--expiry <SECS>` | Expiry in seconds (default: 86400) |
+| `--tier <TIER>` | Capability tier for redeemers: `client`, `warren-only`, `node`, `admin`. Default: `admin` (legacy). Warren tiers require a warren on the host |
 
 ```bash
 hop admin orch fleet-invite --tags web,staging
 hop admin orch fleet-invite --tags db --max-uses 5
+hop admin orch fleet-invite --tags web --tier node   # provision servers as nodes, not admins
 ```
+
+The `--tier` mirrors `hop invite --tier`: `node`/`warren-only` redeemers join the
+warren without admin rights; `client` strips the warren ticket; `admin` (default)
+keeps the legacy orchestrator-trusted behaviour.
 
 #### `hop admin <target> fleet-list`
 

@@ -2415,10 +2415,11 @@ async fn cmd_admin(
             invite: *invite,
         },
         AdminAction::Status => AdminRequest::Status,
-        AdminAction::FleetInvite { tags, max_uses, expiry } => AdminRequest::CreateFleetInvite {
+        AdminAction::FleetInvite { tags, max_uses, expiry, tier } => AdminRequest::CreateFleetInvite {
             tags: tags.clone(),
             max_uses: *max_uses,
             expiry_secs: *expiry,
+            tier: tier.clone(),
         },
         AdminAction::FleetList { tag } => AdminRequest::ListFleet {
             tag_filter: tag.clone(),

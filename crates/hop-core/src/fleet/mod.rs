@@ -283,28 +283,99 @@ pub fn handle_create_fleet_invite(
     tags: Vec<String>,
     _max_uses: u32,
     expiry_secs: u64,
+    tier: Option<String>,
 ) -> AdminResponse {
-    // Fleet invites are regular invites with Creator role (so the host trusts the orchestrator)
-    match invite::generate_invite_with_role(
+    use crate::invite::InviteTier;
+    // Parse the tier; default (None) preserves the legacy admin/Creator behaviour.
+    let tier = match tier.as_deref() {
+        None => None,
+        Some(s) => match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "client" => Some(InviteTier::Client),
+            "warren-only" | "warren" | "vpn" => Some(InviteTier::WarrenOnly),
+            "node" => Some(InviteTier::Node),
+            "admin" => Some(InviteTier::Admin),
+            other => {
+                return AdminResponse::Error {
+                    message: format!("unknown --tier {other:?} (expected: client, warren-only, node, admin)"),
+                };
+            }
+        },
+    };
+    // Warren tiers need a warren on this host.
+    if matches!(tier, Some(InviteTier::WarrenOnly | InviteTier::Node | InviteTier::Admin))
+        && !config_dir.join("netdoc.ticket").exists()
+    {
+        return AdminResponse::Error {
+            message: "a warren tier was requested but this host has no warren (enable the VPN first)".to_string(),
+        };
+    }
+    // Tier → role (must be set BEFORE the pending invite is stored). Legacy
+    // default (tier None) and admin tier are Creator; node/warren-only are Peer.
+    let (peer_role, role_name) = match tier {
+        None | Some(InviteTier::Admin) => (PeerRole::Creator, None),
+        Some(InviteTier::WarrenOnly) => (PeerRole::Peer, Some("warren-only".to_string())),
+        Some(InviteTier::Client) | Some(InviteTier::Node) => (PeerRole::Peer, None),
+    };
+    let token = match invite::generate_invite_with_role(
         host_public_key,
         config_dir,
         relay_url,
         None,
         None,
-        PeerRole::Creator,
-        None,
+        peer_role,
+        role_name,
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
     ) {
-        Ok(token) => {
-            // Store tags metadata alongside the invite for fleet registration
-            tracing::info!("Fleet invite created with tags: {:?}", tags);
-            AdminResponse::FleetInviteCreated { token }
+        Ok(t) => t,
+        Err(e) => {
+            return AdminResponse::Error {
+                message: format!("failed to create fleet invite: {e}"),
+            };
         }
-        Err(e) => AdminResponse::Error {
-            message: format!("failed to create fleet invite: {e}"),
+    };
+    // Stamp the explicit tier (+ founder anchor / client-tier warren strip), like
+    // `hop invite --tier`. Safe post-generation: the pending-invite store records
+    // only the secret/role, not the tier/warren_ticket.
+    let token = match tier {
+        None => token,
+        Some(t) => match stamp_invite_tier(config_dir, &token, t) {
+            Ok(s) => s,
+            Err(e) => {
+                return AdminResponse::Error {
+                    message: format!("failed to stamp fleet invite tier: {e}"),
+                };
+            }
         },
+    };
+    tracing::info!("Fleet invite created (tier {:?}) with tags: {:?}", tier.map(|t| t.as_str()), tags);
+    AdminResponse::FleetInviteCreated { token }
+}
+
+/// Stamp an explicit `InviteTier` onto a freshly-generated token: set the tier
+/// field, pin the founder author for warren tiers, and strip the warren ticket
+/// for the client tier (so it can never self-upgrade). Mirrors `cmd_invite`.
+fn stamp_invite_tier(config_dir: &Path, token: &str, tier: crate::invite::InviteTier) -> anyhow::Result<String> {
+    use crate::invite::InviteTier;
+    let mut decoded = invite::decode_invite(token)?;
+    decoded.tier = tier;
+    if tier == InviteTier::Client {
+        decoded.warren_ticket = None;
+        decoded.founder_author = None;
+    } else {
+        // Founder author: persisted (federated node) or in the host's creator_invite.
+        decoded.founder_author = std::fs::read_to_string(config_dir.join("netdoc-founder.author"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(config_dir.join("creator_invite"))
+                    .ok()
+                    .and_then(|ci| invite::decode_invite(ci.trim()).ok())
+                    .and_then(|t| t.founder_author)
+            });
     }
+    invite::encode_invite(&decoded)
 }
 
 pub fn handle_list_fleet(config_dir: &Path, tag_filter: Option<&str>) -> AdminResponse {
@@ -940,6 +1011,47 @@ mod tests {
         let role = store.find_role("developer").unwrap();
         assert_eq!(role.host_tags, vec!["dev", "staging", "production"]);
         assert!(role.sudo);
+    }
+
+    #[test]
+    fn fleet_invite_tier_stamping() {
+        use crate::invite::{decode_invite, InviteTier};
+        let dir = tempfile::tempdir().unwrap();
+        let pk = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let make = |tier: Option<&str>| {
+            handle_create_fleet_invite(dir.path(), None, &pk, vec![], 0, 3600, tier.map(String::from))
+        };
+        let tok_of = |resp: AdminResponse| match resp {
+            AdminResponse::FleetInviteCreated { token } => decode_invite(&token).unwrap(),
+            other => panic!("expected FleetInviteCreated, got {other:?}"),
+        };
+
+        // Default (no tier) → legacy Creator/admin.
+        assert_eq!(tok_of(make(None)).role, PeerRole::Creator);
+        // A warren tier with no warren on the host → error.
+        assert!(matches!(make(Some("node")), AdminResponse::Error { .. }));
+        // Give the host a warren ticket; warren tiers now work.
+        std::fs::write(dir.path().join("netdoc.ticket"), "dummy-ticket").unwrap();
+
+        let node = tok_of(make(Some("node")));
+        assert_eq!(node.tier, InviteTier::Node);
+        assert_eq!(node.role, PeerRole::Peer);
+        assert!(node.warren_ticket.is_some());
+
+        let admin = tok_of(make(Some("admin")));
+        assert_eq!(admin.tier, InviteTier::Admin);
+        assert_eq!(admin.role, PeerRole::Creator);
+
+        let warren_only = tok_of(make(Some("warren-only")));
+        assert_eq!(warren_only.tier, InviteTier::WarrenOnly);
+        assert_eq!(warren_only.role_name.as_deref(), Some("warren-only"));
+
+        // Client tier strips the warren ticket (can't self-upgrade).
+        let client = tok_of(make(Some("client")));
+        assert!(client.warren_ticket.is_none());
+
+        // Unknown tier → error.
+        assert!(matches!(make(Some("bogus")), AdminResponse::Error { .. }));
     }
 
     #[test]

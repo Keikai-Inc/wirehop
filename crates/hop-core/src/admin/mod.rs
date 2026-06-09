@@ -56,8 +56,8 @@ pub fn handle_admin_request(
         ),
         AdminRequest::Status => handle_status(config_dir),
         // Fleet admin (Phase 2)
-        AdminRequest::CreateFleetInvite { tags, max_uses, expiry_secs } => {
-            crate::fleet::handle_create_fleet_invite(config_dir, relay_url, host_public_key, tags, max_uses, expiry_secs)
+        AdminRequest::CreateFleetInvite { tags, max_uses, expiry_secs, tier } => {
+            crate::fleet::handle_create_fleet_invite(config_dir, relay_url, host_public_key, tags, max_uses, expiry_secs, tier)
         }
         AdminRequest::ListFleet { tag_filter } => {
             crate::fleet::handle_list_fleet(config_dir, tag_filter.as_deref())

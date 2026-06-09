@@ -453,6 +453,10 @@ pub enum AdminAction {
         /// Expiry in seconds (default: 24h)
         #[arg(long, default_value = "86400")]
         expiry: u64,
+        /// Capability tier for redeemers: client, warren-only, node, admin.
+        /// Default: admin (legacy behaviour). Warren tiers need a warren.
+        #[arg(long, value_name = "TIER")]
+        tier: Option<String>,
     },
     /// List fleet members (orchestrator)
     FleetList {

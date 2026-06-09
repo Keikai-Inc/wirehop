@@ -536,9 +536,12 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   `HOP_SIGNING_KEY` set** — `HOP_PUBKEY` empty ⇒ checksum-only (today's
   behaviour, unchanged). Once the pubkey is embedded, every release must be
   signed (install fails closed on a missing/bad signature).
-- **Phase 2 — fleet-invite tiers.** Aggregate (`hop admin <host> fleet-invite`)
-  tokens should carry an explicit `InviteTier` like `hop invite --tier` does
-  (currently always Creator/admin). Needs an `AdminRequest::CreateFleetInvite`
-  field + handler stamping. Still pending.
+- **Phase 2 — fleet-invite tiers SHIPPED (0.6.52).** `hop admin <host>
+  fleet-invite --tier client|warren-only|node|admin` carries an explicit
+  `InviteTier` (default `admin` = legacy Creator behaviour, back-compatible via a
+  serde-default `tier` field on `AdminRequest::CreateFleetInvite`). The handler
+  maps tier→role before storing the pending invite and stamps the tier + founder
+  anchor (+ client-tier warren strip), mirroring `hop invite --tier`. Unit-tested
+  (`fleet_invite_tier_stamping`).
 
 *Last updated: 0.6.49 (signing plumbing shipped unkeyed)*

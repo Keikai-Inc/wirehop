@@ -150,6 +150,11 @@ pub enum AdminRequest {
         tags: Vec<String>,
         max_uses: u32,
         expiry_secs: u64,
+        /// Capability tier for redeemers (client/warren-only/node/admin). `None`
+        /// (serde default → back-compatible) keeps the legacy admin/Creator
+        /// behaviour. A warren tier needs a warren on the orchestrating host.
+        #[serde(default)]
+        tier: Option<String>,
     },
     /// List fleet members.
     ListFleet { tag_filter: Option<String> },
