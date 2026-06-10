@@ -134,18 +134,28 @@ claim another's addr), and adds no runtime coupling.
 
 Dropping the shared `vpn/` write outright (so the endpoint lives only in the
 self-doc) **broke live 2-node routing** in `vpn-e2e`: the founder (host-a) did
-not reliably resolve a member's (host-b) endpoint from the member's **imported**
-self-doc in time, even though the reverse direction worked and all unit tests
-passed (the model is correct; the data plane didn't converge). Root cause is in
-the **imported-self-doc sync**: a member self-doc pulled in by `member_self_doc`
-needs active sync priming (like `resume_sync` does for the admin doc) so its
-content actually replicates to the importer, and the asymmetry (founder importing
-a member's namespace) needs investigating. Until that's hardened, the endpoint
-stays **dual-written** (self-doc preferred + shared fallback) — interception is
-still blocked (readers prefer the owner's self-doc keyed by `peer/N.vip`), only
-the *physical* isolation is deferred. **This convergence work gates both the
-shared-write drop AND read-ticket members** (a read-ticket member can't write the
-shared fallback, so the self-doc path must be rock-solid first).
+not resolve a member's (host-b) endpoint from the member's **imported** self-doc,
+even though the reverse direction worked and all unit tests passed (the model is
+correct; the data plane didn't converge).
+
+**Active-sync hardening shipped (but insufficient on its own):**
+`member_self_doc` now `start_sync`s each imported member self-doc (it previously
+`open`ed already-present namespaces without syncing), and
+`resync_member_self_docs` re-syncs them on the keepalives (300 s + the 20 s fast
+loop) — the analogue of `resume_sync` for the admin doc. This is a real
+robustness win and is kept. **But the shared-write drop STILL broke routing with
+it in place** — so the founder→member self-doc convergence has a **deeper issue**
+(only `INFO` logs were available; it needs `debug` instrumentation on
+`member_self_doc` / `start_sync` / the `vpn/vpn/1` ingress to see whether the
+import connects, whether content replicates, and the founder-importing-a-member
+asymmetry). Not blind-iterated further — it's the access-critical data plane.
+
+Until then the endpoint stays **dual-written** (self-doc preferred + shared
+fallback): interception is still blocked (readers prefer the owner's self-doc
+keyed by `peer/N.vip`), only the *physical* isolation is deferred. **This
+convergence work gates both the shared-write drop AND read-ticket members** (a
+read-ticket member can't write the shared fallback, so the self-doc path must be
+rock-solid first).
 
 **Remaining (the final isolation flip):**
 7. **Harden imported-self-doc sync** (active sync for `member_self_doc` docs), then

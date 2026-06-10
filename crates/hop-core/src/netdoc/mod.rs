@@ -126,8 +126,10 @@ pub struct NetDoc {
     /// its namespace. `None` for test/`spawn` instances (no persistence).
     meta_path: Option<std::path::PathBuf>,
     /// Lazily-imported, read-only member self-docs keyed by node_id (lazy/on-
-    /// demand sync). Populated by `member_self_doc` on first reach; cached here.
-    member_docs: tokio::sync::RwLock<std::collections::HashMap<String, Doc>>,
+    /// demand sync). Populated by `member_self_doc` on first reach; the cached
+    /// value is `(doc, owner endpoint addrs)` so a keepalive can actively
+    /// re-sync each (an opened-but-not-syncing self-doc otherwise goes stale).
+    member_docs: tokio::sync::RwLock<std::collections::HashMap<String, (Doc, Vec<EndpointAddr>)>>,
     author: AuthorId,
     namespace: NamespaceId,
     /// The endpoint the docs/vpn stack runs on (for opening VPN connections).
@@ -800,6 +802,8 @@ impl NetDoc {
                     Ok(_) => {}
                     Err(e) => tracing::debug!("netdoc: periodic re-sync failed: {e:#}"),
                 }
+                // Keep imported member self-docs syncing too (#3b).
+                me.resync_member_self_docs().await;
             }
         });
     }
@@ -816,6 +820,9 @@ impl NetDoc {
             loop {
                 tokio::time::sleep(interval).await;
                 me.refresh_admin_authors().await;
+                // Fast re-sync of imported member self-docs so the data plane
+                // converges in seconds (discovery resolves a stale ticket addr).
+                me.resync_member_self_docs().await;
             }
         });
     }
@@ -830,13 +837,14 @@ impl NetDoc {
             .unwrap_or_default();
         let value = format!("{} {relay}", self.endpoint.id());
         let key = format!("{KEY_VPN_PREFIX}{addr}");
-        // #3b: the endpoint is dual-written (self-doc + shared). Both read paths
-        // PREFER the owner's self-doc keyed by the admin-allocated peer/N.vip
-        // (Phase 2) — so a forged shared `vpn/<victim>` is never consulted
-        // (interception-resistant). The shared copy remains as the convergence
-        // fallback: dropping it broke live 2-node routing (host-a didn't resolve
-        // host-b's endpoint from its self-doc in time), so the final isolation
-        // step is gated on hardening imported-self-doc sync. See §10.
+        // #3b: dual-written (self-doc preferred + shared fallback). Readers prefer
+        // the owner's self-doc keyed by peer/N.vip, so a forged shared entry is
+        // never consulted (interception-resistant). The shared fallback stays
+        // because dropping it still broke live 2-node routing even WITH active
+        // imported-self-doc sync (member_self_doc start_sync + keepalive) — the
+        // founder→member self-doc convergence has a deeper issue that needs debug
+        // instrumentation, not blind iteration on the access-critical data plane.
+        // The final isolation drop is gated on that. See per-member-self-docs.md.
         self.put_self(&key, value.into_bytes()).await.context("registering vpn endpoint")?;
         Ok(())
     }
@@ -1537,12 +1545,15 @@ impl NetDoc {
     /// On-demand sync: the self-doc is imported the first time a member is
     /// reached, then cached for the process lifetime.
     pub async fn member_self_doc(&self, node_id: &str) -> Option<Doc> {
-        if let Some(doc) = self.member_docs.read().await.get(node_id).cloned() {
+        if let Some((doc, _)) = self.member_docs.read().await.get(node_id).cloned() {
             return Some(doc);
         }
         let peer = self.get_peer(node_id).await.ok().flatten()?;
         let ticket: DocTicket = peer.self_doc.as_deref()?.parse().ok()?;
-        // Already syncing this namespace (e.g. our own)? open instead of re-import.
+        let addrs = ticket.nodes.clone();
+        // Open if already in the local store, else import. NOTE: `open` does NOT
+        // start sync, so always start_sync afterwards with the owner's address —
+        // otherwise the content goes stale and the data plane never converges.
         let ns = ticket.capability.id();
         let doc = match self.docs.open(ns).await {
             Ok(Some(d)) => d,
@@ -1554,8 +1565,32 @@ impl NetDoc {
                 }
             },
         };
-        self.member_docs.write().await.insert(node_id.to_string(), doc.clone());
+        if !addrs.is_empty()
+            && let Err(e) = doc.start_sync(addrs.clone()).await
+        {
+            tracing::debug!("netdoc: start_sync self-doc for {} failed (best-effort): {e:#}", &node_id[..8.min(node_id.len())]);
+        }
+        self.member_docs.write().await.insert(node_id.to_string(), (doc.clone(), addrs));
         Some(doc)
+    }
+
+    /// Re-affirm sync with every imported member self-doc (keepalive). An
+    /// imported self-doc that was `open`ed (not freshly imported) or whose owner
+    /// reconnected won't keep syncing on its own, so periodically re-`start_sync`
+    /// each with the owner's address — the analogue of `resume_sync` for the
+    /// admin doc. Best-effort.
+    pub async fn resync_member_self_docs(&self) {
+        let docs: Vec<(Doc, Vec<EndpointAddr>)> = self
+            .member_docs
+            .read()
+            .await
+            .values()
+            .filter(|(_, a)| !a.is_empty())
+            .cloned()
+            .collect();
+        for (doc, addrs) in docs {
+            let _ = doc.start_sync(addrs).await;
+        }
     }
 
     /// Drop a member's cached self-doc (on revoke).
