@@ -124,6 +124,16 @@ pub type VpnLocalIp = std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>;
 #[cfg(unix)]
 pub type VpnRefresh = std::sync::Arc<tokio::sync::Notify>;
 
+/// `remote endpoint id hex → live inbound hop/vpn/1 connection`. Registered by
+/// `VpnInbound` on accept (newest wins) and shared with the outbound forwarder,
+/// which PREFERS it over its own dial cache: after a peer reboots and redials,
+/// replies immediately ride the fresh inbound connection instead of a
+/// silently-dead cached one (no CLOSE frame is ever received from a rebooted
+/// peer, so `close_reason()` can't detect it until the QUIC idle timeout).
+#[cfg(unix)]
+pub type VpnConns =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>>;
+
 /// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
 /// packets) to the TUN device — **after authenticating ingress** (security-audit
 /// C2). A datagram is delivered only if (a) the connecting node is a registered
@@ -137,6 +147,7 @@ pub struct VpnInbound {
     peer_ips: VpnPeerIps,
     local_ip: VpnLocalIp,
     refresh: VpnRefresh,
+    conns: VpnConns,
 }
 
 #[cfg(unix)]
@@ -148,8 +159,69 @@ impl std::fmt::Debug for VpnInbound {
 
 #[cfg(unix)]
 impl VpnInbound {
-    pub fn new(tun: TunSlot, peer_ips: VpnPeerIps, local_ip: VpnLocalIp, refresh: VpnRefresh) -> Self {
-        Self { tun, peer_ips, local_ip, refresh }
+    pub fn new(
+        tun: TunSlot,
+        peer_ips: VpnPeerIps,
+        local_ip: VpnLocalIp,
+        refresh: VpnRefresh,
+        conns: VpnConns,
+    ) -> Self {
+        Self { tun, peer_ips, local_ip, refresh, conns }
+    }
+}
+
+/// Read datagrams off a hop/vpn/1 connection (inbound OR dialed — QUIC
+/// datagrams are bidirectional) and deliver each to the TUN after
+/// authenticating ingress (security-audit C2). Returns when the connection
+/// dies. Shared by `VpnInbound::accept` and the outbound forwarder's dialed
+/// connections, so replies sent back over the *same* connection a peer dialed
+/// are actually read — the old accept-only pump silently discarded them.
+#[cfg(unix)]
+pub async fn pump_vpn_datagrams(
+    conn: &iroh::endpoint::Connection,
+    tun: &TunSlot,
+    peer_ips: &VpnPeerIps,
+    local_ip: &VpnLocalIp,
+    refresh: &VpnRefresh,
+) {
+    // The authenticated identity of the remote node (QUIC/TLS-verified).
+    let remote = conn.remote_id().to_string();
+    while let Ok(dg) = conn.read_datagram().await {
+        // Look up the peer's authorized vIP *per datagram* (not once up front)
+        // so a refresh mid-connection — e.g. after the peer reboots and
+        // re-registers — takes effect without dropping the connection.
+        let expected_src = peer_ips.read().await.get(&remote).copied();
+        let Some(expected) = expected_src else {
+            // Unknown peer: ask the NetDoc to refresh from the document. The
+            // notify coalesces and the consumer is rate-limited, so a packet
+            // flood can't amplify into excessive doc reads.
+            tracing::debug!(
+                "vpn ingress: DROP datagram from {} — no endpoint→vIP mapping (map has {} entries); refresh requested",
+                &remote[..10.min(remote.len())],
+                peer_ips.read().await.len()
+            );
+            refresh.notify_one();
+            continue;
+        };
+        // Anti-spoofing: the packet's source vIP must be this node's vIP. A
+        // mismatch can mean the peer changed vIP — refresh and re-check next
+        // datagram rather than blackholing it indefinitely.
+        match parse_src_ipv4(&dg) {
+            Some(src) if src == expected => {}
+            _ => {
+                refresh.notify_one();
+                continue;
+            }
+        }
+        // The datagram must be destined for *us* (our virtual IP).
+        if let Some(local) = *local_ip.read().await
+            && parse_dest_ipv4(&dg) != Some(local)
+        {
+            continue;
+        }
+        if let Some(tun) = tun.read().await.clone() {
+            let _ = tun.send(&dg).await;
+        }
     }
 }
 
@@ -159,38 +231,18 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
         &self,
         conn: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        // The authenticated identity of the connecting node (QUIC/TLS-verified).
         let remote = conn.remote_id().to_string();
-        while let Ok(dg) = conn.read_datagram().await {
-            // Look up the peer's authorized vIP *per datagram* (not once up front)
-            // so a refresh mid-connection — e.g. after the peer reboots and
-            // re-registers — takes effect without dropping the connection.
-            let expected_src = self.peer_ips.read().await.get(&remote).copied();
-            let Some(expected) = expected_src else {
-                // Unknown peer: ask the NetDoc to refresh from the document. The
-                // notify coalesces and the consumer is rate-limited, so a packet
-                // flood can't amplify into excessive doc reads.
-                self.refresh.notify_one();
-                continue;
-            };
-            // Anti-spoofing: the packet's source vIP must be this node's vIP. A
-            // mismatch can mean the peer changed vIP — refresh and re-check next
-            // datagram rather than blackholing it indefinitely.
-            match parse_src_ipv4(&dg) {
-                Some(src) if src == expected => {}
-                _ => {
-                    self.refresh.notify_one();
-                    continue;
-                }
-            }
-            // The datagram must be destined for *us* (our virtual IP).
-            if let Some(local) = *self.local_ip.read().await
-                && parse_dest_ipv4(&dg) != Some(local)
-            {
-                continue;
-            }
-            if let Some(tun) = self.tun.read().await.clone() {
-                let _ = tun.send(&dg).await;
+        // Register this connection for the outbound forwarder (newest wins): a
+        // peer that just rebooted redials us, and replies must ride THIS fresh
+        // connection, not a silently-dead cached dial.
+        let my_id = conn.stable_id();
+        self.conns.write().await.insert(remote.clone(), conn.clone());
+        pump_vpn_datagrams(&conn, &self.tun, &self.peer_ips, &self.local_ip, &self.refresh).await;
+        // Connection ended — unregister, unless a newer one already replaced it.
+        {
+            let mut conns = self.conns.write().await;
+            if conns.get(&remote).map(|c| c.stable_id()) == Some(my_id) {
+                conns.remove(&remote);
             }
         }
         Ok(())

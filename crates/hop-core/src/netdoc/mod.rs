@@ -153,6 +153,11 @@ pub struct NetDoc {
     /// map so a just-rebooted peer reconverges fast (rate-limited).
     #[cfg(unix)]
     vpn_refresh: crate::vpn::VpnRefresh,
+    /// Live inbound hop/vpn/1 connections (newest per peer), shared with the
+    /// outbound forwarder so replies ride a fresh connection after a peer
+    /// reboot instead of a silently-dead cached dial.
+    #[cfg(unix)]
+    vpn_conns: crate::vpn::VpnConns,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -269,6 +274,9 @@ impl NetDoc {
         let vpn_local_ip: crate::vpn::VpnLocalIp = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         #[cfg(unix)]
         let vpn_refresh: crate::vpn::VpnRefresh = std::sync::Arc::new(tokio::sync::Notify::new());
+        #[cfg(unix)]
+        let vpn_conns: crate::vpn::VpnConns =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_docs::ALPN, docs.clone())
@@ -287,6 +295,7 @@ impl NetDoc {
                     vpn_peer_ips.clone(),
                     vpn_local_ip.clone(),
                     vpn_refresh.clone(),
+                    vpn_conns.clone(),
                 ),
             );
         }
@@ -313,6 +322,8 @@ impl NetDoc {
             vpn_local_ip,
             #[cfg(unix)]
             vpn_refresh,
+            #[cfg(unix)]
+            vpn_conns,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -574,6 +585,27 @@ impl NetDoc {
         Ok(doc)
     }
 
+    /// Admit a member into the warren directory: the trust anchor allocates its
+    /// vIP once and records it on the peer entry (`peer/N.vip` — the admin-owned
+    /// addr→owner authority readers trust, #3b), then writes the entry. The
+    /// claim probes + resolves collisions in the shared `ip/` table; members
+    /// never allocate. Best-effort — a failed claim never blocks admission
+    /// (readers fall back to the author-validated `ip/` table). Used by BOTH
+    /// admission paths: invite redemption (auth) and reconcile.
+    pub async fn admit_peer(&self, peer: &Peer) -> Result<()> {
+        let mut p = peer.clone();
+        if p.vip.is_none() && self.is_trust_anchor() {
+            match self.claim_virtual_ip(&p.node_id).await {
+                Ok(addr) => p.vip = Some(addr.to_string()),
+                Err(e) => tracing::warn!(
+                    "netdoc #3b: vIP claim for {} failed: {e:#}",
+                    &p.node_id[..8.min(p.node_id.len())]
+                ),
+            }
+        }
+        self.put_peer(&p).await
+    }
+
     /// Idempotently migrate peers into the doc (skips ones already present or
     /// revoked). Returns the number newly written.
     pub async fn ensure_peers(&self, peers: &[Peer]) -> Result<usize> {
@@ -619,18 +651,7 @@ impl NetDoc {
         // Adds: present locally, missing from the doc, not already revoked.
         for p in peers {
             if !self.is_revoked(&p.node_id).await? && self.get_peer(&p.node_id).await?.is_none() {
-                // #3b: the trust anchor allocates each admitted member's vIP once
-                // and records it (admin-owned addr→owner authority). claim probes
-                // + resolves collisions in the shared ip/ table. Members never
-                // allocate. Best-effort — a failed claim never blocks admission.
-                let mut p = p.clone();
-                if p.vip.is_none() && self.is_trust_anchor() {
-                    match self.claim_virtual_ip(&p.node_id).await {
-                        Ok(addr) => p.vip = Some(addr.to_string()),
-                        Err(e) => tracing::warn!("netdoc #3b: vIP claim for {} failed: {e:#}", &p.node_id[..8.min(p.node_id.len())]),
-                    }
-                }
-                self.put_peer(&p).await?;
+                self.admit_peer(p).await?;
             }
         }
         // Removals: in the doc but no longer present locally → revoke. Skipped
@@ -751,11 +772,28 @@ impl NetDoc {
     /// periodically. Returns the number of peers re-synced with.
     pub async fn resume_sync(&self) -> Result<usize> {
         let self_id = self.endpoint.id();
+        let mut peers: Vec<EndpointAddr> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Primary source (#3b): each member's self-doc ticket (recorded in the
+        // admin doc, persisted locally) embeds that member's netdoc endpoint
+        // address. The shared `vpn/` table no longer carries endpoints (they
+        // live in per-member self-docs), so membership is the peer source.
+        for peer in self.list_peers().await.unwrap_or_default() {
+            let Some(ticket) = peer.self_doc.as_deref().and_then(|s| s.parse::<DocTicket>().ok()) else {
+                continue;
+            };
+            for addr in ticket.nodes {
+                if addr.id != self_id && seen.insert(addr.id) {
+                    peers.push(addr);
+                }
+            }
+        }
+
+        // Legacy source: the shared `vpn/` table (pre-self-doc members).
         let query = Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build();
         let stream = self.doc.get_many(query).await.context("get_many vpn")?;
         let mut stream = std::pin::pin!(stream);
-        let mut peers: Vec<EndpointAddr> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         while let Some(entry) = stream.next().await {
             let entry = entry.context("reading vpn entry")?;
             if entry.content_len() == 0 {
@@ -837,29 +875,55 @@ impl NetDoc {
             .unwrap_or_default();
         let value = format!("{} {relay}", self.endpoint.id());
         let key = format!("{KEY_VPN_PREFIX}{addr}");
-        // #3b: dual-written (self-doc preferred + shared fallback). Readers prefer
-        // the owner's self-doc keyed by peer/N.vip, so a forged shared entry is
-        // never consulted (interception-resistant). The shared fallback stays
-        // because dropping it still broke live 2-node routing even WITH active
-        // imported-self-doc sync (member_self_doc start_sync + keepalive) — the
-        // founder→member self-doc convergence has a deeper issue that needs debug
-        // instrumentation, not blind iteration on the access-critical data plane.
-        // The final isolation drop is gated on that. See per-member-self-docs.md.
-        self.put_self(&key, value.into_bytes()).await.context("registering vpn endpoint")?;
+        // #3b isolation: the endpoint lives ONLY in this node's self-doc — no
+        // shared-doc copy for any other member to forge. Readers resolve it from
+        // the owner's self-doc keyed by the admin-allocated peer/N.vip; imported
+        // member self-docs are actively kept in sync (member_self_doc start_sync
+        // + the resync keepalives).
+        self.self_doc()
+            .await?
+            .set_bytes(self.author, key.into_bytes(), value.into_bytes())
+            .await
+            .context("registering vpn endpoint")?;
         Ok(())
     }
 
-    /// The node that owns `addr` per the admin-allocated `peer/N.vip` authority
-    /// (`None` if no peer holds it). `list_peers` is admin-owned + validated
-    /// under enforce, so a member can't forge ownership of another's addr.
+    /// The node that owns `addr`: primarily the admin-allocated `peer/N.vip`
+    /// authority (admin-owned + validated under enforce, so a member can't forge
+    /// ownership of another's addr); falling back to the shared `ip/` allocation
+    /// table for legacy members with no `vip` — honored only when the claim is
+    /// authored by that node's vouched author (same rule as
+    /// `refresh_vpn_peer_ips`, so the fallback can't be forged either).
     async fn vip_owner(&self, addr: std::net::Ipv4Addr) -> Option<String> {
         let target = addr.to_string();
-        self.list_peers()
+        if let Some(p) = self
+            .list_peers()
             .await
             .ok()?
             .into_iter()
             .find(|p| p.vip.as_deref() == Some(target.as_str()))
-            .map(|p| p.node_id)
+        {
+            return Some(p.node_id);
+        }
+        // Legacy fallback: the self-claimed `ip/` table, author-validated.
+        let key = format!("{KEY_IP_PREFIX}{target}");
+        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+        let entry = self.doc.get_one(query).await.ok().flatten()?;
+        if entry.content_len() == 0 {
+            return None;
+        }
+        let bytes = self.fs_store.get_bytes(entry.content_hash()).await.ok()?;
+        let node = String::from_utf8_lossy(&bytes).trim().to_string();
+        let bindings = self.vouched_authors().await;
+        // Self-claim or vouched-admin allocation, same rule as refresh.
+        if self_entry_author_ok(Some(&node), &entry.author(), &bindings, self.validation_mode())
+            || self.is_admin_author(&entry.author())
+        {
+            Some(node)
+        } else {
+            tracing::debug!("netdoc: ip/{target} fallback claim rejected (author ≠ owner binding)");
+            None
+        }
     }
 
     /// Resolve a virtual `addr` to the VPN endpoint serving it. #3b: prefer the
@@ -880,17 +944,20 @@ impl NetDoc {
             && let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await
             && let Some(v) = parse_vpn_endpoint_value(&bytes)
         {
+            tracing::debug!("netdoc egress: {addr} resolved via owner self-doc");
             return Ok(Some(v));
         }
 
         // Fallback: the shared `vpn/` table (legacy / self-doc not yet imported).
         let Some(entry) = self.doc.get_one(mk_query()).await.context("get_one vpn")? else {
+            tracing::debug!("netdoc egress: {addr} UNRESOLVED (no self-doc hit, no shared entry)");
             return Ok(None);
         };
         if entry.content_len() == 0 {
             return Ok(None);
         }
         let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+        tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
         Ok(parse_vpn_endpoint_value(&bytes))
     }
 
@@ -918,7 +985,11 @@ impl NetDoc {
                 let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else { continue };
                 let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
                 let node = String::from_utf8_lossy(&bytes).trim().to_string();
-                if self_entry_author_ok(Some(&node), &entry.author(), &bindings, mode) {
+                // Valid if claimed by the owner itself OR allocated by a vouched
+                // admin (the trust anchor claims on behalf at admission — #3b).
+                if self_entry_author_ok(Some(&node), &entry.author(), &bindings, mode)
+                    || self.is_admin_author(&entry.author())
+                {
                     ip_owner.insert(addr, node);
                 } else {
                     tracing::warn!("netdoc C1: ip/{addr} author ≠ owner binding — REJECTED (forged vIP claim)");
@@ -972,19 +1043,33 @@ impl NetDoc {
         // still serves not-yet-upgraded members.
         let local_ip = *self.vpn_local_ip.read().await;
         for (addr, owner) in ip_owner.iter() {
-            let sd = if Some(*addr) == local_ip {
+            let own = Some(*addr) == local_ip;
+            let sd = if own {
                 self.self_doc().await.ok() // our own addr → our own self-doc
             } else {
                 self.member_self_doc(owner).await
             };
-            let Some(sd) = sd else { continue };
+            let Some(sd) = sd else {
+                tracing::debug!("netdoc refresh: vpn/{addr} owner {} — NO self-doc available", &owner[..8.min(owner.len())]);
+                continue;
+            };
             let key = format!("{KEY_VPN_PREFIX}{addr}");
             let q = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
-            let Ok(Some(entry)) = sd.get_one(q).await else { continue };
-            if entry.content_len() == 0 {
+            let entry = match sd.get_one(q).await {
+                Ok(Some(e)) if e.content_len() > 0 => e,
+                Ok(_) => {
+                    tracing::debug!("netdoc refresh: vpn/{addr} owner {} — self-doc open but NO entry yet (sync pending?)", &owner[..8.min(owner.len())]);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("netdoc refresh: vpn/{addr} owner {} — self-doc read error: {e:#}", &owner[..8.min(owner.len())]);
+                    continue;
+                }
+            };
+            let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else {
+                tracing::debug!("netdoc refresh: vpn/{addr} owner {} — entry present but BLOB content missing", &owner[..8.min(owner.len())]);
                 continue;
-            }
-            let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+            };
             if let Some(id) = String::from_utf8_lossy(&bytes).split_whitespace().next() {
                 // Replace any stale shared-doc endpoint for this addr, then bind ours.
                 map.retain(|_, a| a != addr);
@@ -992,6 +1077,11 @@ impl NetDoc {
             }
         }
 
+        tracing::debug!(
+            "netdoc refresh: vpn_peer_ips = {:?} (ip_owner had {} addr(s))",
+            map.iter().map(|(id, a)| format!("{}→{a}", &id[..10.min(id.len())])).collect::<Vec<_>>(),
+            ip_owner.len()
+        );
         *self.vpn_peer_ips.write().await = map;
     }
 
@@ -1211,7 +1301,37 @@ impl NetDoc {
         host_node_id: &str,
         host_tags: &[String],
     ) -> Result<std::net::Ipv4Addr> {
-        let addr = self.claim_virtual_ip(host_node_id).await?;
+        // vIP acquisition (#3b): a federated member's vIP is allocated by the
+        // admin at admission (`peer/N.vip`, with a matching `ip/` claim) — wait
+        // briefly for it to replicate instead of self-claiming, since a
+        // read-ticket member CANNOT write the shared `ip/` table. Falls back to
+        // self-claiming (legacy write members). The founder claims directly.
+        let addr = if self.federated {
+            let mut found = None;
+            for _ in 0..15 {
+                if let Some(v) = self
+                    .get_peer(host_node_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.vip.as_deref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()))
+                {
+                    found = Some(v);
+                    break;
+                }
+                if let Ok(Some(ip)) = self.get_virtual_ip(host_node_id).await {
+                    found = Some(ip);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            match found {
+                Some(a) => a,
+                None => self.claim_virtual_ip(host_node_id).await?,
+            }
+        } else {
+            self.claim_virtual_ip(host_node_id).await?
+        };
         let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
         *self.vpn_tun.write().await = Some(tun.clone());
         // Ingress authentication state (security-audit C2): our own vIP (the only
@@ -1430,32 +1550,61 @@ impl NetDoc {
                 Ok(Some(v)) => v,
                 _ => continue, // unknown destination — drop
             };
-            // Reuse an open connection, else dial one.
-            let conn = match conns.get(&pubkey) {
-                Some(c) if c.close_reason().is_none() => c.clone(),
-                _ => {
-                    match crate::net::connect_to_host_with_alpn(
-                        &self.endpoint,
-                        pubkey,
-                        relay.as_ref(),
-                        crate::vpn::VPN_ALPN,
-                    )
-                    .await
-                    {
-                        Ok((c, _)) => {
-                            conns.insert(pubkey, c.clone());
-                            c
-                        }
-                        Err(e) => {
-                            tracing::debug!("vpn: dial {pubkey} failed: {e}");
-                            continue;
+            // Prefer the peer's live INBOUND connection (it dialed us — that
+            // conn is provably fresh; a rebooted peer redials immediately and
+            // its new conn replaces the old in the shared map). Fall back to
+            // our own dial cache, then dial. A silently-dead cached dial can't
+            // be detected via close_reason() until the QUIC idle timeout, so
+            // freshest-inbound-first is what makes post-reboot replies instant.
+            let inbound = self.vpn_conns.read().await.get(&pubkey.to_string()).cloned();
+            let conn = match inbound {
+                Some(c) if c.close_reason().is_none() => c,
+                _ => match conns.get(&pubkey) {
+                    Some(c) if c.close_reason().is_none() => c.clone(),
+                    _ => {
+                        match crate::net::connect_to_host_with_alpn(
+                            &self.endpoint,
+                            pubkey,
+                            relay.as_ref(),
+                            crate::vpn::VPN_ALPN,
+                        )
+                        .await
+                        {
+                            Ok((c, _)) => {
+                                // Pump return datagrams on this dialed conn too:
+                                // the remote replies over the SAME connection we
+                                // dialed (QUIC datagrams are bidirectional), and
+                                // without a reader those replies are discarded.
+                                {
+                                    let (conn2, tun2, ips2, lip2, rfr2) = (
+                                        c.clone(),
+                                        self.vpn_tun.clone(),
+                                        self.vpn_peer_ips.clone(),
+                                        self.vpn_local_ip.clone(),
+                                        self.vpn_refresh.clone(),
+                                    );
+                                    tokio::spawn(async move {
+                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2).await;
+                                    });
+                                }
+                                conns.insert(pubkey, c.clone());
+                                c
+                            }
+                            Err(e) => {
+                                tracing::debug!("vpn: dial {pubkey} failed: {e}");
+                                continue;
+                            }
                         }
                     }
-                }
+                },
             };
             if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(pkt)) {
                 tracing::debug!("vpn: send_datagram failed: {e}");
                 conns.remove(&pubkey);
+                let mut shared = self.vpn_conns.write().await;
+                if shared.get(&pubkey.to_string()).map(|c| c.stable_id()) == Some(conn.stable_id()) {
+                    shared.remove(&pubkey.to_string());
+                }
             }
         }
     }
@@ -1545,31 +1694,53 @@ impl NetDoc {
     /// On-demand sync: the self-doc is imported the first time a member is
     /// reached, then cached for the process lifetime.
     pub async fn member_self_doc(&self, node_id: &str) -> Option<Doc> {
+        let short = &node_id[..8.min(node_id.len())];
         if let Some((doc, _)) = self.member_docs.read().await.get(node_id).cloned() {
             return Some(doc);
         }
         let peer = self.get_peer(node_id).await.ok().flatten()?;
-        let ticket: DocTicket = peer.self_doc.as_deref()?.parse().ok()?;
+        let Some(ticket_str) = peer.self_doc.as_deref() else {
+            tracing::debug!("netdoc: member {short} has no self_doc ticket recorded yet");
+            return None;
+        };
+        let ticket: DocTicket = match ticket_str.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("netdoc: member {short} self_doc ticket unparseable: {e:#}");
+                return None;
+            }
+        };
         let addrs = ticket.nodes.clone();
         // Open if already in the local store, else import. NOTE: `open` does NOT
         // start sync, so always start_sync afterwards with the owner's address —
         // otherwise the content goes stale and the data plane never converges.
         let ns = ticket.capability.id();
-        let doc = match self.docs.open(ns).await {
-            Ok(Some(d)) => d,
+        let (doc, how) = match self.docs.open(ns).await {
+            Ok(Some(d)) => (d, "opened"),
             _ => match self.docs.import(ticket).await {
-                Ok(d) => d,
+                Ok(d) => (d, "imported"),
                 Err(e) => {
-                    tracing::debug!("netdoc: import self-doc for {} failed: {e:#}", &node_id[..8.min(node_id.len())]);
+                    tracing::debug!("netdoc: import self-doc for {short} failed: {e:#}");
                     return None;
                 }
             },
         };
-        if !addrs.is_empty()
-            && let Err(e) = doc.start_sync(addrs.clone()).await
-        {
-            tracing::debug!("netdoc: start_sync self-doc for {} failed (best-effort): {e:#}", &node_id[..8.min(node_id.len())]);
-        }
+        let sync_res = if addrs.is_empty() {
+            "no-addrs"
+        } else {
+            match doc.start_sync(addrs.clone()).await {
+                Ok(()) => "start_sync ok",
+                Err(e) => {
+                    tracing::debug!("netdoc: start_sync self-doc for {short} failed (best-effort): {e:#}");
+                    "start_sync FAILED"
+                }
+            }
+        };
+        tracing::debug!(
+            "netdoc: member {short} self-doc {how} (ns {}), {} addr(s), {sync_res}",
+            ns.fmt_short(),
+            addrs.len()
+        );
         self.member_docs.write().await.insert(node_id.to_string(), (doc.clone(), addrs));
         Some(doc)
     }
@@ -1611,10 +1782,16 @@ impl NetDoc {
             .set_bytes(self.author, key.as_bytes().to_vec(), value.clone())
             .await
             .context("writing self-doc entry")?;
-        self.doc
+        // The shared mirror is best-effort: a read-ticket member (#3b Phase 4)
+        // has no write capability on the admin doc — its state lives in the
+        // self-doc alone, which readers prefer anyway.
+        if let Err(e) = self
+            .doc
             .set_bytes(self.author, key.as_bytes().to_vec(), value)
             .await
-            .context("writing shared self entry")?;
+        {
+            tracing::debug!("netdoc: shared mirror write for {key:?} failed (read-only member?): {e:#}");
+        }
         Ok(())
     }
 
@@ -1980,6 +2157,55 @@ mod tests {
         assert!(net.is_revoked("aaaa").await.unwrap());
         assert!(net.get_peer("aaaa").await.unwrap().is_none());
         assert_eq!(net.list_peers().await.unwrap().len(), 1);
+    }
+
+    /// Root-cause regression for the e2e routing break: a member admitted with
+    /// NO `peer.vip` (e.g. by an older admin) must still be egress-resolvable —
+    /// `vip_owner` falls back to its author-validated shared `ip/` claim, so
+    /// `lookup_vpn_endpoint` finds its self-doc-only endpoint. And `admit_peer`
+    /// (the redemption path) allocates the vip so new admissions never need it.
+    #[tokio::test]
+    async fn egress_resolves_vipless_member_via_ip_fallback() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+        let bep = b.endpoint.id();
+
+        // A admits B WITHOUT a vip (the old redemption gap), but records B's
+        // self-doc ticket; B claims its own vIP in the shared ip/ table and
+        // registers its endpoint (self-doc only, post-drop).
+        let mut peer_b = sample_peer(&b_id, "B");
+        peer_b.self_doc = Some(b.self_doc_read_ticket().await.unwrap());
+        a.put_peer(&peer_b).await.unwrap();
+        let addr = b.claim_virtual_ip(&b_id).await.unwrap();
+        b.register_vpn_endpoint(addr).await.unwrap();
+
+        // A resolves B's endpoint via the ip/ fallback → B's self-doc.
+        let mut found = false;
+        for _ in 0..150 {
+            if let Ok(Some((pk, _))) = a.lookup_vpn_endpoint(addr).await
+                && pk == bep
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(found, "egress must resolve a vip-less member via the validated ip/ fallback");
+
+        // admit_peer (the redemption path) allocates a vip for a new member.
+        a.admit_peer(&sample_peer("nodeNEWMEMBER", "N")).await.unwrap();
+        let admitted = a.get_peer("nodeNEWMEMBER").await.unwrap().unwrap();
+        assert!(admitted.vip.is_some(), "admit_peer on the trust anchor must allocate peer.vip");
     }
 
     /// #3b Phase 1: the trust anchor allocates + records each admitted member's

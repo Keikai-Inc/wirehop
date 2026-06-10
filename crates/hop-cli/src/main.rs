@@ -405,6 +405,13 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     }
                     tracing::info!("netdoc ready (namespace {})", net.namespace());
 
+                    // Publish a READ ticket too (#3b Phase 4): node/warren-only
+                    // invites embed this instead of the write ticket, so members
+                    // import the admin doc read-only (write scope = admin only).
+                    if let Ok(rt) = net.read_ticket().await {
+                        let _ = config::write_secret_file(&cfg.join("netdoc-read.ticket"), &rt);
+                    }
+
                     // Publish a write ticket so other hosts can join this network
                     // (federation). Written to <config>/netdoc.ticket.
                     if let Ok(ticket) = net.write_ticket().await {
@@ -1397,6 +1404,18 @@ fn cmd_invite(
         } else {
             // Pin the founder author so a joining node anchors C1 trust.
             decoded.founder_author = resolve_founder_author(config_dir);
+            // #3b Phase 4 — ticket scope follows the tier: node/warren-only get
+            // the READ ticket (import the admin doc read-only; write their own
+            // self-doc); only admin keeps the write ticket. Falls back to the
+            // legacy write ticket when no read ticket is persisted (old daemon).
+            if matches!(t, InviteTier::Node | InviteTier::WarrenOnly)
+                && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
+            {
+                let rt = rt.trim().to_string();
+                if !rt.is_empty() {
+                    decoded.warren_ticket = Some(rt);
+                }
+            }
         }
         invite::encode_invite(&decoded)?
     } else {

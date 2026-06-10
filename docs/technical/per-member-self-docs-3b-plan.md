@@ -41,7 +41,18 @@ tickets, and the addr→owner authority is still the shared `ip/` table.
   another's addr. The vIP is **static** (allocated once) so the member still
   self-updates its dynamic endpoint with **no admin online**.
 
-## Execution status (in progress)
+## ✅ EXECUTION COMPLETE
+
+All four phases shipped; the shared `vpn/` write is dropped and read-ticket
+members route end-to-end under enforce, including the no-admin-online guarantee
+(`vpn-e2e` green: VPN E2E + REBOOT + READ-SCOPE + READ-MEMBER ROUTING +
+NO-ADMIN-ONLINE; 53/53 regression; full unit suite + clippy clean). The
+"convergence blocker" turned out to be two concrete bugs, not a sync problem —
+see `per-member-self-docs.md` for the root-cause story (missing vip on
+redemption-admitted members; accept-only datagram pump). History below retained
+for reference.
+
+## Execution status (historical)
 
 - **Phase 1 — DONE** (commit `#3b Phase 1`): `Peer.vip` + trust-anchor allocates
   in `reconcile` + founder self-reg vip. Inert; unit-tested; vpn-e2e green.

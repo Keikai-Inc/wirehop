@@ -154,10 +154,12 @@ pub async fn authenticate_client(
                 peers.save(config_dir)?;
 
                 // Dual-write to the network document (best-effort) so the new
-                // peer replicates to other nodes. Never fail auth on a doc error.
+                // peer replicates to other nodes. `admit_peer` also allocates the
+                // member's vIP (`peer/N.vip`, the addr→owner authority the data
+                // plane resolves endpoints by — #3b). Never fail auth on a doc error.
                 if let Some(nd) = netdoc
                     && let Some(entry) = peers.peers.iter().find(|p| p.node_id == remote_id.to_string())
-                    && let Err(e) = nd.put_peer(entry).await
+                    && let Err(e) = nd.admit_peer(entry).await
                 {
                     tracing::warn!("netdoc: failed to mirror invited peer: {e:#}");
                 }

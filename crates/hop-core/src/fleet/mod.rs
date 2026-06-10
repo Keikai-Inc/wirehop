@@ -374,6 +374,16 @@ fn stamp_invite_tier(config_dir: &Path, token: &str, tier: crate::invite::Invite
                     .and_then(|ci| invite::decode_invite(ci.trim()).ok())
                     .and_then(|t| t.founder_author)
             });
+        // #3b Phase 4 — ticket scope follows the tier: node/warren-only carry the
+        // READ ticket; only admin keeps write. Legacy fallback when absent.
+        if matches!(tier, InviteTier::Node | InviteTier::WarrenOnly)
+            && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
+        {
+            let rt = rt.trim().to_string();
+            if !rt.is_empty() {
+                decoded.warren_ticket = Some(rt);
+            }
+        }
     }
     invite::encode_invite(&decoded)
 }
@@ -1052,6 +1062,25 @@ mod tests {
 
         // Unknown tier → error.
         assert!(matches!(make(Some("bogus")), AdminResponse::Error { .. }));
+
+        // #3b Phase 4 — once a READ ticket is persisted, node/warren-only carry
+        // it (read scope); admin keeps the write ticket.
+        std::fs::write(dir.path().join("netdoc-read.ticket"), "dummy-READ-ticket").unwrap();
+        assert_eq!(
+            tok_of(make(Some("node"))).warren_ticket.as_deref(),
+            Some("dummy-READ-ticket"),
+            "node tier must carry the read ticket"
+        );
+        assert_eq!(
+            tok_of(make(Some("warren-only"))).warren_ticket.as_deref(),
+            Some("dummy-READ-ticket"),
+            "warren-only tier must carry the read ticket"
+        );
+        assert_eq!(
+            tok_of(make(Some("admin"))).warren_ticket.as_deref(),
+            Some("dummy-ticket"),
+            "admin tier keeps the WRITE ticket"
+        );
     }
 
     #[test]

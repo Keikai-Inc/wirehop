@@ -495,25 +495,24 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
     `spawn_admin_author_refresh`, decoupled from the 300 s sync keepalive) so the
     window closes fast. The 3-node federated e2e is folded into the per-member
     self-doc migration harness (Phase 0b below).
-- **Phase 0b — per-member self-documents (chosen design, in progress).** Instead
-  of read-ticket members + admin-writes-on-behalf (which couples a member's
-  VPN-reachability to an admin being online), each member owns its **own**
-  iroh-docs namespace and holds the only write key to it; it self-writes `ip/
-  vpn/ name/ tag/ posture/` there. The admin doc (write-restricted to vouched
-  admins) keeps `peer/ role/ acl/ revocation/ network/` and records
-  `peer/N.self_doc = <read ticket>` (admin-authored ⇒ trusted; reuses the
-  `AnnounceNetdocAuthor` channel, generalized to announce the self-doc ticket).
-  Forgery becomes **physically impossible** (no write key for others' docs), with
-  **no admin-online coupling**. Decisions: **lazy/on-demand** self-doc sync (sync
-  the admin doc always; import a member's self-doc on first reach, then cache);
-  **additive migration** (read self-state from the self-doc if present, else the
-  shared-doc self-keys; keep the shipped self-key enforce as defense-in-depth
-  during overlap). **Infrastructure + mechanism shipped:** retained `Docs`
-  engine, per-node self-doc lifecycle (`NetDocMeta.self_namespace`), dual-write
-  (`put_self`), `AnnounceNetdocAuthor.self_doc` + `record_peer_self_doc`, lazy
-  `member_self_doc` import — unit-tested (`member_self_doc_roundtrips`) +
-  asserted in vpn-e2e. **Remaining:** flip reads to self-doc-preferred, then drop
-  the shared-doc write for full physical isolation (`docs/technical/per-member-self-docs.md`).
+- **Phase 0b — per-member self-documents: ✅ COMPLETE.** Each member owns its own
+  iroh-docs namespace (sole write key) and self-writes its VPN endpoint there; the
+  admin doc (write-restricted to vouched admins) keeps `peer/ role/ acl/
+  revocation/ network/` + the admin-allocated `peer/N.vip` (addr→owner authority)
+  and `peer/N.self_doc` read ticket. The shared `vpn/` write is **dropped** — the
+  endpoint is now physically isolated (no shared copy any member could forge).
+  `node`/`warren-only` invites carry the admin doc's **read** ticket (write
+  reserved for `admin`); a read-ticket member self-writes only its own self-doc
+  and waits for its admin-allocated `peer/N.vip` at bringup. **No admin-online
+  coupling**: a member re-registers its endpoint with no admin up. Endpoint
+  resolution (`refresh_vpn_peer_ips` ingress + `lookup_vpn_endpoint` egress) reads
+  from the owner's self-doc keyed by `peer/N.vip`, with an author-validated `ip/`
+  fallback for legacy members. Proven end-to-end under enforce (`vpn-e2e`):
+  founder↔member + reboot with the shared write gone, read-ticket member routing,
+  and the no-admin-online guarantee (founder stopped, member re-registers + still
+  routes). Full details + the root-cause debug story in
+  `docs/technical/per-member-self-docs.md`. Tidy-ups (non-blocking): `name/ tag/
+  posture/` still dual-write until their read paths (MagicDNS, Cedar) migrate.
 - **Phase 1b — embedded `hop __install-daemon` SHIPPED inert (0.6.53).** A hidden
   subcommand installs + starts the daemon from **embedded** launchd/systemd
   templates (`include_str!` of `pkg/com.hop.daemon.plist` / `pkg/hop.service`),
@@ -527,11 +526,9 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   *scope* still pending.** `hop invite --tier client|warren-only|node|admin` now
   sets the explicit `InviteTier`: `client` strips the warren ticket (can't
   self-upgrade), `warren-only` pins the `network_only` role, `admin` redeems as
-  creator, and warren tiers pin the founder anchor. What remains is the C1
-  read/write split — a `node`/`warren-only` invite still carries a **write**
-  ticket; it should carry a **read** ticket (Phase 0b) so a member is never
-  over-powered. Until then, enforce (vouched authors) is what bounds a write
-  member's effective reach.
+  creator, and warren tiers pin the founder anchor. The read/write ticket *scope*
+  split is now **done** (Phase 0b ✅): `node`/`warren-only` carry the admin doc's
+  **read** ticket, `admin` keeps write.
 - **Phase 2 — artifact signing (H9): plumbing SHIPPED, inert until keyed.**
   `release.sh` signs each artifact with a detached `openssl dgst -sha256`
   signature when `HOP_SIGNING_KEY` is set; `install.sh` verifies it against an

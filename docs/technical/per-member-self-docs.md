@@ -130,32 +130,63 @@ leave the shared `ip/` table too. Two options:
 handling, keeps the authority admin-validated (no interception — a member can't
 claim another's addr), and adds no runtime coupling.
 
-### ⚠️ Convergence blocker found (gates the final drop + read tickets)
+### ✅ The "convergence blocker" — root cause found (debug instrumentation)
 
-Dropping the shared `vpn/` write outright (so the endpoint lives only in the
-self-doc) **broke live 2-node routing** in `vpn-e2e`: the founder (host-a) did
-not resolve a member's (host-b) endpoint from the member's **imported** self-doc,
-even though the reverse direction worked and all unit tests passed (the model is
-correct; the data plane didn't converge).
+Dropping the shared `vpn/` write initially **broke live 2-node routing** in
+`vpn-e2e` and was twice halted by the gate. Debug-level instrumentation
+(ingress-drop, refresh-override, egress-resolution, and self-doc-import markers)
+showed it was **never a sync problem**: the founder imported the member's
+self-doc, `start_sync` succeeded, content replicated, and the **ingress** map
+converged. The break was **egress asymmetry**:
 
-**Active-sync hardening shipped (but insufficient on its own):**
-`member_self_doc` now `start_sync`s each imported member self-doc (it previously
-`open`ed already-present namespaces without syncing), and
-`resync_member_self_docs` re-syncs them on the keepalives (300 s + the 20 s fast
-loop) — the analogue of `resume_sync` for the admin doc. This is a real
-robustness win and is kept. **But the shared-write drop STILL broke routing with
-it in place** — so the founder→member self-doc convergence has a **deeper issue**
-(only `INFO` logs were available; it needs `debug` instrumentation on
-`member_self_doc` / `start_sync` / the `vpn/vpn/1` ingress to see whether the
-import connects, whether content replicates, and the founder-importing-a-member
-asymmetry). Not blind-iterated further — it's the access-critical data plane.
+- `lookup_vpn_endpoint`'s self-doc path keyed *only* off `peer.vip`, and
+  **redemption-admitted members never got a `vip`** — the auth path mirrored the
+  peer with a direct `put_peer`, bypassing `reconcile` (the only place Phase 1
+  allocated). The founder's own entry *did* have a `vip`, so member→founder
+  resolved while founder→member returned UNRESOLVED — the founder received
+  pings but could never address its replies.
 
-Until then the endpoint stays **dual-written** (self-doc preferred + shared
-fallback): interception is still blocked (readers prefer the owner's self-doc
-keyed by `peer/N.vip`), only the *physical* isolation is deferred. **This
-convergence work gates both the shared-write drop AND read-ticket members** (a
-read-ticket member can't write the shared fallback, so the self-doc path must be
-rock-solid first).
+**Fixes (all shipped together with the drop):**
+1. `admit_peer` — one admission choke point (auth redemption **and** reconcile)
+   that allocates `peer/N.vip` on the trust anchor.
+2. `vip_owner` falls back to the **author-validated** shared `ip/` claim for
+   legacy members with no `vip` (same rule as the refresh path — unforgeable).
+3. Admin-authored `ip/` claims are accepted (the anchor claims on behalf at
+   admission — that *is* the allocation mechanism).
+4. `resume_sync` now derives its sync-peer list from `peer/N.self_doc` ticket
+   addresses (membership), since the shared `vpn/` table no longer carries
+   endpoints; the old `vpn/`-scan stays as a legacy source.
+
+The earlier **active-sync hardening is kept** (`member_self_doc` always
+`start_sync`s; `resync_member_self_docs` on both keepalives) — it's what makes
+imported self-docs stay fresh; the vip gap was simply sitting in front of it.
+
+A second break surfaced once egress resolved: the QUIC **datagram pump ran only
+on the accept side**, so replies sent back over the connection a peer *dialed*
+were silently discarded (no reader). Fixed by extracting `pump_vpn_datagrams`
+and running it on dialed connections too, and by sharing live inbound
+connections (`VpnConns`) so the outbound forwarder prefers a peer's fresh
+inbound connection over a silently-dead cached dial (no CLOSE frame ever arrives
+from a rebooted peer until the QUIC idle timeout).
+
+## ✅ Status: COMPLETE (shared write dropped; read-ticket members shipped)
+
+The shared `vpn/` write is **dropped** — a node's endpoint lives only in its
+isolated self-doc. `node`/`warren-only` invites carry the admin doc's **read**
+ticket (write reserved for `admin`); `enable_vpn` waits for the admin-allocated
+`peer/N.vip` instead of self-claiming (read members can't write `ip/`);
+`put_self`'s shared mirror is best-effort (read members have no write cap).
+
+Proven end-to-end by `tests/e2e/vpn-e2e.sh` under enforce:
+- founder↔member routing + reboot reconvergence (shared write gone);
+- **READ-SCOPE**: a `--tier node` invite carries the read ticket;
+- **READ-MEMBER ROUTING**: a read-ticket member (host-c) routes under enforce;
+- **NO-ADMIN-ONLINE**: host-c re-registers its endpoint and keeps routing to
+  host-b with the founder (host-a) stopped — the no-admin-coupling guarantee.
+
+Remaining tidy-ups (non-blocking): `name/ tag/ posture/` still dual-write (their
+read paths — MagicDNS, Cedar reach — haven't migrated to self-docs yet); the
+shared-doc self-key *enforce* can be removed once self-docs are universal.
 
 **Remaining (the final isolation flip):**
 7. **Harden imported-self-doc sync** (active sync for `member_self_doc` docs), then
