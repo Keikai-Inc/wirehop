@@ -830,13 +830,13 @@ impl NetDoc {
             .unwrap_or_default();
         let value = format!("{} {relay}", self.endpoint.id());
         let key = format!("{KEY_VPN_PREFIX}{addr}");
-        // Dual-write (migration): the endpoint goes to this node's isolated
-        // self-doc AND the shared doc. `refresh_vpn_peer_ips` already prefers the
-        // self-doc copy (keyed by the validated ip/ owner), so the data-plane read
-        // path is live and exercised; the shared copy keeps not-yet-upgraded
-        // readers + lookup_vpn_endpoint working. The final isolation step drops
-        // the shared write here (and migrates lookup_vpn_endpoint + the vpn/
-        // forgery tests to the self-doc model). See per-member-self-docs.md.
+        // #3b: the endpoint is dual-written (self-doc + shared). Both read paths
+        // PREFER the owner's self-doc keyed by the admin-allocated peer/N.vip
+        // (Phase 2) — so a forged shared `vpn/<victim>` is never consulted
+        // (interception-resistant). The shared copy remains as the convergence
+        // fallback: dropping it broke live 2-node routing (host-a didn't resolve
+        // host-b's endpoint from its self-doc in time), so the final isolation
+        // step is gated on hardening imported-self-doc sync. See §10.
         self.put_self(&key, value.into_bytes()).await.context("registering vpn endpoint")?;
         Ok(())
     }
@@ -1563,12 +1563,13 @@ impl NetDoc {
         self.member_docs.write().await.remove(node_id);
     }
 
-    /// Write a self-owned entry (`ip/ vpn/ name/ tag/ posture/`) to this node's
-    /// **self-doc** (the isolated, member-only-writable source) AND the shared
-    /// admin doc (migration dual-write). The shared-doc copy keeps not-yet-
-    /// upgraded readers — which only read the shared doc — working; the self-doc
-    /// is what upgraded readers prefer. Once self-docs are universal the
-    /// shared-doc write is dropped, leaving self-state physically isolated.
+    /// Write a self-owned entry (`vpn/ name/ tag/ posture/`) to this node's
+    /// **self-doc** AND the shared admin doc (dual-write). Readers PREFER the
+    /// owner's self-doc keyed by the admin-allocated `peer/N.vip` (so a forged
+    /// shared entry is never consulted — interception-resistant); the shared
+    /// copy is the convergence/legacy fallback. Dropping the shared write is the
+    /// final isolation step, gated on hardening imported-self-doc sync (a live
+    /// 2-node test showed routing didn't converge without it). See §10.
     async fn put_self(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.self_doc()
             .await?
@@ -1581,6 +1582,7 @@ impl NetDoc {
             .context("writing shared self entry")?;
         Ok(())
     }
+
 
     // ── Peers ────────────────────────────────────────────────────────────
 
@@ -2149,140 +2151,80 @@ mod tests {
     /// to host B after it imports A's write ticket. Validates the multi-node
     /// doc-sync path (gossip + reconciliation) the VPN routing depends on.
     ///
-    /// C1 self-key enforce, end to end: a member with a write ticket forges
-    /// `vpn/<founder_addr>` to point the founder's vIP at the member's own
-    /// endpoint (traffic interception). In Observe the forgery replicates and is
-    /// honored; flipping the founder to Enforce drops it while keeping the
-    /// founder's legitimate registration.
+    /// #3b interception resistance (the security property of the self-doc model):
+    /// a member's endpoint lives ONLY in its own self-doc, and a reader resolves
+    /// `vpn/<addr>` from the self-doc of the node that **owns** `addr` per the
+    /// admin-allocated `peer/N.vip`. So an attacker M cannot hijack victim V's
+    /// vIP: M can't write V's self-doc (no key), and M writing `vpn/<V.vip>` in
+    /// M's OWN self-doc is never consulted (the reader reads V.vip from V's
+    /// self-doc, since V owns it). M also can't forge `peer/V.vip` (admin-owned).
     #[cfg(unix)]
     #[tokio::test]
-    async fn enforce_rejects_forged_vpn_entry() {
+    async fn self_doc_blocks_endpoint_interception() {
         let dir_a = tempfile::tempdir().unwrap();
         let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
             .await
             .expect("spawn A");
-        a.record_founder_anchor(None); // founder = A's own author
-
-        // A claims a vIP, vouches its own author binding (peer/node_a), and
-        // registers its endpoint — all authored by A.
-        let node_a = "nodeAAAAAAAA";
-        let addr = a.claim_virtual_ip(node_a).await.unwrap();
-        let mut peer = sample_peer(node_a, "A");
-        peer.netdoc_author = Some(a.author_hex());
-        a.put_peer(&peer).await.unwrap();
-        a.register_vpn_endpoint(addr).await.unwrap();
-
-        // Member B (write ticket) forges A's vpn entry → A's addr → B's endpoint.
+        a.record_founder_anchor(None); // admin / trust anchor
         let ticket = a.write_ticket().await.unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+
+        // Victim V and attacker M are both members.
+        let dir_v = tempfile::tempdir().unwrap();
+        let v = NetDoc::spawn(test_endpoint().await, dir_v.path(), Bootstrap::Import(Box::new(ticket.clone())))
             .await
-            .expect("spawn B");
-        b.register_vpn_endpoint(addr).await.unwrap();
+            .expect("spawn V");
+        let dir_m = tempfile::tempdir().unwrap();
+        let m = NetDoc::spawn(test_endpoint().await, dir_m.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn M");
+        let (v_id, m_id) = (v.endpoint.id().to_string(), m.endpoint.id().to_string());
+        let (v_ep, m_ep) = (v.endpoint.id().to_string(), m.endpoint.id().to_string());
+        let v_vip: std::net::Ipv4Addr = "100.64.9.9".parse().unwrap();
+        let m_vip: std::net::Ipv4Addr = "100.64.9.10".parse().unwrap();
 
-        let a_id = a.endpoint.id().to_string();
-        let b_id = b.endpoint.id().to_string();
+        // Admin admits both with allocated vIPs + records their self-doc tickets.
+        let mut pv = sample_peer(&v_id, "V");
+        pv.vip = Some(v_vip.to_string());
+        pv.self_doc = Some(v.self_doc_read_ticket().await.unwrap());
+        a.put_peer(&pv).await.unwrap();
+        let mut pm = sample_peer(&m_id, "M");
+        pm.vip = Some(m_vip.to_string());
+        pm.self_doc = Some(m.self_doc_read_ticket().await.unwrap());
+        a.put_peer(&pm).await.unwrap();
 
-        // Phase 1 (Observe, the default): poll until B's forgery replicates and is
-        // honored — proving the attack would work without enforcement.
-        let mut replicated = false;
+        // V writes its legit endpoint. M writes its legit endpoint AND forges
+        // `vpn/<V.vip>` -> M's endpoint in M's own self-doc (the interception try).
+        let vdoc = v.self_doc().await.unwrap();
+        vdoc.set_bytes(v.author, format!("{KEY_VPN_PREFIX}{v_vip}").into_bytes(), format!("{v_ep} ").into_bytes()).await.unwrap();
+        let mdoc = m.self_doc().await.unwrap();
+        mdoc.set_bytes(m.author, format!("{KEY_VPN_PREFIX}{m_vip}").into_bytes(), format!("{m_ep} ").into_bytes()).await.unwrap();
+        mdoc.set_bytes(m.author, format!("{KEY_VPN_PREFIX}{v_vip}").into_bytes(), format!("{m_ep} ").into_bytes()).await.unwrap(); // ATTACK
+
+        a.set_validation_mode(ValidationMode::Enforce);
+        // Wait for both members' self-docs to replicate + refresh.
+        let mut ready = false;
         for _ in 0..150 {
             a.refresh_vpn_peer_ips().await;
-            if a.vpn_peer_ips.read().await.contains_key(&b_id) {
-                replicated = true;
+            let map = a.vpn_peer_ips.read().await;
+            if map.contains_key(&v_ep) && map.contains_key(&m_ep) {
+                ready = true;
                 break;
             }
+            drop(map);
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        assert!(replicated, "forged vpn entry did not replicate A<-B within 10s (test setup)");
+        assert!(ready, "V+M self-doc endpoints did not replicate to A within 30s (setup)");
 
-        // Phase 2 (Enforce): the forgery must be dropped; A's own entry kept.
-        a.set_validation_mode(ValidationMode::Enforce);
-        a.refresh_vpn_peer_ips().await;
         let map = a.vpn_peer_ips.read().await.clone();
-        assert_eq!(map.get(&a_id), Some(&addr), "founder's own endpoint must remain mapped");
-        assert!(
-            !map.contains_key(&b_id),
-            "enforce must reject the forged vpn entry (member's endpoint on the founder's vIP)"
-        );
-    }
-
-    /// C1 self-key enforce, the binding's teeth: once the founder vouches member
-    /// B's author via `record_peer_author` (the `AnnounceNetdocAuthor`
-    /// mechanism), a forged `vpn/<B's vIP>` from a *different* author is rejected
-    /// under Enforce while B's own registration is honored. Before the vouch the
-    /// owner is unbound (migration grace) and the forgery would be honored —
-    /// proving the binding, not mere membership, is what authorizes the entry.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn enforce_rejects_forgery_against_vouched_member() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
-            .await
-            .expect("spawn A");
-        a.record_founder_anchor(None); // founder = A
-
-        let ticket = a.write_ticket().await.unwrap();
-        // Member B (legitimate) and attacker C both import the warren.
-        let dir_b = tempfile::tempdir().unwrap();
-        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket.clone())))
-            .await
-            .expect("spawn B");
-        let dir_c = tempfile::tempdir().unwrap();
-        let c = NetDoc::spawn(test_endpoint().await, dir_c.path(), Bootstrap::Import(Box::new(ticket)))
-            .await
-            .expect("spawn C");
-        let b_id = b.endpoint.id().to_string();
-        let c_id = c.endpoint.id().to_string();
-
-        // A admits B (admin-owned peer entry). B claims its own stable vIP and
-        // registers its endpoint (both self-owned, authored by B). Attacker C
-        // forges the same vIP -> C's endpoint (authored by C).
-        a.put_peer(&sample_peer(&b_id, "B")).await.unwrap();
-        let addr_b = b.claim_virtual_ip(&b_id).await.unwrap();
-        b.register_vpn_endpoint(addr_b).await.unwrap();
-        c.register_vpn_endpoint(addr_b).await.unwrap();
-
-        // Wait until both B's legit registration and C's forgery replicate to A
-        // (Observe default — both honored, proving the attack works unguarded).
-        let mut replicated = false;
-        for _ in 0..150 {
-            a.refresh_vpn_peer_ips().await;
-            let m = a.vpn_peer_ips.read().await;
-            if m.contains_key(&c_id) && m.contains_key(&b_id) {
-                replicated = true;
-                break;
+        // V's vIP is served by V's endpoint; M's endpoint serves only its OWN vIP.
+        assert_eq!(map.get(&v_ep), Some(&v_vip), "V's endpoint serves V's vIP");
+        assert_eq!(map.get(&m_ep), Some(&m_vip), "M's endpoint serves only its own vIP, not V's");
+        // No endpoint other than V's may be associated with V's vIP.
+        for (ep, addr) in map.iter() {
+            if *addr == v_vip {
+                assert_eq!(ep, &v_ep, "only V may serve V's vIP — interception blocked");
             }
-            drop(m);
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        assert!(replicated, "B+C vpn entries did not replicate to A within 10s (test setup)");
-
-        // Founder vouches B's author (the announce mechanism). Idempotent + only
-        // for an already-admitted member.
-        assert!(
-            a.record_peer_author(&b_id, &b.author_hex()).await.unwrap(),
-            "trust anchor must record the binding for an admitted member"
-        );
-        assert!(
-            a.record_peer_author(&b_id, &b.author_hex()).await.unwrap(),
-            "record_peer_author must be idempotent"
-        );
-        assert_eq!(
-            a.vouched_authors().await.get(&b_id).copied(),
-            parse_author_hex(&b.author_hex()),
-            "vouched binding must be visible to the validator"
-        );
-
-        // Enforce: B's own endpoint stays mapped; C's forgery is dropped.
-        a.set_validation_mode(ValidationMode::Enforce);
-        a.refresh_vpn_peer_ips().await;
-        let map = a.vpn_peer_ips.read().await.clone();
-        assert_eq!(map.get(&b_id), Some(&addr_b), "vouched member's own entry must be honored");
-        assert!(
-            !map.contains_key(&c_id),
-            "enforce must reject a forgery against a vouched member's vIP"
-        );
     }
 
     /// Vouched-admin-authors: a co-admin's federated `peer/` entry is rejected
@@ -2581,26 +2523,33 @@ mod tests {
         assert!(a.record_peer_author("nodeZZZZ", "not-hex").await.is_err());
     }
 
+    /// #3b: a node's VPN endpoint (now self-doc-only) resolves on another node
+    /// via the admin-recorded `peer/N.vip` + `peer/N.self_doc`, with no shared
+    /// `vpn/` entry — the data plane is carried entirely by the isolated self-doc.
     #[tokio::test]
-    async fn federation_replicates_vpn_registration() {
+    async fn vpn_endpoint_replicates_via_self_doc() {
         let dir_a = tempfile::tempdir().unwrap();
         let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
             .await
             .expect("spawn A");
+        a.record_founder_anchor(None);
+        let a_id = a.endpoint.id().to_string();
         let addr: std::net::Ipv4Addr = "100.64.1.2".parse().unwrap();
-        a.register_vpn_endpoint(addr).await.unwrap();
+        a.register_vpn_endpoint(addr).await.unwrap(); // self-doc only
+
+        // A records its own admin-doc entry: vip + self-doc read ticket.
+        let mut peer_a = sample_peer(&a_id, "A");
+        peer_a.vip = Some(addr.to_string());
+        peer_a.self_doc = Some(a.self_doc_read_ticket().await.unwrap());
+        a.put_peer(&peer_a).await.unwrap();
+
         let ticket = a.write_ticket().await.unwrap();
-
         let dir_b = tempfile::tempdir().unwrap();
-        let b = NetDoc::spawn(
-            test_endpoint().await,
-            dir_b.path(),
-            Bootstrap::Import(Box::new(ticket)),
-        )
-        .await
-        .expect("spawn B");
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
 
-        // Poll for replication (gossip + set reconciliation over loopback).
+        // B resolves A's endpoint via peer.vip → A's self-doc (no shared vpn/).
         for _ in 0..150 {
             if let Ok(Some((pubkey, _))) = b.lookup_vpn_endpoint(addr).await {
                 assert_eq!(pubkey, a.endpoint.id());
@@ -2608,6 +2557,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        panic!("vpn registration did not replicate A -> B within 10s");
+        panic!("vpn endpoint did not resolve A -> B via self-doc within 30s");
     }
 }

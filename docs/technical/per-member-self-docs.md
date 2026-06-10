@@ -130,8 +130,26 @@ leave the shared `ip/` table too. Two options:
 handling, keeps the authority admin-validated (no interception — a member can't
 claim another's addr), and adds no runtime coupling.
 
+### ⚠️ Convergence blocker found (gates the final drop + read tickets)
+
+Dropping the shared `vpn/` write outright (so the endpoint lives only in the
+self-doc) **broke live 2-node routing** in `vpn-e2e`: the founder (host-a) did
+not reliably resolve a member's (host-b) endpoint from the member's **imported**
+self-doc in time, even though the reverse direction worked and all unit tests
+passed (the model is correct; the data plane didn't converge). Root cause is in
+the **imported-self-doc sync**: a member self-doc pulled in by `member_self_doc`
+needs active sync priming (like `resume_sync` does for the admin doc) so its
+content actually replicates to the importer, and the asymmetry (founder importing
+a member's namespace) needs investigating. Until that's hardened, the endpoint
+stays **dual-written** (self-doc preferred + shared fallback) — interception is
+still blocked (readers prefer the owner's self-doc keyed by `peer/N.vip`), only
+the *physical* isolation is deferred. **This convergence work gates both the
+shared-write drop AND read-ticket members** (a read-ticket member can't write the
+shared fallback, so the self-doc path must be rock-solid first).
+
 **Remaining (the final isolation flip):**
-7. **Drop the shared-doc `vpn/` write** (`register_vpn_endpoint` → self-doc only)
+7. **Harden imported-self-doc sync** (active sync for `member_self_doc` docs), then
+   **drop the shared-doc `vpn/` write** (`register_vpn_endpoint` → self-doc only)
    so the endpoint is physically isolated; migrate `lookup_vpn_endpoint` (egress
    resolution) to the self-doc; and rewrite the `vpn/` forgery tests
    (`enforce_rejects_forged_vpn_entry`, federation) for the self-doc model (a
