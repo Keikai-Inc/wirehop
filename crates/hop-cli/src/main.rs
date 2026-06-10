@@ -71,7 +71,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Host { quiet } => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            // The daemon owns the *host* config (identity, peers, warren, netdoc).
+            // With --config (how the LaunchDaemon/systemd unit invokes us) this is
+            // the override; a manual `hop host` with no --config resolves to the
+            // installed daemon dir (/etc/hop) rather than the per-user dir.
+            let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
@@ -126,7 +130,12 @@ async fn main() -> Result<()> {
             cmd_config(action, &host_config_dir)
         }
         Command::Warren { action } => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            // `warren join/status/leave` operate on the *daemon's* warren membership
+            // and use the host identity (the node that is actually on the warren),
+            // so they must target the host config dir — not the per-user client dir.
+            // (Previously this used the client dir, so `warren status` reported
+            // "not on a warren" on a machine whose daemon was on one.)
+            let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_warren(secret_key, &config_dir, action).await
         }
@@ -196,7 +205,11 @@ async fn main() -> Result<()> {
             hop_mcp::run_stdio_server_with_datastore(&config_dir, datastore).await
         }
         Command::Id => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            // Print the *host* node id on a machine with a daemon (the id peers
+            // connect to / invites are minted for); falls back to the per-user
+            // identity on a client-only machine. Ensures the dir so a fresh
+            // client can still generate one.
+            let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let public_key = secret_key.public();
             println!("{public_key}");
@@ -2748,7 +2761,9 @@ async fn cmd_fleet(
 ) -> Result<()> {
     match action {
         FleetAction::Status { fleet } => {
-            let host_config_dir = config::resolve_host_config_dir(Some(config_dir))?;
+            // The fleet registrations store is the daemon's (like the FleetStore
+            // sites below): resolve without override to find the system config dir.
+            let host_config_dir = config::resolve_host_config_dir(None)?;
             let store = hop_core::fleet::FleetRegistrationsStore::load(&host_config_dir)?;
             if store.registrations.is_empty() {
                 println!("Not registered with any fleet.");

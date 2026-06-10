@@ -207,6 +207,30 @@ pub fn resolve_host_config_dir(override_path: Option<&Path>) -> Result<PathBuf> 
     default_config_dir()
 }
 
+/// Resolve the host-side config dir (like [`resolve_host_config_dir`]) AND ensure
+/// it exists, for commands that *write* the local daemon's state (`warren join`,
+/// `host`). Creates the directory (owner-only 0700) only when it does not already
+/// exist, so an existing daemon dir — typically root-owned and setgid (2770) for
+/// shared daemon/CLI access — is never re-permissioned out from under the daemon.
+///
+/// With `--config` (the way the LaunchDaemon/systemd unit invokes `hop host`),
+/// this resolves to that override unchanged, so production daemons are unaffected.
+pub fn ensure_host_config_dir(override_path: Option<&Path>) -> Result<PathBuf> {
+    let dir = resolve_host_config_dir(override_path)?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: a created dir is owner-only; ignore failures so a
+            // restrictive umask or odd mount doesn't make the command fail.
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(dir)
+}
+
 /// Role assigned to an authorized peer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -582,6 +606,51 @@ mod tests {
     #[test]
     fn peer_role_defaults_to_peer() {
         assert_eq!(PeerRole::default(), PeerRole::Peer);
+    }
+
+    #[test]
+    fn resolve_host_config_dir_honors_override() {
+        // An explicit --config always wins (this is how the daemon is invoked).
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_host_config_dir(Some(dir.path())).unwrap();
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn ensure_host_config_dir_creates_missing_override() {
+        // Host-side write commands (warren join, host) need the dir to exist.
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("nested").join("hop");
+        assert!(!target.exists());
+        let resolved = ensure_host_config_dir(Some(&target)).unwrap();
+        assert_eq!(resolved, target);
+        assert!(target.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "freshly created host dir is owner-only");
+        }
+    }
+
+    #[test]
+    fn ensure_host_config_dir_preserves_existing_perms() {
+        // An existing daemon dir (e.g. root-owned, setgid 2770) must not be
+        // re-permissioned out from under the daemon.
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o2770)).unwrap();
+        }
+        let resolved = ensure_host_config_dir(Some(dir.path())).unwrap();
+        assert_eq!(resolved, dir.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o2770, "existing perms (incl. setgid) untouched");
+        }
     }
 
     #[test]
