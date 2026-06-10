@@ -41,6 +41,31 @@ tickets, and the addr→owner authority is still the shared `ip/` table.
   another's addr. The vIP is **static** (allocated once) so the member still
   self-updates its dynamic endpoint with **no admin online**.
 
+## Execution status (in progress)
+
+- **Phase 1 — DONE** (commit `#3b Phase 1`): `Peer.vip` + trust-anchor allocates
+  in `reconcile` + founder self-reg vip. Inert; unit-tested; vpn-e2e green.
+- **Phase 2 — DONE** (`#3b Phase 2`): `refresh_vpn_peer_ips` + `lookup_vpn_endpoint`
+  use `peer/N.vip` (addr→owner) + the owner's self-doc for the endpoint, shared
+  fallback. Behavior-identical; egress unit test; vpn-e2e green.
+- **Phase 3 — DONE except the physical drop** (`#3b Phase 3`): the model is
+  interception-resistant + the `vpn/` forgery tests are rewritten for the
+  self-doc model (incl. a 3-node adversarial `self_doc_blocks_endpoint_interception`).
+  **The e2e gate caught that dropping the shared `vpn/` write outright BROKE live
+  2-node routing** — the founder didn't converge on a member's endpoint from the
+  imported self-doc. So the endpoint stays dual-written (self-doc preferred +
+  shared fallback); interception is still blocked, only physical isolation defers.
+- **⚠️ BLOCKER (gates the Phase 3 drop AND Phase 4):** harden **imported
+  member-self-doc sync**. Symptom: founder→member self-doc content doesn't
+  converge in time (the reverse works). Suspect: stale ticket addresses /
+  imported self-docs aren't actively re-synced like the admin doc's
+  `resume_sync(self.doc.start_sync(peers))`. Likely fix: a self-doc keepalive
+  that `start_sync`s each imported member self-doc with the owner's current
+  endpoint address (from discovery / the admin doc), and/or re-share the self-doc
+  ticket after addresses stabilize. **Validate with vpn-e2e after dropping the
+  shared write** (Phase 3 step 7) — only then is Phase 4 (read-ticket members,
+  who can't write the shared fallback) safe.
+
 ## Phased execution (each phase: compile → unit tests → vpn-e2e → commit → release)
 
 ### Phase 1 — `peer/N.vip` allocation (additive, inert)
