@@ -58,6 +58,110 @@ pub enum SessionOutcome {
     Disconnected,
 }
 
+/// Opening and closing markers a terminal wraps a paste in when the remote
+/// app has enabled bracketed-paste mode (DECSET 2004).
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Find the first occurrence of `needle` in `haystack`, returning its start index.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Tracks bracketed-paste state across a session and carries the one input
+/// chunk that can be lost at a disconnect, so the input stream survives a
+/// reconnect without corrupting an in-progress paste.
+///
+/// Why this exists: a reconnect that lands mid-paste used to drop the chunk
+/// being sent at that instant. If that chunk held the closing `ESC[201~`, the
+/// remote vim/tmux stayed stuck treating every later keystroke as literal
+/// paste text. `in_paste` lets the reconnect logic tell "this buffered input
+/// is paste content that must be delivered" from "this is free typing during
+/// a visible reconnect dialog that should be dropped rather than dumped into
+/// the shell".
+#[derive(Default)]
+pub struct InputReplay {
+    /// True if the bytes delivered to the host so far ended inside a paste
+    /// (a `PASTE_START` with no matching `PASTE_END` yet).
+    in_paste: bool,
+    /// Up to `PASTE_END.len() - 1` trailing bytes of the last observed chunk,
+    /// carried forward so a marker split across chunk boundaries is still seen.
+    tail: Vec<u8>,
+    /// The chunk pulled from the input channel but not successfully sent when
+    /// the connection dropped. Replayed first on resume so no bytes are lost.
+    unsent: Vec<u8>,
+}
+
+impl InputReplay {
+    /// Update paste state from a chunk that was just delivered to the host.
+    /// Only call this for bytes the host actually received (or will receive
+    /// via replay) — never for a chunk that was dropped — so `in_paste`
+    /// reflects exactly what the remote terminal has seen.
+    fn observe(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return; // heartbeat / empty write — no terminal effect
+        }
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(chunk);
+
+        // Scan for whichever marker comes last; markers are the same length.
+        let mlen = PASTE_START.len();
+        let mut i = 0;
+        while i + mlen <= buf.len() {
+            if &buf[i..i + mlen] == PASTE_START {
+                self.in_paste = true;
+                i += mlen;
+            } else if &buf[i..i + mlen] == PASTE_END {
+                self.in_paste = false;
+                i += mlen;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Carry the trailing bytes that could be the head of a marker split
+        // across the next chunk. Keeping fewer than a full marker guarantees a
+        // complete marker can't sit entirely in the tail, so it's never
+        // double-counted on the next call.
+        let keep = buf.len().min(mlen - 1);
+        self.tail = buf.split_off(buf.len() - keep);
+    }
+
+    /// Whether the host's terminal is currently mid-paste.
+    pub fn in_paste(&self) -> bool {
+        self.in_paste
+    }
+
+    /// Take the un-sent in-flight chunk captured at the last disconnect.
+    pub fn take_unsent(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.unsent)
+    }
+
+    /// Decide which buffered bytes to replay after a *visible* reconnect.
+    ///
+    /// If the host was mid-paste, deliver the stream up to and including the
+    /// closing `ESC[201~` so the paste completes — and drop anything typed
+    /// after it, so a flood of keystrokes banged out during the dialog isn't
+    /// dumped into the shell. If the close marker hasn't been buffered yet,
+    /// deliver all of it (it's still paste content) and let the resumed loop
+    /// carry the eventual close through normally. If not mid-paste, drop
+    /// everything — free typing during a visible reconnect is discarded.
+    pub fn filter_replay(&self, stream: &[u8]) -> Vec<u8> {
+        if !self.in_paste {
+            return Vec::new();
+        }
+        match find_subslice(stream, PASTE_END) {
+            Some(i) => stream[..i + PASTE_END.len()].to_vec(),
+            None => stream.to_vec(),
+        }
+    }
+}
+
 /// Host side: spawn a PTY and bridge I/O over the wire protocol.
 ///
 /// If `username` is `Some`, the shell runs as that Unix user via `login -fp`
@@ -1149,7 +1253,9 @@ pub async fn client_shell_session(
     // Enter raw mode
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
 
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
+    // v1 has no reconnect, so paste/lost-chunk state is local and discarded.
+    let mut replay = InputReplay::default();
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, &mut replay).await;
 
     // Always restore terminal
     let _ = terminal::disable_raw_mode();
@@ -1166,6 +1272,7 @@ pub async fn client_shell_session_v2(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    replay: &mut InputReplay,
 ) -> Result<(Option<String>, SessionOutcome)> {
     use crossterm::terminal;
 
@@ -1225,7 +1332,7 @@ pub async fn client_shell_session_v2(
     };
 
     let _raw_guard = RawModeGuard::enable()?;
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, replay).await;
     drop(_raw_guard);
 
     match result {
@@ -1243,9 +1350,25 @@ pub async fn client_shell_loop_resumed(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    replay: &mut InputReplay,
+    to_send: Vec<u8>,
 ) -> Result<SessionOutcome> {
     let _raw_guard = RawModeGuard::enable()?;
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx).await;
+    // Replay any input the reconnect logic decided to carry across (the lost
+    // in-flight chunk, and/or buffered paste content) before resuming live I/O.
+    if !to_send.is_empty() {
+        let msg = ClientMessage::Input(to_send);
+        if proto::write_message(&mut send, &msg).await.is_err() {
+            if let ClientMessage::Input(data) = msg {
+                replay.unsent = data;
+            }
+            return Ok(SessionOutcome::Disconnected);
+        }
+        if let ClientMessage::Input(data) = &msg {
+            replay.observe(data);
+        }
+    }
+    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, replay).await;
     drop(_raw_guard);
     result
 }
@@ -1269,6 +1392,7 @@ async fn client_shell_loop(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
+    replay: &mut InputReplay,
 ) -> Result<SessionOutcome> {
     use crossterm::terminal;
 
@@ -1327,8 +1451,19 @@ async fn client_shell_loop(
         tokio::select! {
             // Stdin -> send to host
             Some(data) = input_rx.recv() => {
-                if proto::write_message(send, &ClientMessage::Input(data)).await.is_err() {
+                let msg = ClientMessage::Input(data);
+                if proto::write_message(send, &msg).await.is_err() {
+                    // Capture the chunk we failed to send so the reconnect can
+                    // replay it — dropping it here is what used to truncate a
+                    // paste and strand the remote terminal mid-bracket.
+                    if let ClientMessage::Input(data) = msg {
+                        replay.unsent = data;
+                    }
                     return Ok(SessionOutcome::Disconnected);
+                }
+                // Only update paste state once the host has the bytes.
+                if let ClientMessage::Input(data) = &msg {
+                    replay.observe(data);
                 }
             }
             // Host messages -> write to stdout
@@ -1626,3 +1761,89 @@ mod reader_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod input_replay_tests {
+    use super::*;
+
+    /// A whole paste observed in one chunk leaves us closed (not mid-paste).
+    #[test]
+    fn complete_paste_in_one_chunk_is_not_mid_paste() {
+        let mut r = InputReplay::default();
+        r.observe(b"\x1b[200~hello world\x1b[201~");
+        assert!(!r.in_paste());
+    }
+
+    /// Seeing only the paste-start leaves us mid-paste.
+    #[test]
+    fn open_paste_is_mid_paste() {
+        let mut r = InputReplay::default();
+        r.observe(b"\x1b[200~partial text");
+        assert!(r.in_paste());
+    }
+
+    /// A marker split across two observed chunks is still detected.
+    #[test]
+    fn detects_marker_split_across_chunks() {
+        let mut r = InputReplay::default();
+        // Split the closing ESC[201~ down the middle.
+        r.observe(b"\x1b[200~some pasted data\x1b[20");
+        assert!(r.in_paste(), "still mid-paste before the close completes");
+        r.observe(b"1~");
+        assert!(!r.in_paste(), "close marker completed across the boundary");
+    }
+
+    /// The start marker can also straddle a boundary.
+    #[test]
+    fn detects_split_start_marker() {
+        let mut r = InputReplay::default();
+        r.observe(b"abc\x1b[2");
+        assert!(!r.in_paste());
+        r.observe(b"00~xyz");
+        assert!(r.in_paste());
+    }
+
+    /// Mid-paste replay delivers through the close marker and drops what was
+    /// typed after it.
+    #[test]
+    fn filter_replay_delivers_paste_drops_trailing_typing() {
+        let mut r = InputReplay::default();
+        r.observe(b"\x1b[200~half a paste"); // disconnect mid-paste
+        assert!(r.in_paste());
+
+        // Buffered during the dialog: rest of paste, its close, then typing.
+        let buffered = b"rest of paste\x1b[201~rm -rf junk\n";
+        let replay = r.filter_replay(buffered);
+        assert_eq!(replay, b"rest of paste\x1b[201~".to_vec());
+    }
+
+    /// If the close marker hasn't been buffered yet, deliver all of it (still
+    /// paste content) and stay mid-paste.
+    #[test]
+    fn filter_replay_delivers_all_when_close_not_yet_seen() {
+        let mut r = InputReplay::default();
+        r.observe(b"\x1b[200~start");
+        let buffered = b"more paste with no close yet";
+        assert_eq!(r.filter_replay(buffered), buffered.to_vec());
+    }
+
+    /// Not mid-paste: free typing during a visible reconnect is dropped.
+    #[test]
+    fn filter_replay_drops_free_typing() {
+        let mut r = InputReplay::default();
+        r.observe(b"ls\n"); // a normal command, fully sent — not mid-paste
+        assert!(!r.in_paste());
+        let buffered = b"sudo reboot\n";
+        assert!(r.filter_replay(buffered).is_empty());
+    }
+
+    /// Empty (heartbeat) chunks don't affect paste state.
+    #[test]
+    fn empty_chunk_is_ignored() {
+        let mut r = InputReplay::default();
+        r.observe(b"\x1b[200~x");
+        r.observe(b"");
+        assert!(r.in_paste());
+    }
+}
+

@@ -26,8 +26,15 @@ pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
 /// - Up to 13 concurrent paths (WiFi + cellular + relay simultaneously).
 ///   Individual path failures don't kill the connection — traffic migrates to
 ///   surviving paths automatically. Single biggest resilience improvement.
-/// - Per-path keepalive (5s) and idle timeout (6.5s) ensure dead paths are
-///   detected and replaced quickly without affecting the connection.
+/// - Per-path keepalive (5s) and idle timeout (20s) detect dead paths and
+///   replace them well before the 60s connection timeout. The 20s gives a 4x
+///   margin over the 5s keepalive: a single delayed probe (busy executor,
+///   scheduler hiccup, or a link saturated by a large paste) no longer reaps
+///   the path. This matters most on single-path connections (e.g. a plain
+///   local network) where path death == connection death == a user-visible
+///   reconnect — the old 6.5s timeout tolerated barely one missed probe and
+///   caused spurious reconnects every few minutes. Active-path failover is
+///   unaffected: it's driven by ACK/loss detection, not the idle timer.
 ///
 /// **NAT traversal address discovery:**
 /// - Peers exchange observed addresses to help discover their public IP behind
@@ -41,7 +48,7 @@ fn hop_transport_config() -> QuicTransportConfig {
         // Multipath: use up to 13 paths simultaneously (WiFi, cellular, relay, etc.)
         .max_concurrent_multipath_paths(13)
         .default_path_keep_alive_interval(Duration::from_secs(5))
-        .default_path_max_idle_timeout(Duration::from_millis(6500))
+        .default_path_max_idle_timeout(Duration::from_secs(20))
         // NAT traversal: exchange observed addresses for better holepunching
         .send_observed_address_reports(true)
         .receive_observed_address_reports(true)

@@ -23,6 +23,11 @@ pub enum ReconnectAction {
         send: OwnedWriteHalf,
         recv: OwnedReadHalf,
         new_session_id: Option<String>,
+        /// Stdin bytes pulled from the channel while the (visible) reconnect
+        /// dialog was up. The caller decides what to replay — paste content is
+        /// delivered, free typing is dropped. Always empty for the quick
+        /// inline reconnect, which leaves the channel untouched.
+        buffered_input: Vec<u8>,
     },
     /// User chose to quit.
     Quit,
@@ -151,6 +156,9 @@ pub async fn try_quick_reconnect(
                     send,
                     recv,
                     new_session_id,
+                    // Quick reconnect never drains the stdin channel; buffered
+                    // input flows naturally into the resumed loop.
+                    buffered_input: Vec::new(),
                 });
             }
             _ => {
@@ -273,24 +281,20 @@ pub async fn show_reconnect_tui_via_agent(
         .await;
 
         match connect_result {
-            Ok(Ok((mut send, recv, new_session_id))) => {
-                // Drain anything that arrived since the last poll, then replay
-                // buffered paste through the new session before handing off.
+            Ok(Ok((send, recv, new_session_id))) => {
+                // Drain anything that arrived since the last poll and hand the
+                // buffered bytes back to the caller. The caller applies the
+                // paste-aware replay policy (deliver paste content, drop free
+                // typing) — we don't blindly replay everything here.
                 while let Ok(data) = stdin_rx.try_recv() {
                     pending_input.extend_from_slice(&data);
-                }
-                if !pending_input.is_empty() {
-                    let _ = proto::write_message(
-                        &mut send,
-                        &ClientMessage::Input(std::mem::take(&mut pending_input)),
-                    )
-                    .await;
                 }
                 cleanup(&mut stdout);
                 return ReconnectAction::ReconnectedViaAgent {
                     send,
                     recv,
                     new_session_id,
+                    buffered_input: std::mem::take(&mut pending_input),
                 };
             }
             _ => {

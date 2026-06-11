@@ -1878,9 +1878,13 @@ async fn cmd_connect(
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
 
+    // Bracketed-paste / lost-chunk state, shared across reconnections so a
+    // paste interrupted by a reconnect is completed rather than stranded.
+    let mut replay = shell::InputReplay::default();
+
     // Run the first shell session
     let (mut session_id, mut outcome) =
-        shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx).await?;
+        shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx, &mut replay).await?;
 
     // Anti-flapping state: track recent reconnections to detect rapid cycling
     let mut last_reconnect_time: Option<std::time::Instant> = None;
@@ -1926,6 +1930,11 @@ async fn cmd_connect(
                     None
                 };
 
+                // Tier 1 is an invisible blip (<5s): deliver buffered input
+                // as-is so brief reconnects "just work". Tier 2 is a visible
+                // dialog: apply the paste-aware filter so a flood of keystrokes
+                // typed while waiting isn't dumped into the shell.
+                let via_quick = quick_result.is_some();
                 let reconnect_result = if let Some(action) = quick_result {
                     action
                 } else {
@@ -1945,14 +1954,31 @@ async fn cmd_connect(
                         send,
                         recv,
                         new_session_id,
+                        buffered_input,
                     } => {
                         last_reconnect_time = Some(std::time::Instant::now());
+
+                        // Rebuild the post-disconnect input stream: the chunk
+                        // lost in flight, followed by whatever was buffered.
+                        let mut stream = replay.take_unsent();
+                        stream.extend_from_slice(&buffered_input);
+                        let to_send = if via_quick {
+                            stream
+                        } else {
+                            replay.filter_replay(&stream)
+                        };
 
                         // The reconnect function already sent setup messages
                         // (WindowSize + SetEnv) and consumed SessionInfo, so
                         // use the loop-only variant that skips the handshake.
-                        let out =
-                            shell::client_shell_loop_resumed(send, recv, &mut stdin_rx).await?;
+                        let out = shell::client_shell_loop_resumed(
+                            send,
+                            recv,
+                            &mut stdin_rx,
+                            &mut replay,
+                            to_send,
+                        )
+                        .await?;
                         session_id = new_session_id.or(session_id);
                         outcome = out;
                     }
