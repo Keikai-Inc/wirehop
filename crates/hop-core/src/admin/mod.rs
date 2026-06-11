@@ -145,6 +145,7 @@ fn handle_create_invite(
         role_name,
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
+        None, // single-use
     ) {
         Ok(token) => {
             log_admin_action(config_dir, "create_invite", &format!("user={:?}", username));
@@ -269,6 +270,7 @@ fn handle_create_user(
             None,
             15 * 60,
             crate::sandbox::SandboxPolicy::default(),
+            None, // single-use
         ) {
             Ok(token) => Some(token),
             Err(e) => {

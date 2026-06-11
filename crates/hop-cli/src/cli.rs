@@ -40,6 +40,13 @@ pub enum Command {
         /// client). Warren tiers require this host to have a warren.
         #[arg(long, value_name = "TIER")]
         tier: Option<String>,
+        /// Make the invite reusable up to N times — one token N hosts redeem to
+        /// join the warren (the warren-first "fleet invite"). Default: single-use.
+        #[arg(long, value_name = "N")]
+        max_uses: Option<u32>,
+        /// Invite lifetime in seconds (default: 900 = 15 minutes).
+        #[arg(long, value_name = "SECS")]
+        expiry: Option<u64>,
         /// Human-readable name for this host (defaults to system hostname)
         #[arg(long)]
         name: Option<String>,
@@ -613,10 +620,12 @@ pub enum FleetAction {
         /// Group/role to filter by
         group: Option<String>,
     },
-    /// Execute a command on all hosts in a group
+    /// Run a command on all warren members (or known hosts) matching a selector.
+    /// The selector matches a warren member's role or any of its tags (from the
+    /// replicated netdoc), or a known-host group.
     Exec {
-        /// Group/role name
-        group: String,
+        /// Selector: a role name, a tag, or a known-host group.
+        selector: String,
         /// Command and arguments
         #[arg(required = true, last = true)]
         command: Vec<String>,

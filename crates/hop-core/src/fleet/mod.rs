@@ -301,41 +301,10 @@ impl RolesStore {
 
 // --- Fleet registration (host side) ---
 
-/// A fleet registration entry (host side) — one per orchestrator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FleetRegistration {
-    pub name: String,
-    pub orchestrator_node_id: String,
-    pub orchestrator_relay_url: Option<String>,
-    pub tags: Vec<String>,
-    pub registered_at: String,
-}
-
-/// Host-side fleet registrations, persisted as `fleet_registrations.json`.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct FleetRegistrationsStore {
-    pub registrations: Vec<FleetRegistration>,
-}
-
-impl FleetRegistrationsStore {
-    pub fn load(config_dir: &Path) -> Result<Self> {
-        let path = config_dir.join("fleet_registrations.json");
-        if path.exists() {
-            let data = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            Ok(serde_json::from_str(&data)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    pub fn save(&self, config_dir: &Path) -> Result<()> {
-        let path = config_dir.join("fleet_registrations.json");
-        let data = serde_json::to_string_pretty(self)?;
-        write_shared_file(&path, &data)?;
-        Ok(())
-    }
-}
+// Retired (warren-first fleet, P4): the host→orchestrator binding
+// (`fleet_registrations.json` / `FleetRegistrationsStore`) is obsolete — a host
+// is a warren node, not "registered with" an orchestrator. `hop fleet status`
+// reads the replicated netdoc snapshot instead.
 
 // --- Aggregate invite store ---
 
@@ -387,7 +356,7 @@ pub fn handle_create_fleet_invite(
     relay_url: Option<&str>,
     host_public_key: &PublicKey,
     tags: Vec<String>,
-    _max_uses: u32,
+    max_uses: u32,
     expiry_secs: u64,
     tier: Option<String>,
 ) -> AdminResponse {
@@ -422,6 +391,9 @@ pub fn handle_create_fleet_invite(
         Some(InviteTier::WarrenOnly) => (PeerRole::Peer, Some("warren-only".to_string())),
         Some(InviteTier::Client) | Some(InviteTier::Node) => (PeerRole::Peer, None),
     };
+    // A fleet invite is the reusable, warren-scoped path: one token N hosts
+    // redeem. max_uses > 1 makes the underlying pending invite reusable.
+    let max_uses_opt = (max_uses > 1).then_some(max_uses);
     let token = match invite::generate_invite_with_role(
         host_public_key,
         config_dir,
@@ -432,6 +404,7 @@ pub fn handle_create_fleet_invite(
         role_name,
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
+        max_uses_opt,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1051,34 +1024,6 @@ mod tests {
         assert_eq!(loaded.members[0].hostname, "web-1");
         assert_eq!(loaded.members[0].tags, vec!["developer", "web"]);
         assert!(loaded.members[0].online);
-    }
-
-    // --- FleetRegistrationsStore tests ---
-
-    #[test]
-    fn fleet_registrations_store_load_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FleetRegistrationsStore::load(dir.path()).unwrap();
-        assert!(store.registrations.is_empty());
-    }
-
-    #[test]
-    fn fleet_registrations_store_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FleetRegistrationsStore {
-            registrations: vec![FleetRegistration {
-                name: "acme-corp".into(),
-                orchestrator_node_id: "orch123".into(),
-                orchestrator_relay_url: Some("https://relay.example.com".into()),
-                tags: vec!["developer".into()],
-                registered_at: "1700000000".into(),
-            }],
-        };
-        store.save(dir.path()).unwrap();
-
-        let loaded = FleetRegistrationsStore::load(dir.path()).unwrap();
-        assert_eq!(loaded.registrations.len(), 1);
-        assert_eq!(loaded.registrations[0].name, "acme-corp");
     }
 
     // --- AggregateInvitesStore tests ---

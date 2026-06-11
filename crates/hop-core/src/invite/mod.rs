@@ -140,6 +140,18 @@ pub struct PendingInvite {
     /// Sandbox restrictions for this invite.
     #[serde(default)]
     pub sandbox: SandboxPolicy,
+    /// Max redemptions before the invite is removed. `None` = single-use (the
+    /// default; back-compatible). `Some(n)` = reusable up to `n` times — one
+    /// token N hosts redeem to join the warren (the warren-first "fleet invite").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// Redemptions so far (for a reusable invite).
+    #[serde(default)]
+    pub uses: u32,
+    /// Per-invite lifetime in seconds. `0` = governed only by the caller's
+    /// global prune age (legacy single-use behavior).
+    #[serde(default)]
+    pub expiry_secs: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -165,14 +177,19 @@ impl PendingInvitesStore {
         Ok(())
     }
 
-    /// Remove expired invites (older than `max_age_secs`).
-    pub fn prune_expired(&mut self, max_age_secs: u64) {
+    /// Remove expired invites. An invite with its own `expiry_secs` is judged by
+    /// that; legacy invites (`expiry_secs == 0`) fall back to `default_max_age`.
+    pub fn prune_expired(&mut self, default_max_age: u64) {
         let now = unix_now();
-        self.invites
-            .retain(|inv| now.saturating_sub(inv.created_at) < max_age_secs);
+        self.invites.retain(|inv| {
+            let limit = if inv.expiry_secs > 0 { inv.expiry_secs } else { default_max_age };
+            now.saturating_sub(inv.created_at) < limit
+        });
     }
 
-    /// Result of consuming an invite: username binding and role.
+    /// Try to redeem an invite by its secret. Single-use invites are removed on
+    /// redemption; reusable invites (`max_uses`) increment a counter and are
+    /// removed once exhausted. A past-expiry invite is removed and not honored.
     pub fn try_consume(&mut self, client_secret: &[u8]) -> Option<ConsumedInvite> {
         let client_secret_str = match std::str::from_utf8(client_secret) {
             Ok(s) => s,
@@ -180,26 +197,37 @@ impl PendingInvitesStore {
         };
 
         let argon2 = Argon2::default();
-
         let idx = self.invites.iter().position(|inv| {
             if let Ok(stored_hash) = PasswordHash::new(&inv.secret_hash) {
                 argon2.verify_password(client_secret_str.as_bytes(), &stored_hash).is_ok()
             } else {
                 false
             }
-        });
+        })?;
 
-        if let Some(idx) = idx {
-            let invite = self.invites.remove(idx);
-            Some(ConsumedInvite {
-                username: invite.username,
-                role: invite.role,
-                role_name: invite.role_name,
-                sandbox: invite.sandbox,
-            })
-        } else {
-            None
+        // Reject (and drop) an expired invite before honoring it.
+        let now = unix_now();
+        let expiry = self.invites[idx].expiry_secs;
+        if expiry > 0 && now.saturating_sub(self.invites[idx].created_at) >= expiry {
+            self.invites.remove(idx);
+            return None;
         }
+
+        let inv = &mut self.invites[idx];
+        let consumed = ConsumedInvite {
+            username: inv.username.clone(),
+            role: inv.role.clone(),
+            role_name: inv.role_name.clone(),
+            sandbox: inv.sandbox.clone(),
+        };
+        inv.uses += 1;
+        // Single-use (max_uses None) is removed immediately; reusable is removed
+        // once it reaches its cap.
+        let exhausted = inv.max_uses.map(|max| inv.uses >= max).unwrap_or(true);
+        if exhausted {
+            self.invites.remove(idx);
+        }
+        Some(consumed)
     }
 }
 
@@ -234,6 +262,7 @@ pub fn generate_invite(
         None,
         15 * 60,
         SandboxPolicy::default(),
+        None, // single-use
     )
 }
 
@@ -251,6 +280,7 @@ pub fn generate_invite_with_role(
     role_name: Option<String>,
     expiry_secs: u64,
     sandbox: SandboxPolicy,
+    max_uses: Option<u32>,
 ) -> Result<String> {
     // Validate the username early so bad values never reach storage.
     // Skip validation for Creator role (maps to root).
@@ -288,6 +318,9 @@ pub fn generate_invite_with_role(
         role: role.clone(),
         role_name: role_name.clone(),
         sandbox: sandbox.clone(),
+        max_uses,
+        uses: 0,
+        expiry_secs,
     });
     store.save(config_dir)?;
 
@@ -495,6 +528,7 @@ mod tests {
             None,
             3600,
             SandboxPolicy::default(),
+            None,
         )
         .unwrap();
 
@@ -533,6 +567,7 @@ mod tests {
             None,
             3600,
             SandboxPolicy::default(),
+            None,
         )
         .unwrap();
 
@@ -541,6 +576,37 @@ mod tests {
         let consumed = store.try_consume(decoded.secret.as_bytes()).unwrap();
         assert_eq!(consumed.role, PeerRole::Creator);
         assert_eq!(consumed.username, None);
+    }
+
+    /// A reusable invite (max_uses) admits N hosts, then is exhausted + removed.
+    #[test]
+    fn reusable_invite_admits_n_then_exhausts() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[9u8; 32]);
+        let public = key.public();
+        let token = generate_invite_with_role(
+            &public,
+            dir.path(),
+            None,
+            None,
+            None,
+            PeerRole::Peer,
+            Some("ci".to_string()),
+            3600,
+            SandboxPolicy::default(),
+            Some(3), // reusable up to 3 times
+        )
+        .unwrap();
+        let decoded = decode_invite(&token).unwrap();
+        let mut store = PendingInvitesStore::load(dir.path()).unwrap();
+        // 3 redemptions succeed, all with the ci role...
+        for _ in 0..3 {
+            let c = store.try_consume(decoded.secret.as_bytes()).expect("redeem within cap");
+            assert_eq!(c.role_name.as_deref(), Some("ci"));
+        }
+        // ...the 4th is rejected and the exhausted invite is gone.
+        assert!(store.try_consume(decoded.secret.as_bytes()).is_none());
+        assert!(store.invites.is_empty());
     }
 
     #[test]
@@ -587,6 +653,9 @@ mod tests {
                     role: PeerRole::Peer,
                     role_name: None,
                     sandbox: SandboxPolicy::default(),
+                    max_uses: None,
+                    uses: 0,
+                    expiry_secs: 0,
                 },
                 PendingInvite {
                     secret_hash: "new".into(),
@@ -595,6 +664,9 @@ mod tests {
                     role: PeerRole::Creator,
                     role_name: None,
                     sandbox: SandboxPolicy::default(),
+                    max_uses: None,
+                    uses: 0,
+                    expiry_secs: 0,
                 },
             ],
         };

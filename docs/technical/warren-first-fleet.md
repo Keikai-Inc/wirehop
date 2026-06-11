@@ -80,19 +80,26 @@ model: *the set of warren hosts I can reach*), backed entirely by the netdoc.
   the same pattern as the daemon already publishing `netdoc.ticket`/`relay_url`
   to files. Every node shows the same view. `hop ls` (Planned in warren-gaps)
   becomes this network-wide, role-filtered view.
-- **P2 — Warren-native bulk exec.** `hop fleet exec <tag|role> -- <cmd>` selects
-  peers from the doc and fans out over the existing exec path
-  (`cmd_exec`/agent), reach-ACL gated. Replaces today's `KnownHostsStore.groups`
-  fan-out (`main.rs` `fleet exec`) with doc-derived selection.
-- **P3 — Reusable warren invites.** `hop invite --role ci --tier node
-  --max-uses N --expiry 24h` → one token N hosts redeem to join the warren as
-  nodes with role `ci`. Completes the stubbed aggregate issuance; this is
-  "provision a fleet," warren-first. Issuer tracks redemptions in a small
-  local store (successor to `aggregate_invites.json`, but warren-scoped).
-- **P4 — Retire the orchestrator files.** Delete `fleet_registrations.json`,
-  demote `fleet.json` to removed/fallback, drop the dead heartbeat fields. The
-  orchestrator authority is already gone (C1). Keep `roles.json` as the
-  git-committable IaC source that reconciles into the doc.
+- **P2 — Warren-native bulk exec (✅ shipped).** `hop fleet exec <selector> --
+  <cmd>` selects warren members from the snapshot whose **role or tags** match
+  the selector (plus legacy known-host groups), and fans out over the existing
+  exec path (`mux::connect_to_host` + `RequestExec`), reach-ACL gated, with a
+  per-host result summary.
+- **P3 — Reusable warren invites (✅ shipped).** `hop invite --role ci --tier
+  node --max-uses N --expiry T` → one token N hosts redeem to join the warren.
+  Implemented by making the existing `PendingInvite` reusable (additive
+  `max_uses`/`uses`/`expiry_secs`): `try_consume` increments and keeps a
+  reusable invite until exhausted/expired (single-use stays the default).
+  Unifies with the aggregate-invite intent (one token → N hosts) without a
+  second store; the admin `fleet-invite` path now passes its `max_uses` through.
+- **P4 — Retire the orchestrator files (✅ partial).** `fleet_registrations.json`
+  + `FleetRegistrationsStore` are **deleted** (a host is a warren node, not
+  "registered with" an orchestrator). `fleet.json`/`FleetStore`, the aggregate
+  invite store, and the dead `online`/`last_heartbeat` fields remain only behind
+  the **legacy admin `fleet-*` RPC handlers**, now superseded by P1–P3 and
+  marked legacy-deprecated — their removal is a separate low-risk cleanup (it
+  touches proto/admin/cli surface). `roles.json` stays as the git-committable
+  IaC source that reconciles into the doc.
 
 ## 5. Liveness without heartbeats
 

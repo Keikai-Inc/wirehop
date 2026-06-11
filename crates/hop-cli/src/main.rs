@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
-        Command::Invite { user, role, tier, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Invite { user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             // Ensure dir exists and auto-generate identity if needed (no need to run `hop id` first)
             std::fs::create_dir_all(&config_dir)
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
             let tier = parse_invite_tier(tier.as_deref())?;
-            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), tier, name.as_deref(), sandbox)
+            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), tier, name.as_deref(), sandbox, max_uses, expiry)
         }
         Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -633,6 +633,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 Some("admin".to_string()),
                 3600, // 1-hour expiry
                 hop_core::sandbox::SandboxPolicy::default(),
+                None, // single-use
             ) {
                 Ok(token) => {
                     // Write to file with restricted permissions
@@ -1373,6 +1374,7 @@ fn resolve_founder_author(config_dir: &std::path::Path) -> Option<String> {
     invite::decode_invite(ci.trim()).ok()?.founder_author
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_invite(
     secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
@@ -1381,6 +1383,8 @@ fn cmd_invite(
     tier: Option<hop_core::invite::InviteTier>,
     host_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
+    max_uses: Option<u32>,
+    expiry: Option<u64>,
 ) -> Result<()> {
     use hop_core::invite::InviteTier;
     let public_key = secret_key.public();
@@ -1438,8 +1442,9 @@ fn cmd_invite(
         host_name,
         peer_role,
         resolved_role_name,
-        15 * 60,
+        expiry.unwrap_or(15 * 60),
         sandbox.clone(),
+        max_uses,
     )?;
 
     // Stamp the explicit tier (and, for warren tiers, the founder trust anchor)
@@ -1485,7 +1490,21 @@ fn cmd_invite(
     println!("The client connects with:");
     println!("  hop connect {token}");
     println!();
-    println!("This invite expires in 15 minutes and is single-use.");
+    let exp_secs = expiry.unwrap_or(15 * 60);
+    let exp_human = if exp_secs.is_multiple_of(3600) {
+        format!("{} hour(s)", exp_secs / 3600)
+    } else if exp_secs.is_multiple_of(60) {
+        format!("{} minute(s)", exp_secs / 60)
+    } else {
+        format!("{exp_secs} seconds")
+    };
+    match max_uses {
+        Some(n) if n > 1 => println!(
+            "This invite expires in {exp_human} and is reusable up to {n} times\n\
+             (one token N hosts redeem to join the warren)."
+        ),
+        _ => println!("This invite expires in {exp_human} and is single-use."),
+    }
     if sandbox.is_restricted() {
         println!();
         println!("Sandbox restrictions:");
@@ -3135,27 +3154,42 @@ async fn cmd_fleet(
             }
             Ok(())
         }
-        FleetAction::Exec { group, command } => {
+        FleetAction::Exec { selector, command } => {
+            // Build the target set: warren members (from the replicated netdoc
+            // snapshot) whose role or tags match the selector, plus known-host
+            // groups (legacy). Each target is (connect_target, display_name) —
+            // warren members connect by node_id, known hosts by alias.
+            let mut seen = HashSet::new();
+            let mut targets: Vec<(String, String)> = Vec::new();
+
+            let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+            for m in &snap.members {
+                let hit = m.role == selector || m.tags.iter().any(|t| t == &selector);
+                if hit && seen.insert(m.node_id.clone()) {
+                    targets.push((m.node_id.clone(), m.name.clone()));
+                }
+            }
             let hosts = KnownHostsStore::load(user_config_dir)?;
-            let targets: Vec<_> = hosts
-                .hosts
-                .iter()
-                .filter(|h| h.groups.contains(&group))
-                .collect();
+            for h in &hosts.hosts {
+                if h.groups.contains(&selector) && seen.insert(h.node_id.clone()) {
+                    targets.push((h.name.clone(), h.name.clone())); // connect by alias
+                }
+            }
+
             if targets.is_empty() {
-                println!("No hosts in group '{group}'.");
+                println!("No warren members or known hosts match '{selector}'.");
                 return Ok(());
             }
+            println!("Running on {} host(s) matching '{selector}':", targets.len());
             let command_str = command.join(" ");
-            for host in &targets {
-                println!("--- {} ({}) ---", host.name, &host.node_id[..10]);
+            let (mut ok, mut failed) = (0u32, 0u32);
+            for (target, name) in &targets {
+                println!("--- {name} ({}) ---", &target[..10.min(target.len())]);
                 match mux::connect_to_host(
                     user_config_dir,
-                    &host.name,
+                    target,
                     None,
-                    &ClientMessage::RequestExec {
-                        command: command_str.clone(),
-                    },
+                    &ClientMessage::RequestExec { command: command_str.clone() },
                 )
                 .await
                 {
@@ -3163,22 +3197,25 @@ async fn cmd_fleet(
                         let mut stdin_rx = spawn_stdin_reader();
                         let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
                         match outcome {
+                            SessionOutcome::Exited(0) => ok += 1,
                             SessionOutcome::Exited(code) => {
-                                if code != 0 {
-                                    eprintln!("Exit code: {code}");
-                                }
+                                eprintln!("Exit code: {code}");
+                                failed += 1;
                             }
                             SessionOutcome::Disconnected => {
                                 eprintln!("Connection lost");
+                                failed += 1;
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("Failed to connect: {e:#}");
+                        failed += 1;
                     }
                 }
                 println!();
             }
+            println!("Done: {ok} ok, {failed} failed.");
             Ok(())
         }
     }
