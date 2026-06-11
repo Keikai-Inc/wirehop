@@ -245,10 +245,13 @@ if [[ "${DAEMON}" == "true" ]]; then
   [[ -n "${DEFAULT_ROLE}" ]]    && DAEMON_ARGS+=(--default-role "${DEFAULT_ROLE}")
   [[ -n "${JOIN_TICKET}" ]]     && DAEMON_ARGS+=(--join "${JOIN_TICKET}")
   [[ -n "${INVITE}" ]]          && DAEMON_ARGS+=(--invite "${INVITE}")
+  # Expand the array safely even when empty: macOS bash 3.2 under `set -u`
+  # treats "${arr[@]}" on an empty array as an unbound-variable error, so use
+  # the ${arr[@]+...} guard which expands to nothing when there are no args.
   if command -v curl >/dev/null 2>&1; then
-    exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh") "${DAEMON_ARGS[@]}"
+    exec bash <(curl -fsSL "${BASE_URL}/install-daemon.sh") ${DAEMON_ARGS[@]+"${DAEMON_ARGS[@]}"}
   elif command -v wget >/dev/null 2>&1; then
-    exec bash <(wget -qO- "${BASE_URL}/install-daemon.sh") "${DAEMON_ARGS[@]}"
+    exec bash <(wget -qO- "${BASE_URL}/install-daemon.sh") ${DAEMON_ARGS[@]+"${DAEMON_ARGS[@]}"}
   else
     die "Neither curl nor wget found."
   fi
