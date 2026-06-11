@@ -230,16 +230,12 @@ pub async fn connect_to_host(
                 println!("Saved as known host: {actual_name}");
 
                 // Unified invite: if it carries the warren's namespace ticket,
-                // persist it so this client can later join the warren VPN
-                // (`hop warren join`) without a re-invite. Dormant until then.
+                // persist it as a fallback (the connect-time auto-upgrade in
+                // cmd_connect handles putting this machine on the warren).
                 if let Some(ticket) = token.warren_ticket.as_deref() {
                     let path = config_dir.join("warren-ticket");
                     if let Err(e) = std::fs::write(&path, ticket) {
                         tracing::debug!("could not persist warren ticket: {e}");
-                    } else {
-                        println!(
-                            "This warren supports a private VPN. Run `hop warren join` to put this machine on it."
-                        );
                     }
                 }
 

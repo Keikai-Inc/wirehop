@@ -513,15 +513,34 @@ or a privilege-escalation hole. Each needs test infrastructure we don't have yet
   routes). Full details + the root-cause debug story in
   `docs/technical/per-member-self-docs.md`. Tidy-ups (non-blocking): `name/ tag/
   posture/` still dual-write until their read paths (MagicDNS, Cedar) migrate.
-- **Phase 1b — embedded `hop __install-daemon` SHIPPED inert (0.6.53).** A hidden
-  subcommand installs + starts the daemon from **embedded** launchd/systemd
-  templates (`include_str!` of `pkg/com.hop.daemon.plist` / `pkg/hop.service`),
-  root-required, no network round-trip. Template validity is unit-tested
-  (`embedded_daemon_templates_present`). **Not yet wired into the self-upgrade**
-  — `hop warren join` still uses the proven shell installer (`install.sh --host`)
-  — because invoking this privileged path needs a **macOS daemon-install e2e**
-  that doesn't exist on the dev host. Inert until that harness exists, then the
-  upgrade flow swaps to it (verify-then-promote → `__install-daemon`).
+- **Phase 1b — embedded `hop __install-daemon` WIRED (flag-gated).** The hidden
+  subcommand now does the full §5 privileged install in one Rust path:
+  **verify-then-promote** the binary to root-owned `/usr/local/bin/hop`
+  (`root:wheel 0755`), copy the staged primer files into the **system** config
+  dir (`config::system_config_dir()`), apply vpn/tier/role primers in-process,
+  write the embedded launchd/systemd template, and start the service. Flags:
+  `--stage --vpn --tier --default-role --tags --promote-from --no-promote`.
+  The unprivileged `verify_and_stage_binary` (sha256 vs the published `.sha256`,
+  `HOP_PROMOTE_ALLOW_UNVERIFIED` dev escape) produces the verified bytes the
+  privileged step promotes — so the user-writable binary is never run as root.
+  `self_upgrade_to_node` wires it into both `hop warren join` **and** the
+  `hop connect <invite>` auto-upgrade, behind **`HOP_NATIVE_DAEMON_INSTALL`**
+  (the proven shell installer stays the default until the macOS e2e flips it).
+  **e2e:** `tests/e2e/daemon-install-e2e.sh` (Linux/systemd, in CI — green) and
+  `tests/e2e/macos-daemon-install.sh` (gated host script, snapshot-guarded
+  teardown, refuses on a machine with a daemon already loaded). Flipping the
+  default to native is gated on a green macOS run on a clean Mac/VM.
+- **Connect-time auto-upgrade + multi-warren resolution (NEW).** `hop connect
+  <warren-invite>` now puts the machine on the warren (consume → on the warren,
+  no `--host`); a client-tier invite stays reach-only. When already on a
+  *different* warren, the consume path offers **replace** (KISS default; a new
+  `hop warren leave` tears down namespace/tickets/store/vIP after a timestamped
+  backup, then joins the new one), with `--on-warren-conflict
+  replace|merge|multi-home|abort` for headless and `--yes` to skip prompts.
+  Conflict is detected via `netdoc::namespace_of_ticket` (decodes the incoming
+  namespace from the ticket without joining) + `classify_warren_conflict`.
+  **merge** (federation) and **multi-home** are designed extension points
+  (enum variants present; bail "not yet available").
 - **Phase 1a — tier *capability* flag SHIPPED (0.6.48); read/write ticket
   *scope* still pending.** `hop invite --tier client|warren-only|node|admin` now
   sets the explicit `InviteTier`: `client` strips the warren ticket (can't

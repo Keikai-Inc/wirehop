@@ -236,8 +236,10 @@ async fn main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
-        Command::InstallDaemon => {
-            cmd_install_daemon()
+        Command::InstallDaemon { stage, vpn, tier, default_role, tags, promote_from, no_promote } => {
+            cmd_install_daemon(InstallDaemonArgs {
+                stage, vpn, tier, default_role, tags, promote_from, no_promote,
+            })
         }
         Command::TransferHelper { mode, dest, compression, chunk_size } => {
             cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
@@ -1625,10 +1627,155 @@ async fn cmd_transfer_helper(mode: &str, dest: &str, compression: Option<&str>, 
 /// still self-upgrades via the proven shell installer (`install.sh --host`).
 /// Wiring this in is gated on a macOS daemon-install e2e (install-and-invite-tiers.md
 /// §10), so this privileged path stays inert until it can be end-to-end tested.
-#[allow(unused_variables, unreachable_code)]
-fn cmd_install_daemon() -> Result<()> {
+/// Arguments to the native daemon installer (`hop __install-daemon`).
+struct InstallDaemonArgs {
+    /// User-owned dir holding staged primer files to copy into the system dir.
+    stage: Option<std::path::PathBuf>,
+    /// "on"/"off" for the warren VPN data plane.
+    vpn: Option<String>,
+    /// Capability tier (informational; reserved for future role mapping).
+    tier: Option<String>,
+    /// Default invite role.
+    default_role: Option<String>,
+    /// Comma-separated host tags.
+    tags: Option<String>,
+    /// Verified binary bytes to promote to /usr/local/bin/hop.
+    promote_from: Option<std::path::PathBuf>,
+    /// Skip promotion (binary already root-owned at /usr/local/bin/hop).
+    no_promote: bool,
+}
+
+/// The root-owned path the launchd plist / systemd unit execute. The daemon
+/// must only ever run a root-owned, root-only-writable binary (decision 7).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const DAEMON_BIN_PATH: &str = "/usr/local/bin/hop";
+
+/// Copy verified binary bytes into the root-owned daemon path and lock down
+/// ownership/permissions (root:wheel 0755 on macOS, root:root 0755 on Linux).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn promote_binary(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Skip a self-copy when the running binary already IS the target (a host
+    // re-install) — copying a file onto itself truncates it.
+    let same = std::fs::canonicalize(source).ok() == std::fs::canonicalize(target).ok()
+        && target.exists();
+    if !same {
+        std::fs::copy(source, target)
+            .with_context(|| format!("promoting {} -> {}", source.display(), target.display()))?;
+    }
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", target.display()))?;
+    #[cfg(target_os = "macos")]
+    let owner = "root:wheel";
+    #[cfg(target_os = "linux")]
+    let owner = "root:root";
+    let status = std::process::Command::new("chown")
+        .arg(owner)
+        .arg(target)
+        .status()
+        .context("running chown")?;
+    anyhow::ensure!(status.success(), "chown {owner} {} failed", target.display());
+    Ok(())
+}
+
+/// Copy staged primer files (written by the unprivileged user) into the system
+/// config dir with correct perms. Validates the join ticket before trusting it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_staged_primers(stage: &std::path::Path, sysdir: &std::path::Path) -> Result<()> {
+    // (filename, is_secret) — secrets 0600, shared 0660.
+    let files: &[(&str, bool)] = &[
+        ("netdoc-join.ticket", true),
+        ("netdoc-founder.author", true),
+        ("netdoc-founder.node", false),
+    ];
+    for (name, secret) in files {
+        let src = stage.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let data = std::fs::read_to_string(&src)
+            .with_context(|| format!("reading staged {}", src.display()))?;
+        if *name == "netdoc-join.ticket" {
+            anyhow::ensure!(!data.trim().is_empty(), "staged netdoc-join.ticket is empty");
+        }
+        let dst = sysdir.join(name);
+        if *secret {
+            hop_core::config::write_secret_file(&dst, &data)?;
+        } else {
+            hop_core::config::write_shared_file(&dst, &data)?;
+        }
+    }
+    Ok(())
+}
+
+/// Map the running platform to its published release artifact base name
+/// (e.g. `hop-darwin-arm64`), matching `install.sh`'s naming.
+fn release_artifact_name() -> Result<String> {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => anyhow::bail!("unsupported OS for self-upgrade: {other}"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        "arm" => "armv7",
+        other => anyhow::bail!("unsupported arch for self-upgrade: {other}"),
+    };
+    Ok(format!("hop-{os}-{arch}"))
+}
+
+/// Verify the running binary against its published release checksum and stage a
+/// trusted copy into a temp dir, returning its path. The privileged installer
+/// then promotes THESE bytes (never the user-writable original) to the
+/// root-owned daemon path — the §5 verify-then-promote invariant.
+///
+/// `HOP_PROMOTE_ALLOW_UNVERIFIED=1` stages the running binary without a network
+/// check, for locally-built binaries / the e2e (which pass `--promote-from`).
+fn verify_and_stage_binary(cdn: &str) -> Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let exe = std::env::current_exe().context("resolving current executable")?;
+    let bytes = std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
+
+    if std::env::var("HOP_PROMOTE_ALLOW_UNVERIFIED").is_err() {
+        let artifact = release_artifact_name()?;
+        let version = env!("CARGO_PKG_VERSION");
+        let url = format!("{cdn}/v{version}/{artifact}.sha256");
+        let published = reqwest::blocking::get(&url)
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.text())
+            .with_context(|| format!(
+                "fetching release checksum {url} (set HOP_PROMOTE_ALLOW_UNVERIFIED=1 for a local build)"
+            ))?;
+        let published_hash = published.split_whitespace().next().unwrap_or("").to_lowercase();
+        let actual_hash = hex::encode(Sha256::digest(&bytes));
+        anyhow::ensure!(
+            !published_hash.is_empty() && published_hash == actual_hash,
+            "binary checksum mismatch (refusing to promote an unverified binary as root)"
+        );
+    }
+
+    // Stage into a fresh, user-owned temp dir (caller cleans it up).
+    let dir = std::env::temp_dir().join(format!("hop-upgrade-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating stage dir {}", dir.display()))?;
+    let staged = dir.join("hop");
+    std::fs::write(&staged, &bytes)
+        .with_context(|| format!("staging verified binary to {}", staged.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(staged)
+}
+
+fn cmd_install_daemon(args: InstallDaemonArgs) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    anyhow::bail!("__install-daemon is only supported on macOS and Linux");
+    {
+        let _ = args;
+        anyhow::bail!("__install-daemon is only supported on macOS and Linux");
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -1636,37 +1783,97 @@ fn cmd_install_daemon() -> Result<()> {
             hop_core::unix_user::is_running_as_root(),
             "__install-daemon must run as root (it installs a system service)"
         );
-        let run = |cmd: &str, args: &[&str]| -> Result<()> {
+        let run = |cmd: &str, cmd_args: &[&str]| -> Result<()> {
             let status = std::process::Command::new(cmd)
-                .args(args)
+                .args(cmd_args)
                 .status()
                 .with_context(|| format!("running {cmd}"))?;
-            anyhow::ensure!(status.success(), "{cmd} {} failed ({status})", args.join(" "));
+            anyhow::ensure!(status.success(), "{cmd} {} failed ({status})", cmd_args.join(" "));
             Ok(())
         };
 
+        // Step A — verify-then-promote the binary the service unit runs.
+        let target = std::path::Path::new(DAEMON_BIN_PATH);
+        if args.no_promote {
+            anyhow::ensure!(
+                target.exists(),
+                "--no-promote given but {DAEMON_BIN_PATH} does not exist"
+            );
+        } else {
+            let source = match args.promote_from.clone() {
+                Some(p) => p,
+                None => std::env::current_exe().context("resolving binary to promote")?,
+            };
+            promote_binary(&source, target)?;
+        }
+
+        // Step B — ensure the SYSTEM config dir (the path the unit's --config
+        // points at) — not the per-user dir resolve_host_config_dir would pick
+        // before a system identity exists.
+        let sysdir = hop_core::config::system_config_dir();
+        std::fs::create_dir_all(&sysdir)
+            .with_context(|| format!("creating {}", sysdir.display()))?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::process::Command::new("groupadd").args(["--system", "hop"]).status();
+            let _ = std::process::Command::new("chown").arg("root:hop").arg(&sysdir).status();
+            // setgid so files created here inherit the hop group.
+            let _ = std::fs::set_permissions(&sysdir, std::fs::Permissions::from_mode(0o2770));
+        }
+
+        // Step C — copy staged primer files into the system dir.
+        if let Some(stage) = &args.stage {
+            copy_staged_primers(stage, &sysdir)?;
+        }
+
+        // Step D — apply scalar primers in-process (one Rust path; no shelling
+        // out to `hop config set`).
+        if let Some(v) = &args.vpn {
+            println!("{}", set_host_config_value(&sysdir, "vpn", v)?);
+        }
+        if let Some(t) = &args.tags {
+            println!("{}", set_host_config_value(&sysdir, "tags", t)?);
+        }
+        if let Some(r) = &args.default_role {
+            println!("{}", set_host_config_value(&sysdir, "default_role", r)?);
+        }
+        let _ = &args.tier; // informational; reserved for future role mapping.
+
+        // Step E — write the service file + start it. The service file is
+        // always written; only the service *start* is skipped under
+        // HOP_INSTALL_DAEMON_NO_START (lets the e2e validate file-laying +
+        // promote + primers in a container with no init system).
+        let no_start = std::env::var("HOP_INSTALL_DAEMON_NO_START").is_ok();
         #[cfg(target_os = "macos")]
         {
             const PLIST: &str = include_str!("../../../pkg/com.hop.daemon.plist");
             const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hop.daemon.plist";
             std::fs::write(PLIST_PATH, PLIST)
                 .with_context(|| format!("writing {PLIST_PATH}"))?;
-            // bootstrap/enable are idempotent-ish; only kickstart must succeed.
-            let _ = run("launchctl", &["bootstrap", "system", PLIST_PATH]);
-            let _ = run("launchctl", &["enable", "system/com.hop.daemon"]);
-            run("launchctl", &["kickstart", "-k", "system/com.hop.daemon"])?;
-            println!("hop daemon installed + started (launchd: com.hop.daemon).");
+            if no_start {
+                println!("hop daemon plist written (start skipped: HOP_INSTALL_DAEMON_NO_START).");
+            } else {
+                // bootstrap/enable are idempotent-ish; only kickstart must succeed.
+                let _ = run("launchctl", &["bootstrap", "system", PLIST_PATH]);
+                let _ = run("launchctl", &["enable", "system/com.hop.daemon"]);
+                run("launchctl", &["kickstart", "-k", "system/com.hop.daemon"])?;
+                println!("hop daemon installed + started (launchd: com.hop.daemon).");
+            }
         }
         #[cfg(target_os = "linux")]
         {
             const SERVICE: &str = include_str!("../../../pkg/hop.service");
             const UNIT_PATH: &str = "/etc/systemd/system/hop.service";
-            let _ = run("groupadd", &["--system", "hop"]); // ignore "already exists"
-            std::fs::create_dir_all("/etc/hop").context("creating /etc/hop")?;
+            std::fs::create_dir_all("/etc/systemd/system").ok();
             std::fs::write(UNIT_PATH, SERVICE).with_context(|| format!("writing {UNIT_PATH}"))?;
-            run("systemctl", &["daemon-reload"])?;
-            run("systemctl", &["enable", "--now", "hop"])?;
-            println!("hop daemon installed + started (systemd: hop.service).");
+            if no_start {
+                println!("hop systemd unit written (start skipped: HOP_INSTALL_DAEMON_NO_START).");
+            } else {
+                run("systemctl", &["daemon-reload"])?;
+                run("systemctl", &["enable", "--now", "hop"])?;
+                println!("hop daemon installed + started (systemd: hop.service).");
+            }
         }
     }
     Ok(())
@@ -1878,6 +2085,15 @@ async fn cmd_connect(
             config_dir, target, cli_name,
             &session_msg,
         ).await?;
+
+    // Convention: consuming a warren-carrying invite puts this machine on the
+    // warren (self-upgrade to a daemon) — no separate `hop warren join`, no
+    // `--host`. The connection above authorized us, which is the membership
+    // redeem. A client-tier invite is a no-op. Best-effort: a failure here must
+    // not block the shell session the user asked for.
+    if let Err(e) = maybe_upgrade_warren_on_connect(config_dir, target) {
+        eprintln!("warren upgrade skipped: {e:#}");
+    }
 
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
@@ -4346,7 +4562,7 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
         return Ok(());
     }
 
-    let mut cfg = HostConfig::load(config_dir)?;
+    let cfg = HostConfig::load(config_dir)?;
 
     match action {
         None => {
@@ -4371,49 +4587,8 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
             );
         }
         Some(ConfigAction::Set { key, value }) => {
-            match key.as_str() {
-                "session_timeout" => {
-                    let secs: u64 = parse_duration_value(&value)?;
-                    cfg.session_timeout_secs = secs;
-                    cfg.save(config_dir)?;
-                    println!("session_timeout set to {secs}s");
-                }
-                "max_sessions" => {
-                    let n: usize = value.parse().context("max_sessions must be a positive integer")?;
-                    cfg.max_sessions = n;
-                    cfg.save(config_dir)?;
-                    println!("max_sessions set to {n}");
-                }
-                "vpn" => {
-                    let on = parse_bool_value(&value)?;
-                    cfg.vpn_enabled = on;
-                    cfg.save(config_dir)?;
-                    println!("vpn set to {}", if on { "on" } else { "off" });
-                }
-                "tags" => {
-                    // Comma-separated; empty string clears tags.
-                    let tags: Vec<String> = value
-                        .split(',')
-                        .map(|t| t.trim().to_string())
-                        .filter(|t| !t.is_empty())
-                        .collect();
-                    cfg.tags = tags.clone();
-                    cfg.save(config_dir)?;
-                    println!("tags set to {tags:?}");
-                }
-                "default_role" => {
-                    let role = value.trim().to_string();
-                    anyhow::ensure!(!role.is_empty(), "default_role must not be empty");
-                    cfg.default_role = role.clone();
-                    cfg.save(config_dir)?;
-                    println!("default_role set to {role}");
-                }
-                _ => {
-                    anyhow::bail!(
-                        "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role"
-                    );
-                }
-            }
+            let confirmation = set_host_config_value(config_dir, &key, &value)?;
+            println!("{confirmation}");
             println!("Note: restart the host/daemon for changes to take effect.");
         }
         // Handled by the early return above; arm kept for exhaustiveness.
@@ -4421,6 +4596,52 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
     }
 
     Ok(())
+}
+
+/// Apply a single host-config key=value, persisting it, and return a
+/// human-readable confirmation. Shared by `hop config set` and the native
+/// daemon installer (which applies vpn/tags/default_role primers in-process
+/// rather than shelling out to `hop config set`).
+fn set_host_config_value(config_dir: &std::path::Path, key: &str, value: &str) -> Result<String> {
+    let mut cfg = HostConfig::load(config_dir)?;
+    let msg = match key {
+        "session_timeout" => {
+            let secs: u64 = parse_duration_value(value)?;
+            cfg.session_timeout_secs = secs;
+            format!("session_timeout set to {secs}s")
+        }
+        "max_sessions" => {
+            let n: usize = value.parse().context("max_sessions must be a positive integer")?;
+            cfg.max_sessions = n;
+            format!("max_sessions set to {n}")
+        }
+        "vpn" => {
+            let on = parse_bool_value(value)?;
+            cfg.vpn_enabled = on;
+            format!("vpn set to {}", if on { "on" } else { "off" })
+        }
+        "tags" => {
+            // Comma-separated; empty string clears tags.
+            let tags: Vec<String> = value
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            cfg.tags = tags.clone();
+            format!("tags set to {tags:?}")
+        }
+        "default_role" => {
+            let role = value.trim().to_string();
+            anyhow::ensure!(!role.is_empty(), "default_role must not be empty");
+            cfg.default_role = role.clone();
+            format!("default_role set to {role}")
+        }
+        _ => anyhow::bail!(
+            "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role"
+        ),
+    };
+    cfg.save(config_dir)?;
+    Ok(msg)
 }
 
 fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
@@ -4508,59 +4729,338 @@ fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Offer to upgrade this machine to a warren node (a system daemon). The invite
+/// has already been decoded + redeemed as the unprivileged user (the H10
+/// invariant); this is the consent + escalate step. Uses the native, embedded
+/// installer (`hop __install-daemon`) when `HOP_NATIVE_DAEMON_INSTALL` is set,
+/// otherwise the proven shell installer (the default until the macOS
+/// daemon-install e2e greenlights flipping native on).
+fn self_upgrade_to_node(
+    config_dir: &std::path::Path,
+    tier: hop_core::invite::InviteTier,
+    assume_yes: bool,
+) -> Result<()> {
+    let cdn = std::env::var("HOP_CDN_URL").unwrap_or_else(|_| "https://hop.keik.ai".to_string());
+    println!();
+
+    if system_daemon_installed() {
+        println!("Joined. A system daemon is already installed — restart it to pick up the warren:");
+        #[cfg(target_os = "macos")]
+        println!("      sudo launchctl kickstart -k system/com.hop.daemon");
+        #[cfg(not(target_os = "macos"))]
+        println!("      sudo systemctl restart hop");
+        return Ok(());
+    }
+
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let proceed = if assume_yes {
+        true
+    } else if interactive {
+        println!(
+            "To put this machine on the warren VPN as a {} it must run as a system",
+            tier.as_str()
+        );
+        println!("daemon (root). Set it up now? This installs the hop daemon with sudo.");
+        print!("  Proceed? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        // Non-interactive without --yes: never escalate silently.
+        false
+    };
+
+    if !proceed {
+        println!("The join ticket is saved; put this machine on the VPN anytime with:");
+        println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
+        return Ok(());
+    }
+
+    let finish_later = || {
+        println!("Daemon setup did not complete. The join ticket is saved; finish later with:");
+        println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
+    };
+
+    if std::env::var("HOP_NATIVE_DAEMON_INSTALL").is_ok() {
+        // Native: verify+stage the running binary, then promote+install as root.
+        // The primer files Join wrote into config_dir are the stage.
+        let staged = verify_and_stage_binary(&cdn)?;
+        let vpn = if tier.is_warren_node() { "on" } else { "off" };
+        let status = std::process::Command::new("sudo")
+            .arg(&staged)
+            .arg("__install-daemon")
+            .arg("--promote-from")
+            .arg(&staged)
+            .arg("--stage")
+            .arg(config_dir)
+            .arg("--vpn")
+            .arg(vpn)
+            .arg("--tier")
+            .arg(tier.as_str())
+            .status()
+            .context("running sudo hop __install-daemon")?;
+        if let Some(parent) = staged.parent() {
+            let _ = std::fs::remove_dir_all(parent); // best-effort temp cleanup
+        }
+        if status.success() {
+            println!("Daemon set up natively — this machine is now on the warren.");
+        } else {
+            finish_later();
+        }
+    } else {
+        let cmd = format!("curl -fsSL {cdn}/install.sh | bash -s -- --host");
+        println!("Running: sudo bash -c \"{cmd}\"");
+        match std::process::Command::new("sudo").args(["bash", "-c", &cmd]).status() {
+            Ok(s) if s.success() => {
+                println!("Daemon set up — this machine is now on the warren.")
+            }
+            _ => finish_later(),
+        }
+    }
+    Ok(())
+}
+
+/// Decide how to resolve consuming a *different* warren's invite while already
+/// on one. Interactive default is Replace (KISS); non-interactive requires the
+/// explicit `--on-warren-conflict` flag (never destroy data implicitly).
+fn resolve_warren_conflict(
+    existing: &str,
+    incoming: &str,
+    flag: Option<cli::OnWarrenConflict>,
+) -> Result<cli::OnWarrenConflict> {
+    use cli::OnWarrenConflict;
+    let short = |s: &str| s[..8.min(s.len())].to_string();
+    if let Some(choice) = flag {
+        return Ok(choice);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "already on warren {} but this invite is for warren {}; \
+             pass --on-warren-conflict replace|abort",
+            short(existing),
+            short(incoming)
+        );
+    }
+    println!();
+    println!("This machine is already on warren {}.", short(existing));
+    println!("The invite you're consuming is for a different warren {}.", short(incoming));
+    println!(
+        "  [R] Replace  — leave {} and join {} (deletes warren state, with backup)",
+        short(existing),
+        short(incoming)
+    );
+    println!("  [A] Abort    — keep {}, do nothing", short(existing));
+    println!("  (merge / multi-home: not yet available)");
+    print!("Choice [R]: ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "r" | "replace" => Ok(OnWarrenConflict::Replace),
+        "a" | "abort" => Ok(OnWarrenConflict::Abort),
+        "m" | "merge" | "h" | "multi-home" | "multihome" => {
+            anyhow::bail!("merge / multi-home are not yet available; choose Replace or Abort")
+        }
+        other => anyhow::bail!("unrecognized choice '{other}'"),
+    }
+}
+
+/// Tear down this machine's warren state so it can join a different warren (or
+/// just leave). Backup-first and idempotent; stops the daemon (if installed) so
+/// the iroh-docs store is released before removal.
+fn leave_warren(config_dir: &std::path::Path, yes: bool, no_backup: bool) -> Result<()> {
+    let Some(ns) = hop_core::netdoc::read_namespace(config_dir) else {
+        println!("Not on a warren — nothing to leave.");
+        return Ok(());
+    };
+    let short = &ns[..8.min(ns.len())];
+
+    if !yes {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!("refusing to leave warren {short} non-interactively without --yes");
+        }
+        print!("Leave warren {short}? Removes local warren state (with backup). [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut a = String::new();
+        let _ = std::io::stdin().read_line(&mut a);
+        if !matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted; still on warren {short}.");
+            return Ok(());
+        }
+    }
+
+    // Stop the daemon so it releases the store and stops re-publishing the vIP.
+    if system_daemon_installed() {
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("sudo")
+            .args(["launchctl", "bootout", "system/com.hop.daemon"])
+            .status();
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("sudo").args(["systemctl", "stop", "hop"]).status();
+    }
+
+    // The warren state set. Removing the `netdoc/` store drops the self-doc too
+    // (they share one store). vIP/MagicDNS are doc-coordinated, not local files.
+    let files = [
+        "netdoc.json",
+        "netdoc-join.ticket",
+        "netdoc.ticket",
+        "netdoc-read.ticket",
+        "warren-ticket",
+        "netdoc-founder.author",
+        "netdoc-founder.node",
+    ];
+    let store_dir = config_dir.join("netdoc");
+
+    if no_backup {
+        for f in files {
+            let _ = std::fs::remove_file(config_dir.join(f));
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    } else {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = config_dir.join(format!(".warren-backup-{ts}"));
+        std::fs::create_dir_all(&backup)
+            .with_context(|| format!("creating {}", backup.display()))?;
+        for f in files {
+            let p = config_dir.join(f);
+            if p.exists() {
+                let _ = std::fs::rename(&p, backup.join(f));
+            }
+        }
+        if store_dir.exists() {
+            let _ = std::fs::rename(&store_dir, backup.join("netdoc"));
+        }
+        println!("Backed up warren state to {}", backup.display());
+    }
+    // A-scoped peer entries (authors/vIPs) would pollute B's reconcile; clear
+    // them. roles.json / fleet.json are warren-agnostic and kept.
+    let _ = std::fs::remove_file(config_dir.join("peers.json"));
+
+    println!("Left warren {short}.");
+    Ok(())
+}
+
+/// Resolve a multi-warren conflict (if any) and write the warren join primers
+/// into `config_dir`. Returns `false` if the user aborted (caller should stop).
+/// Shared by `hop warren join` and the `hop connect <invite>` auto-upgrade.
+fn prepare_warren_join(
+    config_dir: &std::path::Path,
+    ticket: &str,
+    founder_author: Option<&str>,
+    founder_node: Option<&str>,
+    conflict_flag: Option<cli::OnWarrenConflict>,
+) -> Result<bool> {
+    use cli::OnWarrenConflict;
+    let incoming_ns = hop_core::netdoc::namespace_of_ticket(ticket)?;
+    match hop_core::netdoc::classify_warren_conflict(config_dir, &incoming_ns) {
+        hop_core::netdoc::WarrenConflict::Same => {
+            println!("Already on this warren — refreshing membership.");
+        }
+        hop_core::netdoc::WarrenConflict::None => {}
+        hop_core::netdoc::WarrenConflict::Conflict { existing } => {
+            match resolve_warren_conflict(&existing, &incoming_ns, conflict_flag)? {
+                OnWarrenConflict::Replace => leave_warren(config_dir, true, false)?,
+                OnWarrenConflict::Abort => {
+                    println!("Aborted; staying on warren {}.", &existing[..8.min(existing.len())]);
+                    return Ok(false);
+                }
+                OnWarrenConflict::Merge | OnWarrenConflict::MultiHome => anyhow::bail!(
+                    "merge / multi-home are not yet available; use --on-warren-conflict replace"
+                ),
+            }
+        }
+    }
+    // Write the join ticket so `hop host` imports the namespace on next start.
+    // 0600 — warren ticket (security-audit H7). Founder author = C1 trust anchor;
+    // founder node = the AnnounceNetdocAuthor target.
+    config::write_secret_file(&config_dir.join("netdoc-join.ticket"), ticket)
+        .context("writing warren join ticket")?;
+    if let Some(fa) = founder_author {
+        let _ = config::write_secret_file(&config_dir.join("netdoc-founder.author"), fa);
+    }
+    if let Some(fnode) = founder_node {
+        let _ = config::write_shared_file(&config_dir.join("netdoc-founder.node"), fnode);
+    }
+    Ok(true)
+}
+
+/// When `hop connect <target>` consumes an invite that carries a warren, put
+/// this machine on the warren (the "consume → on the warren, no --host"
+/// convention). A client-tier invite (no warren ticket) is a no-op. Runs after
+/// the connection authorized us (that handshake is the membership redeem).
+fn maybe_upgrade_warren_on_connect(config_dir: &std::path::Path, target: &str) -> Result<()> {
+    if !hop_core::invite::is_invite_token(target) {
+        return Ok(());
+    }
+    let Ok(decoded) = hop_core::invite::decode_invite(target) else {
+        return Ok(());
+    };
+    let Some(ticket) = decoded.warren_ticket.as_deref() else {
+        return Ok(()); // client tier — reach only, never upgrades
+    };
+    println!();
+    println!("This invite carries a warren — putting this machine on it.");
+    if !prepare_warren_join(
+        config_dir,
+        ticket,
+        decoded.founder_author.as_deref(),
+        Some(&decoded.node_id),
+        None,
+    )? {
+        return Ok(());
+    }
+    self_upgrade_to_node(config_dir, decoded.effective_tier(), false)
+}
+
 async fn cmd_warren(
     config_dir: &std::path::Path,
     action: cli::WarrenAction,
 ) -> Result<()> {
     use cli::WarrenAction;
     match action {
-        WarrenAction::Join { invite } => {
-            // Resolve the warren namespace ticket: from the invite (which now
-            // carries it), or from the ticket stored when we connected as a client.
-            let (ticket, founder_author, founder_node, redeem) = match invite {
+        WarrenAction::Join { invite, yes, on_warren_conflict } => {
+            // Resolve the warren ticket + tier from the invite (which carries
+            // them), or the ticket stored from a prior client connection.
+            let (ticket, founder_author, founder_node, redeem, tier) = match invite {
                 Some(tok) => {
                     let decoded = hop_core::invite::decode_invite(&tok)
                         .context("invalid invite token")?;
                     let t = decoded.warren_ticket.clone().context(
                         "this invite does not carry a warren — the host has no VPN/warren enabled",
                     )?;
-                    (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok))
+                    let tier = decoded.effective_tier();
+                    (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok), tier)
                 }
                 None => {
                     let stored = std::fs::read_to_string(config_dir.join("warren-ticket"))
                         .context("no invite given and no stored warren ticket — run `hop warren join <invite>` first")?;
                     let t = stored.trim().to_string();
                     anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
-                    (t, None, None, None)
+                    (t, None, None, None, hop_core::invite::InviteTier::Node)
                 }
             };
 
-            // Write the join ticket so `hop host` imports the warren namespace on
-            // its next start (this is what makes the machine a node on the VPN).
-            // 0600 — warren *write* ticket; any local reader gains warren write
-            // access if this is world-readable (security-audit H7).
-            config::write_secret_file(&config_dir.join("netdoc-join.ticket"), &ticket)
-                .context("writing warren join ticket")?;
-
-            // Persist the founder's doc author (C1 trust anchor) so the daemon
-            // records it as the trusted admin on next start. Plain (non-secret)
-            // — it's a public author id, but keep it owner-readable for tidiness.
-            if let Some(fa) = founder_author {
-                let _ = config::write_secret_file(&config_dir.join("netdoc-founder.author"), &fa);
-            }
-            // Persist the founder's main node id so the daemon knows whom to send
-            // its `AnnounceNetdocAuthor` to on startup (C1 self-key binding).
-            if let Some(fnode) = founder_node {
-                let _ = config::write_shared_file(&config_dir.join("netdoc-founder.node"), &fnode);
+            // Multi-warren resolution (KISS default = replace) + write the join
+            // primers. Runs in the unprivileged user context, before the daemon.
+            if !prepare_warren_join(
+                config_dir,
+                &ticket,
+                founder_author.as_deref(),
+                founder_node.as_deref(),
+                on_warren_conflict,
+            )? {
+                return Ok(());
             }
 
-            // Redeem the invite for membership (auth handshake → the inviting host
-            // records us in the warren directory with our role).
+            // Redeem for membership (auth handshake → the inviting host records
+            // us). Identity loaded lazily — only redeeming needs the key.
             if let Some(tok) = redeem {
                 println!("Joining warren — redeeming invite for membership...");
-                // Load the identity lazily — only redeeming needs the key, so
-                // `status` (and ticket-only joins) never touch root-owned
-                // identity.json.
                 let secret_key = config::load_or_generate_identity(config_dir)?;
                 if let Err(e) =
                     cmd_exec(secret_key, &tok, config_dir, &["true".to_string()],
@@ -4570,53 +5070,11 @@ async fn cmd_warren(
                 }
             }
 
-            // Self-upgrade (install-and-invite-tiers.md Phase 1b): the invite was
-            // decoded + redeemed as *this user* above (no root yet — the H10 fix).
-            // Becoming a warren node needs a system daemon (root). Offer to set it
-            // up now, reusing the battle-tested installer (which verifies the
-            // download and promotes the binary to a root-owned path — §5 invariant).
-            let cdn = std::env::var("HOP_CDN_URL").unwrap_or_else(|_| "https://hop.keik.ai".to_string());
-            println!();
-            if system_daemon_installed() {
-                println!("Joined. A system daemon is already installed — restart it to pick up the");
-                println!("warren (the join ticket is now in place):");
-                #[cfg(target_os = "macos")]
-                println!("      sudo launchctl kickstart -k system/com.hop.daemon");
-                #[cfg(not(target_os = "macos"))]
-                println!("      sudo systemctl restart hop");
-            } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                println!("To put this machine on the warren VPN it must run as a system daemon");
-                println!("(root). Set it up now? This runs the official installer with sudo.");
-                print!("  Proceed? [y/N] ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let mut answer = String::new();
-                let _ = std::io::stdin().read_line(&mut answer);
-                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    // No --invite here: the join ticket is already written, so the
-                    // daemon installer must not redeem a second time.
-                    let cmd = format!("curl -fsSL {cdn}/install.sh | bash -s -- --host");
-                    println!("Running: sudo bash -c \"{cmd}\"");
-                    let status = std::process::Command::new("sudo")
-                        .args(["bash", "-c", &cmd])
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => println!("Daemon set up — this machine is now on the warren."),
-                        _ => {
-                            println!("Daemon setup did not complete. The join ticket is saved; finish later with:");
-                            println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
-                        }
-                    }
-                } else {
-                    println!("Skipped. The join ticket is saved; put this machine on the VPN anytime with:");
-                    println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
-                }
-            } else {
-                // Non-interactive (scripts): never prompt — print the explicit step.
-                println!("Joined. This machine will be on the warren once it runs as a system daemon:");
-                println!("      curl -fsSL {cdn}/install.sh | bash -s -- --host");
-            }
+            // Consent + escalate to a system daemon (the H10-safe self-upgrade).
+            self_upgrade_to_node(config_dir, tier, yes)?;
             Ok(())
         }
+        WarrenAction::Leave { yes, no_backup } => leave_warren(config_dir, yes, no_backup),
         WarrenAction::Status => {
             // Membership / namespace. netdoc.json stores the namespace as a
             // NamespaceId (a JSON byte array), so use the typed reader rather
@@ -4871,6 +5329,104 @@ mod tests {
         let service = include_str!("../../../pkg/hop.service");
         assert!(service.contains("ExecStart="), "systemd ExecStart missing");
         assert!(service.contains("/usr/local/bin/hop host"), "systemd binary path missing");
+    }
+
+    /// The daemon-install binary path the plist/unit run must match the
+    /// promote target — a drift here would point the service at a binary the
+    /// installer never wrote.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn daemon_bin_path_matches_templates() {
+        assert_eq!(DAEMON_BIN_PATH, "/usr/local/bin/hop");
+        assert!(include_str!("../../../pkg/com.hop.daemon.plist").contains(DAEMON_BIN_PATH));
+        assert!(include_str!("../../../pkg/hop.service").contains(DAEMON_BIN_PATH));
+    }
+
+    /// Staged primer files are copied into the system dir; the join ticket is
+    /// validated and a missing optional file is skipped (not an error).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_daemon_copies_staged_primers() {
+        let stage = tempfile::tempdir().unwrap();
+        let sysdir = tempfile::tempdir().unwrap();
+        std::fs::write(stage.path().join("netdoc-join.ticket"), "ticket-abc").unwrap();
+        std::fs::write(stage.path().join("netdoc-founder.author"), "author-xyz").unwrap();
+        // netdoc-founder.node intentionally absent — must be skipped, not fail.
+
+        copy_staged_primers(stage.path(), sysdir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(sysdir.path().join("netdoc-join.ticket")).unwrap(),
+            "ticket-abc"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sysdir.path().join("netdoc-founder.author")).unwrap(),
+            "author-xyz"
+        );
+        assert!(!sysdir.path().join("netdoc-founder.node").exists());
+    }
+
+    /// An empty staged join ticket is rejected (never poison the system dir).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_daemon_rejects_empty_join_ticket() {
+        let stage = tempfile::tempdir().unwrap();
+        let sysdir = tempfile::tempdir().unwrap();
+        std::fs::write(stage.path().join("netdoc-join.ticket"), "   ").unwrap();
+        assert!(copy_staged_primers(stage.path(), sysdir.path()).is_err());
+    }
+
+    /// Leaving a warren backs up and clears the warren state (namespace gone),
+    /// while keeping warren-agnostic role/fleet files.
+    #[test]
+    fn leave_warren_backs_up_and_clears_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        // Stand up a fake warren state.
+        let ns_hex = "38b534260368fb961765edbdd9ca90b712e107952a8ab7e3948662c2b1dfc230";
+        let meta = serde_json::json!({
+            "namespace": hex::decode(ns_hex).unwrap(), "federated": false, "self_namespace": null,
+        });
+        std::fs::write(p.join("netdoc.json"), meta.to_string()).unwrap();
+        std::fs::write(p.join("netdoc-join.ticket"), "tkt").unwrap();
+        std::fs::write(p.join("netdoc-founder.author"), "auth").unwrap();
+        std::fs::write(p.join("peers.json"), "{}").unwrap();
+        std::fs::write(p.join("roles.json"), "{}").unwrap();
+        std::fs::create_dir_all(p.join("netdoc")).unwrap();
+
+        leave_warren(p, true, false).unwrap();
+
+        // Warren state gone; no longer on a warren.
+        assert!(hop_core::netdoc::read_namespace(p).is_none());
+        assert!(!p.join("netdoc.json").exists());
+        assert!(!p.join("netdoc-join.ticket").exists());
+        assert!(!p.join("netdoc").exists());
+        assert!(!p.join("peers.json").exists(), "A-scoped peers cleared");
+        // Warren-agnostic config kept.
+        assert!(p.join("roles.json").exists(), "roles.json preserved");
+        // A backup dir was created holding the moved state.
+        let backup = std::fs::read_dir(p)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(".warren-backup-"));
+        assert!(backup.is_some(), "backup dir created");
+
+        // Idempotent: a second leave is a clean no-op.
+        leave_warren(p, true, false).unwrap();
+    }
+
+    /// Scalar primers are applied to host_config.json in-process.
+    #[test]
+    fn set_host_config_value_applies_scalars() {
+        let dir = tempfile::tempdir().unwrap();
+        set_host_config_value(dir.path(), "vpn", "on").unwrap();
+        set_host_config_value(dir.path(), "default_role", "developer").unwrap();
+        set_host_config_value(dir.path(), "tags", "prod, web").unwrap();
+        let cfg = hop_core::config::HostConfig::load(dir.path()).unwrap();
+        assert!(cfg.vpn_enabled);
+        assert_eq!(cfg.default_role, "developer");
+        assert_eq!(cfg.tags, vec!["prod".to_string(), "web".to_string()]);
+        assert!(set_host_config_value(dir.path(), "bogus", "x").is_err());
     }
 
     #[test]

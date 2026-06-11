@@ -14,6 +14,15 @@ const SYSTEM_CONFIG_DIR: &str = "/Library/Application Support/hop";
 #[cfg(target_os = "linux")]
 const SYSTEM_CONFIG_DIR: &str = "/etc/hop";
 
+/// The system-level config directory the root daemon uses (the path the
+/// launchd plist / systemd unit pass via `--config`). The native daemon
+/// installer must place primers here, not in the per-user dir that
+/// `resolve_host_config_dir` would pick before a system identity exists.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn system_config_dir() -> PathBuf {
+    PathBuf::from(SYSTEM_CONFIG_DIR)
+}
+
 /// Write a file with restricted permissions (0600) for secrets.
 /// On non-Unix platforms, falls back to a regular write.
 pub fn write_secret_file(path: &Path, data: &str) -> Result<()> {

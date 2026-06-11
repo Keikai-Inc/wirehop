@@ -297,10 +297,36 @@ pub enum Command {
     Ps,
 
     /// Internal: install + start the hop system daemon from embedded templates
-    /// (launchd on macOS, systemd on Linux). Must run as root. Reserved for the
-    /// self-upgrade path; not yet wired in (see install-and-invite-tiers.md §10).
+    /// (launchd on macOS, systemd on Linux). Must run as root. Invoked under the
+    /// self-upgrade `sudo` after the unprivileged user has decoded the invite and
+    /// staged the primer files (see install-and-invite-tiers.md §5).
     #[command(name = "__install-daemon", hide = true)]
-    InstallDaemon,
+    InstallDaemon {
+        /// User-owned staging dir holding primer files the unprivileged step
+        /// already wrote (netdoc-join.ticket, netdoc-founder.author,
+        /// netdoc-founder.node). Copied into the system config dir as root.
+        #[arg(long)]
+        stage: Option<PathBuf>,
+        /// Enable/disable the warren VPN data plane in the daemon config.
+        #[arg(long)]
+        vpn: Option<String>,
+        /// Capability tier (client|warren-only|node|admin) — informational.
+        #[arg(long)]
+        tier: Option<String>,
+        /// Default invite role for this node.
+        #[arg(long)]
+        default_role: Option<String>,
+        /// Host tags (comma-separated).
+        #[arg(long)]
+        tags: Option<String>,
+        /// Promote these (already-verified) binary bytes to the root-owned
+        /// /usr/local/bin/hop that the service unit points at.
+        #[arg(long)]
+        promote_from: Option<PathBuf>,
+        /// Skip promotion (the binary is already the root-owned /usr/local/bin/hop).
+        #[arg(long)]
+        no_promote: bool,
+    },
 
     /// Internal: privilege-separated transfer helper (runs as target user)
     #[command(name = "__transfer-helper", hide = true)]
@@ -365,9 +391,41 @@ pub enum WarrenAction {
     Join {
         /// Invite token. Omit to use the ticket stored from a prior connection.
         invite: Option<String>,
+        /// Assume "yes" to all prompts (headless: run the daemon upgrade and any
+        /// warren switch without asking).
+        #[arg(long)]
+        yes: bool,
+        /// How to resolve consuming a *different* warren's invite while already
+        /// on one. Interactive default is `replace`; non-interactive defaults to
+        /// `abort` unless this is set.
+        #[arg(long = "on-warren-conflict", value_enum)]
+        on_warren_conflict: Option<OnWarrenConflict>,
+    },
+    /// Leave the warren: tear down this machine's warren state (namespace,
+    /// tickets, store, vIP) after a backup. Does not uninstall the daemon.
+    Leave {
+        /// Skip the confirmation prompt (required non-interactively).
+        #[arg(long)]
+        yes: bool,
+        /// Don't back up the torn-down state to a .warren-backup-<ts> dir.
+        #[arg(long)]
+        no_backup: bool,
     },
     /// Show this machine's warren membership and VPN state.
     Status,
+}
+
+/// How to resolve consuming a different warren's invite while already on one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnWarrenConflict {
+    /// Leave the current warren and join the new one (the KISS default).
+    Replace,
+    /// Federate the two warrens (not yet implemented).
+    Merge,
+    /// Stay on both warrens at once (not yet implemented).
+    MultiHome,
+    /// Keep the current warren; do nothing.
+    Abort,
 }
 
 #[derive(Subcommand)]

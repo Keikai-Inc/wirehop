@@ -94,6 +94,36 @@ pub fn read_namespace(config_dir: &Path) -> Option<String> {
         .map(|meta| meta.namespace.to_string())
 }
 
+/// Extract the namespace id a warren ticket points at, *without* joining or
+/// importing it. Lets the consume path detect a multi-warren conflict in the
+/// unprivileged user context before any daemon restart.
+pub fn namespace_of_ticket(ticket: &str) -> Result<String> {
+    let t: DocTicket = ticket.trim().parse().context("invalid warren ticket")?;
+    Ok(t.capability.id().to_string())
+}
+
+/// How consuming a warren ticket relates to the host's current warren.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WarrenConflict {
+    /// Not on any warren yet — joining is a clean first-run.
+    None,
+    /// The incoming warren is the one we're already on — idempotent, no prompt.
+    Same,
+    /// Already on a *different* warren — the caller must resolve the conflict
+    /// (replace / merge / multi-home / abort).
+    Conflict { existing: String },
+}
+
+/// Classify whether consuming the warren identified by `incoming_ns` conflicts
+/// with the host's currently-joined warren (read from `netdoc.json`).
+pub fn classify_warren_conflict(config_dir: &Path, incoming_ns: &str) -> WarrenConflict {
+    match read_namespace(config_dir) {
+        None => WarrenConflict::None,
+        Some(existing) if existing == incoming_ns => WarrenConflict::Same,
+        Some(existing) => WarrenConflict::Conflict { existing },
+    }
+}
+
 /// A revocation entry: marks a peer as no longer authorized network-wide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Revocation {
@@ -2049,6 +2079,32 @@ mod tests {
     use super::*;
     use crate::config::PeerRole;
     use crate::sandbox::SandboxPolicy;
+
+    /// Conflict classification drives the multi-warren resolution prompt:
+    /// no warren → clean join; same namespace → idempotent; different → conflict.
+    #[test]
+    fn warren_conflict_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        // No netdoc.json yet → first warren, no conflict.
+        assert_eq!(classify_warren_conflict(dir.path(), "abc123"), WarrenConflict::None);
+
+        // Persist a netdoc.json with a namespace by writing the typed struct's
+        // JSON shape directly (namespace is a 32-byte id; use a known hex).
+        let ns_hex = "38b534260368fb961765edbdd9ca90b712e107952a8ab7e3948662c2b1dfc230";
+        let meta = serde_json::json!({
+            "namespace": hex::decode(ns_hex).unwrap(),
+            "federated": false,
+            "self_namespace": null,
+        });
+        std::fs::write(dir.path().join("netdoc.json"), meta.to_string()).unwrap();
+        let existing = read_namespace(dir.path()).expect("namespace reads back");
+
+        assert_eq!(classify_warren_conflict(dir.path(), &existing), WarrenConflict::Same);
+        assert_eq!(
+            classify_warren_conflict(dir.path(), "deadbeef"),
+            WarrenConflict::Conflict { existing }
+        );
+    }
 
     #[test]
     fn self_owned_key_classification() {
