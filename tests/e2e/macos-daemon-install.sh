@@ -69,11 +69,20 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*"; exit 1; }
 
-# ---- build the test binary --------------------------------------------------
-echo "=== building hop (release) ==="
-( cd "$PROJECT_ROOT" && cargo build --release -p hop-cli >/dev/null )
-HOP="$PROJECT_ROOT/target/release/hop"
-[[ -x "$HOP" ]] || fail "release binary missing at $HOP"
+# ---- obtain the test binary -------------------------------------------------
+# HOP_TEST_BIN lets a clean VM run a binary you already built on the host (an
+# Apple-Silicon `cargo build --release` arm64 `hop`), so the VM needs no Rust
+# toolchain and no source tree — just this script + the binary.
+if [[ -n "${HOP_TEST_BIN:-}" ]]; then
+  HOP="$HOP_TEST_BIN"
+  [[ -x "$HOP" ]] || fail "HOP_TEST_BIN='$HOP' is not an executable"
+  echo "=== using prebuilt binary: $HOP ==="
+else
+  echo "=== building hop (release) ==="
+  ( cd "$PROJECT_ROOT" && cargo build --release -p hop-cli >/dev/null )
+  HOP="$PROJECT_ROOT/target/release/hop"
+  [[ -x "$HOP" ]] || fail "release binary missing at $HOP"
+fi
 
 # ---- mint a throwaway founder warren + its invite ---------------------------
 echo "=== starting throwaway founder ==="
