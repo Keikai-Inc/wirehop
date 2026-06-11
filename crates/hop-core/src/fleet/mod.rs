@@ -15,6 +15,112 @@ use crate::proto::{
 };
 use crate::sandbox::SandboxPolicy;
 
+// --- Warren membership snapshot (warren-first fleet) ---
+
+/// A read-only mirror of this node's netdoc replica view, exported by the daemon
+/// to `warren-members.json`. The full warren membership lives only in the
+/// daemon's (exclusively-leased) netdoc store; this file lets any local
+/// operator's `hop fleet list/status` read the replicated view without holding
+/// the store open and without admin rights (membership is replicated to every
+/// node). Same shape every node sees — there is no orchestrator master copy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WarrenSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub members: Vec<WarrenMemberInfo>,
+    #[serde(default)]
+    pub roles: Vec<RoleDefinition>,
+    /// Unix seconds when the daemon last refreshed this snapshot.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// A warren member as seen in the replicated netdoc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarrenMemberInfo {
+    pub node_id: String,
+    pub name: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+}
+
+impl WarrenSnapshot {
+    pub fn load(config_dir: &Path) -> Result<Self> {
+        let path = config_dir.join("warren-members.json");
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok(serde_json::from_str(&data)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn save(&self, config_dir: &Path) -> Result<()> {
+        let data = serde_json::to_string_pretty(self)?;
+        write_shared_file(&config_dir.join("warren-members.json"), &data)?;
+        Ok(())
+    }
+}
+
+/// Pure join of netdoc reads into a snapshot — `peer/` entries enriched with the
+/// admin-allocated vIP (falling back to the shared `ip/` table) and per-node
+/// tags. Separated from the async reads so it can be unit-tested.
+fn join_warren_snapshot(
+    peers: Vec<crate::config::Peer>,
+    roles: Vec<RoleDefinition>,
+    vips: Vec<(std::net::Ipv4Addr, String)>,
+    tags: std::collections::HashMap<String, Vec<String>>,
+    namespace: Option<String>,
+) -> WarrenSnapshot {
+    let vip_by_node: std::collections::HashMap<String, String> =
+        vips.into_iter().map(|(addr, node)| (node, addr.to_string())).collect();
+    let members = peers
+        .into_iter()
+        .map(|p| {
+            let role = p
+                .role_name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", p.role).to_lowercase());
+            let vip = p.vip.clone().or_else(|| vip_by_node.get(&p.node_id).cloned());
+            let node_tags = tags.get(&p.node_id).cloned().unwrap_or_default();
+            WarrenMemberInfo { node_id: p.node_id, name: p.name, role, vip, tags: node_tags, last_seen: p.last_seen }
+        })
+        .collect();
+    WarrenSnapshot { namespace, members, roles, updated_at: 0 }
+}
+
+/// Build a membership snapshot from the live netdoc (daemon side).
+pub async fn build_warren_snapshot(netdoc: &crate::netdoc::NetDoc) -> Result<WarrenSnapshot> {
+    let peers = netdoc.list_peers().await.context("list_peers")?;
+    let roles = netdoc.list_roles().await.unwrap_or_default();
+    let vips = netdoc.list_virtual_ips().await.unwrap_or_default();
+    let tags = netdoc.list_host_tags().await.unwrap_or_default();
+    let mut snap = join_warren_snapshot(peers, roles, vips, tags, Some(netdoc.namespace().to_string()));
+    snap.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(snap)
+}
+
+/// Build + persist the snapshot (daemon side). Best-effort; logs on failure.
+pub async fn export_warren_snapshot(netdoc: &crate::netdoc::NetDoc, config_dir: &Path) {
+    match build_warren_snapshot(netdoc).await {
+        Ok(snap) => {
+            if let Err(e) = snap.save(config_dir) {
+                tracing::warn!("warren snapshot save failed: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("warren snapshot build failed: {e:#}"),
+    }
+}
+
 // --- Fleet store ---
 
 /// A registered fleet member (orchestrator side).
@@ -797,6 +903,70 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::proto::UserMode;
+
+    fn peer(node_id: &str, name: &str, role_name: Option<&str>, vip: Option<&str>) -> crate::config::Peer {
+        crate::config::Peer {
+            node_id: node_id.into(),
+            name: name.into(),
+            authorized_at: "0".into(),
+            last_seen: None,
+            username: None,
+            role: PeerRole::Peer,
+            role_name: role_name.map(String::from),
+            netdoc_author: None,
+            self_doc: None,
+            vip: vip.map(String::from),
+            sandbox: SandboxPolicy::default(),
+        }
+    }
+
+    /// The snapshot join enriches each peer with its vIP (admin-allocated on the
+    /// peer entry, else the shared ip/ table) and its tags, and carries roles.
+    #[test]
+    fn warren_snapshot_join() {
+        let peers = vec![
+            peer("aaaa", "web-1", Some("developer"), Some("100.64.0.2")),
+            peer("bbbb", "ci-1", Some("ci"), None), // vIP from the ip/ table fallback
+        ];
+        let roles = vec![test_role("developer", vec!["staging".into()], UserMode::Individual, false, false, vec![], None)];
+        let vips = vec![("100.64.0.3".parse().unwrap(), "bbbb".to_string())];
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("aaaa".to_string(), vec!["staging".to_string()]);
+
+        let snap = join_warren_snapshot(peers, roles, vips, tags, Some("ns123".into()));
+
+        assert_eq!(snap.namespace.as_deref(), Some("ns123"));
+        assert_eq!(snap.members.len(), 2);
+        assert_eq!(snap.roles.len(), 1);
+        let web = &snap.members[0];
+        assert_eq!(web.name, "web-1");
+        assert_eq!(web.role, "developer");
+        assert_eq!(web.vip.as_deref(), Some("100.64.0.2")); // from the peer entry
+        assert_eq!(web.tags, vec!["staging".to_string()]);
+        let ci = &snap.members[1];
+        assert_eq!(ci.vip.as_deref(), Some("100.64.0.3")); // from the ip/ table fallback
+        assert!(ci.tags.is_empty());
+    }
+
+    /// Snapshot round-trips through warren-members.json.
+    #[test]
+    fn warren_snapshot_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = WarrenSnapshot {
+            namespace: Some("ns".into()),
+            members: vec![WarrenMemberInfo {
+                node_id: "n".into(), name: "h".into(), role: "node".into(),
+                vip: Some("100.64.0.9".into()), tags: vec!["t".into()], last_seen: None,
+            }],
+            roles: vec![],
+            updated_at: 42,
+        };
+        snap.save(dir.path()).unwrap();
+        let loaded = WarrenSnapshot::load(dir.path()).unwrap();
+        assert_eq!(loaded.members.len(), 1);
+        assert_eq!(loaded.members[0].vip.as_deref(), Some("100.64.0.9"));
+        assert_eq!(loaded.updated_at, 42);
+    }
 
     /// Helper to build a RoleDefinition with default sandbox for tests.
     fn test_role(name: &str, host_tags: Vec<String>, user_mode: UserMode, sudo: bool, admin: bool, groups: Vec<String>, shell: Option<String>) -> RoleDefinition {

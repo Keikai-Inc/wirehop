@@ -168,9 +168,15 @@ async fn main() -> Result<()> {
             cmd_creator_invite(&config_dir)
         }
         Command::Fleet { action } => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_fleet(secret_key, &config_dir, action).await
+            // The daemon writes the warren snapshot to ITS config dir: honor an
+            // explicit --config (the daemon ran with it), else the system daemon
+            // dir. Known-hosts (a client concern) live in the user dir.
+            let host_dir = match cli.config.as_deref() {
+                Some(p) => p.to_path_buf(),
+                None => config::resolve_host_config_dir(None)?,
+            };
+            let user_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            cmd_fleet(&host_dir, &user_dir, action).await
         }
         Command::Cap { action } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -474,6 +480,30 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     // Converge on co-admin authority fast (enforce default-on
                     // readiness) — far lighter than a full re-sync.
                     net.spawn_admin_author_refresh(std::time::Duration::from_secs(20));
+
+                    // Warren-first fleet: export a read-only membership snapshot
+                    // (warren-members.json) of the replicated netdoc every 30s so
+                    // `hop fleet list/status` can read the full warren view (the
+                    // netdoc store itself is daemon-exclusive). First tick fires
+                    // immediately, so the snapshot exists shortly after startup.
+                    {
+                        let net_snap = net.clone();
+                        let cfg_snap = cfg.clone();
+                        let secs = std::env::var("HOP_WARREN_SNAPSHOT_SECS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(30u64)
+                            .max(1);
+                        tokio::spawn(async move {
+                            let mut tick =
+                                tokio::time::interval(std::time::Duration::from_secs(secs));
+                            loop {
+                                tick.tick().await;
+                                hop_core::fleet::export_warren_snapshot(net_snap.as_ref(), &cfg_snap)
+                                    .await;
+                            }
+                        });
+                    }
 
                     // Phase 3: the warren VPN data plane is OFF BY DEFAULT
                     // (opt-in; see security-audit.md C1). HOP_VPN=1 forces on
@@ -1255,6 +1285,9 @@ async fn dispatch_session(
                 }
                 // A grant/revoke of admin role changes the trusted-admin set.
                 nd.refresh_admin_authors().await;
+                // Refresh the fleet snapshot immediately so the admin change
+                // shows in `hop fleet list` without waiting for the 30s tick.
+                hop_core::fleet::export_warren_snapshot(nd.as_ref(), config_dir).await;
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
@@ -3001,50 +3034,46 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
 }
 
 async fn cmd_fleet(
-    _secret_key: iroh::SecretKey,
-    config_dir: &std::path::Path,
+    host_config_dir: &std::path::Path,
+    user_config_dir: &std::path::Path,
     action: FleetAction,
 ) -> Result<()> {
     match action {
-        FleetAction::Status { fleet } => {
-            // The fleet registrations store is the daemon's (like the FleetStore
-            // sites below): resolve without override to find the system config dir.
-            let host_config_dir = config::resolve_host_config_dir(None)?;
-            let store = hop_core::fleet::FleetRegistrationsStore::load(&host_config_dir)?;
-            if store.registrations.is_empty() {
-                println!("Not registered with any fleet.");
-                return Ok(());
-            }
-            let reg = if let Some(name) = fleet {
-                store
-                    .registrations
-                    .iter()
-                    .find(|r| r.name == name)
-                    .context(format!("No fleet registration named '{name}'"))?
-            } else {
-                &store.registrations[0]
-            };
-            println!("Fleet: {}", reg.name);
-            println!("  Orchestrator: {}", &reg.orchestrator_node_id[..10]);
-            println!("  Tags: {}", reg.tags.join(", "));
-            println!("  Registered: {}", reg.registered_at);
-            if let Some(ref url) = reg.orchestrator_relay_url {
-                println!("  Orchestrator relay: {url}");
+        FleetAction::Status { fleet: _ } => {
+            // Warren-first: read the daemon's replicated-netdoc snapshot
+            // (warren-members.json) from the host config dir. Every node has the
+            // same view — no orchestrator.
+            let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+            match &snap.namespace {
+                Some(ns) => {
+                    println!("warren namespace  {ns}");
+                    println!("members           {}", snap.members.len());
+                    println!("roles             {}", snap.roles.len());
+                    if snap.updated_at > 0 {
+                        let age = unix_now_secs().saturating_sub(snap.updated_at);
+                        println!("snapshot age      {age}s");
+                    }
+                }
+                None => {
+                    println!(
+                        "Not on a warren (no membership snapshot — is the daemon running and joined?)."
+                    );
+                }
             }
             Ok(())
         }
         FleetAction::Add { name, tags } => {
             // Read from user's known_hosts
-            let host = KnownHostsStore::load(config_dir)?
+            let host = KnownHostsStore::load(user_config_dir)?
                 .hosts
                 .iter()
                 .find(|h| h.name == name)
                 .cloned()
                 .with_context(|| format!("Host '{name}' not found in known_hosts"))?;
 
-            // Write to daemon's fleet.json (resolve without override to find system config dir)
-            let host_config_dir = config::resolve_host_config_dir(None)?;
-            let mut fleet = hop_core::fleet::FleetStore::load(&host_config_dir)?;
+            // Write to daemon's fleet.json (legacy; warren-first views read the
+            // netdoc snapshot — `fleet add` is retained until P4).
+            let mut fleet = hop_core::fleet::FleetStore::load(host_config_dir)?;
             fleet.add_member(hop_core::fleet::FleetMember {
                 node_id: host.node_id.clone(),
                 hostname: name.clone(),
@@ -3054,7 +3083,7 @@ async fn cmd_fleet(
                 relay_url: host.relay_url.clone(),
                 online: false,
             });
-            fleet.save(&host_config_dir)?;
+            fleet.save(host_config_dir)?;
 
             let tag_display = if tags.is_empty() {
                 String::new()
@@ -3068,25 +3097,26 @@ async fn cmd_fleet(
             let mut seen = HashSet::new();
             let mut any = false;
 
-            // 1. FleetStore members (daemon's fleet.json) — shown with tags
-            let host_config_dir = config::resolve_host_config_dir(None)?;
-            if let Ok(fleet) = hop_core::fleet::FleetStore::load(&host_config_dir) {
-                for m in &fleet.members {
-                    let matches = group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true);
-                    if !matches { continue; }
-                    seen.insert(m.node_id.clone());
-                    let tags = if m.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", m.tags.join(", "))
-                    };
-                    println!("  {} ({}){tags}", &m.node_id[..10], m.hostname);
-                    any = true;
-                }
+            // 1. Warren members — from the replicated netdoc snapshot (daemon's
+            // warren-members.json), the same view on every node.
+            let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+            if let Some(ns) = &snap.namespace {
+                println!("warren {} — {} member(s)", &ns[..8.min(ns.len())], snap.members.len());
+            }
+            for m in &snap.members {
+                let matches = group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true);
+                if !matches { continue; }
+                seen.insert(m.node_id.clone());
+                let id = &m.node_id[..10.min(m.node_id.len())];
+                let vip = m.vip.as_deref().map(|v| format!("  {v}")).unwrap_or_default();
+                let tags = if m.tags.is_empty() { String::new() } else { format!("  [{}]", m.tags.join(", ")) };
+                println!("  {id}  {}  role={}{vip}{tags}", m.name, m.role);
+                any = true;
             }
 
-            // 2. KnownHostsStore (user's known_hosts) — shown with groups, skip dupes
-            let hosts = KnownHostsStore::load(config_dir)?;
+            // 2. KnownHostsStore (user's known_hosts) — hosts you've connected to
+            // that aren't warren members; shown with groups, dupes skipped.
+            let hosts = KnownHostsStore::load(user_config_dir)?;
             for h in &hosts.hosts {
                 if seen.contains(&h.node_id) { continue; }
                 let matches = group.as_ref().map(|g| h.groups.contains(g)).unwrap_or(true);
@@ -3094,19 +3124,19 @@ async fn cmd_fleet(
                 let groups = if h.groups.is_empty() {
                     String::new()
                 } else {
-                    format!(" [{}]", h.groups.join(", "))
+                    format!("  [{}]", h.groups.join(", "))
                 };
-                println!("  {} ({}){groups}", &h.node_id[..10], h.name);
+                println!("  {}  {} (known host){groups}", &h.node_id[..10.min(h.node_id.len())], h.name);
                 any = true;
             }
 
             if !any {
-                println!("No hosts found.");
+                println!("No warren members or known hosts found.");
             }
             Ok(())
         }
         FleetAction::Exec { group, command } => {
-            let hosts = KnownHostsStore::load(config_dir)?;
+            let hosts = KnownHostsStore::load(user_config_dir)?;
             let targets: Vec<_> = hosts
                 .hosts
                 .iter()
@@ -3120,7 +3150,7 @@ async fn cmd_fleet(
             for host in &targets {
                 println!("--- {} ({}) ---", host.name, &host.node_id[..10]);
                 match mux::connect_to_host(
-                    config_dir,
+                    user_config_dir,
                     &host.name,
                     None,
                     &ClientMessage::RequestExec {
