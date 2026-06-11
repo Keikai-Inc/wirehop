@@ -80,6 +80,20 @@ struct NetDocMeta {
     self_namespace: Option<NamespaceId>,
 }
 
+/// Read the persisted warren namespace from a host config dir's `netdoc.json`,
+/// returning its canonical string form, or `None` if this host isn't on a
+/// warren (or the file is unreadable).
+///
+/// The namespace is stored as a `NamespaceId`, which serde encodes as a JSON
+/// byte array — not a string. Callers must deserialize the typed struct;
+/// pulling `["namespace"].as_str()` off the raw JSON always yields `None`.
+pub fn read_namespace(config_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(config_dir.join("netdoc.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<NetDocMeta>(&s).ok())
+        .map(|meta| meta.namespace.to_string())
+}
+
 /// A revocation entry: marks a peer as no longer authorized network-wide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Revocation {

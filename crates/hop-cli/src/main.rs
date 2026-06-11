@@ -130,14 +130,18 @@ async fn main() -> Result<()> {
             cmd_config(action, &host_config_dir)
         }
         Command::Warren { action } => {
-            // `warren join/status/leave` operate on the *daemon's* warren membership
-            // and use the host identity (the node that is actually on the warren),
-            // so they must target the host config dir — not the per-user client dir.
+            // `warren join/status` operate on the *daemon's* warren membership
+            // and target the host config dir — not the per-user client dir.
             // (Previously this used the client dir, so `warren status` reported
             // "not on a warren" on a machine whose daemon was on one.)
+            //
+            // Do NOT eagerly load the host identity here: `identity.json` is
+            // root-only (0600), so reading it fails for a non-root user on a
+            // machine running the daemon. `status` only reads group-readable
+            // state files and never needs the key; `join` loads it lazily, and
+            // only when it actually redeems an invite.
             let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_warren(secret_key, &config_dir, action).await
+            cmd_warren(&config_dir, action).await
         }
         Command::Acl { action } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
@@ -4505,7 +4509,6 @@ fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
 }
 
 async fn cmd_warren(
-    secret_key: iroh::SecretKey,
     config_dir: &std::path::Path,
     action: cli::WarrenAction,
 ) -> Result<()> {
@@ -4555,6 +4558,10 @@ async fn cmd_warren(
             // records us in the warren directory with our role).
             if let Some(tok) = redeem {
                 println!("Joining warren — redeeming invite for membership...");
+                // Load the identity lazily — only redeeming needs the key, so
+                // `status` (and ticket-only joins) never touch root-owned
+                // identity.json.
+                let secret_key = config::load_or_generate_identity(config_dir)?;
                 if let Err(e) =
                     cmd_exec(secret_key, &tok, config_dir, &["true".to_string()],
                         hop_core::sandbox::SandboxPolicy::default()).await
@@ -4611,11 +4618,11 @@ async fn cmd_warren(
             Ok(())
         }
         WarrenAction::Status => {
-            // Membership / namespace.
-            let ns = std::fs::read_to_string(config_dir.join("netdoc.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("namespace").and_then(|n| n.as_str()).map(String::from));
+            // Membership / namespace. netdoc.json stores the namespace as a
+            // NamespaceId (a JSON byte array), so use the typed reader rather
+            // than parsing it as a string (which always missed and reported
+            // "not on a warren" even for a host that was).
+            let ns = hop_core::netdoc::read_namespace(config_dir);
             let has_join = config_dir.join("netdoc-join.ticket").exists()
                 || config_dir.join("warren-ticket").exists();
             let vpn_enabled = hop_core::config::HostConfig::load(config_dir)
