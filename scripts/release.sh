@@ -122,7 +122,10 @@ if [[ -n "${NEW_VERSION}" ]]; then
   cargo check -p hop-cli --quiet
 
   echo "==> Committing version bump"
-  git -C "${PROJECT_ROOT}" add Cargo.toml
+  # Include Cargo.lock: the `cargo check` above rewrites the workspace crate
+  # versions in the lockfile, so committing only Cargo.toml leaves the lock a
+  # version behind and the next build dirties the tree (blocking the release).
+  git -C "${PROJECT_ROOT}" add Cargo.toml Cargo.lock
   git -C "${PROJECT_ROOT}" commit -m "Bump version to ${NEW_VERSION}"
 fi
 
