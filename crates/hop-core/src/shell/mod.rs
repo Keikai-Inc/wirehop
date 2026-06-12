@@ -162,6 +162,133 @@ impl InputReplay {
     }
 }
 
+/// A session PTY master: either locally spawned (the daemon is root, or the
+/// session runs as the daemon's own user) or created by the privsep monitor and
+/// handed to us as a raw master fd. The two share one I/O surface so the bridge
+/// loop is identical; only acquisition differs.
+#[cfg(unix)]
+enum SessionPty {
+    /// Worker spawned the PTY itself (current behavior).
+    Local(Box<dyn portable_pty::MasterPty + Send>),
+    /// privsep monitor spawned the (setuid) session; we own the master fd. The
+    /// monitor owns + reaps the child, so there's no local `Child` to wait — the
+    /// session ends when the master reads EOF.
+    Passed(std::fs::File),
+}
+
+#[cfg(unix)]
+impl SessionPty {
+    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+        match self {
+            SessionPty::Local(m) => m.try_clone_reader().map_err(|e| anyhow::anyhow!("{e}")),
+            SessionPty::Passed(f) => Ok(Box::new(f.try_clone().context("clone passed PTY master")?)),
+        }
+    }
+    fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+        match self {
+            SessionPty::Local(m) => m.take_writer().map_err(|e| anyhow::anyhow!("{e}")),
+            SessionPty::Passed(f) => Ok(Box::new(f.try_clone().context("clone passed PTY master")?)),
+        }
+    }
+    fn resize(&self, size: PtySize) -> Result<()> {
+        match self {
+            SessionPty::Local(m) => m.resize(size).map_err(|e| anyhow::anyhow!("{e}")),
+            SessionPty::Passed(f) => {
+                use std::os::fd::AsRawFd;
+                let ws = libc::winsize {
+                    ws_row: size.rows,
+                    ws_col: size.cols,
+                    ws_xpixel: size.pixel_width,
+                    ws_ypixel: size.pixel_height,
+                };
+                let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+                anyhow::ensure!(rc == 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Resolve the session command and acquire its PTY. Returns the master plus the
+/// local `Child` to wait on (`None` when the privsep monitor owns the child).
+///
+/// The privsep monitor is used exactly when this worker cannot itself switch
+/// users — it is unprivileged (`!root`) but a peer is bound to an account, so
+/// the `login`/`su` the worker built needs root. In every other case (daemon is
+/// root, or session runs as the worker's own user) the worker spawns locally,
+/// byte-identically to the pre-privsep path.
+#[cfg(unix)]
+fn acquire_session_pty(
+    sandbox: &crate::sandbox::SandboxPolicy,
+    shell: &str,
+    username: Option<&str>,
+    env_pairs: &[(String, String)],
+    size: PtySize,
+    broker_config: Option<&std::path::Path>,
+) -> Result<(SessionPty, Option<Box<dyn portable_pty::Child + Send + Sync>>)> {
+    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, shell, username, broker_config);
+
+    let via_monitor = username.is_some()
+        && !crate::unix_user::is_running_as_root()
+        && crate::privsep::is_privsep_worker();
+
+    if via_monitor {
+        let mut argv = Vec::with_capacity(1 + args.len());
+        argv.push(bin);
+        argv.extend(args);
+        let fd = crate::privsep::worker_spawn_session(
+            &argv,
+            env_pairs,
+            size.rows,
+            size.cols,
+            size.pixel_width,
+            size.pixel_height,
+            username,
+        )
+        .context("privsep monitor SpawnSession")?;
+        return Ok((SessionPty::Passed(std::fs::File::from(fd)), None));
+    }
+
+    let pair = native_pty_system().openpty(size).context("Failed to open PTY")?;
+    let mut cmd = CommandBuilder::new(&bin);
+    cmd.args(args.iter().map(|s| s.as_str()));
+    for (k, v) in env_pairs {
+        cmd.env(k, v);
+    }
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("Failed to spawn shell")?;
+    drop(pair.slave);
+    Ok((SessionPty::Local(pair.master), Some(child)))
+}
+
+/// Build the allowlisted environment for a session PTY from client-supplied
+/// vars, defaulting `TERM` for old clients. Shared by the local and monitor
+/// spawn paths so both apply the identical security allowlist.
+fn session_env_pairs(env_vars: &HashMap<String, String>) -> Vec<(String, String)> {
+    const ENV_ALLOWLIST: &[&str] = &[
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "COLORTERM",
+    ];
+    let mut pairs: Vec<(String, String)> = ENV_ALLOWLIST
+        .iter()
+        .filter_map(|k| env_vars.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    if !env_vars.contains_key("TERM") {
+        pairs.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    pairs
+}
+
 /// Host side: spawn a PTY and bridge I/O over the wire protocol.
 ///
 /// If `username` is `Some`, the shell runs as that Unix user via `login -fp`
@@ -226,12 +353,6 @@ pub async fn host_shell_session(
         }
     }
 
-    let pty_system = native_pty_system();
-
-    let pair = pty_system
-        .openpty(initial_size)
-        .context("Failed to open PTY")?;
-
     // Use the target user's login shell, not the daemon's $SHELL.
     #[cfg(unix)]
     let shell = match username {
@@ -241,72 +362,40 @@ pub async fn host_shell_session(
     #[cfg(not(unix))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
-    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
-    let mut cmd = CommandBuilder::new(&bin);
-    cmd.args(args.iter().map(|s| s.as_str()));
-    // Apply environment variables from client through a security allowlist
-    const ENV_ALLOWLIST: &[&str] = &[
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_COLLATE",
-        "LC_MESSAGES",
-        "LC_MONETARY",
-        "LC_NUMERIC",
-        "LC_TIME",
-        "COLORTERM",
-    ];
-    for key in ENV_ALLOWLIST {
-        if let Some(val) = env_vars.get(*key) {
-            cmd.env(key, val);
-        }
-    }
-    // Default TERM if not received (old client compat)
-    if !env_vars.contains_key("TERM") {
-        cmd.env("TERM", "xterm-256color");
-    }
+    let env_pairs = session_env_pairs(&env_vars);
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("Failed to spawn shell")?;
+    // Acquire the session PTY — locally, or (unprivileged worker + bound user)
+    // via the privsep monitor. `child` is the local process to wait on; `None`
+    // means the monitor owns + reaps it and we detect exit via master EOF.
+    let (session_pty, child) = acquire_session_pty(
+        sandbox,
+        &shell,
+        username,
+        &env_pairs,
+        initial_size,
+        broker_config,
+    )?;
 
-    // We're done with the slave side
-    drop(pair.slave);
-
-    let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-    let pty_writer = pair.master.take_writer().context("take PTY writer")?;
+    let pty_writer = session_pty.take_writer().context("take PTY writer")?;
 
     // Wrap the pty_writer in Arc<Mutex<>> for sharing between tasks
     let pty_writer = std::sync::Arc::new(std::sync::Mutex::new(pty_writer));
 
     // Keep master alive so PTY doesn't close
-    let _master = pair.master;
-
-    // Task: read from PTY -> send to client
-    let pty_writer_clone = pty_writer.clone();
-    let pty_to_client = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut buf = [0u8; 4096];
-        let output_buf = match pty_reader.read(&mut buf) {
-            Ok(0) => Vec::new(),
-            Ok(n) => buf[..n].to_vec(),
-            Err(e) => {
-                tracing::debug!("PTY read error: {e}");
-                Vec::new()
-            }
-        };
-        Ok(output_buf)
-    });
-
-    // Actually, let's use a channel-based approach instead
-    drop(pty_to_client);
-    drop(pty_writer_clone);
+    let _master = session_pty;
 
     // Channel for PTY output -> network
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Channel for PTY close notification
     let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+    // Route the single exit sender to exactly one owner: the local child waiter
+    // when we have a child, otherwise the reader task (which fires it on master
+    // EOF — the session-end signal when the privsep monitor owns the child).
+    let (child_waiter, mut eof_exit_tx) = match child {
+        Some(c) => (Some((c, exit_tx)), None),
+        None => (None, Some(exit_tx)),
+    };
 
     // Spawn blocking reader for PTY output
     let mut pty_reader2 = _master.try_clone_reader().context("clone PTY reader")?;
@@ -323,18 +412,22 @@ pub async fn host_shell_session(
                 Err(_) => break,
             }
         }
-    });
-
-    // Spawn blocking waiter for child exit
-    tokio::task::spawn_blocking(move || {
-        if let Ok(status) = child.wait() {
-            let code = status
-                .exit_code()
-                .try_into()
-                .unwrap_or(1);
-            let _ = exit_tx.send(code);
+        // Master EOF == session ended; report exit for the monitor-owned case.
+        if let Some(tx) = eof_exit_tx.take() {
+            let _ = tx.send(0);
         }
     });
+
+    // Spawn blocking waiter for the local child exit (absent when the monitor
+    // owns and reaps the child — see the EOF path above).
+    if let Some((mut child, exit_tx)) = child_waiter {
+        tokio::task::spawn_blocking(move || {
+            if let Ok(status) = child.wait() {
+                let code = status.exit_code().try_into().unwrap_or(1);
+                let _ = exit_tx.send(code);
+            }
+        });
+    }
 
     // Process any leftover message from the setup phase
     if let Some(msg) = leftover_msg {
@@ -477,7 +570,9 @@ pub fn check_shell_security(username: Option<&str>) -> Result<()> {
         if let Some(name) = username {
             unix_user::validate_username(name)?;
 
-            if !is_root {
+            // A non-root daemon can't switch users — except the privsep worker,
+            // which delegates the setuid spawn to its root monitor (SpawnSession).
+            if !is_root && !crate::privsep::is_privsep_worker() {
                 bail!(
                     "peer is bound to user '{name}' but hop host is not running as root — \
                      restart with `sudo hop host` to enable per-user shell sessions."
