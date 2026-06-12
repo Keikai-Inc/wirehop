@@ -110,9 +110,11 @@ pub async fn host_transfer_session(
         NegotiatedParams::legacy()
     };
 
-    // On unix running as root with a bound username, file I/O for the
-    // transfer is delegated to a privilege-separated helper process so
-    // it runs under the target user's kernel-enforced permissions. The
+    // On unix with a bound username, file I/O for the transfer is delegated to a
+    // privilege-separated helper process so it runs under the target user's
+    // kernel-enforced permissions — spawned directly when we're root, or via the
+    // privsep monitor (`SpawnHelper`) when we're the unprivileged worker, which
+    // can't switch to the bound user itself. The
     // arm bodies below intentionally do NOT early-return on the helper
     // path: we want helper errors to flow through the shared
     // TransferMsg::Error write below so the client sees a real message
@@ -121,7 +123,8 @@ pub async fn host_transfer_session(
         (TransferMode::Copy { .. }, TransferDirection::Push) => {
             // Client pushes files to us — we receive.
             #[cfg(unix)]
-            let arm_result = if crate::unix_user::is_running_as_root()
+            let arm_result = if (crate::unix_user::is_running_as_root()
+                || crate::privsep::is_privsep_worker())
                 && let Some(user) = username
             {
                 helper::proxy_via_helper(
@@ -138,7 +141,8 @@ pub async fn host_transfer_session(
             // Client pulls files from us — we send.
             let recursive = matches!(request.mode, TransferMode::Copy { recursive: true });
             #[cfg(unix)]
-            let arm_result = if crate::unix_user::is_running_as_root()
+            let arm_result = if (crate::unix_user::is_running_as_root()
+                || crate::privsep::is_privsep_worker())
                 && let Some(user) = username
             {
                 let send_mode = if recursive { "send-recursive" } else { "send" };
@@ -155,7 +159,8 @@ pub async fn host_transfer_session(
         (TransferMode::Sync, TransferDirection::Push) => {
             // Client sync-pushes to us.
             #[cfg(unix)]
-            let arm_result = if crate::unix_user::is_running_as_root()
+            let arm_result = if (crate::unix_user::is_running_as_root()
+                || crate::privsep::is_privsep_worker())
                 && let Some(user) = username
             {
                 helper::proxy_via_helper(
@@ -171,7 +176,8 @@ pub async fn host_transfer_session(
         (TransferMode::Sync, TransferDirection::Pull) => {
             // Client sync-pulls from us.
             #[cfg(unix)]
-            let arm_result = if crate::unix_user::is_running_as_root()
+            let arm_result = if (crate::unix_user::is_running_as_root()
+                || crate::privsep::is_privsep_worker())
                 && let Some(user) = username
             {
                 let mode = if request.delete_extraneous { "sync-send-delete" } else { "sync-send" };
