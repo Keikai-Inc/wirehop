@@ -37,6 +37,99 @@ pub fn control_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     .context("creating control socketpair")
 }
 
+/// The fixed, closed set of privileged operations the unprivileged worker may
+/// ask the root monitor to perform (privsep-node.md §4). Minimality here is the
+/// security argument: the monitor never exposes a general "run as root", only
+/// these typed, range/allowlist-validated primitives. Reused by both the full
+/// monitor/worker split and the lighter B-lite fallback.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MonitorRequest {
+    /// Create + configure a TUN at `vip` (must be in 100.64.0.0/10) and return
+    /// its fd. The monitor validates the range before touching the kernel.
+    CreateTun { vip: [u8; 4] },
+    /// Bind a UDP socket on `(addr, port)` and return its fd. The monitor
+    /// allowlists this to the node's own vip and port 53 (MagicDNS) only.
+    BindPrivPort { addr: [u8; 4], port: u16 },
+    // SpawnSession { user, … } is added in Phase 3 (move setuid into the monitor).
+}
+
+/// The monitor's reply. On `OkFd` a file descriptor follows as ancillary data
+/// (received with [`recv_fd`]); `Error` carries a human-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MonitorReply {
+    OkFd,
+    Error { message: String },
+}
+
+/// Cap on a single control message (defensive — these are tiny structs).
+const MAX_CTRL_MSG: usize = 64 * 1024;
+
+/// Write all of `buf` to a raw socket fd, looping over short writes.
+fn write_all(sock: RawFd, buf: &[u8]) -> Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe {
+            libc::write(sock, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("write to control socket");
+        }
+        if n == 0 {
+            anyhow::bail!("control socket closed mid-write");
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes from a raw socket fd.
+fn read_exact(sock: RawFd, buf: &mut [u8]) -> Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe {
+            libc::read(sock, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("read from control socket");
+        }
+        if n == 0 {
+            anyhow::bail!("control socket closed mid-read");
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+/// Send a length-prefixed, bincode-encoded control message.
+pub fn send_msg<T: serde::Serialize>(sock: RawFd, msg: &T) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .context("encoding control message")?;
+    anyhow::ensure!(bytes.len() <= MAX_CTRL_MSG, "control message too large");
+    write_all(sock, &(bytes.len() as u32).to_be_bytes())?;
+    write_all(sock, &bytes)
+}
+
+/// Receive a length-prefixed, bincode-encoded control message.
+pub fn recv_msg<T: serde::de::DeserializeOwned>(sock: RawFd) -> Result<T> {
+    let mut len_buf = [0u8; 4];
+    read_exact(sock, &mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    anyhow::ensure!(len <= MAX_CTRL_MSG, "control message length {len} exceeds cap");
+    let mut buf = vec![0u8; len];
+    read_exact(sock, &mut buf)?;
+    let (msg, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+        .context("decoding control message")?;
+    Ok(msg)
+}
+
 /// Send a single file descriptor over `sock` via `SCM_RIGHTS`, with one byte of
 /// in-band data (some platforms require ≥1 real byte alongside the ancillary
 /// data). The kernel duplicates `fd` into the receiver; the sender keeps its own
@@ -250,6 +343,21 @@ mod tests {
         // The original fd is still independently valid.
         let mut s2 = String::new();
         let _ = pr.read_to_string(&mut s2); // already drained via the dup; fine either way
+    }
+
+    /// Control messages frame + round-trip over the stream socketpair.
+    #[test]
+    fn control_protocol_round_trips() {
+        let (a, b) = control_socketpair().unwrap();
+        let req = MonitorRequest::CreateTun { vip: [100, 64, 0, 5] };
+        send_msg(a.as_raw_fd(), &req).unwrap();
+        let got: MonitorRequest = recv_msg(b.as_raw_fd()).unwrap();
+        assert_eq!(got, req);
+
+        let reply = MonitorReply::Error { message: "out of range".into() };
+        send_msg(b.as_raw_fd(), &reply).unwrap();
+        let got: MonitorReply = recv_msg(a.as_raw_fd()).unwrap();
+        assert_eq!(got, reply);
     }
 
     /// Receiving with no pending message is an error, not a panic/UB.
