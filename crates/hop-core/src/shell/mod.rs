@@ -1631,6 +1631,33 @@ async fn client_shell_loop(
     }
 }
 
+/// Where an exec session's exit code comes from: the local child (`wait()`), or
+/// — under privsep — the monitor's status pipe, which yields the 4-byte LE code
+/// when the monitor reaps the child.
+enum ExecExit {
+    Child(tokio::process::Child),
+    #[cfg(unix)]
+    Status(tokio::net::unix::pipe::Receiver),
+}
+
+impl ExecExit {
+    async fn code(&mut self) -> i32 {
+        match self {
+            ExecExit::Child(c) => c.wait().await.ok().and_then(|s| s.code()).unwrap_or(1),
+            #[cfg(unix)]
+            ExecExit::Status(r) => {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 4];
+                // EOF before 4 bytes (monitor died) → generic failure code.
+                match r.read_exact(&mut buf).await {
+                    Ok(_) => i32::from_le_bytes(buf),
+                    Err(_) => 1,
+                }
+            }
+        }
+    }
+}
+
 /// Host side: execute a command via pipes (no PTY) and stream output over the wire.
 pub async fn host_exec_session(
     mut send: SendStream,
@@ -1658,7 +1685,9 @@ pub async fn host_exec_session(
         if let Some(name) = username {
             unix_user::validate_username(name)?;
 
-            if !is_root {
+            // A non-root daemon can't switch users — except the privsep worker,
+            // which delegates the setuid exec to its root monitor (SpawnExec).
+            if !is_root && !crate::privsep::is_privsep_worker() {
                 bail!(
                     "peer is bound to user '{name}' but hop host is not running as root — \
                      restart with `sudo hop host` to enable per-user sessions."
@@ -1667,13 +1696,53 @@ pub async fn host_exec_session(
         }
     }
 
-    // Build the command with sandbox enforcement
-    let mut child = crate::sandbox::spawn_sandboxed_command(command, sandbox, username)
-        .context("Failed to spawn sandboxed command")?;
+    // Acquire the exec child's I/O — locally, or (unprivileged worker + bound
+    // user) via the privsep monitor (`SpawnExec`), which returns the three pipe
+    // fds plus a status pipe carrying the exit code. Both paths expose the same
+    // boxed async I/O so the bridge below is identical.
+    #[cfg(unix)]
+    let via_monitor = username.is_some()
+        && !crate::unix_user::is_running_as_root()
+        && crate::privsep::is_privsep_worker();
+    #[cfg(not(unix))]
+    let via_monitor = false;
 
-    let child_stdin = child.stdin.take();
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take();
+    let child_stdin: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>;
+    let child_stdout: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>;
+    let child_stderr: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>;
+    let mut exit: ExecExit;
+
+    #[cfg(unix)]
+    if via_monitor {
+        use tokio::net::unix::pipe;
+        let fds = crate::privsep::worker_spawn_exec(command, sandbox, username.unwrap())
+            .context("privsep monitor SpawnExec")?;
+        let mut it = fds.into_iter();
+        let stdin = it.next().context("SpawnExec missing stdin fd")?;
+        let stdout = it.next().context("SpawnExec missing stdout fd")?;
+        let stderr = it.next().context("SpawnExec missing stderr fd")?;
+        let status = it.next().context("SpawnExec missing status fd")?;
+        child_stdin = Some(Box::new(pipe::Sender::from_owned_fd(stdin)?));
+        child_stdout = Some(Box::new(pipe::Receiver::from_owned_fd(stdout)?));
+        child_stderr = Some(Box::new(pipe::Receiver::from_owned_fd(stderr)?));
+        exit = ExecExit::Status(pipe::Receiver::from_owned_fd(status)?);
+    } else {
+        let mut child = crate::sandbox::spawn_sandboxed_command(command, sandbox, username)
+            .context("Failed to spawn sandboxed command")?;
+        child_stdin = child.stdin.take().map(|s| Box::new(s) as _);
+        child_stdout = child.stdout.take().map(|s| Box::new(s) as _);
+        child_stderr = child.stderr.take().map(|s| Box::new(s) as _);
+        exit = ExecExit::Child(child);
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child = crate::sandbox::spawn_sandboxed_command(command, sandbox, username)
+            .context("Failed to spawn sandboxed command")?;
+        child_stdin = child.stdin.take().map(|s| Box::new(s) as _);
+        child_stdout = child.stdout.take().map(|s| Box::new(s) as _);
+        child_stderr = child.stderr.take().map(|s| Box::new(s) as _);
+        exit = ExecExit::Child(child);
+    }
 
     let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(64);
 
@@ -1743,9 +1812,9 @@ pub async fn host_exec_session(
                 }
             }
             None => {
-                // Both stdout and stderr finished — wait for child exit
-                let status = child.wait().await.context("Failed to wait for child")?;
-                let code = status.code().unwrap_or(1);
+                // Both stdout and stderr finished — collect the exit code (from
+                // the local child, or the monitor's status pipe under privsep).
+                let code = exit.code().await;
                 let _ = proto::write_message(&mut send, &HostMessage::Exit(code)).await;
                 clean_exit = true;
                 break;

@@ -27,6 +27,75 @@ pub use validator::{ValidationError, validate_command};
 
 use std::process::Stdio;
 
+/// Build a **synchronous** `std::process::Command` for an exec session as a
+/// bound user, with the OS-native sandbox applied — the privsep monitor's
+/// counterpart to [`build_exec_command`] (which is tokio-based and needs a
+/// runtime the monitor doesn't have). Only the `Some(user)` case exists: the
+/// monitor is invoked for exec exactly when a peer is bound to a user that the
+/// unprivileged worker can't switch to itself. stdio is piped so the monitor can
+/// hand the pipe fds to the worker. Mirrors `build_exec_command` branch-for-branch.
+#[cfg(unix)]
+pub fn build_exec_command_std(
+    cmd: &str,
+    policy: &SandboxPolicy,
+    user: &str,
+) -> std::process::Command {
+    let user_shell = crate::unix_user::user_login_shell(user);
+    let wrapped = with_rc_source(cmd, &user_shell);
+
+    #[cfg(target_os = "macos")]
+    {
+        // Broker-safe (setuid monitoring tools) and unsandboxed both run the
+        // command directly under the user's login shell; restricted wraps it in
+        // sandbox-exec, exactly as build_exec_command does.
+        let first_word = cmd.split_whitespace().next().unwrap_or("");
+        let cmd_name = std::path::Path::new(first_word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first_word);
+        let mut command = std::process::Command::new("login");
+        if policy.is_restricted() && !broker::is_broker_safe(cmd_name) {
+            let profile = macos::generate_sbpl_profile(policy);
+            command
+                .args(["-fpq", user, "/usr/bin/sandbox-exec", "-p"])
+                .arg(&profile)
+                .args([&user_shell, "-lc", &wrapped]);
+        } else {
+            command.args(["-fpq", user, &user_shell, "-lc", &wrapped]);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("su");
+        if policy.is_restricted() {
+            let policy_clone = policy.clone();
+            command.args(["-", user, "-c", cmd]);
+            // SAFETY: apply_sandbox is async-signal-safe (prctl/landlock syscalls
+            // only); runs in the forked child after su drops to the user.
+            unsafe {
+                command.pre_exec(move || {
+                    linux::apply_sandbox(&policy_clone)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+                });
+            }
+        } else {
+            command.args(["-", user, "-s", &user_shell, "-c", &wrapped]);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+}
+
 /// Spawn a sandboxed command (non-PTY exec session).
 ///
 /// Validates the command against the policy, then spawns it under the

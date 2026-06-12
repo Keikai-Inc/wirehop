@@ -42,7 +42,9 @@ pub fn control_socketpair() -> Result<(OwnedFd, OwnedFd)> {
 /// security argument: the monitor never exposes a general "run as root", only
 /// these typed, range/allowlist-validated primitives. Reused by both the full
 /// monitor/worker split and the lighter B-lite fallback.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// `Eq` is intentionally omitted: SpawnExec carries a SandboxPolicy, which is
+// only `PartialEq`. Tests compare with `assert_eq!`, which needs only PartialEq.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MonitorRequest {
     /// Create + configure a TUN at `vip` (must be in 100.64.0.0/10) and return
     /// its fd. The monitor validates the range before touching the kernel.
@@ -66,6 +68,17 @@ pub enum MonitorRequest {
         pixel_width: u16,
         pixel_height: u16,
         username: Option<String>,
+    },
+    /// Spawn a non-PTY exec command as `username` under the sandbox `policy`, and
+    /// return four fds (stdin-write, stdout-read, stderr-read, status-read). The
+    /// monitor builds the privileged command itself (it must apply the Linux
+    /// sandbox `pre_exec`, which can't cross the wire), reaps the child, and
+    /// writes the 4-byte exit code to the status pipe on exit — so the worker
+    /// gets the exit code out-of-band without a second control reply.
+    SpawnExec {
+        cmd: String,
+        policy: crate::sandbox::SandboxPolicy,
+        username: String,
     },
 }
 
@@ -481,6 +494,39 @@ pub fn monitor_spawn_session(
     Ok((owned, child))
 }
 
+/// Monitor side of `SpawnExec`: validate, build + spawn the privileged exec
+/// command (with the OS sandbox applied) as the bound user, and return the four
+/// fds the worker bridges — `[stdin-write, stdout-read, stderr-read,
+/// status-read]` — plus the child and the status-pipe write end. The caller
+/// (the monitor loop) passes the fds, then spawns a reaper that `wait()`s the
+/// child and writes the 4-byte exit code (LE) to the status pipe.
+pub fn monitor_spawn_exec(
+    cmd: &str,
+    policy: &crate::sandbox::SandboxPolicy,
+    username: &str,
+) -> Result<(Vec<OwnedFd>, std::process::Child, OwnedFd)> {
+    anyhow::ensure!(
+        crate::unix_user::validate_username(username).is_ok(),
+        "SpawnExec: invalid username {username:?}"
+    );
+    // Mirror spawn_sandboxed_command's layer-1 validation before spawning.
+    if policy.is_restricted() {
+        crate::sandbox::validate_command(cmd, policy)
+            .map_err(|e| anyhow::anyhow!("SpawnExec: command rejected by policy: {e}"))?;
+    }
+
+    let mut command = crate::sandbox::build_exec_command_std(cmd, policy, username);
+    let mut child = command.spawn().context("monitor spawn exec command")?;
+
+    let stdin = OwnedFd::from(child.stdin.take().context("exec child has no stdin")?);
+    let stdout = OwnedFd::from(child.stdout.take().context("exec child has no stdout")?);
+    let stderr = OwnedFd::from(child.stderr.take().context("exec child has no stderr")?);
+    let (status_r, status_w) = nix::unistd::pipe().context("status pipe")?;
+
+    tracing::info!(user = username, "privsep monitor: spawned exec, passing 4 fds to worker");
+    Ok((vec![stdin, stdout, stderr, status_r], child, status_w))
+}
+
 // ── Worker side: acquire the TUN from the monitor ───────────────────────────
 
 /// The control-socket fd the monitor passed us, if we are a privsep worker.
@@ -554,6 +600,30 @@ pub fn worker_spawn_session(
         MonitorReply::OkFd => recv_fd(ctrl),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnSession: {message}")
+        }
+    }
+}
+
+/// Worker side of `SpawnExec`: ask the monitor to run `cmd` as `username` under
+/// `policy` and return the four fds `[stdin-write, stdout-read, stderr-read,
+/// status-read]`. The status fd yields the 4-byte LE exit code when the child
+/// exits. Only meaningful in privsep-worker mode.
+pub fn worker_spawn_exec(
+    cmd: &str,
+    policy: &crate::sandbox::SandboxPolicy,
+    username: &str,
+) -> Result<Vec<OwnedFd>> {
+    let ctrl = worker_control_fd().context("worker_spawn_exec called outside privsep worker")?;
+    let req = MonitorRequest::SpawnExec {
+        cmd: cmd.to_string(),
+        policy: policy.clone(),
+        username: username.to_string(),
+    };
+    send_msg(ctrl, &req).context("requesting SpawnExec from monitor")?;
+    match recv_msg::<MonitorReply>(ctrl)? {
+        MonitorReply::OkFd => recv_fds(ctrl, 4),
+        MonitorReply::Error { message } => {
+            anyhow::bail!("privsep monitor refused SpawnExec: {message}")
         }
     }
 }
@@ -796,6 +866,35 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                 }
                 Err(e) => {
                     tracing::warn!("privsep monitor: SpawnSession denied: {e:#}");
+                    let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                }
+            },
+            MonitorRequest::SpawnExec {
+                cmd,
+                policy,
+                username,
+            } => match monitor_spawn_exec(&cmd, &policy, &username) {
+                Ok((fds, child, status_w)) => {
+                    let raws: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+                    if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
+                        && send_fds(mon_fd, &raws).is_ok()
+                    {
+                        // Reap the child off-thread and report the exit code on
+                        // the status pipe; the worker (holding dups of the I/O
+                        // fds) reads it after stdout/stderr EOF.
+                        std::thread::spawn(move || {
+                            use std::io::Write;
+                            let mut child = child;
+                            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                            let mut sw = std::fs::File::from(status_w);
+                            let _ = sw.write_all(&code.to_le_bytes());
+                            // sw drops → close → worker sees 4 bytes then EOF.
+                        });
+                    }
+                    // The monitor's fd copies drop here; the worker has dups.
+                }
+                Err(e) => {
+                    tracing::warn!("privsep monitor: SpawnExec denied: {e:#}");
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
