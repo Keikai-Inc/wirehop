@@ -39,6 +39,8 @@ docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates jq iputils-ping iproute2 procps && rm -rf /var/lib/apt/lists/*
+# Phase 2: the unprivileged service account the worker drops to (HOP_PRIVSEP_DROP).
+RUN useradd -r -M -s /usr/sbin/nologin hop
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
 DOCKERFILE
@@ -47,10 +49,14 @@ docker network create "$NET" >/dev/null
 docker volume create "$VOL" >/dev/null
 
 # HOP_PRIVSEP=1 turns each `hop host` into a monitor that spawns the worker.
+# HOP_PRIVSEP_DROP=1 (Phase 2) drops that worker to the unprivileged `hop` user;
+# the monitor re-owns /cfg first so the worker reads its own secrets. This also
+# proves the Phase-0 feasibility on Linux for a NON-root worker: it does all TUN
+# data-plane I/O on the monitor-passed fd while running as `hop`.
 # HOP_VPN=1 opts into the warren VPN; the containers grant TUN + NET_ADMIN.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
         -v "$VOL:/shared" -e RUST_LOG="${HOP_E2E_LOG:-hop=info,hop_core=info}"
-        -e HOP_VPN=1 -e HOP_PRIVSEP=1 --user root)
+        -e HOP_VPN=1 -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1 --user root)
 
 echo "=== starting host-a (warren owner, privsep) ==="
 docker run -d --name hop-ps-a "${COMMON[@]}" "$IMG" bash -c '
@@ -105,6 +111,16 @@ for c in hop-ps-a hop-ps-b; do
     done' 2>/dev/null | head -1 || true)
   if [ -n "$WORKER_PID" ]; then
     echo "  $c: worker PID $WORKER_PID has HOP_PRIVSEP_WORKER=1 (monitor/worker split OK)"
+    # Phase 2: the worker must run as the unprivileged `hop` user, not root.
+    WUID=$(docker exec "$c" bash -c "awk '/^Uid:/{print \$2}' /proc/$WORKER_PID/status" 2>/dev/null | head -1 || echo "?")
+    HOPUID=$(docker exec "$c" id -u hop 2>/dev/null || echo "")
+    if [ -n "$HOPUID" ] && [ "$WUID" = "$HOPUID" ]; then
+      echo "  $c: worker runs as hop (uid=$WUID, non-root) — privilege drop OK"
+    else
+      echo "  $c: FAIL — worker uid=$WUID, expected hop uid=$HOPUID (privilege drop did not take)"
+      docker exec "$c" grep -i "privsep" /cfg/log | tail -10 || true
+      RC=1
+    fi
   else
     echo "  $c: FAIL — no worker process carrying HOP_PRIVSEP_WORKER found (procs: $NPROC)"
     docker exec "$c" bash -c 'ps -ef | grep -i hop | grep -v grep' || true

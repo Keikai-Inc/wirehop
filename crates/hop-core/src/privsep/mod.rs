@@ -386,6 +386,111 @@ pub async fn acquire_tun(addr: std::net::Ipv4Addr) -> Result<tun::AsyncDevice> {
     }
 }
 
+// ── Phase 2: service user (`_hop`) & privilege drop ─────────────────────────
+
+/// The unprivileged service account the worker runs as: `_hop` on macOS
+/// (Apple's `_`-prefixed daemon-user convention), `hop` on Linux.
+pub const SERVICE_USER: &str = if cfg!(target_os = "macos") {
+    "_hop"
+} else {
+    "hop"
+};
+
+/// Resolve the service user's `(uid, gid)`, if the account exists. Returns
+/// `None` when it hasn't been created (install-time step) — the caller then
+/// keeps the worker as root (Phase-1 behavior) rather than failing.
+pub fn service_user_ids() -> Option<(u32, u32)> {
+    match nix::unistd::User::from_name(SERVICE_USER) {
+        Ok(Some(u)) => Some((u.uid.as_raw(), u.gid.as_raw())),
+        _ => None,
+    }
+}
+
+/// Re-own the daemon config dir to the service user so the (soon-unprivileged)
+/// worker can read its own identity/tickets/datastore. Runs as root in the
+/// monitor before the worker is spawned; idempotent. Permissions are unchanged
+/// (files stay `0600`/dirs `0700`), so only the service user and root can read
+/// the secrets — the threat model's "other local users" still cannot. Best
+/// effort per entry: a chown failure on one path is logged, not fatal.
+fn migrate_config_ownership(dir: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let want_uid = nix::unistd::Uid::from_raw(uid);
+    let want_gid = nix::unistd::Gid::from_raw(gid);
+    let mut stack = vec![dir.to_path_buf()];
+    let mut changed = 0usize;
+    while let Some(path) = stack.pop() {
+        // Use symlink_metadata so we chown the link itself, never follow it out
+        // of the config tree.
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("privsep: stat {} failed: {e}", path.display());
+                continue;
+            }
+        };
+        if md.uid() != uid || md.gid() != gid {
+            if let Err(e) = nix::unistd::fchownat(
+                None,
+                &path,
+                Some(want_uid),
+                Some(want_gid),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                tracing::warn!("privsep: chown {} failed: {e}", path.display());
+            } else {
+                changed += 1;
+            }
+        }
+        if md.file_type().is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    for ent in entries.flatten() {
+                        stack.push(ent.path());
+                    }
+                }
+                Err(e) => tracing::warn!("privsep: readdir {} failed: {e}", path.display()),
+            }
+        }
+    }
+    tracing::info!(
+        "privsep: config ownership migrated to {SERVICE_USER} ({changed} path(s) re-owned)"
+    );
+    Ok(())
+}
+
+/// Install the privilege drop on the worker command: as root in the forked
+/// child (before `exec`), set supplementary groups for the service user, then
+/// `setgid`, then `setuid` — the canonical order (groups before uid, since
+/// dropping uid first would forbid the later setgid). Errors abort the child so
+/// a half-dropped worker never execs.
+fn apply_privilege_drop(cmd: &mut std::process::Command, username: &str, uid: u32, gid: u32) {
+    use std::os::unix::process::CommandExt;
+    let user_c = match std::ffi::CString::new(username) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // initgroups' `basegroup` is `c_int` on Apple but `gid_t` on Linux.
+    #[cfg(target_os = "macos")]
+    let basegroup = gid as libc::c_int;
+    #[cfg(not(target_os = "macos"))]
+    let basegroup = gid as libc::gid_t;
+    unsafe {
+        cmd.pre_exec(move || {
+            // initgroups(_hop, gid): supplementary groups for the service user.
+            if libc::initgroups(user_c.as_ptr(), basegroup) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(gid as libc::gid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid as libc::uid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 // ── Monitor side: supervise the worker, serve privileged primitives ─────────
 
 /// Run the privilege-separation **monitor** (privsep-node.md §3). Spawns the
@@ -411,7 +516,31 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     }
     cmd.env("HOP_PRIVSEP_WORKER", "1")
         .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string());
-    // Phase 2 adds `.uid(_hop).gid(_hop)` here.
+
+    // Phase 2: drop the worker to the `_hop` service user. Gated on
+    // HOP_PRIVSEP_DROP (separate from HOP_PRIVSEP) because a dropped worker
+    // cannot host other-user sessions until Phase 3's SpawnSession lands — so
+    // until then the default (HOP_PRIVSEP alone) keeps the worker as root and
+    // only moves *who creates the TUN*. When enabled and the service user
+    // exists, re-own the config so the worker reads its own secrets, then drop.
+    if std::env::var_os("HOP_PRIVSEP_DROP").is_some() {
+        match service_user_ids() {
+            Some((uid, gid)) => {
+                migrate_config_ownership(config_dir, uid, gid)?;
+                apply_privilege_drop(&mut cmd, SERVICE_USER, uid, gid);
+                tracing::info!(
+                    "privsep monitor: worker will drop to {SERVICE_USER} (uid={uid}, gid={gid})"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "privsep monitor: HOP_PRIVSEP_DROP set but service user {SERVICE_USER} does not \
+                     exist; worker stays root (create it at install time)"
+                );
+            }
+        }
+    }
+
     let mut child = cmd.spawn().context("spawning privsep worker")?;
     drop(wrk); // only the worker needs that end
     tracing::info!(
