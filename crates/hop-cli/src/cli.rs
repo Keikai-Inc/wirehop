@@ -303,6 +303,27 @@ pub enum Command {
     #[command(name = "__ps", hide = true)]
     Ps,
 
+    /// Internal: privilege-separation feasibility gate (privsep-node.md §8.1).
+    /// Run as root (e.g. `sudo hop __privsep-probe`); creates a TUN, hands the
+    /// fd to a non-root child, and reports whether non-root TUN I/O is permitted.
+    #[command(name = "__privsep-probe", hide = true)]
+    PrivsepProbe {
+        /// Unprivileged uid the child drops to (default: $SUDO_UID).
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Unprivileged gid the child drops to (default: $SUDO_GID).
+        #[arg(long)]
+        gid: Option<u32>,
+    },
+
+    /// Internal: child half of the privsep probe — receives the TUN fd and
+    /// tests non-root I/O. Spawned by `__privsep-probe`; not run directly.
+    #[command(name = "__privsep-probe-child", hide = true)]
+    PrivsepProbeChild {
+        #[arg(long = "sock-fd")]
+        sock_fd: i32,
+    },
+
     /// Internal: install + start the hop system daemon from embedded templates
     /// (launchd on macOS, systemd on Linux). Must run as root. Invoked under the
     /// self-upgrade `sudo` after the unprivileged user has decoded the invite and

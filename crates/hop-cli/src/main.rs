@@ -247,6 +247,16 @@ async fn main() -> Result<()> {
                 stage, vpn, tier, default_role, tags, promote_from, no_promote,
             })
         }
+        #[cfg(unix)]
+        Command::PrivsepProbe { uid, gid } => cmd_privsep_probe(uid, gid),
+        #[cfg(unix)]
+        Command::PrivsepProbeChild { sock_fd } => {
+            std::process::exit(hop_core::privsep::run_tun_fd_probe_child(sock_fd));
+        }
+        #[cfg(not(unix))]
+        Command::PrivsepProbe { .. } | Command::PrivsepProbeChild { .. } => {
+            anyhow::bail!("privsep probe is unix-only")
+        }
         Command::TransferHelper { mode, dest, compression, chunk_size } => {
             cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
         }
@@ -1929,6 +1939,35 @@ fn cmd_install_daemon(args: InstallDaemonArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run the privsep Phase-0 feasibility gate (privsep-node.md §8.1). Resolves an
+/// unprivileged uid/gid (defaulting to the invoking user via `$SUDO_UID`),
+/// creates a TUN as root, and reports whether a non-root process can do I/O on
+/// the passed fd — the decision point for the whole privilege-separated design.
+#[cfg(unix)]
+fn cmd_privsep_probe(uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    let uid = uid
+        .or_else(|| std::env::var("SUDO_UID").ok().and_then(|s| s.parse().ok()))
+        .context("could not determine an unprivileged uid — pass --uid, or run via sudo so $SUDO_UID is set")?;
+    let gid = gid
+        .or_else(|| std::env::var("SUDO_GID").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(uid);
+    anyhow::ensure!(uid != 0, "refusing to probe with uid 0 — the child must be unprivileged");
+
+    println!("privsep Phase-0 gate: creating a TUN as root; testing fd I/O as uid={uid} gid={gid} …");
+    if hop_core::privsep::run_tun_fd_probe(uid, gid)? {
+        println!();
+        println!("PASS — a non-root process read/wrote the root-created TUN fd.");
+        println!("The privilege-separated node design (privsep-node.md, option B) is viable here.");
+        Ok(())
+    } else {
+        println!();
+        println!("FAIL — the kernel denied non-root I/O on the passed TUN fd.");
+        println!("B-full is not viable as designed; fall back to B-lite (packet I/O stays in the");
+        println!("root monitor) or option A (userspace netstack). See privsep-node.md §8.1/§10.");
+        anyhow::bail!("privsep Phase-0 gate failed")
+    }
 }
 
 fn cmd_ps() -> Result<()> {

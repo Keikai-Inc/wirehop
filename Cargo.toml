@@ -63,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # System
 libc = "0.2"
-nix = { version = "0.29", features = ["user", "net", "term", "signal", "process", "fs"] }
+nix = { version = "0.29", features = ["user", "net", "term", "signal", "process", "fs", "socket", "uio"] }
 users = "0.11"
 hostname = "0.4"
 filetime = "0.2"
