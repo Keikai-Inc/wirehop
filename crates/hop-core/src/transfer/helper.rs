@@ -61,50 +61,77 @@ pub async fn proxy_via_helper(
     helper_args.push("--chunk-size".to_string());
     helper_args.push(params.max_chunk_size.to_string());
 
-    // On macOS, route through `login -fpq` so the child gets a real user
-    // session (fresh audit session id, setlogin, PAM setup). A bare setuid
-    // from launchd's root audit session leaves filesystem access blocked
-    // on user-owned files — the same reason `hop on <host>` uses `login -fp`
-    // to spawn shells. `-q` suppresses the "Last login" banner so it doesn't
-    // corrupt our stdout IPC framing.
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("/usr/bin/login");
-        c.arg("-fpq").arg(username).arg(&exe).args(&helper_args);
-        c
-    };
+    // Acquire the helper's I/O. When this worker is unprivileged (privsep), it
+    // can't switch users, so the root monitor spawns the helper (`SpawnHelper`)
+    // and hands back the pipe fds + a status fd; otherwise spawn it locally.
+    let via_monitor =
+        !crate::unix_user::is_running_as_root() && crate::privsep::is_privsep_worker();
 
-    // Linux has no audit-session axis, so uid/gid drop + initgroups is
-    // sufficient.
-    #[cfg(not(target_os = "macos"))]
-    let mut cmd = {
-        let (uid, gid) = lookup_uid_gid(username)?;
-        let username_for_pre_exec = username.to_string();
-        let mut c = tokio::process::Command::new(&exe);
-        c.args(&helper_args).uid(uid).gid(gid);
-        unsafe {
-            c.pre_exec(move || {
-                let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                libc::initgroups(c_name.as_ptr(), gid as _);
-                Ok(())
-            });
-        }
-        c
-    };
+    let child_stdin: Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+    let child_stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+    let mut exit: HelperExit;
+    let child_pid;
 
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        // If the parent future is dropped (cancellation, panic, connection
-        // torn down), ensure the child is SIGKILLed instead of orphaned.
-        .kill_on_drop(true);
+    if via_monitor {
+        use tokio::net::unix::pipe;
+        let mut argv = vec![exe.to_string_lossy().to_string()];
+        argv.extend(helper_args);
+        let fds = crate::privsep::worker_spawn_helper(&argv, username)
+            .context("privsep monitor SpawnHelper")?;
+        let mut it = fds.into_iter();
+        let stdin = it.next().context("SpawnHelper missing stdin fd")?;
+        let stdout = it.next().context("SpawnHelper missing stdout fd")?;
+        let status = it.next().context("SpawnHelper missing status fd")?;
+        child_stdin = Box::new(pipe::Sender::from_owned_fd(stdin)?);
+        child_stdout = Box::new(pipe::Receiver::from_owned_fd(stdout)?);
+        exit = HelperExit::Status(pipe::Receiver::from_owned_fd(status)?);
+        child_pid = None;
+    } else {
+        // On macOS, route through `login -fpq` so the child gets a real user
+        // session (fresh audit session id, setlogin, PAM setup). A bare setuid
+        // from launchd's root audit session leaves filesystem access blocked
+        // on user-owned files — the same reason `hop on <host>` uses `login -fp`
+        // to spawn shells. `-q` suppresses the "Last login" banner so it doesn't
+        // corrupt our stdout IPC framing.
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("/usr/bin/login");
+            c.arg("-fpq").arg(username).arg(&exe).args(&helper_args);
+            c
+        };
 
-    let mut child = cmd.spawn().context("failed to spawn transfer helper")?;
-    let child_pid = child.id();
+        // Linux has no audit-session axis, so uid/gid drop + initgroups is
+        // sufficient.
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = {
+            let (uid, gid) = lookup_uid_gid(username)?;
+            let username_for_pre_exec = username.to_string();
+            let mut c = tokio::process::Command::new(&exe);
+            c.args(&helper_args).uid(uid).gid(gid);
+            unsafe {
+                c.pre_exec(move || {
+                    let c_name = std::ffi::CString::new(username_for_pre_exec.as_str())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    libc::initgroups(c_name.as_ptr(), gid as _);
+                    Ok(())
+                });
+            }
+            c
+        };
 
-    let child_stdin = child.stdin.take().context("no child stdin")?;
-    let child_stdout = child.stdout.take().context("no child stdout")?;
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            // If the parent future is dropped (cancellation, panic, connection
+            // torn down), ensure the child is SIGKILLed instead of orphaned.
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().context("failed to spawn transfer helper")?;
+        child_pid = child.id();
+        child_stdin = Box::new(child.stdin.take().context("no child stdin")?);
+        child_stdout = Box::new(child.stdout.take().context("no child stdout")?);
+        exit = HelperExit::Child(child);
+    }
 
     // Monotonic counter bumped on every successful read or write in either
     // direction. The watchdog reads it to detect a stuck proxy.
@@ -147,17 +174,50 @@ pub async fn proxy_via_helper(
                 "transfer helper (pid={child_pid:?}) idle > {}s; killing",
                 PROXY_IDLE_TIMEOUT.as_secs()
             );
-            let _ = child.kill().await;
+            exit.kill().await;
             bail!("transfer helper idle timeout");
         }
     }
 
-    let status = child.wait().await.context("failed to wait for transfer helper")?;
-    if !status.success() {
-        bail!("transfer helper exited with {status}");
+    let code = exit.code().await;
+    if code != 0 {
+        bail!("transfer helper exited with code {code}");
     }
 
     Ok(())
+}
+
+/// Where a transfer helper's exit comes from: the local child, or — under
+/// privsep — the monitor's status pipe (4-byte LE exit code written on reap).
+#[cfg(unix)]
+enum HelperExit {
+    Child(tokio::process::Child),
+    Status(tokio::net::unix::pipe::Receiver),
+}
+
+#[cfg(unix)]
+impl HelperExit {
+    /// Best-effort kill on idle timeout. The monitor-owned child can't be killed
+    /// directly; dropping our fds (on return) closes its stdin → the helper sees
+    /// EOF and exits.
+    async fn kill(&mut self) {
+        if let HelperExit::Child(c) = self {
+            let _ = c.kill().await;
+        }
+    }
+    async fn code(&mut self) -> i32 {
+        match self {
+            HelperExit::Child(c) => c.wait().await.ok().and_then(|s| s.code()).unwrap_or(1),
+            HelperExit::Status(r) => {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 4];
+                match r.read_exact(&mut buf).await {
+                    Ok(_) => i32::from_le_bytes(buf),
+                    Err(_) => 1,
+                }
+            }
+        }
+    }
 }
 
 /// `tokio::io::copy` equivalent that bumps `activity` on every successful

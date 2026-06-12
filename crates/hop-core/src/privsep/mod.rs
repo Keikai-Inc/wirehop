@@ -80,6 +80,16 @@ pub enum MonitorRequest {
         policy: crate::sandbox::SandboxPolicy,
         username: String,
     },
+    /// Spawn the trusted file-transfer helper (`hop __transfer-helper …`, the
+    /// worker-built `argv`) as `username`, with stdin/stdout piped and stderr
+    /// inherited. Returns three fds (stdin-write, stdout-read, status-read). No
+    /// sandbox policy — the helper is hop's own code; the monitor applies only
+    /// the user switch (login on macOS, uid/gid+initgroups on Linux). `argv[0]`
+    /// must be the hop executable running `__transfer-helper`.
+    SpawnHelper {
+        argv: Vec<String>,
+        username: String,
+    },
 }
 
 /// The monitor's reply. On `OkFd` a file descriptor follows as ancillary data
@@ -527,6 +537,76 @@ pub fn monitor_spawn_exec(
     Ok((vec![stdin, stdout, stderr, status_r], child, status_w))
 }
 
+/// Validate a `SpawnHelper`: `argv[0]` must be the running hop executable, the
+/// next arg must be the `__transfer-helper` subcommand (so the worker can't make
+/// the monitor run an arbitrary program as the user), and the username valid.
+fn validate_spawn_helper(argv: &[String], username: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving current exe")?;
+    let bin = argv.first().context("SpawnHelper: empty argv")?;
+    anyhow::ensure!(
+        std::path::Path::new(bin) == exe,
+        "SpawnHelper: argv[0] {bin:?} is not this hop executable"
+    );
+    anyhow::ensure!(
+        argv.get(1).map(String::as_str) == Some("__transfer-helper"),
+        "SpawnHelper: not a __transfer-helper invocation"
+    );
+    anyhow::ensure!(
+        crate::unix_user::validate_username(username).is_ok(),
+        "SpawnHelper: invalid username {username:?}"
+    );
+    Ok(())
+}
+
+/// Monitor side of `SpawnHelper`: spawn the trusted transfer helper as the bound
+/// user (login on macOS, uid/gid+initgroups on Linux), stdin/stdout piped and
+/// stderr inherited, and return `[stdin-write, stdout-read, status-read]` plus
+/// the child and status-pipe write end (the loop reaps + reports the exit code).
+pub fn monitor_spawn_helper(
+    argv: &[String],
+    username: &str,
+) -> Result<(Vec<OwnedFd>, std::process::Child, OwnedFd)> {
+    use std::process::Stdio;
+    validate_spawn_helper(argv, username)?;
+
+    let mut command;
+    #[cfg(target_os = "macos")]
+    {
+        // login -fpq <user> <exe> <helper args…> — a real user/audit session.
+        command = std::process::Command::new("/usr/bin/login");
+        command.arg("-fpq").arg(username).args(argv);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::process::CommandExt;
+        let (uid, gid) = crate::transfer::lookup_uid_gid(username)?;
+        command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]).uid(uid).gid(gid);
+        let user_c = std::ffi::CString::new(username)
+            .map_err(|e| anyhow::anyhow!("username NUL: {e}"))?;
+        // SAFETY: initgroups is a single syscall, async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                libc::initgroups(user_c.as_ptr(), gid as _);
+                Ok(())
+            });
+        }
+    }
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = command.spawn().context("monitor spawn transfer helper")?;
+
+    let stdin = OwnedFd::from(child.stdin.take().context("helper has no stdin")?);
+    let stdout = OwnedFd::from(child.stdout.take().context("helper has no stdout")?);
+    let (status_r, status_w) = nix::unistd::pipe().context("status pipe")?;
+
+    tracing::info!(user = username, "privsep monitor: spawned transfer helper, passing 3 fds");
+    Ok((vec![stdin, stdout, status_r], child, status_w))
+}
+
 // ── Worker side: acquire the TUN from the monitor ───────────────────────────
 
 /// The control-socket fd the monitor passed us, if we are a privsep worker.
@@ -624,6 +704,23 @@ pub fn worker_spawn_exec(
         MonitorReply::OkFd => recv_fds(ctrl, 4),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnExec: {message}")
+        }
+    }
+}
+
+/// Worker side of `SpawnHelper`: ask the monitor to run the transfer helper
+/// `argv` as `username` and return `[stdin-write, stdout-read, status-read]`.
+pub fn worker_spawn_helper(argv: &[String], username: &str) -> Result<Vec<OwnedFd>> {
+    let ctrl = worker_control_fd().context("worker_spawn_helper called outside privsep worker")?;
+    let req = MonitorRequest::SpawnHelper {
+        argv: argv.to_vec(),
+        username: username.to_string(),
+    };
+    send_msg(ctrl, &req).context("requesting SpawnHelper from monitor")?;
+    match recv_msg::<MonitorReply>(ctrl)? {
+        MonitorReply::OkFd => recv_fds(ctrl, 3),
+        MonitorReply::Error { message } => {
+            anyhow::bail!("privsep monitor refused SpawnHelper: {message}")
         }
     }
 }
@@ -898,6 +995,28 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
+            MonitorRequest::SpawnHelper { argv, username } => {
+                match monitor_spawn_helper(&argv, &username) {
+                    Ok((fds, child, status_w)) => {
+                        let raws: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+                        if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
+                            && send_fds(mon_fd, &raws).is_ok()
+                        {
+                            std::thread::spawn(move || {
+                                use std::io::Write;
+                                let mut child = child;
+                                let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                                let mut sw = std::fs::File::from(status_w);
+                                let _ = sw.write_all(&code.to_le_bytes());
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("privsep monitor: SpawnHelper denied: {e:#}");
+                        let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                    }
+                }
+            }
         }
     }
 
