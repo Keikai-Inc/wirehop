@@ -76,6 +76,17 @@ async fn main() -> Result<()> {
             // the override; a manual `hop host` with no --config resolves to the
             // installed daemon dir (/etc/hop) rather than the per-user dir.
             let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
+            // Privilege separation (privsep-node.md): when HOP_PRIVSEP=1 and we
+            // are root and not already the worker, become the monitor — it owns
+            // the privileged primitives (TUN, :53) and spawns this same binary
+            // as the unprivileged worker. Off by default; the worker re-enters
+            // here with HOP_PRIVSEP_WORKER set and falls through to the daemon.
+            if std::env::var_os("HOP_PRIVSEP").is_some()
+                && std::env::var_os("HOP_PRIVSEP_WORKER").is_none()
+                && hop_core::unix_user::is_running_as_root()
+            {
+                return hop_core::privsep::run_monitor(&config_dir, quiet);
+            }
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }

@@ -342,6 +342,123 @@ pub fn monitor_bind_priv_port(addr: [u8; 4], port: u16) -> Result<OwnedFd> {
     Ok(OwnedFd::from(sock))
 }
 
+// ── Worker side: acquire the TUN from the monitor ───────────────────────────
+
+/// The control-socket fd the monitor passed us, if we are a privsep worker.
+fn worker_control_fd() -> Option<RawFd> {
+    std::env::var("HOP_PRIVSEP_CTRL_FD").ok()?.trim().parse().ok()
+}
+
+/// True when this process is the unprivileged worker half of a privsep node.
+pub fn is_privsep_worker() -> bool {
+    worker_control_fd().is_some()
+}
+
+/// Wrap a TUN fd passed by the monitor as an async device. `raw_fd` only wraps
+/// (no `.address()`), so the worker never reconfigures the interface — the
+/// monitor already did, with root. `close_fd_on_drop` (default true) means the
+/// worker's copy closes on exit while the monitor's canonical fd keeps the
+/// device alive.
+pub fn worker_tun_from_fd(fd: OwnedFd) -> Result<tun::AsyncDevice> {
+    use std::os::fd::IntoRawFd;
+    let raw = fd.into_raw_fd();
+    let mut config = tun::configure();
+    config.raw_fd(raw);
+    tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("wrapping passed TUN fd: {e}"))
+}
+
+/// Acquire the VPN TUN for `addr`: in privsep-worker mode, ask the monitor to
+/// create it and receive the fd; otherwise create it directly (current,
+/// non-privsep behavior). This is the single integration point in `enable_vpn`.
+pub async fn acquire_tun(addr: std::net::Ipv4Addr) -> Result<tun::AsyncDevice> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            send_msg(ctrl, &MonitorRequest::CreateTun { vip: addr.octets() })
+                .context("requesting TUN from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::OkFd => worker_tun_from_fd(recv_fd(ctrl)?),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused CreateTun: {message}")
+                }
+            }
+        }
+        None => crate::vpn::create_tun(addr).await,
+    }
+}
+
+// ── Monitor side: supervise the worker, serve privileged primitives ─────────
+
+/// Run the privilege-separation **monitor** (privsep-node.md §3). Spawns the
+/// unprivileged worker (`hop host …` with the control fd + `HOP_PRIVSEP_WORKER`
+/// set) and serves its `CreateTun`/`BindPrivPort` requests, keeping the created
+/// devices/sockets alive for the worker's lifetime. Never returns: when the
+/// worker exits, the monitor exits too and launchd/systemd `KeepAlive` restarts
+/// the pair. (Phase 1: the worker still runs as root; the `_hop` privilege drop
+/// is Phase 2. Behind the `HOP_PRIVSEP` flag — off by default.)
+pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
+    anyhow::ensure!(
+        crate::unix_user::is_running_as_root(),
+        "the privsep monitor must run as root"
+    );
+    let (mon, wrk) = control_socketpair()?;
+    clear_cloexec(wrk.as_raw_fd())?;
+
+    let exe = std::env::current_exe().context("resolving current exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("host").arg("--config").arg(config_dir);
+    if quiet {
+        cmd.arg("--quiet");
+    }
+    cmd.env("HOP_PRIVSEP_WORKER", "1")
+        .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string());
+    // Phase 2 adds `.uid(_hop).gid(_hop)` here.
+    let mut child = cmd.spawn().context("spawning privsep worker")?;
+    drop(wrk); // only the worker needs that end
+
+    let mon_fd = mon.as_raw_fd();
+    // Hold every created device/socket so the kernel keeps the interface up and
+    // the :53 bind alive for as long as the monitor (and thus the worker) runs.
+    let mut kept_tuns: Vec<tun::Device> = Vec::new();
+    let mut kept_socks: Vec<OwnedFd> = Vec::new();
+
+    loop {
+        let req: MonitorRequest = match recv_msg(mon_fd) {
+            Ok(r) => r,
+            // The worker closed the channel (exited) — leave the loop to reap it.
+            Err(_) => break,
+        };
+        match req {
+            MonitorRequest::CreateTun { vip } => match monitor_create_tun(vip) {
+                Ok(dev) => {
+                    if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
+                        && send_fd(mon_fd, dev.as_raw_fd()).is_ok()
+                    {
+                        kept_tuns.push(dev);
+                    }
+                }
+                Err(e) => {
+                    let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                }
+            },
+            MonitorRequest::BindPrivPort { addr, port } => match monitor_bind_priv_port(addr, port) {
+                Ok(sock) => {
+                    if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
+                        && send_fd(mon_fd, sock.as_raw_fd()).is_ok()
+                    {
+                        kept_socks.push(sock);
+                    }
+                }
+                Err(e) => {
+                    let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                }
+            },
+        }
+    }
+
+    let status = child.wait().context("waiting on privsep worker")?;
+    anyhow::bail!("privsep worker exited ({status:?}); monitor exiting for KeepAlive restart")
+}
+
 /// Clear the close-on-exec flag so an fd survives `exec` into a child process.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn clear_cloexec(fd: RawFd) -> Result<()> {

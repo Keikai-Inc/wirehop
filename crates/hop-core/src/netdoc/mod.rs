@@ -1376,7 +1376,9 @@ impl NetDoc {
         } else {
             self.claim_virtual_ip(host_node_id).await?
         };
-        let tun = std::sync::Arc::new(crate::vpn::create_tun(addr).await?);
+        // In privsep-worker mode this requests the TUN fd from the root monitor;
+        // otherwise it creates the device directly (non-privsep path).
+        let tun = std::sync::Arc::new(crate::privsep::acquire_tun(addr).await?);
         *self.vpn_tun.write().await = Some(tun.clone());
         // Ingress authentication state (security-audit C2): our own vIP (the only
         // legitimate ingress destination) + the peer-IP map (refreshed below and
