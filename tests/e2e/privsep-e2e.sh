@@ -98,32 +98,30 @@ docker exec hop-ps-b test -f /shared/ready-b || { echo "FAIL: host-b not ready";
 
 RC=0
 
-# ── ASSERTION 1: each node split into a monitor + worker, worker has the flag ──
+# ── ASSERTION 1: each node split into a root monitor + a non-root `hop` worker ──
+# The worker is the `hop host` process owned by user `hop`, whose parent is the
+# root monitor. (We identify it by owner/parentage, not by reading the worker's
+# environ: setuid clears the process's dumpable flag, so /proc/PID/environ
+# becomes root-only and unreadable from a plain exec.)
 echo ""
-echo "=== TEST: monitor/worker process split ==="
+echo "=== TEST: monitor/worker split + privilege drop ==="
 for c in hop-ps-a hop-ps-b; do
-  # Two `hop host` processes: the monitor (started by the entrypoint) and the
-  # worker it spawned. The worker carries HOP_PRIVSEP_WORKER in its environ.
-  NPROC=$(docker exec "$c" pgrep -fc 'hop --config /cfg host|hop host --config' 2>/dev/null | head -1 || echo 0)
-  WORKER_PID=$(docker exec "$c" bash -c '
-    for p in $(pgrep -f "hop"); do
-      if tr "\0" "\n" </proc/$p/environ 2>/dev/null | grep -q "^HOP_PRIVSEP_WORKER=1$"; then echo $p; fi
-    done' 2>/dev/null | head -1 || true)
+  WORKER_PID=$(docker exec "$c" bash -c "ps -eo pid=,user=,args= | awk '\$2==\"hop\" && /hop( |\\/).*host/ {print \$1; exit}'" 2>/dev/null | tr -d ' ' || true)
   if [ -n "$WORKER_PID" ]; then
-    echo "  $c: worker PID $WORKER_PID has HOP_PRIVSEP_WORKER=1 (monitor/worker split OK)"
-    # Phase 2: the worker must run as the unprivileged `hop` user, not root.
-    WUID=$(docker exec "$c" bash -c "awk '/^Uid:/{print \$2}' /proc/$WORKER_PID/status" 2>/dev/null | head -1 || echo "?")
-    HOPUID=$(docker exec "$c" id -u hop 2>/dev/null || echo "")
-    if [ -n "$HOPUID" ] && [ "$WUID" = "$HOPUID" ]; then
-      echo "  $c: worker runs as hop (uid=$WUID, non-root) — privilege drop OK"
+    WPPID=$(docker exec "$c" bash -c "ps -o ppid= -p $WORKER_PID" 2>/dev/null | tr -d ' ' || true)
+    PARENT_USER=$(docker exec "$c" bash -c "ps -o user= -p ${WPPID:-0}" 2>/dev/null | tr -d ' ' || true)
+    PARENT_ARGS=$(docker exec "$c" bash -c "ps -o args= -p ${WPPID:-0}" 2>/dev/null || true)
+    if [ "$PARENT_USER" = "root" ] && echo "$PARENT_ARGS" | grep -q "host"; then
+      echo "  $c: worker PID $WORKER_PID runs as hop (non-root), parent PID $WPPID is the root monitor — split + drop OK"
     else
-      echo "  $c: FAIL — worker uid=$WUID, expected hop uid=$HOPUID (privilege drop did not take)"
-      docker exec "$c" grep -i "privsep" /cfg/log | tail -10 || true
+      echo "  $c: FAIL — worker found but parent (PID $WPPID, user $PARENT_USER) is not the root monitor"
+      docker exec "$c" bash -c 'ps -eo pid,ppid,user,args | grep -i hop | grep -v grep' || true
       RC=1
     fi
   else
-    echo "  $c: FAIL — no worker process carrying HOP_PRIVSEP_WORKER found (procs: $NPROC)"
-    docker exec "$c" bash -c 'ps -ef | grep -i hop | grep -v grep' || true
+    echo "  $c: FAIL — no hop-owned worker process found (privilege drop did not take)"
+    docker exec "$c" bash -c 'ps -eo pid,ppid,user,args | grep -i hop | grep -v grep' || true
+    docker exec "$c" grep -i "privsep" /cfg/log | tail -10 || true
     RC=1
   fi
 done
