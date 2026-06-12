@@ -12,6 +12,11 @@ services:
       - HOP_CONFIG_DIR=/home/hop/config-a
       - HOP_INVITE_FILE=/shared/invite-a
       - HOP_READY_FILE=/shared/ready-a
+      # Privsep passthrough (bare = inherit from the run.sh shell only if set, so
+      # the default e2e is unaffected). Set both to exercise the monitor/worker
+      # split + setuid-via-monitor session/exec/transfer under HOP_PRIVSEP_DROP.
+      - HOP_PRIVSEP
+      - HOP_PRIVSEP_DROP
 
   hop-host-b:
     build: .
@@ -26,6 +31,8 @@ services:
       - HOP_CONFIG_DIR=/home/hop/config-b
       - HOP_INVITE_FILE=/shared/invite-b
       - HOP_READY_FILE=/shared/ready-b
+      - HOP_PRIVSEP
+      - HOP_PRIVSEP_DROP
 
   hop-test:
     build: .
