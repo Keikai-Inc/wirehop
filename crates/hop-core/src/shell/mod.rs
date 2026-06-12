@@ -737,6 +737,24 @@ fn spawn_persistent_pty(
 )> {
     let session_id = session_registry::generate_session_id();
 
+    // Persistent sessions are not yet relocated to the privsep monitor: the
+    // detached-session machinery (a resize task that owns the portable-pty
+    // master, pid-based registry kill, the cancellable reader) doesn't yet have
+    // a monitor-passed-fd variant. Refuse loudly rather than spawn `login`/`su`
+    // as the unprivileged worker (which would fail opaquely). One-shot shells,
+    // exec, and transfer all work under privsep; persistent is the remaining
+    // surface (privsep-node.md §10 Phase 3).
+    #[cfg(unix)]
+    if username.is_some()
+        && !crate::unix_user::is_running_as_root()
+        && crate::privsep::is_privsep_worker()
+    {
+        anyhow::bail!(
+            "persistent sessions are not yet supported under privilege separation \
+             (HOP_PRIVSEP_DROP); use a non-persistent session for now"
+        );
+    }
+
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).context("Failed to open PTY")?;
 

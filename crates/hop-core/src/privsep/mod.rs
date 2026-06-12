@@ -579,7 +579,7 @@ pub fn monitor_spawn_helper(
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::process::CommandExt;
-        let (uid, gid) = crate::transfer::lookup_uid_gid(username)?;
+        let (uid, gid) = crate::transfer::helper::lookup_uid_gid(username)?;
         command = std::process::Command::new(&argv[0]);
         command.args(&argv[1..]).uid(uid).gid(gid);
         let user_c = std::ffi::CString::new(username)
