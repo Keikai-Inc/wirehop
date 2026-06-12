@@ -366,12 +366,30 @@ defense that doesn't depend on every peer's worker being honest.
   `host_shell_session`, `acquire_session_pty` (monitor path iff bound-user +
   non-root + privsep worker), and `check_shell_security` now admits the non-root
   privsep worker. Non-privsep path proven unchanged (full 53-test e2e green).
-  **Remaining:** the **exec** surface (`host_exec_session` is pipe-based, not PTY —
-  needs a pipe-mode primitive that also returns the exit code), the
-  **persistent-shell** surface (`session_registry`), and **file transfer**
-  (`transfer/helper.rs`). A node can host interactive shells under
-  `HOP_PRIVSEP_DROP` once these land; sequence each with a privsep-drop session
-  e2e (shell-as-bound-user via the monitor) as its gate.
+  **Remaining surfaces** (each its own change, gated by a privsep-drop e2e):
+  - **exec** (`host_exec_session`) — pipe-based, not PTY, and harder than shell:
+    on Linux the sandbox is an in-process `pre_exec` landlock closure
+    (`sandbox/mod.rs:112`), not an argv wrapper, so the monitor (not the worker)
+    must apply it. Design (plumbing already in place — `send_fds`/`recv_fds`
+    multi-fd passing is built + unit-tested):
+    `MonitorRequest::SpawnExec { cmd, policy, username }` (`SandboxPolicy` is
+    serde, so it serializes); the monitor builds a **`std::process::Command`**
+    (a sync sibling of the tokio `build_exec_command`) with `Stdio::piped()` and
+    the platform sandbox (Linux `pre_exec` apply, macOS argv `sandbox-exec`),
+    spawns as root, and `send_fds` returns **four** fds — child stdin (write),
+    stdout (read), stderr (read), and a **status pipe** (read). A reaper thread
+    `wait()`s the child and writes the 4-byte exit code to the status pipe, so
+    the worker gets the exit code out-of-band without a control-channel reply.
+    The worker wraps the three I/O fds with `tokio::net::unix::pipe` and bridges
+    them exactly as today, reading the exit code from the status fd on EOF.
+  - **persistent-shell** (`session_registry`) — reuses the PTY `SpawnSession`;
+    integrate with the detached-session registry.
+  - **file transfer** (`transfer/helper.rs`) — the helper runs as the bound user;
+    relocate its spawn the same way.
+
+  A node can host interactive shells under `HOP_PRIVSEP_DROP` today; it runs
+  *fully* once the three above land, validated by running the 53-test e2e with the
+  hosts in `HOP_PRIVSEP_DROP` (exec/transfer/cp as the bound user via the monitor).
 - **Phase 4 — Hardening + e2e.** macOS daemon-install e2e (the harness we built)
   extended to assert the monitor is root / the worker is `_hop` / sessions still
   work / VPN still routes; Linux container e2e; receiver-side ACL (§9).
