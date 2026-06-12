@@ -286,6 +286,62 @@ pub fn run_tun_fd_probe_child(sock_fd: RawFd) -> i32 {
     0
 }
 
+// ── Monitor-side privileged primitives ──────────────────────────────────────
+//
+// These are the operations the root monitor performs on a worker request. The
+// *validation* is factored into pure predicates so it is unit-testable without
+// root; the act (create the device / bind the socket) needs root and is covered
+// by the daemon-install e2e. Validation is the §T3 security boundary — the
+// monitor accepts only a vIP in the warren range and only the :53 bind.
+
+/// Accept a `CreateTun` only for an address in the warren range (100.64.0.0/10).
+fn validate_create_tun(vip: [u8; 4]) -> Result<()> {
+    let addr = std::net::Ipv4Addr::from(vip);
+    anyhow::ensure!(
+        crate::vpn::is_virtual_addr(addr),
+        "refusing CreateTun for {addr}: not in the warren range 100.64.0.0/10"
+    );
+    Ok(())
+}
+
+/// Accept a `BindPrivPort` only for the node's own vIP and the MagicDNS port 53.
+fn validate_bind_priv_port(addr: [u8; 4], port: u16) -> Result<()> {
+    anyhow::ensure!(
+        port == 53,
+        "refusing BindPrivPort: only :53 (MagicDNS) is permitted, not :{port}"
+    );
+    anyhow::ensure!(
+        crate::vpn::is_virtual_addr(std::net::Ipv4Addr::from(addr)),
+        "refusing BindPrivPort: {} is not a warren vIP",
+        std::net::Ipv4Addr::from(addr)
+    );
+    Ok(())
+}
+
+/// Monitor side of `CreateTun`: validate, then create + configure the device.
+/// The monitor keeps the returned `Device` alive (so the interface + route
+/// persist across worker restarts) and passes its fd to the worker.
+pub fn monitor_create_tun(vip: [u8; 4]) -> Result<tun::Device> {
+    validate_create_tun(vip)?;
+    let addr = std::net::Ipv4Addr::from(vip);
+    let mut config = tun::configure();
+    config
+        .address(addr)
+        .netmask(std::net::Ipv4Addr::new(255, 192, 0, 0))
+        .mtu(crate::vpn::VPN_MTU)
+        .up();
+    tun::create(&config).map_err(|e| anyhow::anyhow!("create TUN {addr}: {e}"))
+}
+
+/// Monitor side of `BindPrivPort`: validate (own vIP + :53), then bind. Returns
+/// the bound UDP socket's fd to hand to the worker's MagicDNS loop.
+pub fn monitor_bind_priv_port(addr: [u8; 4], port: u16) -> Result<OwnedFd> {
+    validate_bind_priv_port(addr, port)?;
+    let a = std::net::Ipv4Addr::from(addr);
+    let sock = std::net::UdpSocket::bind((a, port)).with_context(|| format!("binding {a}:{port}"))?;
+    Ok(OwnedFd::from(sock))
+}
+
 /// Clear the close-on-exec flag so an fd survives `exec` into a child process.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn clear_cloexec(fd: RawFd) -> Result<()> {
@@ -343,6 +399,24 @@ mod tests {
         // The original fd is still independently valid.
         let mut s2 = String::new();
         let _ = pr.read_to_string(&mut s2); // already drained via the dup; fine either way
+    }
+
+    /// The monitor's primitive validation is the privilege boundary: it must
+    /// accept only warren-range vIPs and only the :53 bind.
+    #[test]
+    fn monitor_primitive_validation() {
+        // CreateTun: warren range accepted, anything else rejected.
+        assert!(validate_create_tun([100, 64, 0, 1]).is_ok());
+        assert!(validate_create_tun([100, 127, 255, 254]).is_ok()); // top of /10
+        assert!(validate_create_tun([10, 0, 0, 1]).is_err()); // private, not warren
+        assert!(validate_create_tun([8, 8, 8, 8]).is_err()); // public
+        assert!(validate_create_tun([100, 63, 0, 1]).is_err()); // just below the /10
+
+        // BindPrivPort: only (warren vIP, 53).
+        assert!(validate_bind_priv_port([100, 64, 0, 1], 53).is_ok());
+        assert!(validate_bind_priv_port([100, 64, 0, 1], 80).is_err()); // wrong port
+        assert!(validate_bind_priv_port([100, 64, 0, 1], 22).is_err());
+        assert!(validate_bind_priv_port([8, 8, 8, 8], 53).is_err()); // non-vIP
     }
 
     /// Control messages frame + round-trip over the stream socketpair.
