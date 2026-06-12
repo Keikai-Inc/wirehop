@@ -1,16 +1,24 @@
 # Privilege-Separated Warren Node (Design)
 
-> **Status: Phase 1 implemented (flag-gated `HOP_PRIVSEP`, off by default),
-> Linux-validated end-to-end; Phases 2–4 planned.** The monitor/worker split, the
-> `SCM_RIGHTS` fd-passing, the 3-primitive control protocol with its validation
-> boundary, and the worker's passed-fd TUN wrapper all ship and are exercised by
-> `tests/e2e/privsep-e2e.sh` (two privsep nodes route real packets over the
-> monitor-passed TUN fd). In Phase 1 the worker still runs as root — the `_hop`
-> privilege drop (Phase 2) and the `SpawnSession` setuid relocation (Phase 3) are
-> the remaining work. **macOS feasibility gate (§8.1) is still unrun** — the
-> Linux e2e proves the mechanic, but a passed *utun* fd surviving non-root I/O on
-> macOS (the B-full vs B-lite decision) is unverified, so privsep must not be
-> activated on macOS hosts yet.
+> **Status: Phases 1–2 done (flag-gated, Linux-validated); Phase 3 partial; macOS
+> gate unrun.** Behind `HOP_PRIVSEP` (off by default) and `HOP_PRIVSEP_DROP`:
+> - **Phase 1** (monitor/worker split, `SCM_RIGHTS` fd-passing, 3-primitive control
+>   protocol + validation, passed-fd TUN wrapper) — shipped in 0.6.60,
+>   `tests/e2e/privsep-e2e.sh` routes real packets over the monitor-passed fd.
+> - **Phase 2** (`_hop`/`hop` service user, config ownership migration, `initgroups`
+>   →`setgid`→`setuid` worker drop) — e2e-validated: the worker runs as non-root
+>   `hop` under the root monitor and still routes.
+> - **Phase 3** — the `SpawnSession` primitive (monitor `openpty`+setuid-spawn,
+>   master-fd hand-back, child reaping, argv/username validation) is implemented +
+>   unit-tested, and the **interactive-shell** surface is integrated (the
+>   non-privsep path is unchanged — full 53-test e2e green). The **exec**,
+>   **persistent-shell**, and **transfer** surfaces are not yet relocated, so a node
+>   can't run *fully* under `HOP_PRIVSEP_DROP` yet.
+>
+> **macOS feasibility gate (§8.1) is still unrun** — the Linux e2e proves the
+> mechanic (a non-root worker does TUN fd I/O), but a passed *utun* fd surviving
+> non-root I/O on macOS (the B-full vs B-lite decision) is unverified, so privsep
+> must not be activated on macOS hosts yet.
 >
 > Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
@@ -348,11 +356,22 @@ defense that doesn't depend on every peer's worker being honest.
   monitor. This is where the EACCES papercuts (`hop invite`/`id`/…) dissolve,
   because the worker reads its own `_hop`-owned secret and the operator's CLI
   goes through the group-readable IPC.
-- **Phase 3 — Move `SpawnSession` (P3) into the monitor.** Relocate the
-  `login`/`su`/setuid logic from the (now-unprivileged) worker into the monitor;
-  the worker requests sessions. This is the larger refactor — until it lands, the
-  worker can't host sessions, so sequence it as a single careful change with the
-  e2e session tests as the gate.
+- **Phase 3 — Move `SpawnSession` into the monitor. 🟡 PARTIAL.** The privileged
+  **primitive is done + unit-tested**: `MonitorRequest::SpawnSession` (worker
+  sends a concrete `argv` with its embedded `login`/`su`, so the monitor needs no
+  sandbox policy), `monitor_spawn_session` (validate → `openpty` → spawn as root →
+  pass the master fd → reap the child off-thread), `validate_spawn_session` (argv[0]
+  allowlist + username), and `worker_spawn_session`. The **interactive-shell
+  surface is integrated**: a `SessionPty` (Local vs monitor-Passed) abstraction in
+  `host_shell_session`, `acquire_session_pty` (monitor path iff bound-user +
+  non-root + privsep worker), and `check_shell_security` now admits the non-root
+  privsep worker. Non-privsep path proven unchanged (full 53-test e2e green).
+  **Remaining:** the **exec** surface (`host_exec_session` is pipe-based, not PTY —
+  needs a pipe-mode primitive that also returns the exit code), the
+  **persistent-shell** surface (`session_registry`), and **file transfer**
+  (`transfer/helper.rs`). A node can host interactive shells under
+  `HOP_PRIVSEP_DROP` once these land; sequence each with a privsep-drop session
+  e2e (shell-as-bound-user via the monitor) as its gate.
 - **Phase 4 — Hardening + e2e.** macOS daemon-install e2e (the harness we built)
   extended to assert the monitor is root / the worker is `_hop` / sessions still
   work / VPN still routes; Linux container e2e; receiver-side ACL (§9).
