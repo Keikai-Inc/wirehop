@@ -1,6 +1,18 @@
 # Privilege-Separated Warren Node (Design)
 
-> **Status: design.** Goal: shrink the warren node's root attack surface from
+> **Status: Phase 1 implemented (flag-gated `HOP_PRIVSEP`, off by default),
+> Linux-validated end-to-end; Phases 2–4 planned.** The monitor/worker split, the
+> `SCM_RIGHTS` fd-passing, the 3-primitive control protocol with its validation
+> boundary, and the worker's passed-fd TUN wrapper all ship and are exercised by
+> `tests/e2e/privsep-e2e.sh` (two privsep nodes route real packets over the
+> monitor-passed TUN fd). In Phase 1 the worker still runs as root — the `_hop`
+> privilege drop (Phase 2) and the `SpawnSession` setuid relocation (Phase 3) are
+> the remaining work. **macOS feasibility gate (§8.1) is still unrun** — the
+> Linux e2e proves the mechanic, but a passed *utun* fd surviving non-root I/O on
+> macOS (the B-full vs B-lite decision) is unverified, so privsep must not be
+> activated on macOS hosts yet.
+>
+> Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
 > the large, attackable, network-facing daemon (QUIC, protocol parsing, the
 > netdoc replication stack, the VPN data plane, DNS logic) runs as an
@@ -314,15 +326,23 @@ defense that doesn't depend on every peer's worker being honest.
 
 ## 10. Phased plan
 
-- **Phase 0 — Feasibility gate (do first, ~a day).** Prove macOS utun fd
-  hand-off to a non-root process (§8.1) and the Linux equivalent, as a standalone
-  test. **Everything below is contingent on this passing.** If it fails on macOS,
-  pivot to B-lite (packet I/O stays in the monitor) or option A.
-- **Phase 1 — fd-passing + the monitor skeleton.** `SEQPACKET` socketpair, the
-  3-primitive protocol, `SCM_RIGHTS` send/recv (nix cmsg), the worker-side
-  `AsyncFd` TUN wrapper (with the macOS AF-prefix). Monitor creates TUN/`:53`,
-  drops privilege, execs the worker, passes fds. No behavior change yet beyond
-  *who* holds the fds.
+- **Phase 0 — Feasibility gate.** Prove a passed TUN fd survives I/O by a
+  different uid (§8.1). **Linux: PROVEN** — `privsep-e2e.sh` routes packets over a
+  monitor-passed TUN fd, and a TUN fd is uid-agnostic on Linux. **macOS: still
+  unrun** — `hop __privsep-probe` (built) must run as root to decide whether a
+  passed *utun* fd survives non-root I/O. If it fails on macOS, pivot to B-lite
+  (packet I/O stays in the monitor) or option A. macOS activation is contingent on
+  this passing.
+- **Phase 1 — fd-passing + the monitor skeleton. ✅ DONE (flag-gated, Linux-validated).**
+  Stream socketpair (macOS AF_UNIX has no `SEQPACKET`), the `CreateTun`/`BindPrivPort`
+  primitives + their validation boundary (warren-range vIP only, `:53` only),
+  `SCM_RIGHTS` send/recv (nix cmsg), and the worker-side passed-fd TUN wrapper
+  (`tun::Configuration::raw_fd`, wrap-only). `run_monitor` spawns the worker
+  (`HOP_PRIVSEP_WORKER` + the control fd) and serves the primitives, holding the
+  devices alive for the worker's lifetime. `enable_vpn` calls `acquire_tun` (the
+  single integration point); the non-privsep path is byte-equivalent. **The worker
+  still runs as root here** — the only change is *who creates the TUN* and that the
+  fd crosses the control channel; the privilege drop is Phase 2.
 - **Phase 2 — `_hop` service user + ownership migration.** Create `_hop`,
   re-own the config dir, run the worker as `_hop`, plist/unit launches the
   monitor. This is where the EACCES papercuts (`hop invite`/`id`/…) dissolve,
