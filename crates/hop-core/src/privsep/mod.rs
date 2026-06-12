@@ -445,7 +445,36 @@ fn validate_spawn_session(argv: &[String], username: Option<&str>) -> Result<()>
             crate::unix_user::validate_username(user).is_ok(),
             "SpawnSession: invalid username {user:?}"
         );
+        validate_spawn_user(user)?;
     }
+    Ok(())
+}
+
+/// Lowest uid a peer-bound session may target. Below this are system/service
+/// accounts (`root`, `daemon`, `_www`, the `_hop` service user itself, …) — the
+/// highest-value escalation targets for a compromised worker. macOS regular
+/// accounts start at 500, Linux at 1000.
+const MIN_SPAWNABLE_UID: u32 = if cfg!(target_os = "macos") { 500 } else { 1000 };
+
+/// Receiver-side authorization for a spawn target (privsep-node.md §9, Phase 4
+/// baseline). The monitor — not the unprivileged worker — decides who may be
+/// spawned. This first layer refuses system/service accounts (uid <
+/// [`MIN_SPAWNABLE_UID`]); a compromised worker is thus confined to regular user
+/// accounts and can never reach `root`, `daemon`, or the `_hop` service user.
+/// (The full ACL — restricting to exactly the users a peer is bound to — needs a
+/// worker-untamperable binding source and is the remaining Phase-4 work.)
+fn validate_spawn_user(username: &str) -> Result<()> {
+    let (uid, _gid) = crate::transfer::helper::lookup_uid_gid(username)?;
+    validate_spawnable_uid(uid, username)
+}
+
+/// The pure uid check, factored out for unit testing.
+fn validate_spawnable_uid(uid: u32, username: &str) -> Result<()> {
+    anyhow::ensure!(
+        uid >= MIN_SPAWNABLE_UID,
+        "refusing to spawn as system/service account {username:?} (uid {uid} < {MIN_SPAWNABLE_UID}); \
+         only regular user accounts may be session/exec/transfer targets"
+    );
     Ok(())
 }
 
@@ -519,6 +548,7 @@ pub fn monitor_spawn_exec(
         crate::unix_user::validate_username(username).is_ok(),
         "SpawnExec: invalid username {username:?}"
     );
+    validate_spawn_user(username)?;
     // Mirror spawn_sandboxed_command's layer-1 validation before spawning.
     if policy.is_restricted() {
         crate::sandbox::validate_command(cmd, policy)
@@ -555,6 +585,7 @@ fn validate_spawn_helper(argv: &[String], username: &str) -> Result<()> {
         crate::unix_user::validate_username(username).is_ok(),
         "SpawnHelper: invalid username {username:?}"
     );
+    validate_spawn_user(username)?;
     Ok(())
 }
 
@@ -1143,6 +1174,18 @@ mod tests {
         send_msg(b.as_raw_fd(), &reply).unwrap();
         let got: MonitorReply = recv_msg(a.as_raw_fd()).unwrap();
         assert_eq!(got, reply);
+    }
+
+    /// The receiver-side ACL refuses system/service accounts and admits regular
+    /// users — a compromised worker can never reach root/daemon/_hop.
+    #[test]
+    fn spawn_user_acl_rejects_system_accounts() {
+        assert!(validate_spawnable_uid(0, "root").is_err()); // root
+        assert!(validate_spawnable_uid(1, "daemon").is_err());
+        assert!(validate_spawnable_uid(MIN_SPAWNABLE_UID - 1, "_svc").is_err());
+        assert!(validate_spawnable_uid(MIN_SPAWNABLE_UID, "alice").is_ok());
+        assert!(validate_spawnable_uid(1001, "hop").is_ok()); // the e2e bound user
+        assert!(validate_spawnable_uid(60123, "bob").is_ok());
     }
 
     /// Several fds round-trip in order through one SCM_RIGHTS message (the
