@@ -179,6 +179,44 @@ pub fn recv_fd(sock: RawFd) -> Result<OwnedFd> {
     anyhow::bail!("no file descriptor in control message");
 }
 
+/// Send several file descriptors in one `SCM_RIGHTS` message (kept as a single
+/// ancillary block so the receiver gets them atomically, in order). Used by
+/// `SpawnExec`, which hands back stdin/stdout/stderr + a status pipe at once.
+pub fn send_fds(sock: RawFd, fds: &[RawFd]) -> Result<()> {
+    let cmsgs = [ControlMessage::ScmRights(fds)];
+    let count = [fds.len() as u8];
+    let iov = [IoSlice::new(&count)];
+    sendmsg::<()>(sock, &iov, &cmsgs, MsgFlags::empty(), None).context("sendmsg SCM_RIGHTS (n)")?;
+    Ok(())
+}
+
+/// Receive exactly `n` file descriptors sent via [`send_fds`], in order.
+pub fn recv_fds(sock: RawFd, n: usize) -> Result<Vec<OwnedFd>> {
+    use std::os::fd::FromRawFd;
+
+    let mut data = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut data)];
+    // Space for up to `n` fds in the ancillary buffer.
+    let mut cmsg_space = vec![0u8; unsafe { libc::CMSG_SPACE((n * std::mem::size_of::<RawFd>()) as u32) } as usize];
+    let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
+        .context("recvmsg SCM_RIGHTS (n)")?;
+    let mut out = Vec::with_capacity(n);
+    for cmsg in msg.cmsgs().context("decoding control messages")? {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+            for fd in fds {
+                // SAFETY: the kernel just installed these fds into our table.
+                out.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    anyhow::ensure!(
+        out.len() == n,
+        "expected {n} file descriptors, received {}",
+        out.len()
+    );
+    Ok(out)
+}
+
 /// Phase-0 feasibility gate (privsep-node.md §8.1) — parent half.
 ///
 /// The whole privsep design assumes a TUN fd created + configured by root can be
@@ -887,6 +925,37 @@ mod tests {
         send_msg(b.as_raw_fd(), &reply).unwrap();
         let got: MonitorReply = recv_msg(a.as_raw_fd()).unwrap();
         assert_eq!(got, reply);
+    }
+
+    /// Several fds round-trip in order through one SCM_RIGHTS message (the
+    /// SpawnExec stdin/stdout/stderr + status handoff).
+    #[test]
+    fn scm_rights_round_trips_multiple_fds() {
+        use std::io::{Read, Write};
+        let (a, b) = control_socketpair().unwrap();
+        // Three independent pipes; send their write ends, write a distinct byte
+        // through each received fd, read it back from the local read end.
+        let mut reads = Vec::new();
+        let mut send_fds_raw = Vec::new();
+        let mut keep = Vec::new();
+        for _ in 0..3 {
+            let (r, w) = nix::unistd::pipe().unwrap();
+            send_fds_raw.push(w.as_raw_fd());
+            reads.push(r);
+            keep.push(w); // keep write ends alive until after send
+        }
+        send_fds(a.as_raw_fd(), &send_fds_raw).unwrap();
+        let got = recv_fds(b.as_raw_fd(), 3).unwrap();
+        assert_eq!(got.len(), 3);
+        for (i, fd) in got.iter().enumerate() {
+            let mut wf = std::fs::File::from(fd.try_clone().unwrap());
+            wf.write_all(&[i as u8 + 1]).unwrap();
+            drop(wf);
+            let mut rf = std::fs::File::from(reads[i].try_clone().unwrap());
+            let mut buf = [0u8; 1];
+            rf.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], i as u8 + 1);
+        }
     }
 
     /// Receiving with no pending message is an error, not a panic/UB.
