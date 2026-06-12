@@ -414,6 +414,10 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // Phase 2 adds `.uid(_hop).gid(_hop)` here.
     let mut child = cmd.spawn().context("spawning privsep worker")?;
     drop(wrk); // only the worker needs that end
+    tracing::info!(
+        worker_pid = child.id(),
+        "privsep monitor: spawned unprivileged worker; serving privileged primitives"
+    );
 
     let mon_fd = mon.as_raw_fd();
     // Hold every created device/socket so the kernel keeps the interface up and
@@ -433,10 +437,15 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
                         && send_fd(mon_fd, dev.as_raw_fd()).is_ok()
                     {
+                        tracing::info!(
+                            vip = ?std::net::Ipv4Addr::from(vip),
+                            "privsep monitor: served CreateTun, passed TUN fd to worker"
+                        );
                         kept_tuns.push(dev);
                     }
                 }
                 Err(e) => {
+                    tracing::warn!("privsep monitor: CreateTun denied: {e:#}");
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
