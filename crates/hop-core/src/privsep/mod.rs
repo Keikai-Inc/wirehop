@@ -50,7 +50,23 @@ pub enum MonitorRequest {
     /// Bind a UDP socket on `(addr, port)` and return its fd. The monitor
     /// allowlists this to the node's own vip and port 53 (MagicDNS) only.
     BindPrivPort { addr: [u8; 4], port: u16 },
-    // SpawnSession { user, … } is added in Phase 3 (move setuid into the monitor).
+    /// Spawn a session command on a fresh PTY and return the PTY **master** fd.
+    /// The worker has already resolved `argv` (including the `login`/`su` and
+    /// sandbox wrapper), so the monitor only performs the privileged act —
+    /// `openpty` + spawn as root, which lets the embedded `login`/`su` switch to
+    /// `username`. `username` is carried for the receiver-side ACL check (§9):
+    /// the monitor confirms the worker is allowed to become that user before
+    /// spawning. The monitor owns the child and reaps it; the worker drives I/O
+    /// over the returned master fd and sees session end as master EOF.
+    SpawnSession {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        username: Option<String>,
+    },
 }
 
 /// The monitor's reply. On `OkFd` a file descriptor follows as ancillary data
@@ -342,6 +358,91 @@ pub fn monitor_bind_priv_port(addr: [u8; 4], port: u16) -> Result<OwnedFd> {
     Ok(OwnedFd::from(sock))
 }
 
+/// Validate a `SpawnSession` before the monitor performs it. `argv[0]` must be
+/// an absolute path to an allowlisted privileged session launcher (`login`/`su`)
+/// or a plain shell — never an arbitrary worker-chosen binary — and `username`,
+/// if present, must be a well-formed account name. This is the receiver-side
+/// boundary (§9): the worker is unprivileged, so the monitor, not the worker,
+/// decides what may be spawned as root.
+fn validate_spawn_session(argv: &[String], username: Option<&str>) -> Result<()> {
+    let bin = argv.first().context("SpawnSession: empty argv")?;
+    // Allowlist the launcher. The privileged forms are exactly the user-switch
+    // helpers the worker builds in `sandbox`; everything else must be an
+    // absolute-path shell (session-as-self needs no setuid but still routes here
+    // under a dropped worker). Reject relative paths (PATH-search ambiguity).
+    let base = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let is_switcher = matches!(base, "login" | "su");
+    anyhow::ensure!(
+        bin.starts_with('/') || is_switcher,
+        "SpawnSession: refusing non-absolute launcher {bin:?}"
+    );
+    if let Some(user) = username {
+        anyhow::ensure!(
+            crate::unix_user::validate_username(user).is_ok(),
+            "SpawnSession: invalid username {user:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Monitor side of `SpawnSession`: validate, open a PTY, spawn the worker-built
+/// `argv` (with its embedded `login`/`su`) as root so it can switch to the bound
+/// user, and return the PTY **master** fd. The monitor keeps the child to reap
+/// it; the worker drives the master fd and detects exit via EOF.
+pub fn monitor_spawn_session(
+    argv: &[String],
+    env: &[(String, String)],
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+    username: Option<&str>,
+) -> Result<(OwnedFd, Box<dyn portable_pty::Child + Send + Sync>)> {
+    use std::os::fd::FromRawFd;
+    validate_spawn_session(argv, username)?;
+
+    let pty = portable_pty::native_pty_system();
+    let pair = pty
+        .openpty(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        })
+        .context("monitor openpty")?;
+
+    let mut cmd = portable_pty::CommandBuilder::new(&argv[0]);
+    cmd.args(argv.iter().skip(1));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("monitor spawn session command")?;
+    drop(pair.slave); // the child holds the slave; the monitor needs only the master
+
+    // Dup the master fd into an OwnedFd to pass to the worker, then let the
+    // PtyPair's master close its own copy. The dup keeps the master open.
+    let raw = pair
+        .master
+        .as_raw_fd()
+        .context("PTY master exposes no fd")?;
+    let dup = unsafe { libc::dup(raw) };
+    anyhow::ensure!(dup >= 0, "dup PTY master: {}", std::io::Error::last_os_error());
+    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+    drop(pair.master);
+
+    tracing::info!(
+        user = username.unwrap_or("<self>"),
+        "privsep monitor: spawned session on PTY, passing master fd to worker"
+    );
+    Ok((owned, child))
+}
+
 // ── Worker side: acquire the TUN from the monitor ───────────────────────────
 
 /// The control-socket fd the monitor passed us, if we are a privsep worker.
@@ -383,6 +484,39 @@ pub async fn acquire_tun(addr: std::net::Ipv4Addr) -> Result<tun::AsyncDevice> {
             }
         }
         None => crate::vpn::create_tun(addr).await,
+    }
+}
+
+/// Worker side of `SpawnSession`: ask the monitor to spawn `argv` (the
+/// worker-resolved `login`/`su`/shell command) on a PTY and return the master
+/// fd. Only meaningful in privsep-worker mode; callers gate on
+/// [`is_privsep_worker`]. The returned fd is the PTY master the worker bridges
+/// to the client stream.
+pub fn worker_spawn_session(
+    argv: &[String],
+    env: &[(String, String)],
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+    username: Option<&str>,
+) -> Result<OwnedFd> {
+    let ctrl = worker_control_fd().context("worker_spawn_session called outside privsep worker")?;
+    let req = MonitorRequest::SpawnSession {
+        argv: argv.to_vec(),
+        env: env.to_vec(),
+        rows,
+        cols,
+        pixel_width,
+        pixel_height,
+        username: username.map(String::from),
+    };
+    send_msg(ctrl, &req).context("requesting SpawnSession from monitor")?;
+    match recv_msg::<MonitorReply>(ctrl)? {
+        MonitorReply::OkFd => recv_fd(ctrl),
+        MonitorReply::Error { message } => {
+            anyhow::bail!("privsep monitor refused SpawnSession: {message}")
+        }
     }
 }
 
@@ -590,6 +724,43 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
+            MonitorRequest::SpawnSession {
+                argv,
+                env,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                username,
+            } => match monitor_spawn_session(
+                &argv,
+                &env,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                username.as_deref(),
+            ) {
+                Ok((master, child)) => {
+                    if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
+                        && send_fd(mon_fd, master.as_raw_fd()).is_ok()
+                    {
+                        // The worker now owns its own dup of the master; the
+                        // monitor reaps the child off-thread so zombies don't
+                        // accumulate and the request loop never blocks on wait().
+                        std::thread::spawn(move || {
+                            let mut child = child;
+                            let _ = child.wait();
+                        });
+                    }
+                    // `master` (the monitor's dup) drops here, closing its copy;
+                    // the fd we passed to the worker keeps the PTY master open.
+                }
+                Err(e) => {
+                    tracing::warn!("privsep monitor: SpawnSession denied: {e:#}");
+                    let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                }
+            },
         }
     }
 
@@ -672,6 +843,35 @@ mod tests {
         assert!(validate_bind_priv_port([100, 64, 0, 1], 80).is_err()); // wrong port
         assert!(validate_bind_priv_port([100, 64, 0, 1], 22).is_err());
         assert!(validate_bind_priv_port([8, 8, 8, 8], 53).is_err()); // non-vIP
+    }
+
+    /// SpawnSession only accepts an absolute-path launcher or the `login`/`su`
+    /// user-switch helpers, and a well-formed username — the worker can't make
+    /// the monitor run an arbitrary binary as root.
+    #[test]
+    fn spawn_session_validation() {
+        let ok = |argv: &[&str], user: Option<&str>| {
+            validate_spawn_session(
+                &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                user,
+            )
+            .is_ok()
+        };
+        // Launcher allowlist (username None skips the account-existence check, so
+        // these isolate the argv[0] boundary). login/su by basename are allowed
+        // (the privileged switch helpers); an absolute-path shell is allowed
+        // (session-as-self under a dropped worker).
+        assert!(ok(&["login", "-fpq", "x", "/bin/zsh"], None));
+        assert!(ok(&["/usr/bin/su", "-", "x"], None));
+        assert!(ok(&["/bin/bash", "-l"], None));
+        // A relative, non-allowlisted launcher is refused (PATH-search ambiguity).
+        assert!(!ok(&["bash"], None));
+        assert!(!ok(&["evil", "--root"], None));
+        // Empty argv is refused.
+        assert!(!ok(&[], None));
+        // A malformed username is refused (fails the format check) even with an
+        // allowlisted launcher.
+        assert!(!ok(&["login", "-fpq", "bad user!"], Some("bad user!")));
     }
 
     /// Control messages frame + round-trip over the stream socketpair.
