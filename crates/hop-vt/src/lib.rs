@@ -61,6 +61,12 @@ pub struct VtScreen {
 impl VtScreen {
     /// Create an empty screen of `rows × cols`. Scrollback off.
     pub fn new(rows: u16, cols: u16) -> Self {
+        // A 0-sized grid makes alacritty index row/col -1 on the first byte and
+        // panic (which aborts the daemon). Clients can send WindowSize 0,0 (e.g.
+        // a pty not yet sized via TIOCSWINSZ), so clamp to a 1×1 floor — `resize`
+        // already does the same.
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         let dims = FixedDims::new(rows, cols);
         let config = Config { scrolling_history: 0, ..Default::default() };
         let term = Term::new(config, &dims, VoidListener);
@@ -381,6 +387,17 @@ mod tests {
         // are inspected separately.
         !out.windows(3).any(|w| w == b"\x1b]?" || w == b"\x1b[c")
             && !out.windows(2).any(|w| w == b"\x1b]") // OSC introducer
+    }
+
+    #[test]
+    fn zero_size_does_not_panic() {
+        // A client can send WindowSize 0,0; new()+advance() must not panic
+        // (regression: alacritty grid OOB aborted the daemon).
+        let mut screen = VtScreen::new(0, 0);
+        screen.advance(b"hello\r\nworld\x1b[2J");
+        let _ = screen.render_full_repaint();
+        screen.resize(0, 0); // also a no-op, not a panic
+        assert_eq!(screen.dims(), (1, 1));
     }
 
     #[test]

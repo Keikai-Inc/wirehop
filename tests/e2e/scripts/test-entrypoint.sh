@@ -93,6 +93,10 @@ echo "Fleet configured with host-a and host-b"
 
 # ── Remote Exec ──
 echo ""
+echo "--- Interactive Shell ---"
+run_test test_interactive_shell
+
+echo ""
 echo "--- Remote Exec ---"
 run_test test_exec_echo
 run_test test_exec_uname

@@ -118,6 +118,19 @@ test_auth_via_invite_b() {
     assert_contains "$output" "auth-ok"
 }
 
+# ── Interactive (persistent) shell ──
+
+test_interactive_shell() {
+    # `hop <host>` (no `exec`) opens the persistent PTY shell. The client enters
+    # raw mode, so it needs a tty — `script` allocates one and forwards our piped
+    # input. Under HOP_PRIVSEP_DROP this exercises the monitor SpawnSession path.
+    local output
+    output=$(printf 'whoami\nexit\n' \
+        | timeout 25 script -qec "hop --config $CONFIG_DIR host-a" /dev/null 2>&1 || true)
+    # The e2e binds the peer to user `hop`, so whoami prints hop.
+    assert_contains "$output" "hop"
+}
+
 # ── Remote Exec Tests ──
 
 test_exec_echo() {
