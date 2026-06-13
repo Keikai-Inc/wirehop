@@ -456,16 +456,32 @@ fn validate_spawn_session(argv: &[String], username: Option<&str>) -> Result<()>
 /// accounts start at 500, Linux at 1000.
 const MIN_SPAWNABLE_UID: u32 = if cfg!(target_os = "macos") { 500 } else { 1000 };
 
-/// Receiver-side authorization for a spawn target (privsep-node.md §9, Phase 4
-/// baseline). The monitor — not the unprivileged worker — decides who may be
-/// spawned. This first layer refuses system/service accounts (uid <
-/// [`MIN_SPAWNABLE_UID`]); a compromised worker is thus confined to regular user
-/// accounts and can never reach `root`, `daemon`, or the `_hop` service user.
-/// (The full ACL — restricting to exactly the users a peer is bound to — needs a
-/// worker-untamperable binding source and is the remaining Phase-4 work.)
+/// The root-owned allowlist of spawnable users, set by [`run_monitor`]. When
+/// present and valid, it is the authoritative bound-user list — see
+/// [`load_allowlist`] for why it must be root-owned.
+static ALLOWLIST_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Receiver-side authorization for a spawn target (privsep-node.md §9, Phase 4).
+/// The monitor — not the unprivileged worker — decides who may be spawned, in two
+/// layers. **Baseline:** refuse system/service accounts (uid <
+/// [`MIN_SPAWNABLE_UID`]), so a compromised worker can never reach
+/// `root`/`daemon`/`_hop`. **Allowlist:** if the operator placed a root-owned
+/// `privsep-users` file in the daemon config dir, the target must appear in it —
+/// constraining spawns to exactly the accounts peers are bound to.
+///
+/// The allowlist must come from the operator, not the worker: the worker owns
+/// `peers.json`, so a worker RCE could forge bindings — only root-owned config is
+/// a trustworthy source (the inherent ceiling of the trust model).
 fn validate_spawn_user(username: &str) -> Result<()> {
     let (uid, _gid) = crate::transfer::helper::lookup_uid_gid(username)?;
-    validate_spawnable_uid(uid, username)
+    validate_spawnable_uid(uid, username)?;
+    if let Some(allowed) = load_allowlist() {
+        anyhow::ensure!(
+            allowed.contains(username),
+            "refusing to spawn as {username:?}: not in the privsep allowlist"
+        );
+    }
+    Ok(())
 }
 
 /// The pure uid check, factored out for unit testing.
@@ -476,6 +492,49 @@ fn validate_spawnable_uid(uid: u32, username: &str) -> Result<()> {
          only regular user accounts may be session/exec/transfer targets"
     );
     Ok(())
+}
+
+/// Load the operator's spawn allowlist, or `None` if there is no *trustworthy*
+/// one (no file, or — critically — a file the worker could tamper with). The
+/// file must be owned by root and not writable by group/other; otherwise the
+/// unprivileged worker could rewrite it to authorize an escalation, so we ignore
+/// it (falling back to the uid baseline) and warn loudly.
+fn load_allowlist() -> Option<std::collections::HashSet<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let path = ALLOWLIST_PATH.get()?;
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    if md.uid() != 0 {
+        tracing::warn!(
+            "privsep: ignoring spawn allowlist {} — not root-owned (uid {}), so the worker \
+             could tamper with it",
+            path.display(),
+            md.uid()
+        );
+        return None;
+    }
+    if md.mode() & 0o022 != 0 {
+        tracing::warn!(
+            "privsep: ignoring spawn allowlist {} — group/other-writable (mode {:o})",
+            path.display(),
+            md.mode() & 0o777
+        );
+        return None;
+    }
+    Some(parse_allowlist(&std::fs::read_to_string(path).ok()?))
+}
+
+/// Parse a `privsep-users` allowlist: one username per line, `#` comments and
+/// blank lines ignored. Pure, for unit testing.
+fn parse_allowlist(content: &str) -> std::collections::HashSet<String> {
+    content
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Monitor side of `SpawnSession`: validate, open a PTY, spawn the worker-built
@@ -875,6 +934,10 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
         crate::unix_user::is_running_as_root(),
         "the privsep monitor must run as root"
     );
+    // The operator's spawn allowlist (Phase-4 ACL) lives in the daemon config
+    // dir. The monitor reads it (root-owned only) on each spawn request.
+    let _ = ALLOWLIST_PATH.set(config_dir.join("privsep-users"));
+
     let (mon, wrk) = control_socketpair()?;
     clear_cloexec(wrk.as_raw_fd())?;
 
@@ -1186,6 +1249,20 @@ mod tests {
         assert!(validate_spawnable_uid(MIN_SPAWNABLE_UID, "alice").is_ok());
         assert!(validate_spawnable_uid(1001, "hop").is_ok()); // the e2e bound user
         assert!(validate_spawnable_uid(60123, "bob").is_ok());
+    }
+
+    /// The allowlist parser ignores comments + blanks and trims usernames.
+    #[test]
+    fn allowlist_parsing() {
+        let set = parse_allowlist(
+            "# bound users\nalice\n  bob  \n\ncarol # inline note\n#full-line comment\n",
+        );
+        assert!(set.contains("alice"));
+        assert!(set.contains("bob"));
+        assert!(set.contains("carol"));
+        assert!(!set.contains("dave"));
+        assert!(!set.iter().any(|u| u.starts_with('#')));
+        assert_eq!(set.len(), 3);
     }
 
     /// Several fds round-trip in order through one SCM_RIGHTS message (the
