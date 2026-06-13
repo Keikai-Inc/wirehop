@@ -190,6 +190,15 @@ impl SessionPty {
             SessionPty::Passed(f) => Ok(Box::new(f.try_clone().context("clone passed PTY master")?)),
         }
     }
+    /// The PTY master's raw fd, for the persistent cancellable reader (which
+    /// dups it). `None` if the local master can't expose one.
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            SessionPty::Local(m) => m.as_raw_fd(),
+            SessionPty::Passed(f) => Some(f.as_raw_fd()),
+        }
+    }
     fn resize(&self, size: PtySize) -> Result<()> {
         match self {
             SessionPty::Local(m) => m.resize(size).map_err(|e| anyhow::anyhow!("{e}")),
@@ -646,6 +655,10 @@ fn spawn_cancellable_pty_reader(
     screen: Arc<std::sync::Mutex<hop_vt::VtScreen>>,
     route_rx: watch::Receiver<Option<mpsc::Sender<Vec<u8>>>>,
     cancel: Arc<tokio::sync::Notify>,
+    // Under privsep the monitor owns the child, so there's no local `wait()` to
+    // report exit — the reader signals it on master EOF instead. `None` for the
+    // local path, where the child-exit watcher owns the exit channel.
+    exit_on_eof: Option<watch::Sender<Option<i32>>>,
 ) -> Result<()> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -708,6 +721,12 @@ fn spawn_cancellable_pty_reader(
                 }
             }
         }
+        // Master EOF/hangup == the shell exited. Under privsep (no local child
+        // waiter) report it so the attach loop can send Exit and the registry
+        // reaps the session.
+        if let Some(tx) = exit_on_eof {
+            let _ = tx.send(Some(0));
+        }
         // async_fd drops here → the dup'd master fd closes.
     });
     Ok(())
@@ -744,19 +763,6 @@ fn spawn_persistent_pty(
     // as the unprivileged worker (which would fail opaquely). One-shot shells,
     // exec, and transfer all work under privsep; persistent is the remaining
     // surface (privsep-node.md §10 Phase 3).
-    #[cfg(unix)]
-    if username.is_some()
-        && !crate::unix_user::is_running_as_root()
-        && crate::privsep::is_privsep_worker()
-    {
-        anyhow::bail!(
-            "persistent sessions are not yet supported under privilege separation \
-             (HOP_PRIVSEP_DROP); use a non-persistent session for now"
-        );
-    }
-
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(size).context("Failed to open PTY")?;
 
     // Use the target user's login shell, not the daemon's $SHELL.
     // When the daemon runs as root, $SHELL is /bin/sh, but the user's
@@ -769,48 +775,33 @@ fn spawn_persistent_pty(
     #[cfg(not(unix))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let broker_config = if sandbox.is_restricted() { Some(config_dir) } else { None };
-    let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, &shell, username, broker_config);
-    let mut cmd = CommandBuilder::new(&bin);
-    cmd.args(args.iter().map(|s| s.as_str()));
 
-    const ENV_ALLOWLIST: &[&str] = &[
-        "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE",
-        "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "COLORTERM",
-    ];
-    for key in ENV_ALLOWLIST {
-        if let Some(val) = env_vars.get(*key) {
-            cmd.env(key, val);
-        }
-    }
-    if !env_vars.contains_key("TERM") {
-        cmd.env("TERM", "xterm-256color");
-    }
-
-    // On macOS, when sandbox is restricted, set up broker shim directory
-    // so the sandboxed shell can proxy setuid-blocked commands through the daemon.
-    //
-    // We can't use cmd.env("PATH", ...) because login shell profile scripts
-    // (path_helper via /etc/zprofile) replace PATH entirely. Instead, we use
-    // ZDOTDIR to inject a .zprofile that prepends the shim dir AFTER the
-    // system profile scripts have already rebuilt PATH.
+    // Allowlisted client env + (macOS, restricted) the broker shim vars, so both
+    // the local and privsep-monitor spawn paths get an identical environment.
+    #[allow(unused_mut)]
+    let mut env_pairs = session_env_pairs(env_vars);
     #[cfg(target_os = "macos")]
     if sandbox.is_restricted() {
         let _ = crate::sandbox::broker::setup_shim_dir(config_dir, &session_id, username);
-        if let Ok(zdotdir) = crate::sandbox::broker::setup_zdotdir(config_dir, &session_id, username) {
-            cmd.env("ZDOTDIR", zdotdir.to_string_lossy().as_ref());
+        if let Ok(zdotdir) =
+            crate::sandbox::broker::setup_zdotdir(config_dir, &session_id, username)
+        {
+            env_pairs.push(("ZDOTDIR".to_string(), zdotdir.to_string_lossy().into_owned()));
         }
-        // Set HOP_BROKER_SOCK as fallback for non-zsh shells
         let sock_path = crate::sandbox::broker::broker_sock_path(config_dir, &session_id);
-        cmd.env("HOP_BROKER_SOCK", sock_path.to_string_lossy().as_ref());
+        env_pairs.push((
+            "HOP_BROKER_SOCK".to_string(),
+            sock_path.to_string_lossy().into_owned(),
+        ));
     }
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("Failed to spawn shell")?;
-    drop(pair.slave);
+    // Acquire the PTY — locally, or via the privsep monitor when we're the
+    // unprivileged worker with a bound user. `child` is None on the monitor path
+    // (the monitor owns + reaps the child; exit arrives as master EOF).
+    let (session_pty, child) =
+        acquire_session_pty(sandbox, &shell, username, &env_pairs, size, broker_config)?;
 
-    let pty_writer = pair.master.take_writer().context("take PTY writer")?;
+    let pty_writer = session_pty.take_writer().context("take PTY writer")?;
     let pty_writer = Arc::new(std::sync::Mutex::new(pty_writer));
 
     // Output routing via watch channel
@@ -837,44 +828,27 @@ fn spawn_persistent_pty(
     // Killing the shell alone isn't enough in that case; this is what makes
     // reclamation independent of what the child or its leftover jobs do.
     let reader_cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-    #[cfg(unix)]
-    {
-        let master_fd = pair
-            .master
-            .as_raw_fd()
-            .context("PTY master exposes no raw fd")?;
-        spawn_cancellable_pty_reader(
-            master_fd,
-            screen.clone(),
-            output_route_rx.clone(),
-            reader_cancel.clone(),
-        )?;
-    }
-    #[cfg(not(unix))]
-    {
-        // Non-unix is not a shipped target; fall back to the blocking reader
-        // (no cancellation — `reader_cancel` is inert here).
-        let _ = &reader_cancel;
-        let mut pty_reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-        let route_rx = output_route_rx.clone();
-        let reader_screen = screen.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match pty_reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        { reader_screen.lock().unwrap().advance(&data); }
-                        if let Some(tx) = route_rx.borrow().clone() {
-                            let _ = tx.blocking_send(data);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
+
+    // Exit channel, created here so the reader can own it on the privsep path.
+    // Local path: the child-exit watcher below sends the real code. Privsep path
+    // (no local child): the reader reports exit on master EOF.
+    let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
+
+    let master_fd = session_pty
+        .as_raw_fd()
+        .context("PTY master exposes no raw fd")?;
+    let exit_on_eof = if child.is_none() {
+        Some(exit_tx.clone())
+    } else {
+        None
+    };
+    spawn_cancellable_pty_reader(
+        master_fd,
+        screen.clone(),
+        output_route_rx.clone(),
+        reader_cancel.clone(),
+        exit_on_eof,
+    )?;
 
     // Input writer task. Unbounded so the shell select-loop never blocks on
     // send: if the PTY's small kernel input buffer fills mid-paste, bytes
@@ -903,7 +877,7 @@ fn spawn_persistent_pty(
     // syscall and we're inside spawn_blocking; awaiting changed() directly
     // would require a separate tokio task that can't safely hold the
     // master across .await on a non-Send-bounded API.
-    let master = pair.master;
+    let master = session_pty;
     tokio::task::spawn_blocking(move || {
         let _master = master;
         let handle = tokio::runtime::Handle::current();
@@ -914,7 +888,8 @@ fn spawn_persistent_pty(
             let new_size = *resize_rx.borrow_and_update();
             let _ = _master.resize(new_size);
         }
-        // _master drops here → PTY closes → shell gets SIGHUP
+        // _master drops here → PTY master closes → shell gets SIGHUP. Under
+        // privsep the worker holds the only master, so this is the sole closer.
     });
 
     // VtScreen-resize task: separate watcher for the off-screen grid.
@@ -934,17 +909,20 @@ fn spawn_persistent_pty(
         }
     });
 
-    // Child exit watcher. Capture the pid first so the registry can terminate
-    // the shell on removal (the master-drop SIGHUP path doesn't fire — the
-    // reader task holds a clone of the master; see session_registry).
-    let child_pid = child.process_id();
-    let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
-    tokio::task::spawn_blocking(move || {
-        if let Ok(status) = child.wait() {
-            let code: i32 = status.exit_code().try_into().unwrap_or(1);
-            let _ = exit_tx.send(Some(code));
-        }
-    });
+    // Child exit watcher. Local path only: capture the pid so the registry can
+    // SIGKILL the shell on removal, and wait() it for the real exit code. On the
+    // privsep path the monitor owns + reaps the child — there is no local pid,
+    // the reader already reports exit on master EOF, and removal relies on the
+    // master-close SIGHUP (the worker holds the only master fd).
+    let child_pid = child.as_ref().and_then(|c| c.process_id());
+    if let Some(mut child) = child {
+        tokio::task::spawn_blocking(move || {
+            if let Ok(status) = child.wait() {
+                let code: i32 = status.exit_code().try_into().unwrap_or(1);
+                let _ = exit_tx.send(Some(code));
+            }
+        });
+    }
 
     Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel))
 }
@@ -1911,7 +1889,7 @@ mod reader_tests {
         let (_route_set, route_get) = watch::channel(Some(route_tx));
         let cancel = Arc::new(tokio::sync::Notify::new());
 
-        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone())
+        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone(), None)
             .expect("spawn reader");
 
         // 1) Data flows through before cancel.
