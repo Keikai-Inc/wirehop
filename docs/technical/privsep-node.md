@@ -25,10 +25,16 @@
 > (the worker owns `peers.json`, so only operator-set root-owned config is
 > trustworthy) — operator-maintained allowlist is the inherent limit, not a gap.
 >
-> **Remaining:** **persistent shells** are refused under drop pending relocation of
-> the detached-session machinery; and the **macOS feasibility gate (§8.1)** is
-> still unrun — a passed *utun* fd surviving non-root I/O on macOS (B-full vs
-> B-lite) is unverified, so privsep must not be activated on macOS hosts yet.
+> **Persistent (interactive) shells now work under drop too** — `spawn_persistent_pty`
+> acquires its PTY via the monitor's `SpawnSession`, validated by the
+> `interactive_shell` e2e under `HOP_PRIVSEP_DROP` (54/54). So all four session
+> surfaces (shell, persistent-shell, exec, transfer) run under privsep.
+>
+> **The only remaining item is the macOS feasibility gate (§8.1):** it is unrun —
+> a passed *utun* fd surviving non-root I/O on macOS (B-full vs B-lite) is
+> unverified, so privsep must not be activated on macOS hosts until
+> `sudo hop __privsep-probe` passes. Everything else is implemented and
+> Linux-validated.
 >
 > Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
@@ -404,11 +410,14 @@ defense that doesn't depend on every peer's worker being honest.
   - **file transfer** (`transfer/helper.rs`) — ✅ done (`SpawnHelper`; all four
     copy/sync arms route through the monitor for the privsep worker).
 
-  Exec + transfer are validated by the 53-test e2e under `HOP_PRIVSEP_DROP`.
-  **persistent-shell** (`session_registry`) is the one un-relocated surface —
-  refused under drop for now (the detached-session machinery — resize task owning
-  the master, pid-based registry kill, cancellable reader — needs a passed-fd
-  variant).
+  - **persistent shell** (`spawn_persistent_pty`) — ✅ done. Acquires its PTY via
+    `acquire_session_pty` → `SessionPty` (Local or monitor-Passed). The cancellable
+    reader takes the master raw fd from `SessionPty::as_raw_fd` and reports exit on
+    EOF when there's no local child (privsep); removal relies on master-close SIGHUP
+    (the worker holds the only master fd, since the monitor drops its copy).
+
+  All four surfaces are validated by the 54-test e2e under `HOP_PRIVSEP_DROP`,
+  including the `interactive_shell` round-trip, with the non-privsep path byte-preserved.
 - **Phase 4 — Hardening + receiver ACL. ✅ ACL done.** The monitor authorizes the
   spawn *target* (`validate_spawn_user`) in two layers: (1) refuse system/service
   accounts (uid < `MIN_SPAWNABLE_UID`), so a compromised worker can't reach
@@ -419,8 +428,10 @@ defense that doesn't depend on every peer's worker being honest.
   unit-tested; e2e-green under drop. A fully-automatic peer-binding sync is
   impossible under the trust model (the worker owns `peers.json`), so the
   operator-maintained root-owned allowlist is the ceiling, not a TODO.
-  **Still open:** macOS daemon-install e2e (monitor=root / worker=`_hop` /
-  sessions+VPN); relocating persistent shells off the in-process path.
+  **Still open (the only remaining item):** the macOS feasibility gate (§8.1) —
+  `sudo hop __privsep-probe` must pass before privsep is activated on macOS. A
+  macOS daemon-install e2e (asserting monitor=root / worker=`_hop` / sessions+VPN)
+  is the natural follow-up once the gate is run. All Linux surfaces are done.
 
 ## 11. Reused components (don't rebuild)
 
