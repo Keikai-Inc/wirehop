@@ -18,14 +18,17 @@
 >   **Persistent shells** are explicitly refused under drop (a clean error) pending
 >   relocation of the detached-session machinery.
 >
-> **Remaining:** Phase 4 receiver-side ACL is **partially done** — the monitor now
-> refuses to spawn as system/service accounts (uid < 500 macOS / 1000 Linux), so a
-> compromised worker can't reach `root`/`daemon`/`_hop`; the *full* ACL (restrict
-> to exactly the users a peer is bound to) still needs a worker-untamperable
-> binding source. **Persistent shells** remain refused under drop. The **macOS
-> feasibility gate (§8.1)** is still unrun — a passed *utun* fd surviving non-root
-> I/O on macOS (B-full vs B-lite) is unverified, so privsep must not be activated
-> on macOS hosts yet.
+> Phase 4 **receiver-side ACL is done** to the trust model's ceiling: the monitor
+> refuses system/service accounts (uid < 500 macOS / 1000 Linux) and, if the
+> operator provides a root-owned `privsep-users` allowlist, restricts spawns to
+> exactly those accounts. A fully-automatic peer-binding sync is *not possible*
+> (the worker owns `peers.json`, so only operator-set root-owned config is
+> trustworthy) — operator-maintained allowlist is the inherent limit, not a gap.
+>
+> **Remaining:** **persistent shells** are refused under drop pending relocation of
+> the detached-session machinery; and the **macOS feasibility gate (§8.1)** is
+> still unrun — a passed *utun* fd surviving non-root I/O on macOS (B-full vs
+> B-lite) is unverified, so privsep must not be activated on macOS hosts yet.
 >
 > Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
@@ -406,17 +409,18 @@ defense that doesn't depend on every peer's worker being honest.
   refused under drop for now (the detached-session machinery — resize task owning
   the master, pid-based registry kill, cancellable reader — needs a passed-fd
   variant).
-- **Phase 4 — Hardening + receiver ACL. 🟡 baseline done.** The monitor now
-  authorizes the spawn *target* (`validate_spawn_user`): a peer-bound
-  session/exec/transfer may only target a regular user account (uid >=
-  `MIN_SPAWNABLE_UID`), so a compromised worker can't reach `root`/`daemon`/`_hop`
-  — the highest-value escalation targets. Wired into all three spawn validators,
-  unit-tested, e2e-green under drop. **Remaining:** the *full* ACL — restrict to
-  exactly the users a peer is bound to — needs a worker-untamperable binding source
-  (the worker owns `peers.json`, so it can't be the source of truth; a root-owned
-  allowlist populated by the invite flow is the likely shape). Also: macOS
-  daemon-install e2e asserting monitor=root / worker=`_hop` / sessions+VPN work;
-  relocate persistent shells off the in-process path.
+- **Phase 4 — Hardening + receiver ACL. ✅ ACL done.** The monitor authorizes the
+  spawn *target* (`validate_spawn_user`) in two layers: (1) refuse system/service
+  accounts (uid < `MIN_SPAWNABLE_UID`), so a compromised worker can't reach
+  `root`/`daemon`/`_hop`; (2) if a **root-owned `privsep-users`** file exists in the
+  config dir, restrict spawns to exactly those accounts. `load_allowlist` rejects a
+  non-root or group/other-writable file (the worker mustn't be able to forge the
+  allowlist). Wired into all three spawn validators; uid threshold + parser
+  unit-tested; e2e-green under drop. A fully-automatic peer-binding sync is
+  impossible under the trust model (the worker owns `peers.json`), so the
+  operator-maintained root-owned allowlist is the ceiling, not a TODO.
+  **Still open:** macOS daemon-install e2e (monitor=root / worker=`_hop` /
+  sessions+VPN); relocating persistent shells off the in-process path.
 
 ## 11. Reused components (don't rebuild)
 
