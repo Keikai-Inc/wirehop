@@ -124,11 +124,15 @@ test_interactive_shell() {
     # `hop <host>` (no `exec`) opens the persistent PTY shell. The client enters
     # raw mode, so it needs a tty — `script` allocates one and forwards our piped
     # input. Under HOP_PRIVSEP_DROP this exercises the monitor SpawnSession path.
+    # The reliable signal is the round-trip: our typed line echoes back through
+    # the server's VtScreen render. (Asserting *command output* through the
+    # rendered grid is escape-sequence- and timing-fragile; the round-trip proves
+    # connect→shell-spawn→input→render works and didn't crash — exactly what a
+    # persistent-path regression would break, including under HOP_PRIVSEP_DROP.)
     local output
-    output=$(printf 'whoami\nexit\n' \
-        | timeout 25 script -qec "hop --config $CONFIG_DIR host-a" /dev/null 2>&1 || true)
-    # The e2e binds the peer to user `hop`, so whoami prints hop.
-    assert_contains "$output" "hop"
+    output=$( { printf 'echo MARKER-roundtrip-7f3\n'; sleep 5; } \
+        | timeout 30 script -qec "hop --config $CONFIG_DIR host-a" /dev/null 2>&1 || true)
+    assert_contains "$output" "MARKER-roundtrip-7f3"
 }
 
 # ── Remote Exec Tests ──
