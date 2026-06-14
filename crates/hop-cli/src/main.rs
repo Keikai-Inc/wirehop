@@ -1913,6 +1913,12 @@ fn cmd_install_daemon(args: InstallDaemonArgs) -> Result<()> {
         }
         let _ = &args.tier; // informational; reserved for future role mapping.
 
+        // Step D2 — create the privsep service account the worker drops to, so
+        // the plist's HOP_PRIVSEP_DROP actually takes effect (otherwise the
+        // monitor finds no service user and keeps the worker root). Idempotent;
+        // non-fatal — privsep degrades to a root worker if creation fails.
+        ensure_service_user();
+
         // Step E — write the service file + start it. The service file is
         // always written; only the service *start* is skipped under
         // HOP_INSTALL_DAEMON_NO_START (lets the e2e validate file-laying +
@@ -1950,6 +1956,61 @@ fn cmd_install_daemon(args: InstallDaemonArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Create the privsep service account (`_hop` on macOS, `hop` on Linux) if it
+/// doesn't already exist, mirroring the `.pkg` postinstall so the native
+/// installer (`install-daemon.sh` → `__install-daemon`) fully activates
+/// HOP_PRIVSEP_DROP. Idempotent and non-fatal: privsep falls back to a root
+/// worker (and the monitor's crash-loop fallback) if the account is absent.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_service_user() {
+    if hop_core::privsep::service_user_ids().is_some() {
+        return; // already present
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Pick a free system UID in [200, 400) just above the highest existing.
+        let mut uid: u32 = 300;
+        if let Ok(out) = std::process::Command::new("dscl")
+            .args([".", "-list", "/Users", "UniqueID"])
+            .output()
+            && let Some(m) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().nth(1).and_then(|n| n.parse::<u32>().ok()))
+                .filter(|u| (200..400).contains(u))
+                .max()
+        {
+            uid = m + 1;
+        }
+        let uid_s = uid.to_string();
+        let dscl = |a: &[&str]| {
+            let _ = std::process::Command::new("dscl").args(a).status();
+        };
+        dscl(&[".", "-create", "/Groups/_hop"]);
+        dscl(&[".", "-create", "/Groups/_hop", "PrimaryGroupID", &uid_s]);
+        dscl(&[".", "-create", "/Groups/_hop", "RealName", "hop service"]);
+        dscl(&[".", "-create", "/Users/_hop"]);
+        dscl(&[".", "-create", "/Users/_hop", "UserShell", "/usr/bin/false"]);
+        dscl(&[".", "-create", "/Users/_hop", "RealName", "hop service"]);
+        dscl(&[".", "-create", "/Users/_hop", "UniqueID", &uid_s]);
+        dscl(&[".", "-create", "/Users/_hop", "PrimaryGroupID", &uid_s]);
+        dscl(&[".", "-create", "/Users/_hop", "NFSHomeDirectory", "/var/empty"]);
+        dscl(&[".", "-create", "/Users/_hop", "IsHidden", "1"]);
+        println!("Created _hop service account (uid {uid}).");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The `hop` system group is created in Step B; add the matching user.
+        let ok = std::process::Command::new("useradd")
+            .args(["--system", "-g", "hop", "-s", "/usr/sbin/nologin", "-M", "hop"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            println!("Created hop service account.");
+        }
+    }
 }
 
 /// Run the privsep Phase-0 feasibility gate (privsep-node.md §8.1). Resolves an
