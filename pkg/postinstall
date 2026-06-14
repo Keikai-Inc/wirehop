@@ -14,6 +14,31 @@ SYSTEM_CONFIG="/Library/Application Support/hop"
 # Ensure /usr/local/bin exists
 mkdir -p /usr/local/bin
 
+# Create the `_hop` service account the privilege-separation worker drops to
+# (privsep-node.md Phase 2). Dormant unless the daemon runs with HOP_PRIVSEP_DROP
+# — creating it is harmless otherwise. macOS `_`-prefixed system accounts live in
+# the 200–400 UID range with a nologin shell and no home.
+if ! dscl . -read /Users/_hop >/dev/null 2>&1; then
+    LAST_UID=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 200 && $2 < 400 {print $2}' | sort -n | tail -1)
+    HOP_UID=$(( ${LAST_UID:-299} + 1 ))
+    HOP_GID=$HOP_UID
+    if ! dscl . -read /Groups/_hop >/dev/null 2>&1; then
+        dscl . -create /Groups/_hop 2>/dev/null || true
+        dscl . -create /Groups/_hop PrimaryGroupID "$HOP_GID" 2>/dev/null || true
+        dscl . -create /Groups/_hop RealName "hop service" 2>/dev/null || true
+    else
+        HOP_GID=$(dscl . -read /Groups/_hop PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    fi
+    dscl . -create /Users/_hop 2>/dev/null || true
+    dscl . -create /Users/_hop UserShell /usr/bin/false 2>/dev/null || true
+    dscl . -create /Users/_hop RealName "hop service" 2>/dev/null || true
+    dscl . -create /Users/_hop UniqueID "$HOP_UID" 2>/dev/null || true
+    dscl . -create /Users/_hop PrimaryGroupID "$HOP_GID" 2>/dev/null || true
+    dscl . -create /Users/_hop NFSHomeDirectory /var/empty 2>/dev/null || true
+    dscl . -create /Users/_hop IsHidden 1 2>/dev/null || true
+    echo "Created _hop service account (uid $HOP_UID)."
+fi
+
 # Set correct ownership and permissions
 chown root:wheel "$BINARY"
 chmod 755 "$BINARY"

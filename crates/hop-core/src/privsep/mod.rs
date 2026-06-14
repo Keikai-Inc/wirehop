@@ -837,10 +837,15 @@ pub fn service_user_ids() -> Option<(u32, u32)> {
 
 /// Re-own the daemon config dir to the service user so the (soon-unprivileged)
 /// worker can read its own identity/tickets/datastore. Runs as root in the
-/// monitor before the worker is spawned; idempotent. Permissions are unchanged
-/// (files stay `0600`/dirs `0700`), so only the service user and root can read
-/// the secrets — the threat model's "other local users" still cannot. Best
-/// effort per entry: a chown failure on one path is logged, not fatal.
+/// monitor before the worker is spawned; idempotent. Permissions (mode) are
+/// unchanged, so only the service user and root can read the secrets — the
+/// threat model's "other local users" still cannot. Best effort per entry.
+///
+/// NOTE (macOS): the installer leaves config `root:admin` so admin users' CLI
+/// (`hop invite`, `hop id`) can read it via the admin group; re-owning to
+/// `_hop:_hop` removes that group access, so those direct-config CLI ops need
+/// `sudo` (or the daemon IPC) under privsep-drop on macOS. Tracked as a follow-up
+/// (route operator CLI through `daemon.sock`); not a lockout — the daemon stays up.
 fn migrate_config_ownership(dir: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let want_uid = nix::unistd::Uid::from_raw(uid);
@@ -938,6 +943,17 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // dir. The monitor reads it (root-owned only) on each spawn request.
     let _ = ALLOWLIST_PATH.set(config_dir.join("privsep-users"));
 
+    // Crash-loop fallback (anti-lockout). privsep ships on-by-default on macOS;
+    // if a platform-specific issue keeps the worker from staying up, we must NOT
+    // leave the host unreachable. The monitor re-spawns the worker, and if it
+    // keeps exiting almost immediately, gives up on privsep and re-execs the
+    // daemon **directly as root** (non-privsep) so the node stays online.
+    const HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(30);
+    const MAX_FAST_FAILURES: u32 = 3;
+    let mut fast_failures: u32 = 0;
+
+    loop {
+    let spawn_instant = std::time::Instant::now();
     let (mon, wrk) = control_socketpair()?;
     clear_cloexec(wrk.as_raw_fd())?;
 
@@ -1115,7 +1131,54 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     }
 
     let status = child.wait().context("waiting on privsep worker")?;
-    anyhow::bail!("privsep worker exited ({status:?}); monitor exiting for KeepAlive restart")
+    let uptime = spawn_instant.elapsed();
+    // Drop this iteration's kept devices/sockets before respawning (a fresh
+    // worker creates fresh ones); they're scoped to the loop body.
+    drop(kept_tuns);
+    drop(kept_socks);
+    drop(mon);
+
+    if uptime < HEALTHY_UPTIME {
+        fast_failures += 1;
+        tracing::warn!(
+            "privsep worker exited ({status:?}) after {uptime:?} — fast failure \
+             {fast_failures}/{MAX_FAST_FAILURES}"
+        );
+        if fast_failures >= MAX_FAST_FAILURES {
+            tracing::error!(
+                "privsep worker crash-looped {MAX_FAST_FAILURES}x; falling back to a \
+                 non-privsep root daemon so the node stays reachable"
+            );
+            return run_non_privsep_fallback(config_dir, quiet);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500)); // backoff
+    } else {
+        tracing::info!("privsep worker exited ({status:?}) after {uptime:?}; respawning");
+        fast_failures = 0;
+    }
+    } // end retry loop
+}
+
+/// Last-resort fallback: re-exec the daemon **without** privilege separation, as
+/// the current (root) process, so a host whose privsep worker can't stay up
+/// stays online instead of locking out. Clears the `HOP_PRIVSEP*` env so the
+/// re-exec takes the ordinary root-daemon path. Only returns on `exec` failure.
+fn run_non_privsep_fallback(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("resolving current exe")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("host").arg("--config").arg(config_dir);
+    if quiet {
+        cmd.arg("--quiet");
+    }
+    cmd.env_remove("HOP_PRIVSEP")
+        .env_remove("HOP_PRIVSEP_DROP")
+        .env_remove("HOP_PRIVSEP_WORKER")
+        .env_remove("HOP_PRIVSEP_CTRL_FD")
+        // Mark the fallback so the daemon logs why it's not privsep-separated.
+        .env("HOP_PRIVSEP_FALLBACK", "1");
+    let err = cmd.exec(); // replaces this process; only returns on failure
+    Err(anyhow::anyhow!("non-privsep fallback exec failed: {err}"))
 }
 
 /// Clear the close-on-exec flag so an fd survives `exec` into a child process.

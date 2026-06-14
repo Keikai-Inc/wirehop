@@ -14,6 +14,22 @@
         <string>/Library/Application Support/hop</string>
     </array>
 
+    <!-- Privilege separation (privsep-node.md). The §8.1 utun gate passed on
+         macOS (B-full), so the daemon runs as a root monitor that owns the TUN /
+         :53 and spawns an unprivileged `_hop` worker for the network-facing
+         daemon. HOP_PRIVSEP = monitor/worker split; HOP_PRIVSEP_DROP = drop the
+         worker to `_hop`. The `_hop` account is created by postinstall; the
+         monitor re-owns the config to `_hop` at startup. If the worker can't
+         stay up, the monitor falls back to a plain root daemon (anti-lockout).
+         Off-by-default in the binary — this plist opts in. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOP_PRIVSEP</key>
+        <string>1</string>
+        <key>HOP_PRIVSEP_DROP</key>
+        <string>1</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 

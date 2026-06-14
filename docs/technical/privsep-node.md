@@ -30,11 +30,18 @@
 > `interactive_shell` e2e under `HOP_PRIVSEP_DROP` (54/54). So all four session
 > surfaces (shell, persistent-shell, exec, transfer) run under privsep.
 >
-> **The only remaining item is the macOS feasibility gate (§8.1):** it is unrun —
-> a passed *utun* fd surviving non-root I/O on macOS (B-full vs B-lite) is
-> unverified, so privsep must not be activated on macOS hosts until
-> `sudo hop __privsep-probe` passes. Everything else is implemented and
-> Linux-validated.
+> **macOS feasibility gate (§8.1): ✅ PASSED (2026-06-13)** — `hop __privsep-probe`
+> ran as root and a non-root child read/wrote the passed utun fd → **B-full is
+> viable on macOS.** macOS **activation** is implemented: the `.pkg` postinstall
+> creates the `_hop` service account, and the LaunchDaemon plist sets
+> `HOP_PRIVSEP` + `HOP_PRIVSEP_DROP` (default-on for new macOS installs). An
+> **anti-lockout crash-loop fallback** is in `run_monitor`: if the worker keeps
+> exiting fast, the monitor re-execs the daemon as a plain root process so the host
+> stays reachable. Two macOS caveats: (1) the full worker-as-`_hop` daemon isn't
+> e2e-tested on macOS (no macOS CI), so validate on a test Mac before production
+> hosts — RexMundi is deliberately excluded pending that; (2) under drop the config
+> is `_hop`-owned, so admin-group CLI ops (`hop invite`/`hop id`, which read config
+> directly) need `sudo` until they're routed through `daemon.sock` (follow-up).
 >
 > Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
@@ -241,17 +248,15 @@ the only lever — hence the fixed 3-primitive protocol.
 
 ## 8. Edge cases
 
-**8.1 — macOS utun fd usable by a non-root process? (THE feasibility gate.)**
-The entire design assumes that after the monitor (root) creates+configures the
-utun, a *passed* fd can be `read`/`write`n by the unprivileged worker. The
+**8.1 — macOS utun fd usable by a non-root process? (THE feasibility gate.) ✅
+PASSED (2026-06-13).** The entire design assumes that after the monitor (root)
+creates+configures the utun, a *passed* fd can be `read`/`write`n by the
+unprivileged worker. `hop __privsep-probe` ran as root on macOS and reported
+`probe child: non-root I/O on the passed TUN fd is PERMITTED` → **PASS**. So the
 privilege checks are at socket *creation* (`SYSPROTO_CONTROL` connect) and
-*interface configuration* (`SIOCSIF*`), not per-I/O — so this is expected to
-work (it's how OpenVPN/Tailscale-style fd hand-off works), but macOS has been
-known to re-check entitlements in surprising places. **This must be empirically
-proven before any other work** (a 30-line standalone test: root creates utun,
-fork+drop to `_hop`, pass the fd, child `write`s an ICMP echo and `read`s the
-reply). If macOS *does* re-check on I/O, fall back to either keeping packet I/O
-in the monitor (a thinner "B-lite", §10) or option A (userspace netstack).
+*interface configuration* (`SIOCSIF*`), not per-I/O, exactly as on Linux —
+**B-full is viable on macOS.** No B-lite pivot needed. (Linux had already proven
+this via `privsep-e2e.sh`.)
 
 **8.2 — Worker crash / restart.** The monitor holds the **canonical** TUN/`:53`
 fds, so the interface, address, and route **persist** across worker restarts
