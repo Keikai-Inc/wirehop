@@ -3244,6 +3244,10 @@ async fn cmd_fleet(
             // 1. Warren members — from the replicated netdoc snapshot (daemon's
             // warren-members.json), the same view on every node.
             let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+            // Mark which member is this node by node-id (best-effort via the
+            // daemon — members carry their real hostname now, not the string
+            // "self"). No daemon → no marker, not an error.
+            let self_id = id_via_daemon(host_config_dir).ok().flatten();
             if let Some(ns) = &snap.namespace {
                 println!("warren {} — {} member(s)", &ns[..8.min(ns.len())], snap.members.len());
             }
@@ -3254,7 +3258,8 @@ async fn cmd_fleet(
                 let id = &m.node_id[..10.min(m.node_id.len())];
                 let vip = m.vip.as_deref().map(|v| format!("  {v}")).unwrap_or_default();
                 let tags = if m.tags.is_empty() { String::new() } else { format!("  [{}]", m.tags.join(", ")) };
-                println!("  {id}  {}  role={}{vip}{tags}", m.name, m.role);
+                let me = if self_id.as_deref() == Some(m.node_id.as_str()) { "  (this node)" } else { "" };
+                println!("  {id}  {}  role={}{vip}{tags}{me}", m.name, m.role);
                 any = true;
             }
 

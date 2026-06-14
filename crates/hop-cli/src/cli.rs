@@ -2,7 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "hop", about = "Secure P2P remote access")]
+#[command(
+    name = "hop",
+    about = "Secure P2P remote access",
+    version = env!("CARGO_PKG_VERSION")
+)]
 pub struct Cli {
     /// Override config directory
     #[arg(long, global = true)]

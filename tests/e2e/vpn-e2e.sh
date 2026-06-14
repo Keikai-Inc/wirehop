@@ -225,6 +225,26 @@ if docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
     else
         RC=0
     fi
+
+    # MagicDNS end-to-end name resolution: host-b resolves host-a's registered
+    # name (host-a is the founder → name lands in the main doc via put_self's
+    # mirror; host-b syncs it and `lookup_name` returns the vIP). Proves the
+    # founder-name registration + cross-node name lookup, not just the :53 socket.
+    if [ "$RC" = "0" ]; then
+        A_NAME=$(docker exec hop-vpn-a hostname | tr 'A-Z' 'a-z' | cut -d. -f1)
+        echo "=== TEST: MagicDNS resolves founder name '${A_NAME}.hop' from host-b ==="
+        NAME_OK=0
+        for attempt in 1 2 3 4 5 6; do
+          R=$(docker exec hop-vpn-b dig +short +time=2 +tries=1 "@$VIP_B" "${A_NAME}.hop" 2>/dev/null | head -1)
+          if [ "$R" = "$VIP_A" ]; then NAME_OK=1; echo "MAGICDNS NAME OK: ${A_NAME}.hop → $R"; break; fi
+          echo "  (attempt $attempt: '${R:-<none>}' ≠ $VIP_A; name sync settling 5s)"; sleep 5
+        done
+        if [ "$NAME_OK" != "1" ]; then
+            echo "VPN E2E FAILED: MagicDNS did not resolve ${A_NAME}.hop → $VIP_A."
+            docker exec hop-vpn-a grep -aE "vpn: MagicDNS serving|name registration" /cfg/log | tail -5 || true
+            RC=1
+        fi
+    fi
 else
     echo ""
     echo "VPN E2E FAILED: ping over TUN did not succeed."
@@ -409,9 +429,13 @@ if [ "$RC" = "0" ]; then
           if [ "${V:-0}" -ge 2 ] 2>/dev/null; then break; fi
           sleep 1
         done
-        sleep 8
+        sleep 10
+        # No-founder reconvergence (c re-registers in its self-doc; b picks it up
+        # over the c↔b gossip path with no admin online) is the slowest path in
+        # the suite — documented to intermittently take >25s. Give it a wide
+        # window so we test "it reconverges", not "within ~24s".
         NA_PING=0
-        for attempt in 1 2 3 4; do
+        for attempt in 1 2 3 4 5 6 7 8; do
           if docker exec hop-vpn-c ping -c 5 -W 3 "$VIP_B"; then NA_PING=1; break; fi
           echo "  (attempt $attempt failed; settling 6s)"; sleep 6
         done

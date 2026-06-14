@@ -1431,7 +1431,11 @@ impl NetDoc {
         if !self.federated && self.get_peer(host_node_id).await.ok().flatten().is_none() {
             let me = Peer {
                 node_id: host_node_id.to_string(),
-                name: "self".to_string(),
+                // The founder's display name is its bare hostname (same label
+                // MagicDNS registers), not the literal "self" — otherwise every
+                // *other* node's `hop fleet list` shows the founder as "self".
+                // "Is this me?" is a node-id comparison the renderer does locally.
+                name: crate::invite::system_hostname().unwrap_or_else(|| "self".to_string()),
                 authorized_at: now_timestamp(),
                 last_seen: None,
                 username: None,
@@ -1504,30 +1508,44 @@ impl NetDoc {
     /// `ip/` table), so a member can't forge a MagicDNS name to point at its own
     /// endpoint (DNS spoofing). An unbound owner passes under migration grace.
     /// Off/Observe resolve straight from the doc (current behaviour).
+    ///
+    /// Searches the main doc first (founder names + admin-mirrored member names),
+    /// then each imported member self-doc — a **read-ticket member** can't write
+    /// the main-doc mirror (`put_self`), so its `name/<host>` lives only in its
+    /// self-doc. Self-doc coverage grows as the node syncs/routes to peers; a
+    /// not-yet-imported member's name won't resolve until its self-doc lands.
     pub async fn lookup_name(&self, name: &str) -> Result<Option<std::net::Ipv4Addr>> {
         let key = format!("name/{}", name.to_lowercase());
-        let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
-        let Some(entry) = self.doc.get_one(query).await.context("get_one name")? else {
-            return Ok(None);
-        };
-        if entry.content_len() == 0 {
-            return Ok(None);
+        let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+
+        // [main doc] then [each imported member self-doc].
+        let member_docs: Vec<Doc> =
+            self.member_docs.read().await.values().map(|(d, _)| d.clone()).collect();
+        for doc in std::iter::once(&self.doc).chain(member_docs.iter()) {
+            let Some(entry) = doc.get_one(mk_query()).await.context("get_one name")? else {
+                continue;
+            };
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            let Some(addr) =
+                String::from_utf8_lossy(&bytes).trim().parse::<std::net::Ipv4Addr>().ok()
+            else {
+                continue;
+            };
+            if self.validation_mode() == ValidationMode::Enforce
+                && !self.name_author_ok(addr, &entry.author()).await
+            {
+                tracing::warn!(
+                    "netdoc C1: name/{} author ≠ owner binding — REJECTED (MagicDNS spoof attempt)",
+                    name.to_lowercase()
+                );
+                continue;
+            }
+            return Ok(Some(addr));
         }
-        let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
-        let Some(addr) = String::from_utf8_lossy(&bytes).trim().parse::<std::net::Ipv4Addr>().ok()
-        else {
-            return Ok(None);
-        };
-        if self.validation_mode() == ValidationMode::Enforce
-            && !self.name_author_ok(addr, &entry.author()).await
-        {
-            tracing::warn!(
-                "netdoc C1: name/{} author ≠ owner binding — REJECTED (MagicDNS spoof attempt)",
-                name.to_lowercase()
-            );
-            return Ok(None);
-        }
-        Ok(Some(addr))
+        Ok(None)
     }
 
     /// Whether `name_author` is allowed to bind a name to `addr`: it must be the
@@ -2807,6 +2825,53 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         assert!(found, "lookup_vpn_endpoint did not resolve B's self-doc endpoint via peer.vip");
+    }
+
+    /// MagicDNS for a read-ticket member: B registers its name ONLY in its
+    /// self-doc (it can't write A's main doc), and A still resolves it via the
+    /// `lookup_name` member-self-doc fallback.
+    #[tokio::test]
+    async fn lookup_name_resolves_member_self_doc_name() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let ticket = a.write_ticket().await.unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        let b_id = b.endpoint.id().to_string();
+
+        let addr: std::net::Ipv4Addr = "100.64.8.8".parse().unwrap();
+        let mut peer_b = sample_peer(&b_id, "B");
+        peer_b.vip = Some(addr.to_string());
+        a.put_peer(&peer_b).await.unwrap();
+
+        // B writes `name/laptop -> addr` ONLY to its self-doc (no main-doc mirror,
+        // as a read-ticket member). A records B's self-doc ticket to import it.
+        b.self_doc()
+            .await
+            .unwrap()
+            .set_bytes(b.author, b"name/laptop".to_vec(), addr.to_string().into_bytes())
+            .await
+            .unwrap();
+        a.record_peer_self_doc(&b_id, &b.self_doc_read_ticket().await.unwrap()).await.unwrap();
+
+        // A resolves `laptop` via B's imported self-doc (the new fallback). The
+        // main doc never had the entry, so this exercises the self-doc path.
+        let mut found = None;
+        for _ in 0..150 {
+            let _ = a.member_self_doc(&b_id).await; // trigger/keep the import
+            if let Ok(Some(ip)) = a.lookup_name("laptop").await {
+                found = Some(ip);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(found, Some(addr), "lookup_name did not resolve B's self-doc name");
     }
 
     /// The data-plane self-doc override: `refresh_vpn_peer_ips` resolves a

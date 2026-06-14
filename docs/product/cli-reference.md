@@ -2,12 +2,14 @@
 
 ```
 hop [--config <PATH>] [-v...] <command>
+hop --version
 ```
 
 | Global flag | Description |
 |---|---|
 | `--config <PATH>` | Override config directory |
 | `-v`, `--verbose` | Increase log verbosity (repeat for more) |
+| `-V`, `--version` | Print the hop version and exit |
 
 ---
 
@@ -414,7 +416,7 @@ Fleet management (host-side).
 | Subcommand | Description |
 |---|---|
 | `status` | Show fleet registration status |
-| `list [group]` | List hosts in a fleet group |
+| `list [group]` | List warren members (by node-id, name, role, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
 | `exec <group> -- <command...>` | Execute a command on all hosts in a group |
 | `add <name> --tags <TAGS>` | Add a known host to the daemon's fleet store |
 
