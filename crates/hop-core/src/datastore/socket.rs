@@ -116,13 +116,18 @@ pub async fn spawn_listener(
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind daemon socket at {}", path.display()))?;
 
-    // Group-own the socket to the operator group + 0o660, so admin operators can
-    // connect without root. Setting the group requires membership (the worker is
-    // `_hop`, added to the group at install) or root (non-privsep daemon).
+    // Mode 0o660 (owner + group). Under privsep the worker is unprivileged and
+    // the monitor's setgid config dir already gives the socket the operator group
+    // (so admin operators connect without root); we additionally best-effort set
+    // the group. We must NOT touch the group when running as **root**
+    // (non-privsep): the root daemon's socket is reached by setuid helper
+    // subprocesses via their root group, and re-grouping it would lock them out.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Some(gid) = operator_group_gid() {
+        if !crate::unix_user::is_running_as_root()
+            && let Some(gid) = operator_group_gid()
+        {
             let _ = nix::unistd::chown(&path, None, Some(nix::unistd::Gid::from_raw(gid)));
         }
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
