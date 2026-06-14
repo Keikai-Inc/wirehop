@@ -170,8 +170,10 @@ echo "=== TEST: non-root operator runs 'hop invite' without sudo (daemon.sock IP
 # /cfg is _hop-owned + operator-group + setgid under drop; the operator reaches
 # daemon.sock via its `hop` group membership, no root.
 INV_OUT=$(docker exec -u opuser hop-ps-a hop --config /cfg invite 2>&1 || true)
-if echo "$INV_OUT" | grep -q "Invite token"; then
-  echo "OPERATOR IPC PASSED: operator minted an invite with no root — routed through daemon.sock."
+ID_OUT=$(docker exec -u opuser hop-ps-a hop --config /cfg id 2>&1 || true)
+if echo "$INV_OUT" | grep -q "Invite token" && echo "$ID_OUT" | grep -qE '^[0-9a-f]{64}$'; then
+  echo "OPERATOR IPC PASSED: operator ran 'hop invite' + 'hop id' with no root — routed through daemon.sock."
+  echo "  host node id (via daemon): $ID_OUT"
   # Prove it did NOT read the _hop config directly: the operator cannot read identity.json.
   if docker exec -u opuser hop-ps-a cat /cfg/identity.json >/dev/null 2>&1; then
     echo "  NOTE: operator can also read identity.json directly (config is group-readable)."

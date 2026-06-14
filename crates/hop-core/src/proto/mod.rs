@@ -127,6 +127,9 @@ pub enum AdminRequest {
     /// expiry, sandbox, …) — used by the local operator CLI over `daemon.sock`
     /// so it never reads `_hop`-owned config or needs root.
     CreateInviteFull(Box<crate::invite::InviteParams>),
+    /// Return this host's node id (public key) — lets `hop id` work without
+    /// reading `_hop`-owned `identity.json` or needing root.
+    HostIdentity,
     /// Change an existing peer's named role (elevation/demotion).
     SetPeerRole {
         node_id_prefix: String,
@@ -205,6 +208,8 @@ pub struct PushMetricPoint {
 pub enum AdminResponse {
     /// An invite was created.
     InviteCreated { token: String },
+    /// This host's node id (public key), for `hop id`.
+    HostIdentity { node_id: String },
     /// List of authorized peers.
     PeerList { peers: Vec<PeerInfo> },
     /// A peer was removed.

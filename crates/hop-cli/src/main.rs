@@ -236,14 +236,16 @@ async fn main() -> Result<()> {
             hop_mcp::run_stdio_server_with_datastore(&config_dir, datastore).await
         }
         Command::Id => {
-            // Print the *host* node id on a machine with a daemon (the id peers
-            // connect to / invites are minted for); falls back to the per-user
-            // identity on a client-only machine. Ensures the dir so a fresh
-            // client can still generate one.
+            // Print the *host* node id. Ask the running daemon first (privsep §6:
+            // it owns the `_hop` identity, so no root needed); fall back to reading
+            // identity.json directly when no daemon is up (a client-only machine).
             let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
-            let public_key = secret_key.public();
-            println!("{public_key}");
+            if let Some(node_id) = id_via_daemon(&config_dir)? {
+                println!("{node_id}");
+            } else {
+                let secret_key = config::load_or_generate_identity(&config_dir)?;
+                println!("{}", secret_key.public());
+            }
             Ok(())
         }
         Command::Agent { action, daemon, config: agent_config } => {
@@ -1414,6 +1416,26 @@ fn invite_via_daemon(
         DsResponse::Admin(resp) => match *resp {
             AdminResponse::InviteCreated { token } => Ok(Some(token)),
             AdminResponse::Error { message } => anyhow::bail!("daemon refused invite: {message}"),
+            other => anyhow::bail!("unexpected admin response from daemon: {other:?}"),
+        },
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Ask the running daemon for this host's node id (privsep §6). `Ok(None)` ⇒ no
+/// daemon (caller reads identity.json directly).
+fn id_via_daemon(config_dir: &std::path::Path) -> Result<Option<String>> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    let conn = match DaemonConnection::connect(config_dir) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let req = DsRequest::Admin(Box::new(AdminRequest::HostIdentity));
+    match conn.request(&req)? {
+        DsResponse::Admin(resp) => match *resp {
+            AdminResponse::HostIdentity { node_id } => Ok(Some(node_id)),
+            AdminResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
             other => anyhow::bail!("unexpected admin response from daemon: {other:?}"),
         },
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
@@ -2960,6 +2982,9 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
             println!();
             println!("  hop connect {token}");
             println!();
+        }
+        AdminResponse::HostIdentity { node_id } => {
+            println!("{node_id}");
         }
         AdminResponse::PeerList { peers } => {
             if peers.is_empty() {

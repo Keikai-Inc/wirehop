@@ -35,6 +35,9 @@ pub fn handle_admin_request(
                 Err(e) => AdminResponse::Error { message: format!("{e:#}") },
             }
         }
+        AdminRequest::HostIdentity => AdminResponse::HostIdentity {
+            node_id: host_public_key.to_string(),
+        },
         AdminRequest::ListPeers => handle_list_peers(config_dir),
         AdminRequest::RemovePeer { node_id_prefix } => {
             handle_remove_peer(config_dir, &node_id_prefix)
