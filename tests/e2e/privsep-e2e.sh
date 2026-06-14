@@ -41,9 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates jq iputils-ping iproute2 procps && rm -rf /var/lib/apt/lists/*
 # Phase 2: the unprivileged service account the worker drops to (HOP_PRIVSEP_DROP).
 RUN useradd -r -M -s /usr/sbin/nologin hop
-# A human operator: non-root, NOT the service user, but in the `hop` operator
-# group so it can reach daemon.sock and run `hop invite` without sudo (privsep §6).
-RUN useradd -m -G hop -s /bin/bash operator
+# A human operator: non-root, NOT the service user, but with primary group `hop`
+# (the operator group) so it can reach daemon.sock and run `hop invite` without
+# sudo (privsep §6). `-g hop` avoids creating a private group (Ubuntu already has
+# an `operator` group), and the name avoids the stock `operator` system user.
+RUN useradd -m -g hop -s /bin/bash opuser
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
 DOCKERFILE
@@ -167,11 +169,11 @@ echo ""
 echo "=== TEST: non-root operator runs 'hop invite' without sudo (daemon.sock IPC) ==="
 # /cfg is _hop-owned + operator-group + setgid under drop; the operator reaches
 # daemon.sock via its `hop` group membership, no root.
-INV_OUT=$(docker exec -u operator hop-ps-a hop --config /cfg invite 2>&1 || true)
+INV_OUT=$(docker exec -u opuser hop-ps-a hop --config /cfg invite 2>&1 || true)
 if echo "$INV_OUT" | grep -q "Invite token"; then
   echo "OPERATOR IPC PASSED: operator minted an invite with no root — routed through daemon.sock."
   # Prove it did NOT read the _hop config directly: the operator cannot read identity.json.
-  if docker exec -u operator hop-ps-a cat /cfg/identity.json >/dev/null 2>&1; then
+  if docker exec -u opuser hop-ps-a cat /cfg/identity.json >/dev/null 2>&1; then
     echo "  NOTE: operator can also read identity.json directly (config is group-readable)."
   else
     echo "  CONFIRMED: operator cannot read _hop identity.json directly — the token came from the daemon."
