@@ -30,6 +30,11 @@ pub enum DsRequest {
     SecretsSet { username: String, name: String, value: Vec<u8> },
     SecretsDelete { username: String, name: String },
     SecretsList { username: String },
+    /// Operator admin op handled by the daemon itself (privsep §6): the daemon
+    /// owns the identity/netdoc, so the local operator CLI asks it to mint
+    /// invites / report identity instead of reading `_hop`-owned config + needing
+    /// root. The socket is group-restricted to the operator group.
+    Admin(Box<crate::proto::AdminRequest>),
 }
 
 /// Response from the daemon's datastore to a client.
@@ -47,4 +52,5 @@ pub enum DsResponse {
     SecretValue(Option<Vec<u8>>),
     SecretNames(Vec<String>),
     StringList(Vec<String>),
+    Admin(Box<crate::proto::AdminResponse>),
 }

@@ -123,6 +123,10 @@ pub enum AdminRequest {
         #[serde(default)]
         role_name: Option<String>,
     },
+    /// Mint an invite from the full `hop invite` parameter set (tier, max-uses,
+    /// expiry, sandbox, …) — used by the local operator CLI over `daemon.sock`
+    /// so it never reads `_hop`-owned config or needs root.
+    CreateInviteFull(Box<crate::invite::InviteParams>),
     /// Change an existing peer's named role (elevation/demotion).
     SetPeerRole {
         node_id_prefix: String,

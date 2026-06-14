@@ -29,6 +29,12 @@ pub fn handle_admin_request(
         AdminRequest::CreateInvite { username, role, role_name } => {
             handle_create_invite(config_dir, relay_url, host_public_key, username, role, role_name)
         }
+        AdminRequest::CreateInviteFull(params) => {
+            match crate::invite::build_invite_token(host_public_key, config_dir, relay_url, &params) {
+                Ok(token) => AdminResponse::InviteCreated { token },
+                Err(e) => AdminResponse::Error { message: format!("{e:#}") },
+            }
+        }
         AdminRequest::ListPeers => handle_list_peers(config_dir),
         AdminRequest::RemovePeer { node_id_prefix } => {
             handle_remove_peer(config_dir, &node_id_prefix)

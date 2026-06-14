@@ -92,13 +92,23 @@ async fn main() -> Result<()> {
         }
         Command::Invite { user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            // Ensure dir exists and auto-generate identity if needed (no need to run `hop id` first)
             std::fs::create_dir_all(&config_dir)
                 .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
             let tier = parse_invite_tier(tier.as_deref())?;
-            cmd_invite(secret_key, &config_dir, user.as_deref(), role.as_deref(), tier, name.as_deref(), sandbox, max_uses, expiry)
+            // Don't eagerly read identity.json here — under privsep it's
+            // `_hop`-owned. cmd_invite asks the running daemon first (it owns the
+            // secrets); only the no-daemon fallback reads config locally.
+            let params = hop_core::invite::InviteParams {
+                username: user,
+                role_name: role,
+                tier,
+                host_name: name,
+                max_uses,
+                expiry,
+                sandbox,
+            };
+            cmd_invite(&config_dir, params)
         }
         Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -760,7 +770,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     }
 
     // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
-    let _socket_listener = hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone()).await?;
+    // and operator-admin ops (the local CLI mints invites / reads identity through
+    // the daemon, so it needs no root or `_hop`-owned config — privsep §6).
+    let _socket_listener =
+        hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone(), public_key)
+            .await?;
 
     // Spawn cron scheduler: every 15s, check for due jobs and execute them.
     // Uses DirectBackend so cron jobs connect via the daemon's own iroh endpoint
@@ -1381,124 +1395,64 @@ fn tier_summary(t: hop_core::invite::InviteTier) -> &'static str {
     }
 }
 
-/// Resolve this host's founder (trust-anchor) doc author. A federated node has
-/// it persisted (`netdoc-founder.author`); the founder itself carries it in its
-/// own augmented `creator_invite`. Used to pin C1 trust into issued invites.
-fn resolve_founder_author(config_dir: &std::path::Path) -> Option<String> {
-    if let Ok(s) = std::fs::read_to_string(config_dir.join("netdoc-founder.author")) {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return Some(s);
-        }
+/// Mint an invite through the running daemon's local socket (privsep §6) — the
+/// daemon owns identity + netdoc, so the operator needs no root and never reads
+/// `_hop`-owned config. `Ok(None)` ⇒ no daemon reachable (caller mints locally);
+/// `Ok(Some)` ⇒ token; `Err` ⇒ the daemon refused (authoritative, don't retry).
+fn invite_via_daemon(
+    config_dir: &std::path::Path,
+    params: &hop_core::invite::InviteParams,
+) -> Result<Option<String>> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    let conn = match DaemonConnection::connect(config_dir) {
+        Ok(c) => c,
+        Err(_) => return Ok(None), // no daemon → local fallback
+    };
+    let req = DsRequest::Admin(Box::new(AdminRequest::CreateInviteFull(Box::new(params.clone()))));
+    match conn.request(&req)? {
+        DsResponse::Admin(resp) => match *resp {
+            AdminResponse::InviteCreated { token } => Ok(Some(token)),
+            AdminResponse::Error { message } => anyhow::bail!("daemon refused invite: {message}"),
+            other => anyhow::bail!("unexpected admin response from daemon: {other:?}"),
+        },
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
     }
-    let ci = std::fs::read_to_string(config_dir.join("creator_invite")).ok()?;
-    invite::decode_invite(ci.trim()).ok()?.founder_author
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_invite(
-    secret_key: iroh::SecretKey,
-    config_dir: &std::path::Path,
-    username: Option<&str>,
-    role_name: Option<&str>,
-    tier: Option<hop_core::invite::InviteTier>,
-    host_name: Option<&str>,
-    sandbox: hop_core::sandbox::SandboxPolicy,
-    max_uses: Option<u32>,
-    expiry: Option<u64>,
-) -> Result<()> {
-    use hop_core::invite::InviteTier;
-    let public_key = secret_key.public();
+fn cmd_invite(config_dir: &std::path::Path, mut params: hop_core::invite::InviteParams) -> Result<()> {
 
-    // A warren tier needs an actual warren on this host.
-    let has_warren = config_dir.join("netdoc.ticket").exists();
-    if matches!(tier, Some(InviteTier::WarrenOnly | InviteTier::Node | InviteTier::Admin))
-        && !has_warren
-    {
-        anyhow::bail!(
-            "--tier {} needs a warren, but this host has none. Enable the VPN first \
-             (`hop config set vpn on` or install with `--host`), then re-issue the invite.",
-            match tier { Some(t) => t.as_str(), None => "" }
-        );
+    // Default the bound user to the *operator* running this command — resolved
+    // here, not in the daemon (which runs as `_hop`).
+    #[cfg(unix)]
+    if params.username.is_none() {
+        params.username = hop_core::unix_user::current_username();
     }
-    // Tier decides the peer role recorded for redemption (must be set BEFORE the
-    // pending invite is stored): admin → Creator; everything else → Peer with a
-    // role name (warren-only pins the seeded `warren-only` network_only role).
-    let (peer_role, resolved_role_name): (PeerRole, Option<String>) = match tier {
-        Some(InviteTier::Admin) => (PeerRole::Creator, Some("admin".to_string())),
-        Some(InviteTier::WarrenOnly) => (PeerRole::Peer, Some("warren-only".to_string())),
-        _ => (
-            PeerRole::Peer,
-            role_name
-                .map(String::from)
-                .or_else(|| config::HostConfig::load(config_dir).ok().map(|c| c.default_role)),
-        ),
-    };
 
-    // Default to current user when --user is not specified.
-    // This ensures peers always have a bound username when the daemon runs as root.
-    #[cfg(unix)]
-    let default_user;
-    #[cfg(unix)]
-    let username = match username {
-        Some(u) => Some(u),
+    // Prefer the running daemon: it owns identity + netdoc, so it mints the token
+    // and the operator CLI needs no root and never reads `_hop`-owned config
+    // (privsep §6). Fall back to local minting only when no daemon is reachable.
+    let token = match invite_via_daemon(config_dir, &params)? {
+        Some(t) => t,
         None => {
-            default_user = hop_core::unix_user::current_username();
-            default_user.as_deref()
+            let secret_key = config::load_or_generate_identity(config_dir)?;
+            let relay_url = std::fs::read_to_string(config_dir.join("relay_url"))
+                .ok()
+                .or_else(|| Some(hop_core::net::HOP_RELAY_URL.to_string()));
+            hop_core::invite::build_invite_token(
+                &secret_key.public(),
+                config_dir,
+                relay_url.as_deref(),
+                &params,
+            )?
         }
     };
 
-    // Read relay URL persisted by the daemon (if available) so the client
-    // can connect via relay immediately instead of waiting for discovery.
-    // Fall back to the default relay URL — musl builds lack full DNS resolver
-    // support, so discovery via DNS/pkarr may fail without a relay hint.
-    let relay_url = std::fs::read_to_string(config_dir.join("relay_url"))
-        .ok()
-        .or_else(|| Some(hop_core::net::HOP_RELAY_URL.to_string()));
-    let token = invite::generate_invite_with_role(
-        &public_key,
-        config_dir,
-        relay_url.as_deref(),
-        username,
-        host_name,
-        peer_role,
-        resolved_role_name,
-        expiry.unwrap_or(15 * 60),
-        sandbox.clone(),
-        max_uses,
-    )?;
-
-    // Stamp the explicit tier (and, for warren tiers, the founder trust anchor)
-    // onto the token. Safe post-generation: the pending-invite store records
-    // only the secret/role/sandbox, never the tier or warren_ticket, so this
-    // can't desync redemption. A client-tier invite strips any warren_ticket so
-    // it can never self-upgrade into a node.
-    let token = if let Some(t) = tier {
-        let mut decoded = invite::decode_invite(&token)?;
-        decoded.tier = t;
-        if t == InviteTier::Client {
-            decoded.warren_ticket = None;
-            decoded.founder_author = None;
-        } else {
-            // Pin the founder author so a joining node anchors C1 trust.
-            decoded.founder_author = resolve_founder_author(config_dir);
-            // #3b Phase 4 — ticket scope follows the tier: node/warren-only get
-            // the READ ticket (import the admin doc read-only; write their own
-            // self-doc); only admin keeps the write ticket. Falls back to the
-            // legacy write ticket when no read ticket is persisted (old daemon).
-            if matches!(t, InviteTier::Node | InviteTier::WarrenOnly)
-                && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
-            {
-                let rt = rt.trim().to_string();
-                if !rt.is_empty() {
-                    decoded.warren_ticket = Some(rt);
-                }
-            }
-        }
-        invite::encode_invite(&decoded)?
-    } else {
-        token
-    };
+    // Re-bind locals the printing block below expects.
+    let tier = params.tier;
+    let max_uses = params.max_uses;
+    let expiry = params.expiry;
+    let sandbox = &params.sandbox;
 
     if let Some(t) = tier {
         println!("Tier: {} — {}", t.as_str(), tier_summary(t));

@@ -835,19 +835,21 @@ pub fn service_user_ids() -> Option<(u32, u32)> {
     }
 }
 
-/// Re-own the daemon config dir to the service user so the (soon-unprivileged)
-/// worker can read its own identity/tickets/datastore. Runs as root in the
-/// monitor before the worker is spawned; idempotent. Permissions (mode) are
-/// unchanged, so only the service user and root can read the secrets — the
-/// threat model's "other local users" still cannot. Best effort per entry.
+/// Re-own the daemon config dir to the service user (privsep §6) so the
+/// unprivileged worker reads its own identity/tickets/datastore, AND so the
+/// daemon socket the worker binds inside the dir is reachable by the operator
+/// group. Runs as root in the monitor before the worker is spawned; idempotent.
 ///
-/// NOTE (macOS): the installer leaves config `root:admin` so admin users' CLI
-/// (`hop invite`, `hop id`) can read it via the admin group; re-owning to
-/// `_hop:_hop` removes that group access, so those direct-config CLI ops need
-/// `sudo` (or the daemon IPC) under privsep-drop on macOS. Tracked as a follow-up
-/// (route operator CLI through `daemon.sock`); not a lockout — the daemon stays up.
-fn migrate_config_ownership(dir: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+/// The group is set to the **operator group** (`admin` on macOS, `hop` on Linux)
+/// — on Linux that equals the worker's own group (no change vs `_hop:_hop`); on
+/// macOS it lets admin operators reach `daemon.sock`. The top dir is made
+/// `setgid` so the worker-bound socket inherits that group. File *modes* are
+/// unchanged: secrets stay as the installer set them (still no world access), and
+/// operators don't read them directly — they go through the socket.
+fn migrate_config_ownership(dir: &std::path::Path, uid: u32, service_gid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // Operator group, falling back to the service group if it doesn't exist.
+    let gid = crate::datastore::socket::operator_group_gid().unwrap_or(service_gid);
     let want_uid = nix::unistd::Uid::from_raw(uid);
     let want_gid = nix::unistd::Gid::from_raw(gid);
     let mut stack = vec![dir.to_path_buf()];
@@ -884,6 +886,14 @@ fn migrate_config_ownership(dir: &std::path::Path, uid: u32, gid: u32) -> Result
                 }
                 Err(e) => tracing::warn!("privsep: readdir {} failed: {e}", path.display()),
             }
+        }
+    }
+    // setgid the top dir so the daemon socket (and other files the worker creates)
+    // inherit the operator group, making the socket reachable without root.
+    if let Ok(md) = std::fs::symlink_metadata(dir) {
+        let mode = md.permissions().mode();
+        if mode & 0o2000 == 0 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o2000));
         }
     }
     tracing::info!(

@@ -77,10 +77,34 @@ impl DaemonConnection {
 
 // ── Server ──────────────────────────────────────────────────────────
 
-/// Spawn a Unix socket listener that serves datastore requests.
+/// The shared operator group whose members may use the daemon socket without
+/// root: `admin` on macOS (where humans-with-admin live), `hop` on Linux. The
+/// privsep monitor adds `_hop` to it so the worker can group-own the socket.
+#[cfg(unix)]
+pub const OPERATOR_GROUP: &str = if cfg!(target_os = "macos") { "admin" } else { "hop" };
+
+/// Resolve the operator group's gid, if it exists.
+#[cfg(unix)]
+pub fn operator_group_gid() -> Option<u32> {
+    nix::unistd::Group::from_name(OPERATOR_GROUP)
+        .ok()
+        .flatten()
+        .map(|g| g.gid.as_raw())
+}
+
+/// Spawn a Unix socket listener that serves datastore + operator-admin requests.
+///
+/// `host_public_key` lets the daemon answer operator `AdminRequest`s (mint
+/// invites, report identity) on behalf of the local CLI — so operators never
+/// read `_hop`-owned config or need root (privsep §6). The socket is group-owned
+/// by [`OPERATOR_GROUP`] (mode `0660`), so only that group + the daemon reach it.
 ///
 /// Returns a `JoinHandle` that removes the socket file when dropped/cancelled.
-pub async fn spawn_listener(config_dir: &Path, datastore: Datastore) -> Result<JoinHandle<()>> {
+pub async fn spawn_listener(
+    config_dir: &Path,
+    datastore: Datastore,
+    host_public_key: iroh::PublicKey,
+) -> Result<JoinHandle<()>> {
     let path = socket_path(config_dir);
 
     // Remove stale socket from a previous crash (best-effort; bind will
@@ -92,23 +116,30 @@ pub async fn spawn_listener(config_dir: &Path, datastore: Datastore) -> Result<J
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind daemon socket at {}", path.display()))?;
 
-    // Set socket permissions to 0o660 (owner + group only)
+    // Group-own the socket to the operator group + 0o660, so admin operators can
+    // connect without root. Setting the group requires membership (the worker is
+    // `_hop`, added to the group at install) or root (non-privsep daemon).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if let Some(gid) = operator_group_gid() {
+            let _ = nix::unistd::chown(&path, None, Some(nix::unistd::Gid::from_raw(gid)));
+        }
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
     }
 
     tracing::info!("Daemon socket listening at {}", path.display());
 
+    let config_dir = config_dir.to_path_buf();
     let path_for_cleanup = path.clone();
     let handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let ds = datastore.clone();
+                    let cfg = config_dir.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, ds).await {
+                        if let Err(e) = handle_connection(stream, ds, cfg, host_public_key).await {
                             tracing::debug!("Socket client disconnected: {e:#}");
                         }
                     });
@@ -131,7 +162,12 @@ pub async fn spawn_listener(config_dir: &Path, datastore: Datastore) -> Result<J
     Ok(wrapper)
 }
 
-async fn handle_connection(mut stream: tokio::net::UnixStream, ds: Datastore) -> Result<()> {
+async fn handle_connection(
+    mut stream: tokio::net::UnixStream,
+    ds: Datastore,
+    config_dir: std::path::PathBuf,
+    host_public_key: iroh::PublicKey,
+) -> Result<()> {
     loop {
         // Read request frame
         let mut len_buf = [0u8; 4];
@@ -148,9 +184,13 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, ds: Datastore) ->
         let (req, _): (DsRequest, _) =
             bincode::serde::decode_from_slice(&payload, bincode::config::standard())?;
 
-        // Dispatch to datastore (blocking) on a thread pool
+        // Dispatch (blocking) on a thread pool — both datastore ops and the
+        // operator-admin handler are sync.
         let ds_clone = ds.clone();
-        let resp = tokio::task::spawn_blocking(move || dispatch_request(&ds_clone, req)).await??;
+        let cfg = config_dir.clone();
+        let resp =
+            tokio::task::spawn_blocking(move || dispatch_request(&ds_clone, &cfg, &host_public_key, req))
+                .await??;
 
         // Write response frame
         let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
@@ -161,8 +201,28 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, ds: Datastore) ->
     }
 }
 
-fn dispatch_request(ds: &Datastore, req: DsRequest) -> Result<DsResponse> {
+fn dispatch_request(
+    ds: &Datastore,
+    config_dir: &Path,
+    host_public_key: &iroh::PublicKey,
+    req: DsRequest,
+) -> Result<DsResponse> {
     Ok(match req {
+        DsRequest::Admin(admin_req) => {
+            // The daemon owns identity + netdoc tickets, so it mints the invite /
+            // reports identity on the operator's behalf — no `_hop`-file reads or
+            // root in the CLI. (Non-mutating ops; peer/role mutations still go
+            // over the authenticated network admin path which also reconciles.)
+            let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
+            let resp = crate::admin::handle_admin_request(
+                *admin_req,
+                config_dir,
+                relay_url.as_deref(),
+                host_public_key,
+                Some(ds),
+            );
+            DsResponse::Admin(Box::new(resp))
+        }
         DsRequest::KvGet { ns, key } => {
             DsResponse::KvEntry(ds.kv_get(&ns, &key)?)
         }
@@ -244,7 +304,9 @@ mod tests {
         let ds_path = dir.path().join("test.redb");
         let ds = Datastore::open(&ds_path).unwrap();
 
-        let _listener = spawn_listener(dir.path(), ds).await.unwrap();
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+            .await
+            .unwrap();
 
         // Give listener a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -296,7 +358,9 @@ mod tests {
     async fn socket_roundtrip_ts() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds).await.unwrap();
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let conn = DaemonConnection::connect(dir.path()).unwrap();
@@ -343,7 +407,9 @@ mod tests {
     async fn socket_roundtrip_cron() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds).await.unwrap();
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let conn = DaemonConnection::connect(dir.path()).unwrap();

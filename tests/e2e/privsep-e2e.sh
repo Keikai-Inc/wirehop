@@ -41,6 +41,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates jq iputils-ping iproute2 procps && rm -rf /var/lib/apt/lists/*
 # Phase 2: the unprivileged service account the worker drops to (HOP_PRIVSEP_DROP).
 RUN useradd -r -M -s /usr/sbin/nologin hop
+# A human operator: non-root, NOT the service user, but in the `hop` operator
+# group so it can reach daemon.sock and run `hop invite` without sudo (privsep §6).
+RUN useradd -m -G hop -s /bin/bash operator
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
 DOCKERFILE
@@ -157,9 +160,33 @@ else
   RC=1
 fi
 
+# ── §6 operator IPC: a non-root operator (in the `hop` group, NOT the service
+#    user) mints an invite WITHOUT sudo, via daemon.sock — the daemon (owning the
+#    _hop config) does the privileged part. ──
+echo ""
+echo "=== TEST: non-root operator runs 'hop invite' without sudo (daemon.sock IPC) ==="
+# /cfg is _hop-owned + operator-group + setgid under drop; the operator reaches
+# daemon.sock via its `hop` group membership, no root.
+INV_OUT=$(docker exec -u operator hop-ps-a hop --config /cfg invite 2>&1 || true)
+if echo "$INV_OUT" | grep -q "Invite token"; then
+  echo "OPERATOR IPC PASSED: operator minted an invite with no root — routed through daemon.sock."
+  # Prove it did NOT read the _hop config directly: the operator cannot read identity.json.
+  if docker exec -u operator hop-ps-a cat /cfg/identity.json >/dev/null 2>&1; then
+    echo "  NOTE: operator can also read identity.json directly (config is group-readable)."
+  else
+    echo "  CONFIRMED: operator cannot read _hop identity.json directly — the token came from the daemon."
+  fi
+else
+  echo "OPERATOR IPC FAILED: operator could not mint an invite without root."
+  echo "--- output ---"; echo "$INV_OUT" | tail -15
+  echo "--- daemon.sock perms ---"; docker exec hop-ps-a ls -la /cfg/daemon.sock 2>&1 || true
+  echo "--- /cfg perms ---"; docker exec hop-ps-a ls -lad /cfg 2>&1 || true
+  RC=1
+fi
+
 if [ "$RC" = "0" ]; then
   echo ""
-  echo "PRIVSEP E2E PASSED: monitor/worker split + SCM_RIGHTS TUN handoff + routing all verified."
+  echo "PRIVSEP E2E PASSED: split + TUN handoff + routing + non-root operator IPC all verified."
 else
   echo ""
   echo "PRIVSEP E2E FAILED (see assertions above)."

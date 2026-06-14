@@ -270,6 +270,113 @@ pub fn generate_invite(
 ///
 /// Creator invites typically use a 1-hour expiry; regular invites use 15 minutes.
 #[allow(clippy::too_many_arguments)]
+/// Everything `hop invite` collects — serializable so the operator CLI can hand
+/// it to the daemon (which owns identity/netdoc) over `daemon.sock` and get back
+/// a token, no root or `_hop`-file reads needed (privsep §6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteParams {
+    pub username: Option<String>,
+    pub role_name: Option<String>,
+    pub tier: Option<InviteTier>,
+    pub host_name: Option<String>,
+    pub max_uses: Option<u32>,
+    pub expiry: Option<u64>,
+    pub sandbox: SandboxPolicy,
+}
+
+/// Resolve this host's founder (trust-anchor) doc author. A federated node has
+/// it persisted (`netdoc-founder.author`); the founder itself carries it in its
+/// own augmented `creator_invite`. Used to pin C1 trust into issued invites.
+fn resolve_founder_author(config_dir: &Path) -> Option<String> {
+    if let Ok(s) = std::fs::read_to_string(config_dir.join("netdoc-founder.author")) {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let ci = std::fs::read_to_string(config_dir.join("creator_invite")).ok()?;
+    decode_invite(ci.trim()).ok()?.founder_author
+}
+
+/// Mint an invite token from `params`, doing all the config-touching work:
+/// warren check, tier→role resolution, generation + pending-invite storage, and
+/// tier stamping (founder anchor + read ticket). Runs wherever the identity/
+/// netdoc config is readable — the daemon (serving the operator CLI over
+/// `daemon.sock`) or the CLI itself (non-privsep fallback).
+pub fn build_invite_token(
+    host_public_key: &PublicKey,
+    config_dir: &Path,
+    relay_url: Option<&str>,
+    params: &InviteParams,
+) -> Result<String> {
+    // A warren tier needs an actual warren on this host.
+    let has_warren = config_dir.join("netdoc.ticket").exists();
+    if matches!(
+        params.tier,
+        Some(InviteTier::WarrenOnly | InviteTier::Node | InviteTier::Admin)
+    ) && !has_warren
+    {
+        anyhow::bail!(
+            "--tier {} needs a warren, but this host has none. Enable the VPN first \
+             (`hop config set vpn on` or install with `--host`), then re-issue the invite.",
+            params.tier.map(|t| t.as_str()).unwrap_or("")
+        );
+    }
+    // Tier → recorded peer role (set BEFORE the pending invite is stored).
+    let (peer_role, resolved_role_name): (PeerRole, Option<String>) = match params.tier {
+        Some(InviteTier::Admin) => (PeerRole::Creator, Some("admin".to_string())),
+        Some(InviteTier::WarrenOnly) => (PeerRole::Peer, Some("warren-only".to_string())),
+        _ => (
+            PeerRole::Peer,
+            params.role_name.clone().or_else(|| {
+                crate::config::HostConfig::load(config_dir)
+                    .ok()
+                    .map(|c| c.default_role)
+            }),
+        ),
+    };
+
+    let token = generate_invite_with_role(
+        host_public_key,
+        config_dir,
+        relay_url,
+        params.username.as_deref(),
+        params.host_name.as_deref(),
+        peer_role,
+        resolved_role_name,
+        params.expiry.unwrap_or(15 * 60),
+        params.sandbox.clone(),
+        params.max_uses,
+    )?;
+
+    // Stamp the explicit tier + (for warren tiers) the founder anchor / read
+    // ticket. Safe post-generation: the pending-invite store records only the
+    // secret/role/sandbox, never the tier or warren_ticket.
+    let token = if let Some(t) = params.tier {
+        let mut decoded = decode_invite(&token)?;
+        decoded.tier = t;
+        if t == InviteTier::Client {
+            decoded.warren_ticket = None;
+            decoded.founder_author = None;
+        } else {
+            decoded.founder_author = resolve_founder_author(config_dir);
+            if matches!(t, InviteTier::Node | InviteTier::WarrenOnly)
+                && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
+            {
+                let rt = rt.trim().to_string();
+                if !rt.is_empty() {
+                    decoded.warren_ticket = Some(rt);
+                }
+            }
+        }
+        encode_invite(&decoded)?
+    } else {
+        token
+    };
+    Ok(token)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_invite_with_role(
     host_public_key: &PublicKey,
     config_dir: &Path,
