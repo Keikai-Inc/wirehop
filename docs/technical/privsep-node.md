@@ -37,11 +37,17 @@
 > `HOP_PRIVSEP` + `HOP_PRIVSEP_DROP` (default-on for new macOS installs). An
 > **anti-lockout crash-loop fallback** is in `run_monitor`: if the worker keeps
 > exiting fast, the monitor re-execs the daemon as a plain root process so the host
-> stays reachable. Two macOS caveats: (1) the full worker-as-`_hop` daemon isn't
-> e2e-tested on macOS (no macOS CI), so validate on a test Mac before production
-> hosts — RexMundi is deliberately excluded pending that; (2) under drop the config
-> is `_hop`-owned, so admin-group CLI ops (`hop invite`/`hop id`, which read config
-> directly) need `sudo` until they're routed through `daemon.sock` (follow-up).
+> stays reachable. macOS note: the full worker-as-`_hop` daemon isn't e2e-tested on
+> macOS (no macOS CI), so validate on a test Mac before production hosts.
+>
+> **Operator IPC (§6) is implemented.** Under drop the config is `_hop`-owned, but
+> `hop invite` / `hop id` no longer need root: the daemon binds `daemon.sock`
+> group-owned by the **operator group** (`admin` on macOS, `hop` on Linux, via the
+> monitor's setgid config dir), and the CLI sends an `AdminRequest` over it — the
+> daemon, which holds identity + netdoc, does the privileged part and returns the
+> token/id. Operators read no `_hop` secrets and never `sudo`. Validated by
+> `privsep-e2e.sh` (a non-root operator mints an invite + reads the host id, and is
+> confirmed *unable* to read `identity.json` directly).
 >
 > Goal: shrink the warren node's root attack surface from
 > "the entire daemon" to a minimal, non-network-facing privileged monitor, while
