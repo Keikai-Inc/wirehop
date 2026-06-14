@@ -1457,13 +1457,35 @@ impl NetDoc {
         // MagicDNS: register this host's name → virtual IP and serve `*.hop`
         // lookups on the virtual interface (split-DNS points `.hop` here).
         if let Ok(h) = hostname::get() {
-            let name = h.to_string_lossy().to_lowercase();
-            if let Err(e) = self.register_name(&name, addr).await {
+            // Register the bare host label, stripping any DNS suffix the OS/DHCP
+            // appended (e.g. macOS returns the FQDN `RexMundi.lan` on a home
+            // network). MagicDNS strips the warren domain off a query and looks
+            // up the remainder, so the registered key must be `rexmundi`, not
+            // `rexmundi.lan`, for `RexMundi.hop` to resolve.
+            let full = h.to_string_lossy().to_lowercase();
+            let name = full.split('.').next().unwrap_or(&full);
+            if !name.is_empty()
+                && let Err(e) = self.register_name(name, addr).await
+            {
                 tracing::warn!("vpn: name registration failed: {e:#}");
             }
         }
         let dns = std::sync::Arc::clone(self);
         tokio::spawn(async move { dns.vpn_dns_loop(addr).await });
+
+        // Automatic split-DNS: point the OS resolver for the warren domain at
+        // this node's MagicDNS server (`addr:53`) so `<host>.<domain>` resolves
+        // with zero manual setup. Privileged, so under privsep this routes
+        // through the monitor; best-effort — failure only costs name resolution.
+        if !crate::vpn::resolver::auto_resolver_disabled() {
+            let domain = self.network_domain().await;
+            if let Err(e) = crate::privsep::configure_resolver(&domain, addr) {
+                tracing::warn!(
+                    "vpn: automatic DNS config failed ({e:#}); names won't resolve until you \
+                     point `.{domain}` at {addr}:53 manually"
+                );
+            }
+        }
 
         Ok(addr)
     }
@@ -1540,10 +1562,13 @@ impl NetDoc {
     /// MagicDNS server: answer `A` queries for `*.hop` on the virtual interface.
     #[cfg(unix)]
     async fn vpn_dns_loop(&self, addr: std::net::Ipv4Addr) {
-        let sock = match tokio::net::UdpSocket::bind((addr, 53)).await {
+        // Under privsep-drop the worker is unprivileged and cannot bind :53, so
+        // route through the monitor (root) which binds and passes back the socket
+        // fd; non-privsep binds directly. See privsep::acquire_priv_port.
+        let sock = match crate::privsep::acquire_priv_port(addr, 53).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("vpn: DNS bind on {addr}:53 failed ({e}); MagicDNS disabled");
+                tracing::warn!("vpn: DNS bind on {addr}:53 failed ({e:#}); MagicDNS disabled");
                 return;
             }
         };

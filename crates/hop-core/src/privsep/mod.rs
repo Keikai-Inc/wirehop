@@ -52,6 +52,11 @@ pub enum MonitorRequest {
     /// Bind a UDP socket on `(addr, port)` and return its fd. The monitor
     /// allowlists this to the node's own vip and port 53 (MagicDNS) only.
     BindPrivPort { addr: [u8; 4], port: u16 },
+    /// Point the OS resolver for the warren `domain` at the local MagicDNS server
+    /// on `vip:53` (split-DNS). Privileged (root-owned `/etc/resolver`, or
+    /// `resolvectl`), so the worker delegates it. The monitor remembers the
+    /// domain and reverts it when it exits. Replies `Ok` (no fd).
+    ConfigureResolver { domain: String, vip: [u8; 4] },
     /// Spawn a session command on a fresh PTY and return the PTY **master** fd.
     /// The worker has already resolved `argv` (including the `login`/`su` and
     /// sandbox wrapper), so the monitor only performs the privileged act —
@@ -97,6 +102,9 @@ pub enum MonitorRequest {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MonitorReply {
     OkFd,
+    /// Success for a side-effect primitive that returns no fd (e.g.
+    /// `ConfigureResolver`).
+    Ok,
     Error { message: String },
 }
 
@@ -704,9 +712,64 @@ fn worker_control_fd() -> Option<RawFd> {
     std::env::var("HOP_PRIVSEP_CTRL_FD").ok()?.trim().parse().ok()
 }
 
+/// Serializes every worker→monitor control transaction. The control socket is a
+/// single shared fd (`HOP_PRIVSEP_CTRL_FD`); without this lock a per-connection
+/// `SpawnSession`/`SpawnExec`/`SpawnHelper` could interleave its framed message
+/// and `SCM_RIGHTS` fd batch with the VPN loop's `CreateTun`/`BindPrivPort` on
+/// that one socket — corrupting the wire protocol and misrouting passed fds.
+/// Each request function holds this across its full send→reply→recv-fd(s)
+/// transaction. The I/O is fast, local socketpair I/O and the critical section
+/// contains no `.await`, so a blocking `std` mutex is appropriate even for the
+/// async callers (`acquire_tun`/`acquire_priv_port`).
+static CTRL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// True when this process is the unprivileged worker half of a privsep node.
 pub fn is_privsep_worker() -> bool {
     worker_control_fd().is_some()
+}
+
+/// Watch the monitor-liveness pipe (`HOP_PRIVSEP_ALIVE_FD`) and shut the worker
+/// down if the monitor dies. Spawns a blocking thread that reads the pipe; the
+/// monitor never writes, so the read blocks until EOF — which happens only when
+/// the monitor closes its write end, i.e. the monitor process is gone. We then
+/// `raise(SIGTERM)` to run the worker's graceful shutdown (releasing the
+/// datastore lock + TUN), with a hard `_exit` backstop if that stalls. No-ops
+/// when not a privsep worker. Call once at host startup.
+pub fn spawn_monitor_liveness_watcher() {
+    let Some(fd) = std::env::var("HOP_PRIVSEP_ALIVE_FD")
+        .ok()
+        .and_then(|s| s.trim().parse::<RawFd>().ok())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n > 0 {
+                continue; // monitor never writes; tolerate a stray byte
+            }
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR — retry
+            }
+            // EOF (n == 0) or a hard error: the monitor is gone.
+            tracing::error!(
+                "privsep worker: monitor exited; shutting down to release the datastore lock + TUN"
+            );
+            // Process-directed (not `raise`, which is thread-directed) so the
+            // kernel delivers it to whichever thread runs tokio's SIGTERM handler.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::this(),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            // Backstop: if graceful shutdown stalls, force-exit so the OS releases
+            // the redb lock and the device — a wedged worker must not block the
+            // monitor's restart. The orphaned worker can't serve privileged ops
+            // anymore, so a prompt exit beats a clean QUIC drain here.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::process::exit(0);
+        }
+    });
 }
 
 /// Wrap a TUN fd passed by the monitor as an async device. `raw_fd` only wraps
@@ -728,16 +791,88 @@ pub fn worker_tun_from_fd(fd: OwnedFd) -> Result<tun::AsyncDevice> {
 pub async fn acquire_tun(addr: std::net::Ipv4Addr) -> Result<tun::AsyncDevice> {
     match worker_control_fd() {
         Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             send_msg(ctrl, &MonitorRequest::CreateTun { vip: addr.octets() })
                 .context("requesting TUN from privsep monitor")?;
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::OkFd => worker_tun_from_fd(recv_fd(ctrl)?),
+                MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a TUN fd"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused CreateTun: {message}")
                 }
             }
         }
         None => crate::vpn::create_tun(addr).await,
+    }
+}
+
+/// Acquire a privileged UDP socket bound to `addr:port` (MagicDNS `:53`): in
+/// privsep-worker mode the worker is unprivileged and cannot bind a port < 1024,
+/// so it asks the monitor (root) to bind and passes back the socket fd via
+/// `SCM_RIGHTS`; otherwise it binds directly (non-privsep behavior). This is the
+/// integration point for `vpn_dns_loop` — mirrors [`acquire_tun`].
+pub async fn acquire_priv_port(
+    addr: std::net::Ipv4Addr,
+    port: u16,
+) -> Result<tokio::net::UdpSocket> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let std_sock = {
+                let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                send_msg(
+                    ctrl,
+                    &MonitorRequest::BindPrivPort {
+                        addr: addr.octets(),
+                        port,
+                    },
+                )
+                .context("requesting privileged port from privsep monitor")?;
+                match recv_msg::<MonitorReply>(ctrl)? {
+                    MonitorReply::OkFd => std::net::UdpSocket::from(recv_fd(ctrl)?),
+                    MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a socket fd"),
+                    MonitorReply::Error { message } => {
+                        anyhow::bail!("privsep monitor refused BindPrivPort: {message}")
+                    }
+                }
+            };
+            std_sock
+                .set_nonblocking(true)
+                .context("setting passed UDP socket non-blocking")?;
+            tokio::net::UdpSocket::from_std(std_sock)
+                .context("wrapping passed UDP socket for tokio")
+        }
+        None => tokio::net::UdpSocket::bind((addr, port))
+            .await
+            .with_context(|| format!("binding {addr}:{port}")),
+    }
+}
+
+/// Point the OS resolver for `domain` at the local MagicDNS server on `vip:53`
+/// (split-DNS). Writing resolver config is privileged, so in privsep-worker mode
+/// the worker delegates to the monitor (`ConfigureResolver`); otherwise it
+/// applies the config directly (non-privsep, worker is root). Best-effort: a
+/// failure here only costs `.hop` name resolution, never connectivity.
+pub fn configure_resolver(domain: &str, vip: std::net::Ipv4Addr) -> Result<()> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            send_msg(
+                ctrl,
+                &MonitorRequest::ConfigureResolver {
+                    domain: domain.to_string(),
+                    vip: vip.octets(),
+                },
+            )
+            .context("requesting resolver config from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::Ok => Ok(()),
+                MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ConfigureResolver"),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused ConfigureResolver: {message}")
+                }
+            }
+        }
+        None => crate::vpn::resolver::apply(domain, vip),
     }
 }
 
@@ -765,9 +900,11 @@ pub fn worker_spawn_session(
         pixel_height,
         username: username.map(String::from),
     };
+    let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     send_msg(ctrl, &req).context("requesting SpawnSession from monitor")?;
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fd(ctrl),
+        MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a PTY fd"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnSession: {message}")
         }
@@ -789,9 +926,11 @@ pub fn worker_spawn_exec(
         policy: policy.clone(),
         username: username.to_string(),
     };
+    let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     send_msg(ctrl, &req).context("requesting SpawnExec from monitor")?;
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fds(ctrl, 4),
+        MonitorReply::Ok => anyhow::bail!("monitor returned Ok without exec fds"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnExec: {message}")
         }
@@ -806,9 +945,11 @@ pub fn worker_spawn_helper(argv: &[String], username: &str) -> Result<Vec<OwnedF
         argv: argv.to_vec(),
         username: username.to_string(),
     };
+    let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     send_msg(ctrl, &req).context("requesting SpawnHelper from monitor")?;
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fds(ctrl, 3),
+        MonitorReply::Ok => anyhow::bail!("monitor returned Ok without helper fds"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnHelper: {message}")
         }
@@ -976,6 +1117,25 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     cmd.env("HOP_PRIVSEP_WORKER", "1")
         .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string());
 
+    // Liveness pipe (anti-lockout, the OpenSSH invariant: the worker must never
+    // outlive its monitor). The worker inherits the READ end and blocks on it in
+    // a watcher thread; the monitor holds the WRITE end. If the monitor dies for
+    // any reason — even SIGKILL — the kernel closes the write end, the worker
+    // reads EOF, and it shuts itself down, releasing the datastore lock + TUN so
+    // a restart (or the crash-loop fallback) can reacquire them. Without this a
+    // monitor death wedges the node: a stranded worker keeps the redb lock and
+    // every restart attempt crash-loops.
+    // The WRITE end must stay confined to the monitor — it must NOT leak into
+    // the worker (its own write end would stop its read from ever hitting EOF)
+    // nor into any session/exec child the monitor later forks (a long-lived shell
+    // would pin it open past the monitor's death, wedging the liveness signal).
+    // nix's `pipe()` returns both ends WITHOUT close-on-exec, so set it on the
+    // write end and clear it on the read end (which the worker inherits via exec).
+    let (alive_r, alive_w) = nix::unistd::pipe().context("creating liveness pipe")?;
+    set_cloexec(alive_w.as_raw_fd())?; // write end stays in the monitor only
+    clear_cloexec(alive_r.as_raw_fd())?; // worker inherits the read end across exec
+    cmd.env("HOP_PRIVSEP_ALIVE_FD", alive_r.as_raw_fd().to_string());
+
     // Phase 2: drop the worker to the `_hop` service user. Gated on
     // HOP_PRIVSEP_DROP (separate from HOP_PRIVSEP) because a dropped worker
     // cannot host other-user sessions until Phase 3's SpawnSession lands — so
@@ -1002,6 +1162,9 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
 
     let mut child = cmd.spawn().context("spawning privsep worker")?;
     drop(wrk); // only the worker needs that end
+    drop(alive_r); // worker inherited the read end; monitor keeps `alive_w` open
+    // `alive_w` stays in scope for this iteration: it closes when the monitor
+    // process dies (kernel-closed) or at end of loop body, signaling the worker.
     tracing::info!(
         worker_pid = child.id(),
         "privsep monitor: spawned unprivileged worker; serving privileged primitives"
@@ -1012,6 +1175,9 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // the :53 bind alive for as long as the monitor (and thus the worker) runs.
     let mut kept_tuns: Vec<tun::Device> = Vec::new();
     let mut kept_socks: Vec<OwnedFd> = Vec::new();
+    // Resolver domains we pointed at MagicDNS for this worker; reverted below when
+    // the worker exits so a stale split-DNS entry never outlives the daemon.
+    let mut kept_resolvers: Vec<String> = Vec::new();
 
     loop {
         let req: MonitorRequest = match recv_msg(mon_fd) {
@@ -1049,6 +1215,21 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
+            MonitorRequest::ConfigureResolver { domain, vip } => {
+                let addr = std::net::Ipv4Addr::from(vip);
+                match crate::vpn::resolver::apply(&domain, addr) {
+                    Ok(()) => {
+                        if !kept_resolvers.contains(&domain) {
+                            kept_resolvers.push(domain);
+                        }
+                        let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                    }
+                    Err(e) => {
+                        tracing::warn!("privsep monitor: ConfigureResolver denied: {e:#}");
+                        let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                    }
+                }
+            }
             MonitorRequest::SpawnSession {
                 argv,
                 env,
@@ -1147,6 +1328,14 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     drop(kept_tuns);
     drop(kept_socks);
     drop(mon);
+    drop(alive_w); // release the liveness write end for this iteration
+    // Revert split-DNS so a stale resolver entry doesn't point at a now-down
+    // MagicDNS server. A respawning worker re-applies it on bring-up.
+    for domain in kept_resolvers.drain(..) {
+        if let Err(e) = crate::vpn::resolver::remove(&domain) {
+            tracing::warn!("privsep: reverting resolver for {domain} failed: {e:#}");
+        }
+    }
 
     if uptime < HEALTHY_UPTIME {
         fast_failures += 1;
@@ -1204,6 +1393,21 @@ fn clear_cloexec(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Set the close-on-exec flag so an fd is closed at `exec` and never leaks into
+/// a child. Used for the liveness write end, which must stay confined to the
+/// monitor process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn set_cloexec(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("F_GETFD");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("F_SETFD");
+    }
+    Ok(())
+}
+
 /// Create a TUN/utun for the probe at a fixed CGNAT test address, reusing the
 /// production `tun` configuration (`vpn::create_tun` is async; the probe is
 /// single-threaded, so build a blocking device here with the same parameters).
@@ -1223,6 +1427,30 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
+
+    /// The liveness-pipe invariant: the read end (held by the worker) must hit
+    /// EOF the instant the last write end (held only by the monitor) closes —
+    /// that EOF is the "monitor died" signal. Regression guard for the CLOEXEC
+    /// leak that let the worker pin its own write end open (read never EOF'd, so
+    /// a dead monitor wedged the node). Also checks the cloexec flag flipping.
+    #[test]
+    fn liveness_pipe_eofs_when_write_end_closes() {
+        use std::os::fd::AsRawFd;
+        let (alive_r, alive_w) = nix::unistd::pipe().unwrap();
+        set_cloexec(alive_w.as_raw_fd()).unwrap();
+        clear_cloexec(alive_r.as_raw_fd()).unwrap();
+        // The write end is confined to the monitor (close-on-exec); the read end
+        // crosses into the worker (cloexec cleared).
+        let getfd = |fd: RawFd| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(getfd(alive_w.as_raw_fd()) & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        assert_eq!(getfd(alive_r.as_raw_fd()) & libc::FD_CLOEXEC, 0);
+        // Closing the only write end makes a blocking read return 0 (EOF).
+        let r_raw = alive_r.as_raw_fd();
+        drop(alive_w);
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(r_raw, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        assert_eq!(n, 0, "read on the liveness pipe must EOF once the write end is gone");
+    }
 
     /// SCM_RIGHTS round-trip (no root): pass the read end of a pipe through a
     /// socketpair and confirm the received fd reads the bytes written to the

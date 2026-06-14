@@ -36,6 +36,7 @@ pub fn parse_dest_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
 pub mod acl;
 pub mod cedar;
 pub mod dns;
+pub mod resolver;
 pub mod tailscale_import;
 
 /// Parse the destination transport port (TCP/UDP) from a raw L3 packet, if the

@@ -333,6 +333,10 @@ async fn main() -> Result<()> {
 type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
+    // If we are the privsep worker, watch the monitor-liveness pipe: should the
+    // monitor die, shut down promptly so the datastore lock + TUN are released
+    // (otherwise a stranded worker wedges every restart). No-op otherwise.
+    hop_core::privsep::spawn_monitor_liveness_watcher();
     let public_key = secret_key.public();
     let secrets_key = hop_core::datastore::derive_secrets_key(&secret_key.to_bytes());
     // Derive the netdoc endpoint key before the host secret is moved into the
@@ -858,6 +862,20 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 tracing::info!("Received SIGINT, shutting down gracefully");
                 break;
             }
+        }
+    }
+
+    // Tear down automatic split-DNS if *we* applied it (non-privsep: worker is
+    // root, so configure_resolver wrote it directly). Under privsep the monitor
+    // owns teardown and reverts it on exit, and an unprivileged worker can't undo
+    // it anyway — so skip there. Idempotent and best-effort.
+    if !hop_core::privsep::is_privsep_worker()
+        && !hop_core::vpn::resolver::auto_resolver_disabled()
+        && let Some(nd) = netdoc_cell.get()
+    {
+        let domain = nd.network_domain().await;
+        if let Err(e) = hop_core::vpn::resolver::remove(&domain) {
+            tracing::warn!("vpn: reverting automatic DNS config failed: {e:#}");
         }
     }
 

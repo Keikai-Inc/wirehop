@@ -44,12 +44,20 @@ One consistent language across product, CLI, and marketing:
 | **role** | A named identity (`developer`, `ops`, …) that determines what a member can reach. |
 | **invite** | A single-use token that admits a machine to the warren with a role. |
 
-**Names (MagicDNS).** Each node is reachable as `<hostname>.<domain>`. The domain
-is **configurable per warren**, with a conventional default: a **named** warren
-uses `<warren-name>.hop` (e.g. `web.acme.hop`); an unnamed warren falls back to
-the flat `hop` domain (e.g. `web.hop`). The domain lives in the warren document
-so every node resolves consistently. *(Today the resolver hard-codes `.hop`;
-making it configurable is part of the role/onboarding work.)*
+**Names (MagicDNS).** Each node is reachable as `<hostname>.<domain>`, using the
+**bare host label** (the OS hostname with any DHCP-appended suffix like `.lan`
+stripped, so `RexMundi.hop` works even when the machine reports `RexMundi.lan`).
+The domain is **configurable per warren**, with a conventional default: a
+**named** warren uses `<warren-name>.hop` (e.g. `web.acme.hop`); an unnamed
+warren falls back to the flat `hop` domain (e.g. `web.hop`). The domain lives in
+the warren document so every node resolves consistently. *(Today the resolver
+hard-codes `.hop`; making it configurable is part of the role/onboarding work.)*
+
+DNS is configured **automatically**: when a node's VPN comes up it points the OS
+resolver for the warren domain at its own MagicDNS server (macOS
+`/etc/resolver/<domain>`; Linux `resolvectl` with systemd-resolved) — split-DNS,
+so only `.<domain>` lookups are affected and nothing else changes. No manual
+`/etc/resolver` editing. Set `HOP_NO_AUTO_RESOLVER` to manage DNS yourself.
 
 ## The two paths: client vs node
 

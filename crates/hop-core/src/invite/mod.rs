@@ -241,7 +241,15 @@ pub struct ConsumedInvite {
 
 /// Get the system hostname.
 pub fn system_hostname() -> Option<String> {
-    hostname::get().ok().and_then(|h| h.into_string().ok())
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        // Strip any DNS suffix the OS/DHCP appended to the hostname (e.g. macOS
+        // on a home network returns the FQDN `RexMundi.lan`). The warren name is
+        // the bare host label — `RexMundi`, not `RexMundi.lan` — so MagicDNS
+        // serves `<label>.<warren-domain>` and `RexMundi.hop` resolves.
+        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
+        .filter(|h| !h.is_empty())
 }
 
 /// Generate a new invite: returns the token string to share and stores the hash on disk.

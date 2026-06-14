@@ -30,7 +30,9 @@ echo "=== building VPN test image ==="
 docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates jq iputils-ping iproute2 && rm -rf /var/lib/apt/lists/*
+        ca-certificates jq iputils-ping iproute2 dnsutils && rm -rf /var/lib/apt/lists/*
+# The privsep worker drops to this unprivileged service user (Linux: `hop`).
+RUN useradd -m -s /bin/bash hop
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
 DOCKERFILE
@@ -49,8 +51,14 @@ docker volume create "$VOL" >/dev/null
 # binding lands, host-b's self-owned ip/vpn entries pass under migration grace
 # (unbound owner), so enforce can't partition a freshly-joined node. If routing
 # works here, enforce is safe to default on.
+# HOP_PRIVSEP + HOP_PRIVSEP_DROP run each node as a root monitor + unprivileged
+# `hop` worker — RexMundi's exact production config (privsep-drop + VPN). This
+# makes the full data plane go through the monitor: the TUN (CreateTun) AND the
+# MagicDNS :53 bind (BindPrivPort), which the dropped worker cannot bind itself.
+# It is the real end-to-end test of privsep::acquire_priv_port.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
         -v "$VOL:/shared" -e RUST_LOG="${HOP_E2E_LOG:-hop=info,hop_core=info}" -e HOP_VPN=1
+        -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1
         -e HOP_NETDOC_VALIDATION=enforce --user root)
 
 echo "=== starting host-a (warren owner) ==="
@@ -104,6 +112,53 @@ done
 docker exec hop-vpn-b test -f /shared/ready-b || { echo "FAIL: host-b not ready"; docker exec hop-vpn-b cat /cfg/log | tail -30; exit 1; }
 VIP_B=$(docker exec hop-vpn-b cat /shared/vip-b)
 echo "host-b virtual IP: $VIP_B"
+
+echo "=== TEST: MagicDNS :53 binds under privsep-drop (via the monitor) ==="
+# The dropped worker (`hop`) cannot bind :53 itself; privsep::acquire_priv_port
+# must route the bind through the root monitor (BindPrivPort) and pass back the
+# socket fd. Success = "MagicDNS serving" logged and NO "DNS bind ... failed".
+DNS_OK=1
+for H in hop-vpn-a hop-vpn-b; do
+    if docker exec "$H" sh -c 'grep -q "DNS bind on .* failed" /cfg/log' 2>/dev/null; then
+        echo "MAGICDNS FAILED on $H: :53 bind failed under privsep-drop"
+        docker exec "$H" grep "DNS bind" /cfg/log | tail -3 || true
+        DNS_OK=0
+    elif docker exec "$H" sh -c 'grep -q "MagicDNS serving" /cfg/log' 2>/dev/null; then
+        echo "MAGICDNS OK on $H: $(docker exec "$H" grep -o 'MagicDNS serving.*' /cfg/log | head -1)"
+    else
+        echo "MAGICDNS WARN on $H: no MagicDNS log line yet"
+    fi
+done
+[ "$DNS_OK" = "1" ] || { echo "VPN E2E FAILED: MagicDNS :53 bind regressed under privsep."; exit 1; }
+# Prove the monitor-passed socket actually does I/O (recv/send), not just binds:
+# query host-a's MagicDNS on its own vIP, from host-a itself (loops through its
+# local stack — no cross-node routing dependency, which settles later). Any DNS
+# reply (dig exit 0, even NXDOMAIN) means the worker recvfrom'd + sendto'd on the
+# fd the monitor handed back; a dead/unreadable fd would time out (exit 9).
+if docker exec hop-vpn-a dig +time=2 +tries=2 "@$VIP_A" probe.hop >/dev/null 2>&1; then
+    echo "MAGICDNS I/O OK: host-a's monitor-passed :53 socket answered a query."
+else
+    echo "VPN E2E FAILED: MagicDNS socket bound but did not answer (passed-fd I/O broken)."
+    docker exec hop-vpn-a grep -aE 'MagicDNS|DNS bind' /cfg/log | tail -5 || true
+    exit 1
+fi
+
+echo "=== TEST: automatic split-DNS requested through the monitor (privsep) ==="
+# enable_vpn asks the monitor to point the OS resolver at MagicDNS via the new
+# ConfigureResolver primitive. These bare containers have no running
+# systemd-resolved, so resolver::apply takes the "not detected → configure
+# manually" branch — but reaching that log proves the worker→monitor round-trip
+# (new primitive + MonitorReply::Ok) works end to end. A protocol break would
+# surface as "ConfigureResolver denied" instead.
+if docker exec hop-vpn-a sh -c 'grep -q "ConfigureResolver denied" /cfg/log' 2>/dev/null; then
+    echo "VPN E2E FAILED: monitor denied ConfigureResolver (resolver IPC broken)."
+    docker exec hop-vpn-a grep -a "ConfigureResolver" /cfg/log | tail -3 || true
+    exit 1
+elif docker exec hop-vpn-a sh -c 'grep -qE "configured systemd-resolved|systemd-resolved not detected" /cfg/log' 2>/dev/null; then
+    echo "RESOLVER-IPC OK: $(docker exec hop-vpn-a grep -aoE 'configured systemd-resolved.*|systemd-resolved not detected[^\"]*' /cfg/log | head -1)"
+else
+    echo "RESOLVER-IPC WARN: no resolver-config log line yet on host-a"
+fi
 
 echo "=== allow replication + tun routes to settle (15s) ==="
 sleep 15
@@ -202,18 +257,25 @@ if [ "$RC" = "0" ]; then
     sleep 3
     # Relaunch the host exactly as a boot service would; logs append to /cfg/log.
     docker exec -d hop-vpn-b bash -c 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
-    echo "waiting for host-b to reconverge (resync + vpn re-enabled, max 90s)..."
+    echo "waiting for host-b to reconverge (vpn re-enabled, max 90s)..."
+    # Gate readiness on `vpn: enabled` incrementing — the deterministic marker
+    # that the *restarted* daemon brought the VPN back up. (We do NOT gate on
+    # "resumed warren sync": that line only logs when resume_sync happens to find
+    # a persisted peer at the exact startup instant — a racy robustness add-on
+    # over iroh-docs' own gossip sync, not a correctness signal. Reconvergence is
+    # proven by the ping below, not by that log line.)
     for i in $(seq 1 90); do
-      R=$(count_in_b 'resumed warren sync')
       V=$(count_in_b 'vpn: enabled')
-      if [ "$R" -gt "$RESUMED_BEFORE" ] && [ "$V" -gt "$VPNUP_BEFORE" ]; then break; fi
+      if [ "$V" -gt "$VPNUP_BEFORE" ]; then break; fi
       sleep 1
     done
     NS_AFTER=$(docker exec hop-vpn-b grep -o 'namespace [0-9a-f]*' /cfg/log | tail -1)
     RESUMED=$(count_in_b 'resumed warren sync')
+    VPNUP_AFTER=$(count_in_b 'vpn: enabled')
     echo "namespace before reboot: $NS_BEFORE"
     echo "namespace after  reboot: $NS_AFTER"
-    echo "resume-sync occurrences: $RESUMED (was $RESUMED_BEFORE)"
+    echo "vpn-enabled occurrences: $VPNUP_AFTER (was $VPNUP_BEFORE)"
+    echo "resume-sync occurrences: $RESUMED (was $RESUMED_BEFORE) [informational]"
     sleep 8   # let the TUN path + QUIC data plane re-establish before re-pinging
     echo "--- re-ping host-a after host-b reboot (retry up to 3x) ---"
     PING_OK=0
@@ -221,8 +283,8 @@ if [ "$RC" = "0" ]; then
       if docker exec hop-vpn-b ping -c 5 -W 3 "$VIP_A"; then PING_OK=1; break; fi
       echo "  (re-ping attempt $attempt failed; settling 5s)"; sleep 5
     done
-    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$RESUMED" -gt "$RESUMED_BEFORE" ] 2>/dev/null && [ "$PING_OK" = "1" ]; then
-        echo "REBOOT TEST PASSED: same warren reopened, sync re-established, routing intact."
+    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$VPNUP_AFTER" -gt "$VPNUP_BEFORE" ] 2>/dev/null && [ "$PING_OK" = "1" ]; then
+        echo "REBOOT TEST PASSED: same warren reopened, VPN re-enabled, routing intact (privsep restart releases the datastore lock cleanly)."
     else
         echo "REBOOT TEST FAILED."
         docker exec hop-vpn-b cat /cfg/log | tail -30 || true
@@ -287,10 +349,13 @@ if [ "$RC" = "0" ]; then
         else
             VIP_C=$(docker exec hop-vpn-c cat /shared/vip-c | tr -d '[:space:]')
             echo "host-c virtual IP: ${VIP_C:-<empty!>}"
-            sleep 20  # 3rd-node convergence settle (a,b,c must cross-import self-docs)
+            # 3rd-node convergence settle (a,b,c must cross-import self-docs).
+            # Privsep adds monitor-spawn startup latency, so give it longer than
+            # the non-privsep baseline before declaring a routing failure.
+            sleep 40
             echo "--- ping host-a from read-ticket host-c (enforce) ---"
             C_PING=0
-            for attempt in 1 2 3 4; do
+            for attempt in 1 2 3 4 5 6; do
               if docker exec hop-vpn-c ping -c 3 -W 3 "$VIP_A"; then C_PING=1; break; fi
               echo "  (attempt $attempt failed; settling 6s)"; sleep 6
             done
@@ -298,10 +363,12 @@ if [ "$RC" = "0" ]; then
                 echo "READ-MEMBER ROUTING PASSED: c→a over TUN under enforce."
             else
                 echo "PHASE 4 FAILED: read-ticket member cannot route."
-                echo "--- host-c vpn enable + egress markers ---"
-                docker exec hop-vpn-c sh -c "grep -aE 'vpn: enabled|vpn: bringup|netdoc egress|vpn ingress|federated|claim' /cfg/log | tail -20" || true
-                echo "--- host-a ingress-of-c markers ---"
-                docker exec hop-vpn-a sh -c "grep -aE 'vpn ingress|netdoc refresh' /cfg/log | tail -10" || true
+                echo "--- does host-c know host-a's vIP→endpoint? (egress side) ---"
+                docker exec hop-vpn-c sh -c "grep -aE 'vpn: enabled|netdoc egress|dial|reach|lookup_vpn|unknown destination' /cfg/log | tail -25" || true
+                echo "--- does host-a know host-c's vIP $VIP_C? (ingress auth side) ---"
+                docker exec hop-vpn-a sh -c "grep -aE 'vpn ingress|netdoc refresh|recorded self-doc|$VIP_C' /cfg/log | tail -20" || true
+                echo "--- host-c sync state (did it import host-a's endpoint?) ---"
+                docker exec hop-vpn-c sh -c "grep -aE 'resumed warren|sync|import|peer' /cfg/log | tail -15" || true
                 docker exec hop-vpn-c cat /cfg/log | tail -15 || true
                 RC=1
             fi

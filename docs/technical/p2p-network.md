@@ -182,8 +182,23 @@ from the doc; the network's domain name is a configurable doc setting (e.g.
   hijacking.
 - **Rejected:** `/etc/hosts` rewriting (invasive, conflicts with manual edits,
   root for every change); mDNS over the VPN (finicky).
-- **Client setup:** `/etc/resolver/<domain>` on macOS; systemd-resolved
-  split-DNS on Linux.
+- **Names:** a node registers the **bare host label** (the OS hostname stripped
+  of any DHCP-appended suffix like `.lan`/`.local`), so `RexMundi.hop` resolves
+  even when `gethostname()` returns the FQDN `RexMundi.lan`.
+- **The `:53` bind is privileged** (port < 1024). Under privsep the unprivileged
+  worker can't bind it, so `enable_vpn` routes the bind through the root monitor
+  (`BindPrivPort`) and receives the socket fd via `SCM_RIGHTS` — same mechanism
+  as the TUN. See `privsep::acquire_priv_port`.
+- **Client setup is automatic.** `enable_vpn` points the OS resolver for the
+  warren domain at this node's MagicDNS server with **zero manual steps**:
+  macOS writes `/etc/resolver/<domain>` (`nameserver <vip>` + `port 53`); Linux
+  uses `resolvectl` on the hop interface when systemd-resolved is present. Both
+  are split-DNS (only `.<domain>` is affected). Writing resolver config is
+  privileged, so under privsep it runs in the monitor via the `ConfigureResolver`
+  primitive; the monitor reverts it on exit. Opt out with `HOP_NO_AUTO_RESOLVER`
+  (then configure `/etc/resolver/<domain>` → `nameserver <your-vip>` manually).
+  If systemd-resolved is absent on Linux, hop logs the manual step rather than
+  editing `/etc/resolv.conf`.
 
 ### 8. Service ACL — doc rules, userspace filter at receiver, default-deny
 

@@ -40,6 +40,17 @@
 > stays reachable. macOS note: the full worker-as-`_hop` daemon isn't e2e-tested on
 > macOS (no macOS CI), so validate on a test Mac before production hosts.
 >
+> **Worker-liveness invariant (the worker never outlives its monitor).** The
+> monitor passes the worker the read end of a **liveness pipe**
+> (`HOP_PRIVSEP_ALIVE_FD`) and holds the write end. A worker thread blocks reading
+> it; if the monitor dies for *any* reason — even `SIGKILL` — the kernel closes
+> the write end, the read hits EOF, and the worker `raise(SIGTERM)`s itself (with
+> a hard-`_exit` backstop). Without this, a stranded worker keeps the
+> `datastore.redb` lock + the TUN, and every restart — including the crash-loop
+> fallback — wedges. This is the OpenSSH model: monitor and child are bound for
+> life. (Found via the privsep-drop vpn-e2e: `pkill` of the daemon left an
+> orphaned worker that defeated even the root fallback.)
+>
 > **Operator IPC (§6) is implemented.** Under drop the config is `_hop`-owned, but
 > `hop invite` / `hop id` no longer need root: the daemon binds `daemon.sock`
 > group-owned by the **operator group** (`admin` on macOS, `hop` on Linux, via the
@@ -172,6 +183,18 @@ anything else. Minimality here is the entire security argument for §T3.
 - Monitor asserts `addr == vip` and `port == 53` (the only privileged port hop
   binds). Binds a UDP socket, sends the fd. Worker runs `vpn_dns_loop` on it.
 - Hard-allowlisted to `(vip, 53)` — not a general "bind any port as root".
+- Worker side is `privsep::acquire_priv_port` (mirrors `acquire_tun`): routes
+  through the monitor under privsep, binds directly otherwise.
+
+**P2b — `ConfigureResolver { domain: String, vip: Ipv4Addr }` → `Ok`.**
+- Points the OS resolver for the warren `domain` at the local MagicDNS server on
+  `vip:53` (split-DNS) so `<host>.<domain>` resolves with no manual setup —
+  privileged because it writes root-owned `/etc/resolver/<domain>` (macOS) or
+  runs `resolvectl` (Linux/systemd-resolved). The monitor sanitizes `domain` (a
+  plain DNS label path — it becomes a filename / CLI arg), applies it, and
+  **remembers it to revert on exit** so a stale entry never outlives the daemon.
+  Returns `MonitorReply::Ok` (no fd). Worker side: `privsep::configure_resolver`.
+  Opt out with `HOP_NO_AUTO_RESOLVER`.
 
 **P3 — `SpawnSession { user, kind, pty_size, argv… }` → `pty_fd`/streams.**
 - The worker authenticates the peer and decides the bound unix user (existing
