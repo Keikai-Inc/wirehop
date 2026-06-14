@@ -66,6 +66,40 @@ kill "$NODE_PID" 2>/dev/null || true; sleep 2
 [ "$(ns_of /node)" = "$NS_A" ] || fail "node not on warren A after join+host (got $(ns_of /node))"
 echo "  ok: node is on warren A"
 
+# --- Safe auto-switch on invite consumption (member-count gated) ---
+# The decision reads the daemon-exported warren-members.json snapshot. We seed it
+# directly (the daemon is stopped) to drive the two branches deterministically;
+# real snapshot population is covered by hop-core unit tests.
+echo "--- least-surprise: a POPULATED warren is NOT auto-switched without a flag ---"
+cat >/node/warren-members.json <<JSON
+{"namespace":"$NS_A","members":[{"node_id":"self","name":"self","role":"admin"},{"node_id":"peer","name":"peer","role":"node"}],"roles":[],"updated_at":1}
+JSON
+if hop --config /node warren join "$INVITE_B" >/node-noflag.log 2>&1; then
+  cat /node-noflag.log; fail "populated warren switched without an explicit flag"
+fi
+grep -qiE "on-warren-conflict|won.t be switched" /node-noflag.log || { cat /node-noflag.log; fail "expected a refusal asking for --on-warren-conflict"; }
+test -f /node/netdoc.json || fail "netdoc.json must remain — no switch should have happened"
+[ "$(ns_of /node)" = "$NS_A" ] || fail "node must still be on warren A after refusal"
+echo "  ok: populated warren kept; explicit choice required"
+
+echo "--- solo auto-adopt: a warren with no other members is adopted with no flag ---"
+cat >/node/warren-members.json <<JSON
+{"namespace":"$NS_A","members":[{"node_id":"self","name":"self","role":"admin"}],"roles":[],"updated_at":1}
+JSON
+hop --config /node warren join "$INVITE_B" >/node-solo.log 2>&1 || true
+cat /node-solo.log
+grep -qi "no other members" /node-solo.log || { cat /node-solo.log; fail "expected the solo auto-adopt message"; }
+ls -d /node/.warren-backup-* >/dev/null 2>&1 || fail "auto-adopt should back up the empty warren"
+test ! -f /node/netdoc.json || fail "netdoc.json should be cleared after auto-adopt (re-imports B on next host)"
+echo "  ok: solo warren auto-adopted warren B with no flag"
+
+# Re-stage the node on warren A to exercise the explicit-flag switch below.
+echo "--- re-stage node on warren A (for the explicit-flag switch test) ---"
+rm -rf /node && hop --config /node warren join "$INVITE_A" >/node-rejoin.log 2>&1 || true
+hop --config /node host --quiet >/node-r.log 2>&1 &  NODE_PID=$!
+wait_ns /node-r.log "$NS_A"
+kill "$NODE_PID" 2>/dev/null || true; sleep 2
+
 echo "--- switch: consume warren B invite while on A (--on-warren-conflict replace) ---"
 hop --config /node warren join "$INVITE_B" --on-warren-conflict replace --yes >/node-switch.log 2>&1 || true
 cat /node-switch.log

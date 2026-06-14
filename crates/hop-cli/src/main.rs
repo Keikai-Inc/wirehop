@@ -467,6 +467,23 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     }
                     tracing::info!("netdoc ready (namespace {})", net.namespace());
 
+                    // Least-surprise safety net: `open_or_create` reopens an
+                    // existing namespace and ignores a join ticket. If a pending
+                    // `netdoc-join.ticket` names a DIFFERENT warren than the one we
+                    // just opened, the operator joined but we kept the old warren —
+                    // make that visible instead of silently stranding them.
+                    if let Ok(t) = std::fs::read_to_string(cfg.join("netdoc-join.ticket"))
+                        && let Ok(pending_ns) = hop_core::netdoc::namespace_of_ticket(t.trim())
+                        && pending_ns != net.namespace().to_string()
+                    {
+                        tracing::warn!(
+                            "netdoc: a pending join ticket is for warren {} but this node is on \
+                             warren {} (kept). To switch: `hop warren join --on-warren-conflict switch`",
+                            &pending_ns[..8.min(pending_ns.len())],
+                            &net.namespace().to_string()[..8]
+                        );
+                    }
+
                     // Publish a READ ticket too (#3b Phase 4): node/warren-only
                     // invites embed this instead of the write ticket, so members
                     // import the admin doc read-only (write scope = admin only).
@@ -4996,13 +5013,17 @@ fn self_upgrade_to_node(
     Ok(())
 }
 
-/// Decide how to resolve consuming a *different* warren's invite while already
-/// on one. Interactive default is Replace (KISS); non-interactive requires the
-/// explicit `--on-warren-conflict` flag (never destroy data implicitly).
+/// Decide how to resolve consuming a *different* warren's invite while the
+/// current warren still has members. The default is **Keep** (never switch a
+/// populated warren out from under the user); switching requires an explicit
+/// choice. Non-interactive requires the `--on-warren-conflict` flag — never
+/// destroy warren state implicitly. `member_count` is the current warren's size
+/// (incl. self) if known, used only to make the prompt concrete.
 fn resolve_warren_conflict(
     existing: &str,
     incoming: &str,
     flag: Option<cli::OnWarrenConflict>,
+    member_count: Option<usize>,
 ) -> Result<cli::OnWarrenConflict> {
     use cli::OnWarrenConflict;
     let short = |s: &str| s[..8.min(s.len())].to_string();
@@ -5011,31 +5032,38 @@ fn resolve_warren_conflict(
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         anyhow::bail!(
-            "already on warren {} but this invite is for warren {}; \
-             pass --on-warren-conflict replace|abort",
+            "already on warren {} (it has members) but this invite is for warren {}; \
+             it won't be switched automatically — pass --on-warren-conflict switch|abort",
             short(existing),
             short(incoming)
         );
     }
     println!();
-    println!("This machine is already on warren {}.", short(existing));
+    match member_count {
+        Some(n) if n > 1 => println!(
+            "This machine is already on warren {} with {} other member(s).",
+            short(existing),
+            n - 1
+        ),
+        _ => println!("This machine is already on warren {}.", short(existing)),
+    }
     println!("The invite you're consuming is for a different warren {}.", short(incoming));
+    println!("  [K] Keep    — stay on {} (default)", short(existing));
     println!(
-        "  [R] Replace  — leave {} and join {} (deletes warren state, with backup)",
+        "  [S] Switch  — leave {} and join {} (deletes warren state, with backup)",
         short(existing),
         short(incoming)
     );
-    println!("  [A] Abort    — keep {}, do nothing", short(existing));
-    println!("  (merge / multi-home: not yet available)");
-    print!("Choice [R]: ");
+    println!("  (multi-home — run both at once: not yet available)");
+    print!("Choice [K]: ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let mut answer = String::new();
     let _ = std::io::stdin().read_line(&mut answer);
     match answer.trim().to_ascii_lowercase().as_str() {
-        "" | "r" | "replace" => Ok(OnWarrenConflict::Replace),
-        "a" | "abort" => Ok(OnWarrenConflict::Abort),
-        "m" | "merge" | "h" | "multi-home" | "multihome" => {
-            anyhow::bail!("merge / multi-home are not yet available; choose Replace or Abort")
+        "" | "k" | "keep" | "a" | "abort" => Ok(OnWarrenConflict::Abort),
+        "s" | "switch" | "r" | "replace" => Ok(OnWarrenConflict::Replace),
+        "m" | "merge" | "multi-home" | "multihome" => {
+            anyhow::bail!("multi-home / merge are not yet available; choose Keep or Switch")
         }
         other => anyhow::bail!("unrecognized choice '{other}'"),
     }
@@ -5138,15 +5166,31 @@ fn prepare_warren_join(
         }
         hop_core::netdoc::WarrenConflict::None => {}
         hop_core::netdoc::WarrenConflict::Conflict { existing } => {
-            match resolve_warren_conflict(&existing, &incoming_ns, conflict_flag)? {
-                OnWarrenConflict::Replace => leave_warren(config_dir, true, false)?,
-                OnWarrenConflict::Abort => {
-                    println!("Aborted; staying on warren {}.", &existing[..8.min(existing.len())]);
-                    return Ok(false);
+            let short_ex = &existing[..8.min(existing.len())];
+            let short_in = &incoming_ns[..8.min(incoming_ns.len())];
+            // Auto-adopt ONLY when we're confident the current warren is solo —
+            // the daemon's snapshot is for this exact warren and shows just this
+            // node (count == 1). A populated warren is never switched without an
+            // explicit choice (principle of least surprise). An unknown count
+            // (no/stale snapshot) is treated as "not solo" → ask.
+            let member_count = hop_core::fleet::warren_member_count(config_dir, &existing);
+            if conflict_flag.is_none() && member_count == Some(1) {
+                println!(
+                    "Current warren {short_ex} has no other members — adopting the \
+                     invite's warren {short_in}."
+                );
+                leave_warren(config_dir, true, false)?;
+            } else {
+                match resolve_warren_conflict(&existing, &incoming_ns, conflict_flag, member_count)? {
+                    OnWarrenConflict::Replace => leave_warren(config_dir, true, false)?,
+                    OnWarrenConflict::Abort => {
+                        println!("Staying on warren {short_ex}.");
+                        return Ok(false);
+                    }
+                    OnWarrenConflict::Merge | OnWarrenConflict::MultiHome => anyhow::bail!(
+                        "merge / multi-home are not yet available; use --on-warren-conflict replace"
+                    ),
                 }
-                OnWarrenConflict::Merge | OnWarrenConflict::MultiHome => anyhow::bail!(
-                    "merge / multi-home are not yet available; use --on-warren-conflict replace"
-                ),
             }
         }
     }

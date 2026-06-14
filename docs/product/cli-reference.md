@@ -240,6 +240,15 @@ hop warren status
 > join` upgrades it to a **node** on the warren (needs sudo to bring up the TUN;
 > on a fresh machine, `install.sh --host` does the privileged setup).
 
+**Already on a warren?** Consuming an invite for a *different* warren resolves as:
+> - **No other members** (the current warren is solo) → the invite's warren is
+>   **adopted automatically** — no prompt.
+> - **Has other members** → it is **never switched silently**. Interactively you
+>   choose **Keep** (default) or **Switch**; non-interactively you must pass
+>   `--on-warren-conflict switch` (alias `replace`) or `abort`. `Switch` leaves the
+>   current warren (backed up to `.warren-backup-*`) and joins the new one.
+>   Running both at once (multi-home) is planned.
+
 ### `hop peers [remove|rename]`
 
 List authorized peers or known hosts.

@@ -68,6 +68,20 @@ impl WarrenSnapshot {
     }
 }
 
+/// Member count of the warren the daemon last snapshotted to `warren-members.json`,
+/// but **only** when that snapshot is for `namespace` — a stale snapshot from a
+/// previously-joined warren must not be trusted. `None` means "unknown" (no
+/// snapshot, or it's for a different warren); callers should treat unknown
+/// conservatively (e.g. prompt rather than auto-switch). The count includes this
+/// node itself, so a solo warren reports `Some(1)`.
+pub fn warren_member_count(config_dir: &Path, namespace: &str) -> Option<usize> {
+    let snap = WarrenSnapshot::load(config_dir).ok()?;
+    match snap.namespace.as_deref() {
+        Some(ns) if ns == namespace => Some(snap.members.len()),
+        _ => None,
+    }
+}
+
 /// Pure join of netdoc reads into a snapshot — `peer/` entries enriched with the
 /// admin-allocated vIP (falling back to the shared `ip/` table) and per-node
 /// tags. Separated from the async reads so it can be unit-tested.
@@ -939,6 +953,41 @@ mod tests {
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].vip.as_deref(), Some("100.64.0.9"));
         assert_eq!(loaded.updated_at, 42);
+    }
+
+    /// `warren_member_count` only trusts a snapshot that matches the queried
+    /// namespace, and returns the member count (incl. self) — the solo signal
+    /// for safe auto-switch.
+    #[test]
+    fn warren_member_count_is_namespace_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        // No snapshot yet → unknown.
+        assert_eq!(warren_member_count(dir.path(), "ns-a"), None);
+        let member = |id: &str| WarrenMemberInfo {
+            node_id: id.into(), name: id.into(), role: "node".into(),
+            vip: None, tags: vec![], last_seen: None,
+        };
+        WarrenSnapshot {
+            namespace: Some("ns-a".into()),
+            members: vec![member("self")],
+            roles: vec![],
+            updated_at: 1,
+        }
+        .save(dir.path())
+        .unwrap();
+        // Solo warren ns-a → Some(1); a snapshot for ns-a must NOT answer for ns-b.
+        assert_eq!(warren_member_count(dir.path(), "ns-a"), Some(1));
+        assert_eq!(warren_member_count(dir.path(), "ns-b"), None);
+        // Populated warren → Some(n) > 1.
+        WarrenSnapshot {
+            namespace: Some("ns-a".into()),
+            members: vec![member("self"), member("peer")],
+            roles: vec![],
+            updated_at: 2,
+        }
+        .save(dir.path())
+        .unwrap();
+        assert_eq!(warren_member_count(dir.path(), "ns-a"), Some(2));
     }
 
     /// Helper to build a RoleDefinition with default sandbox for tests.
