@@ -45,13 +45,14 @@ fn hop_transport_config() -> QuicTransportConfig {
         .max_idle_timeout(Some(Duration::from_secs(60).try_into().expect("valid idle timeout")))
         .keep_alive_interval(Duration::from_secs(5))
         .initial_rtt(Duration::from_millis(300))
-        // Single-path QUIC. Multipath (using several paths *simultaneously*) was
-        // tried at 13 paths but it's a memory multiplier + a prime suspect for the
-        // per-packet allocation leak and the direct↔relay latency gyration on a
-        // simple 2-machine warren. One path still *migrates* between direct/relay
-        // for failover (that's path migration, not multipath); we just don't run
-        // them concurrently. Re-raise per-deployment if true multipath is wanted.
-        .max_concurrent_multipath_paths(1)
+        // Multipath: keep several validated paths (WiFi, cellular, relay) alive at
+        // once so a network move / path failure is absorbed by an already-warm
+        // backup instead of a full reconnect. This was dropped to 1 because the
+        // QUIC engine (noq-proto) leaked an FxHashMap<PathId,u64> per sent packet,
+        // ×concurrent-paths (a multi-GB bleed under load). That leak is now fixed
+        // in our vendored noq-proto (inline TinyVec, see [patch.crates-io]), so we
+        // restore concurrent multipath.
+        .max_concurrent_multipath_paths(13)
         .default_path_keep_alive_interval(Duration::from_secs(5))
         .default_path_max_idle_timeout(Duration::from_secs(20))
         // NAT traversal: exchange observed addresses for better holepunching
