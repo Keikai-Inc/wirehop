@@ -391,6 +391,16 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // ESTABLISHED for hours after the relay link is functionally broken).
     let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), None);
 
+    // Serve `hop connect` through THIS daemon's endpoint: a machine running the
+    // daemon must not let the client spawn a second iroh endpoint under the same
+    // node-id (the relay prunes the two against each other every few seconds —
+    // the identity collision). Routing client connects through the daemon's sole
+    // endpoint is the fix. Additive + non-fatal: if it can't bind, clients fall
+    // back to their own agent (collision returns, but the daemon is unharmed).
+    if let Err(e) = agent::spawn_mux_listener(endpoint.clone(), config_dir.join("agent.sock")) {
+        tracing::warn!("daemon mux service unavailable (clients will spawn their own agent): {e:#}");
+    }
+
     // Network document (Phase 1): spawn the iroh-docs replication stack on its
     // own isolated endpoint and migrate existing peers/roles on first run. This
     // is best-effort and NON-FATAL — if any of it fails the daemon keeps serving

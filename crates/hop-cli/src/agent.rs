@@ -603,6 +603,53 @@ async fn check_idle_actor(
 // Main agent entry point
 // ---------------------------------------------------------------------------
 
+/// Bind a mux IPC socket on `sock_path` and serve `MuxConnect` requests using
+/// `endpoint`. Shared by the standalone agent and — crucially — the host daemon:
+/// a machine running `hop host` serves client connects (`hop connect`) through
+/// ITS single endpoint instead of letting the client spawn a *second* endpoint
+/// under the same node-id, which the relay prunes against the daemon every few
+/// seconds (the identity collision). Additive + defensive: a bind failure is
+/// returned to the caller (the daemon logs and continues — the mux is a
+/// convenience, never load-bearing for the daemon's own VPN/inbound roles).
+pub fn spawn_mux_listener(endpoint: Endpoint, sock_path: std::path::PathBuf) -> Result<()> {
+    if sock_path.exists() {
+        let _ = std::fs::remove_file(&sock_path);
+    }
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format!("bind mux socket {}", sock_path.display()))?;
+    // Local-trust: let the logged-in user's `hop connect` reach the daemon's
+    // socket (the daemon may run as _hop/root). Single-user posture; multi-user
+    // hosts should group-scope this rather than world-rw (tracked follow-up).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
+    }
+    let handle = spawn_agent_actor(endpoint);
+    let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let h = handle.clone();
+                    let sessions = active_sessions.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(stream, h, sessions).await {
+                            tracing::debug!("daemon mux client error: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("daemon mux accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    tracing::info!("daemon mux service listening on {}", sock_path.display());
+    Ok(())
+}
+
 async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle) -> Result<()> {
     let sock_path = mux::agent_sock_path(config_dir);
     let pid_path = mux::agent_pid_path(config_dir);

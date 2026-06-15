@@ -105,7 +105,22 @@ pub async fn read_ipc_message<T: for<'de> Deserialize<'de>>(
 pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
     let sock = agent_sock_path(config_dir);
 
-    // Try existing agent
+    // Prefer a running host daemon's mux socket. The daemon owns the machine's
+    // single iroh endpoint, so routing client connects through it avoids a
+    // SECOND endpoint under the same node-id — which the relay prunes against
+    // the daemon every few seconds (the identity collision that destabilizes
+    // both client sessions and the VPN). Falls through if no daemon is serving.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let daemon_sock = hop_core::config::system_config_dir().join("agent.sock");
+        if daemon_sock != sock
+            && let Ok(stream) = UnixStream::connect(&daemon_sock).await
+        {
+            return Ok(stream);
+        }
+    }
+
+    // Try existing (user) agent
     if let Ok(stream) = UnixStream::connect(&sock).await {
         return Ok(stream);
     }
