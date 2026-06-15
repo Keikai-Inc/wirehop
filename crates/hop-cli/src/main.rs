@@ -446,9 +446,18 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     let peers = hop_core::config::PeersStore::load(&cfg)
                         .map(|p| p.peers)
                         .unwrap_or_default();
-                    let roles = hop_core::fleet::RolesStore::load(&cfg)
-                        .map(|r| r.roles)
-                        .unwrap_or_default();
+                    let mut roles_store =
+                        hop_core::fleet::RolesStore::load(&cfg).unwrap_or_default();
+                    // Self-heal: ensure the `member` role exists so admitted
+                    // members aren't stranded by a roles.json that predates it
+                    // (the founder writes it into the warren doc via reconcile).
+                    if roles_store.ensure_member() {
+                        tracing::info!(
+                            "netdoc: seeded missing `member` role (warren reach) — self-heal"
+                        );
+                        let _ = roles_store.save(&cfg);
+                    }
+                    let roles = roles_store.roles;
                     match net.reconcile(&peers, &roles).await {
                         Ok(()) => tracing::info!(
                             "netdoc: reconciled {} peer(s), {} role(s)",

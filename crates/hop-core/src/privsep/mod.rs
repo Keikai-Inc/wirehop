@@ -389,16 +389,19 @@ fn validate_create_tun(vip: [u8; 4]) -> Result<()> {
     Ok(())
 }
 
-/// Accept a `BindPrivPort` only for the node's own vIP and the MagicDNS port 53.
+/// Accept a `BindPrivPort` only for MagicDNS port 53 on either the node's own vIP
+/// (Linux) or loopback (macOS serves MagicDNS on `127.0.0.1` — see
+/// `vpn::magicdns_bind_addr`). Both are local-only DNS sockets, never a general
+/// privileged bind.
 fn validate_bind_priv_port(addr: [u8; 4], port: u16) -> Result<()> {
     anyhow::ensure!(
         port == 53,
         "refusing BindPrivPort: only :53 (MagicDNS) is permitted, not :{port}"
     );
+    let a = std::net::Ipv4Addr::from(addr);
     anyhow::ensure!(
-        crate::vpn::is_virtual_addr(std::net::Ipv4Addr::from(addr)),
-        "refusing BindPrivPort: {} is not a warren vIP",
-        std::net::Ipv4Addr::from(addr)
+        crate::vpn::is_virtual_addr(a) || a == std::net::Ipv4Addr::LOCALHOST,
+        "refusing BindPrivPort: {a} is neither a warren vIP nor loopback"
     );
     Ok(())
 }
@@ -407,6 +410,7 @@ fn validate_bind_priv_port(addr: [u8; 4], port: u16) -> Result<()> {
 /// The monitor keeps the returned `Device` alive (so the interface + route
 /// persist across worker restarts) and passes its fd to the worker.
 pub fn monitor_create_tun(vip: [u8; 4]) -> Result<tun::Device> {
+    use tun::AbstractDevice;
     validate_create_tun(vip)?;
     let addr = std::net::Ipv4Addr::from(vip);
     let mut config = tun::configure();
@@ -415,7 +419,15 @@ pub fn monitor_create_tun(vip: [u8; 4]) -> Result<tun::Device> {
         .netmask(std::net::Ipv4Addr::new(255, 192, 0, 0))
         .mtu(crate::vpn::VPN_MTU)
         .up();
-    tun::create(&config).map_err(|e| anyhow::anyhow!("create TUN {addr}: {e}"))
+    let dev = tun::create(&config).map_err(|e| anyhow::anyhow!("create TUN {addr}: {e}"))?;
+    // macOS doesn't auto-install the /10 route on a p2p utun — the monitor (root)
+    // pins it explicitly so warren traffic flows. No-op on Linux.
+    if let Ok(name) = dev.tun_name()
+        && let Err(e) = crate::vpn::ensure_warren_route(&name)
+    {
+        tracing::warn!("privsep: warren route setup on {name} failed: {e:#}");
+    }
+    Ok(dev)
 }
 
 /// Monitor side of `BindPrivPort`: validate (own vIP + :53), then bind. Returns
@@ -1103,6 +1115,11 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     const MAX_FAST_FAILURES: u32 = 3;
     let mut fast_failures: u32 = 0;
 
+    // The monitor is root, so it owns route enforcement: keep the warren /10 route
+    // pinned to the hop utun across worker restarts, sleep/wake, and network
+    // changes (macOS flushes it; Linux's kernel keeps it). No-op on Linux.
+    crate::vpn::spawn_route_enforcer();
+
     loop {
     let spawn_instant = std::time::Instant::now();
     let (mon, wrk) = control_socketpair()?;
@@ -1491,9 +1508,11 @@ mod tests {
 
         // BindPrivPort: only (warren vIP, 53).
         assert!(validate_bind_priv_port([100, 64, 0, 1], 53).is_ok());
+        assert!(validate_bind_priv_port([127, 0, 0, 1], 53).is_ok()); // macOS MagicDNS on loopback
+        assert!(validate_bind_priv_port([127, 0, 0, 1], 80).is_err()); // loopback but wrong port
         assert!(validate_bind_priv_port([100, 64, 0, 1], 80).is_err()); // wrong port
         assert!(validate_bind_priv_port([100, 64, 0, 1], 22).is_err());
-        assert!(validate_bind_priv_port([8, 8, 8, 8], 53).is_err()); // non-vIP
+        assert!(validate_bind_priv_port([8, 8, 8, 8], 53).is_err()); // non-vIP, non-loopback
     }
 
     /// SpawnSession only accepts an absolute-path launcher or the `login`/`su`

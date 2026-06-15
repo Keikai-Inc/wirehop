@@ -98,16 +98,111 @@ const CGNAT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
 pub type TunSlot = std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tun::AsyncDevice>>>>;
 
 /// Create a TUN device bound to `addr` within `100.64.0.0/10` and bring it up.
-/// The kernel installs a route for the /10 to this interface automatically.
+/// On Linux the kernel installs the /10 route from the netmask; on macOS a
+/// point-to-point utun does NOT, so we install it explicitly (`ensure_warren_route`).
 #[cfg(unix)]
 pub async fn create_tun(addr: Ipv4Addr) -> anyhow::Result<tun::AsyncDevice> {
+    use tun::AbstractDevice;
     let mut config = tun::configure();
     config
         .address(addr)
         .netmask(CGNAT_NETMASK)
         .mtu(VPN_MTU)
         .up();
-    tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("create TUN device: {e}"))
+    let dev =
+        tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("create TUN device: {e}"))?;
+    if let Ok(name) = dev.tun_name()
+        && let Err(e) = ensure_warren_route(&name)
+    {
+        tracing::warn!("vpn: warren route setup on {name} failed: {e:#}");
+    }
+    // Keep the route asserted across sleep/wake + network changes (non-privsep
+    // daemon is root here; under privsep the monitor runs the enforcer).
+    spawn_route_enforcer();
+    Ok(dev)
+}
+
+/// Ensure the warren `100.64.0.0/10` route is pinned to `iface`. macOS p2p utuns
+/// don't auto-install the range route from their netmask (Linux does), so without
+/// this warren traffic falls through to the default route. Idempotent: a re-add
+/// of an existing route is success. macOS-only; a no-op elsewhere. Must run as
+/// root (privsep monitor / non-privsep daemon both qualify).
+#[cfg(target_os = "macos")]
+pub fn ensure_warren_route(iface: &str) -> anyhow::Result<()> {
+    let out = std::process::Command::new("/sbin/route")
+        .args(["-n", "add", "-net", "100.64.0.0/10", "-interface", iface])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawning route add: {e}"))?;
+    if out.status.success() {
+        tracing::info!("vpn: installed warren route 100.64.0.0/10 -> {iface}");
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.to_lowercase().contains("exists") {
+        return Ok(()); // route already present → fine
+    }
+    anyhow::bail!("route add 100.64.0.0/10 -> {iface} failed: {}", err.trim());
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn ensure_warren_route(_iface: &str) -> anyhow::Result<()> {
+    Ok(()) // Linux: kernel installs the /10 route from the address/netmask.
+}
+
+/// The hop TUN interface name (a `utun*`/`tun*` carrying a `100.64.0.0/10`
+/// address), if up. Used by the route enforcer to re-find the device across
+/// utun renumbering. macOS-relevant; returns `None` if not found.
+#[cfg(target_os = "macos")]
+pub fn warren_tun_iface() -> Option<String> {
+    let addrs = nix::ifaddrs::getifaddrs().ok()?;
+    for ifa in addrs {
+        if let Some(v4) = ifa.address.and_then(|a| a.as_sockaddr_in().map(|s| s.ip()))
+            && is_virtual_addr(v4)
+        {
+            return Some(ifa.interface_name);
+        }
+    }
+    None
+}
+
+/// Robustly enforce the warren route: every 30s re-find the hop TUN and re-assert
+/// its `/10` route, so a route flushed by sleep/wake or a network change is
+/// restored without waiting for a daemon restart. macOS-only (Linux's kernel
+/// keeps the interface route); must be spawned as root. Never returns.
+#[cfg(target_os = "macos")]
+pub fn spawn_route_enforcer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return; // one enforcer per process
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Some(iface) = warren_tun_iface()
+                && let Err(e) = ensure_warren_route(&iface)
+            {
+                tracing::debug!("vpn: route re-assert on {iface} failed: {e:#}");
+            }
+        }
+    });
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn spawn_route_enforcer() {}
+
+/// Address MagicDNS binds on and the OS resolver is pointed at. On Linux the
+/// node's own vIP works (the kernel delivers packets addressed to a local
+/// interface). On macOS a point-to-point utun routes a query to the node's OWN
+/// vIP back *out* the tunnel instead of to the bound socket, so MagicDNS is
+/// unreachable on the vIP from the same host — serve on loopback instead, which
+/// is always locally deliverable.
+pub fn magicdns_bind_addr(vip: Ipv4Addr) -> Ipv4Addr {
+    if cfg!(target_os = "macos") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        vip
+    }
 }
 
 /// `endpoint-id-hex → virtual IP` for every registered VPN node, shared with the

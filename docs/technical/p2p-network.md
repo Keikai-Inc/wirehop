@@ -189,16 +189,29 @@ from the doc; the network's domain name is a configurable doc setting (e.g.
   worker can't bind it, so `enable_vpn` routes the bind through the root monitor
   (`BindPrivPort`) and receives the socket fd via `SCM_RIGHTS` — same mechanism
   as the TUN. See `privsep::acquire_priv_port`.
+- **MagicDNS bind address is platform-specific** (`vpn::magicdns_bind_addr`).
+  Linux serves on the node's vIP (the kernel delivers packets addressed to a
+  local interface). macOS serves on **`127.0.0.1`**: a point-to-point utun routes
+  a query to the node's *own* vIP back out the tunnel instead of to the bound
+  socket, so MagicDNS would be unreachable from the same host on the vIP. Loopback
+  is always locally deliverable. `validate_bind_priv_port` allows `127.0.0.1:53`
+  in addition to the vIP for this.
 - **Client setup is automatic.** `enable_vpn` points the OS resolver for the
   warren domain at this node's MagicDNS server with **zero manual steps**:
-  macOS writes `/etc/resolver/<domain>` (`nameserver <vip>` + `port 53`); Linux
-  uses `resolvectl` on the hop interface when systemd-resolved is present. Both
-  are split-DNS (only `.<domain>` is affected). Writing resolver config is
-  privileged, so under privsep it runs in the monitor via the `ConfigureResolver`
-  primitive; the monitor reverts it on exit. Opt out with `HOP_NO_AUTO_RESOLVER`
-  (then configure `/etc/resolver/<domain>` → `nameserver <your-vip>` manually).
-  If systemd-resolved is absent on Linux, hop logs the manual step rather than
-  editing `/etc/resolv.conf`.
+  macOS writes `/etc/resolver/<domain>` (`nameserver 127.0.0.1` + `port 53`);
+  Linux uses `resolvectl` on the hop interface (vIP) when systemd-resolved is
+  present. Both are split-DNS (only `.<domain>` is affected). Writing resolver
+  config is privileged, so under privsep it runs in the monitor via the
+  `ConfigureResolver` primitive; the monitor reverts it on exit. Opt out with
+  `HOP_NO_AUTO_RESOLVER`. If systemd-resolved is absent on Linux, hop logs the
+  manual step rather than editing `/etc/resolv.conf`. (`nslookup`/`dig` ignore
+  `/etc/resolver/*` — they hit `/etc/resolv.conf`; the scoped resolver is used by
+  `getaddrinfo`/`ping`. Verify with `scutil --dns`.)
+- **Routing on macOS is installed + enforced** (`vpn::ensure_warren_route` +
+  `spawn_route_enforcer`). A macOS p2p utun does NOT auto-install the
+  `100.64.0.0/10` route from its netmask (Linux's kernel does), so the route is
+  added explicitly when the TUN is created, and a 30s enforcer re-finds the hop
+  utun and re-asserts the route after sleep/wake / network changes / restarts.
 
 ### 8. Service ACL — doc rules, userspace filter at receiver, default-deny
 

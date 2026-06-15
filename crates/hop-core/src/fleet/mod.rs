@@ -213,16 +213,45 @@ impl RolesStore {
         self.roles.iter().find(|r| r.name == name)
     }
 
+    /// Ensure the canonical `member` role exists (warren-mesh reach, no host
+    /// sessions). Self-heals a warren whose `roles.json` was seeded **before**
+    /// `member` was a default role: an admitted peer with `role_name = "member"`
+    /// but no such definition hits the reach engine's role-not-found path and
+    /// reaches NOTHING. Returns `true` if it added the role (caller should
+    /// `save` + reconcile so it propagates to members). No-op if already present.
+    pub fn ensure_member(&mut self) -> bool {
+        if self.roles.iter().any(|r| r.name == "member") {
+            return false;
+        }
+        self.roles.push(RoleDefinition {
+            name: "member".into(),
+            host_tags: vec!["*".into()],
+            sudo: false,
+            admin: false,
+            network_only: false,
+            user_mode: UserMode::Individual,
+            groups: vec![],
+            shell: None,
+            sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
+        });
+        true
+    }
+
     /// Seed opinionated default roles on first orchestrator startup.
     /// Only call this when roles.json does not yet exist.
     pub fn seed_defaults(config_dir: &Path) -> Result<Self> {
         let store = Self {
             roles: vec![
-                // Least-privilege default: in the warren with an address, but
-                // default-deny reach (no host tags) until elevated.
+                // Default role for every node invite. Reaches the warren mesh by
+                // default (`*`) so a fresh/personal warren "just works" — members
+                // can ping/route to each other with no extra config. It grants L3
+                // reach only, NOT host sessions (no sudo/admin). To restrict who
+                // reaches sensitive hosts, tag those hosts and admit users with a
+                // tag-scoped role (e.g. `developer`) instead of `member`.
                 RoleDefinition {
                     name: "member".into(),
-                    host_tags: vec![],
+                    host_tags: vec!["*".into()],
                     sudo: false,
                     admin: false,
                     network_only: false,
@@ -955,6 +984,21 @@ mod tests {
         assert_eq!(loaded.updated_at, 42);
     }
 
+    /// `ensure_member` self-heals a roles.json missing the `member` role (adds it
+    /// once with warren reach); idempotent if already present.
+    #[test]
+    fn ensure_member_seeds_when_missing() {
+        // Missing → added with wildcard reach, no sessions.
+        let mut store = RolesStore { roles: vec![] };
+        assert!(store.ensure_member());
+        let m = store.find_role("member").expect("member added");
+        assert_eq!(m.host_tags, vec!["*"]);
+        assert!(!m.admin && !m.sudo);
+        // Already present → no-op (no duplicate).
+        assert!(!store.ensure_member());
+        assert_eq!(store.roles.iter().filter(|r| r.name == "member").count(), 1);
+    }
+
     /// `warren_member_count` only trusts a snapshot that matches the queried
     /// namespace, and returns the member count (incl. self) — the solo signal
     /// for safe auto-switch.
@@ -1310,10 +1354,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RolesStore::seed_defaults(dir.path()).unwrap();
         assert_eq!(store.roles.len(), 7);
-        // Least-privilege default exists with no reach.
+        // Default `member`: reaches the warren mesh (`*`) so a fresh warren works
+        // out of the box, but grants no host sessions (not admin, no sudo).
         let member = store.find_role("member").unwrap();
-        assert!(member.host_tags.is_empty());
+        assert_eq!(member.host_tags, vec!["*"]);
         assert!(!member.admin);
+        assert!(!member.sudo);
 
         // Verify file was written
         assert!(dir.path().join("roles.json").exists());

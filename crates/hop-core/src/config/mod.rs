@@ -516,8 +516,9 @@ pub struct HostConfig {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
 
-    /// Named role assigned to invites that don't specify one. Defaults to the
-    /// least-privilege `member` (default-deny reach). Re-point per deployment.
+    /// Named role assigned to invites that don't specify one. Defaults to
+    /// `member` — warren-mesh reach (`*`), but no host sessions. Re-point per
+    /// deployment (e.g. a tag-scoped role) to restrict reach.
     #[serde(default = "default_role_name")]
     pub default_role: String,
 

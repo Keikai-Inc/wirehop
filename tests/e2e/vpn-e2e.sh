@@ -404,8 +404,12 @@ if [ "$RC" = "0" ]; then
     if [ "$RC" = "0" ]; then
         echo ""
         echo "--- warming c↔b path (founder still up) ---"
+        # Cold mesh path between two non-founder nodes — c only ever talked to a,
+        # so c↔b must hole-punch/dial from scratch. Like the no-admin reconvergence
+        # this is the slowest 3-node case; give it a wide window so we test "it
+        # establishes", not "within ~30s".
         CB_WARM=0
-        for attempt in 1 2 3 4 5; do
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
           if docker exec hop-vpn-c ping -c 3 -W 3 "$VIP_B"; then CB_WARM=1; break; fi
           echo "  (c→b warm attempt $attempt failed; settling 6s)"; sleep 6
         done

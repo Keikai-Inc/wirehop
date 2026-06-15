@@ -1474,19 +1474,23 @@ impl NetDoc {
                 tracing::warn!("vpn: name registration failed: {e:#}");
             }
         }
+        // MagicDNS binds on the vIP on Linux, but loopback on macOS (a p2p utun
+        // can't deliver a query to its own vIP locally). The resolver is pointed
+        // at the same address, so they always agree.
+        let dns_bind = crate::vpn::magicdns_bind_addr(addr);
         let dns = std::sync::Arc::clone(self);
-        tokio::spawn(async move { dns.vpn_dns_loop(addr).await });
+        tokio::spawn(async move { dns.vpn_dns_loop(dns_bind).await });
 
         // Automatic split-DNS: point the OS resolver for the warren domain at
-        // this node's MagicDNS server (`addr:53`) so `<host>.<domain>` resolves
-        // with zero manual setup. Privileged, so under privsep this routes
-        // through the monitor; best-effort — failure only costs name resolution.
+        // this node's MagicDNS server so `<host>.<domain>` resolves with zero
+        // manual setup. Privileged, so under privsep this routes through the
+        // monitor; best-effort — failure only costs name resolution.
         if !crate::vpn::resolver::auto_resolver_disabled() {
             let domain = self.network_domain().await;
-            if let Err(e) = crate::privsep::configure_resolver(&domain, addr) {
+            if let Err(e) = crate::privsep::configure_resolver(&domain, dns_bind) {
                 tracing::warn!(
                     "vpn: automatic DNS config failed ({e:#}); names won't resolve until you \
-                     point `.{domain}` at {addr}:53 manually"
+                     point `.{domain}` at {dns_bind}:53 manually"
                 );
             }
         }
