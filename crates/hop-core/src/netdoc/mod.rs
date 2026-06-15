@@ -202,6 +202,11 @@ pub struct NetDoc {
     /// reboot instead of a silently-dead cached dial.
     #[cfg(unix)]
     vpn_conns: crate::vpn::VpnConns,
+    /// Per-peer last-inbound-datagram timestamps, shared with `VpnInbound` and
+    /// every pump. The outbound forwarder uses it to detect a silently-dead
+    /// pooled connection (still `Ok` on send, but no replies) and re-dial.
+    #[cfg(unix)]
+    vpn_last_rx: crate::vpn::VpnLastRx,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -321,6 +326,9 @@ impl NetDoc {
         #[cfg(unix)]
         let vpn_conns: crate::vpn::VpnConns =
             std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        #[cfg(unix)]
+        let vpn_last_rx: crate::vpn::VpnLastRx =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
         let mut builder = Router::builder(endpoint.clone())
             .accept(iroh_docs::ALPN, docs.clone())
@@ -340,6 +348,7 @@ impl NetDoc {
                     vpn_local_ip.clone(),
                     vpn_refresh.clone(),
                     vpn_conns.clone(),
+                    vpn_last_rx.clone(),
                 ),
             );
         }
@@ -368,6 +377,8 @@ impl NetDoc {
             vpn_refresh,
             #[cfg(unix)]
             vpn_conns,
+            #[cfg(unix)]
+            vpn_last_rx,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1239,13 +1250,22 @@ impl NetDoc {
         };
         let owner = |ip: std::net::Ipv4Addr| ips.iter().find(|(a, _)| *a == ip).map(|(_, n)| n.clone());
         let (Some(src_node), Some(dst_node)) = (owner(src_ip), owner(dst_ip)) else {
+            // The ip/ ownership table lags peer/role sync (5s refresh tick). Hard-
+            // denying here drops a legitimate member's packets during the
+            // convergence window — the "member but can't reach" footgun, just
+            // relocated to the resolution layer. Fail OPEN and kick a refresh
+            // instead of blackholing: the endpoint-resolution step
+            // (lookup_vpn_endpoint) still gates actual delivery, so an unknown
+            // vIP has no endpoint and is dropped there — fail-open here can't
+            // forward to a non-member, it only avoids dropping during sync lag.
             tracing::debug!(
-                "reach DENY {src_ip}->{dst_ip}: unknown vIP owner (src_known={}, dst_known={}) — \
-                 ip/ table not synced?",
+                "reach ALLOW(sync) {src_ip}->{dst_ip}: vIP owner not resolved yet (src_known={}, \
+                 dst_known={}) — refreshing rather than blackholing",
                 owner(src_ip).is_some(),
                 owner(dst_ip).is_some()
             );
-            return false;
+            self.vpn_refresh.notify_one();
+            return true;
         };
         // Cedar reach engine (cached); default-deny on any build failure.
         match self.reach_engine().await {
@@ -1658,7 +1678,17 @@ impl NetDoc {
     #[cfg(unix)]
     async fn vpn_outbound_loop(&self, tun: std::sync::Arc<tun::AsyncDevice>) {
         use std::collections::HashMap;
-        let mut conns: HashMap<iroh::PublicKey, iroh::endpoint::Connection> = HashMap::new();
+        // Cached dials: connection + when we dialed it (for the post-dial grace).
+        let mut conns: HashMap<iroh::PublicKey, (iroh::endpoint::Connection, std::time::Instant)> =
+            HashMap::new();
+        // Recovery thresholds. QUIC datagram sends return Ok even on a dead path,
+        // so close_reason() never trips — a pooled connection is treated as usable
+        // only if we've received a datagram from the peer within STALE_AFTER
+        // (proves the path is live), or, for one we just dialed, within DIAL_GRACE
+        // while the first reply is still in flight. Otherwise we re-dial. Both ends
+        // run this, so a silently-dead path recovers on whichever side is sending.
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+        const DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
         let mut buf = vec![0u8; 65535];
         loop {
             let n = match tun.recv(&mut buf).await {
@@ -1695,17 +1725,31 @@ impl NetDoc {
                     continue;
                 }
             };
-            // Prefer the peer's live INBOUND connection (it dialed us — that
-            // conn is provably fresh; a rebooted peer redials immediately and
-            // its new conn replaces the old in the shared map). Fall back to
-            // our own dial cache, then dial. A silently-dead cached dial can't
-            // be detected via close_reason() until the QUIC idle timeout, so
-            // freshest-inbound-first is what makes post-reboot replies instant.
+            // Have we received a datagram from this peer recently? That's the only
+            // trustworthy liveness signal on the datagram data plane.
+            let rx_fresh = self
+                .vpn_last_rx
+                .read()
+                .await
+                .get(&pubkey.to_string())
+                .map(|t| t.elapsed() < STALE_AFTER)
+                .unwrap_or(false);
+
+            // Prefer the peer's live INBOUND connection when we've heard from it
+            // recently (a rebooted peer redials and that fresh conn replaces the
+            // old one). Else reuse our dial cache if it's fresh / within grace.
+            // Else dial. The rx_fresh gate is what lets a silently-dead connection
+            // be abandoned instead of black-holing every packet onto it forever.
             let inbound = self.vpn_conns.read().await.get(&pubkey.to_string()).cloned();
             let conn = match inbound {
-                Some(c) if c.close_reason().is_none() => c,
+                Some(c) if c.close_reason().is_none() && rx_fresh => c,
                 _ => match conns.get(&pubkey) {
-                    Some(c) if c.close_reason().is_none() => c.clone(),
+                    Some((c, dialed))
+                        if c.close_reason().is_none()
+                            && (rx_fresh || dialed.elapsed() < DIAL_GRACE) =>
+                    {
+                        c.clone()
+                    }
                     _ => {
                         match crate::net::connect_to_host_with_alpn(
                             &self.endpoint,
@@ -1721,18 +1765,19 @@ impl NetDoc {
                                 // dialed (QUIC datagrams are bidirectional), and
                                 // without a reader those replies are discarded.
                                 {
-                                    let (conn2, tun2, ips2, lip2, rfr2) = (
+                                    let (conn2, tun2, ips2, lip2, rfr2, rx2) = (
                                         c.clone(),
                                         self.vpn_tun.clone(),
                                         self.vpn_peer_ips.clone(),
                                         self.vpn_local_ip.clone(),
                                         self.vpn_refresh.clone(),
+                                        self.vpn_last_rx.clone(),
                                     );
                                     tokio::spawn(async move {
-                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2).await;
+                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2, &rx2).await;
                                     });
                                 }
-                                conns.insert(pubkey, c.clone());
+                                conns.insert(pubkey, (c.clone(), std::time::Instant::now()));
                                 c
                             }
                             Err(e) => {

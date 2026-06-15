@@ -246,6 +246,14 @@ pub type VpnLocalIp = std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>;
 #[cfg(unix)]
 pub type VpnRefresh = std::sync::Arc<tokio::sync::Notify>;
 
+/// Per-peer timestamp of the last inbound VPN datagram, keyed by remote node-id
+/// string. The outbound forwarder reads it to detect a silently-dead pooled
+/// connection (we keep sending but hear nothing back) and force a re-dial —
+/// QUIC datagram sends return `Ok` on a dead path, so `close_reason()` alone
+/// never triggers recovery. Updated by `pump_vpn_datagrams` on every datagram.
+pub type VpnLastRx =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>;
+
 /// `remote endpoint id hex → live inbound hop/vpn/1 connection`. Registered by
 /// `VpnInbound` on accept (newest wins) and shared with the outbound forwarder,
 /// which PREFERS it over its own dial cache: after a peer reboots and redials,
@@ -270,6 +278,7 @@ pub struct VpnInbound {
     local_ip: VpnLocalIp,
     refresh: VpnRefresh,
     conns: VpnConns,
+    last_rx: VpnLastRx,
 }
 
 #[cfg(unix)]
@@ -287,8 +296,9 @@ impl VpnInbound {
         local_ip: VpnLocalIp,
         refresh: VpnRefresh,
         conns: VpnConns,
+        last_rx: VpnLastRx,
     ) -> Self {
-        Self { tun, peer_ips, local_ip, refresh, conns }
+        Self { tun, peer_ips, local_ip, refresh, conns, last_rx }
     }
 }
 
@@ -305,10 +315,15 @@ pub async fn pump_vpn_datagrams(
     peer_ips: &VpnPeerIps,
     local_ip: &VpnLocalIp,
     refresh: &VpnRefresh,
+    last_rx: &VpnLastRx,
 ) {
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
     while let Ok(dg) = conn.read_datagram().await {
+        // Liveness signal: a datagram arrived from this peer, so the path is
+        // alive right now. The outbound forwarder uses this to tell a working
+        // pooled connection from a silently-dead one and recover from the latter.
+        last_rx.write().await.insert(remote.clone(), std::time::Instant::now());
         // Look up the peer's authorized vIP *per datagram* (not once up front)
         // so a refresh mid-connection — e.g. after the peer reboots and
         // re-registers — takes effect without dropping the connection.
@@ -359,7 +374,7 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
         // connection, not a silently-dead cached dial.
         let my_id = conn.stable_id();
         self.conns.write().await.insert(remote.clone(), conn.clone());
-        pump_vpn_datagrams(&conn, &self.tun, &self.peer_ips, &self.local_ip, &self.refresh).await;
+        pump_vpn_datagrams(&conn, &self.tun, &self.peer_ips, &self.local_ip, &self.refresh, &self.last_rx).await;
         // Connection ended — unregister, unless a newer one already replaced it.
         {
             let mut conns = self.conns.write().await;
