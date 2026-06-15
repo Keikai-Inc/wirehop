@@ -991,9 +991,13 @@ impl NetDoc {
         let key = format!("{KEY_VPN_PREFIX}{addr}");
         let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
 
+        // Who owns this vIP? Validated (admin-allocated peer.vip / vouched ip/).
+        // Computed once, reused by the self-doc lookup and the node-id fallback.
+        let owner = self.vip_owner(addr).await;
+
         // Preferred: the addr owner's self-doc (the isolated endpoint source).
-        if let Some(owner) = self.vip_owner(addr).await
-            && let Some(sd) = self.member_self_doc(&owner).await
+        if let Some(ref owner) = owner
+            && let Some(sd) = self.member_self_doc(owner).await
             && let Ok(Some(entry)) = sd.get_one(mk_query()).await
             && entry.content_len() > 0
             && let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await
@@ -1003,17 +1007,34 @@ impl NetDoc {
             return Ok(Some(v));
         }
 
-        // Fallback: the shared `vpn/` table (legacy / self-doc not yet imported).
-        let Some(entry) = self.doc.get_one(mk_query()).await.context("get_one vpn")? else {
-            tracing::debug!("netdoc egress: {addr} UNRESOLVED (no self-doc hit, no shared entry)");
-            return Ok(None);
-        };
-        if entry.content_len() == 0 {
-            return Ok(None);
+        // Fallback 1: the shared `vpn/` table (legacy / self-doc not yet imported).
+        if let Some(entry) = self.doc.get_one(mk_query()).await.context("get_one vpn")?
+            && entry.content_len() > 0
+        {
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            if let Some(v) = parse_vpn_endpoint_value(&bytes) {
+                tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
+                return Ok(Some(v));
+            }
         }
-        let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
-        tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
-        Ok(parse_vpn_endpoint_value(&bytes))
+
+        // Fallback 2: the vIP OWNER's node-id alone. We already know who owns this
+        // vIP, and that node-id + the warren relay is everything connect_to_host
+        // needs to dial the VPN ALPN — exactly what a self-doc / vpn entry yields
+        // (both resolve to just `(pubkey, relay)`). A member on an older build
+        // that publishes neither a self-doc nor a shared `vpn/` entry is still
+        // reachable by node-id, so don't black-hole its traffic over a doc-sync
+        // gap. The owner is author-validated, so this dials the legitimate owner.
+        if let Some(owner) = owner
+            && let Ok(pubkey) = owner.parse::<iroh::PublicKey>()
+        {
+            let relay = crate::net::HOP_RELAY_URL.parse().ok();
+            tracing::debug!("netdoc egress: {addr} resolved via owner node-id fallback");
+            return Ok(Some((pubkey, relay)));
+        }
+
+        tracing::debug!("netdoc egress: {addr} UNRESOLVED (no self-doc, no shared entry, no owner)");
+        Ok(None)
     }
 
     /// Refresh the `endpoint-id-hex → vIP` map used for VPN ingress
@@ -2945,6 +2966,35 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         assert!(found, "lookup_vpn_endpoint did not resolve B's self-doc endpoint via peer.vip");
+    }
+
+    /// A member with an admin-allocated vIP but NO published endpoint (neither a
+    /// self-doc nor a shared `vpn/` entry — a doc-sync gap, as seen on a live
+    /// 0.6.80 warren) must still resolve via the owner node-id fallback: the
+    /// validated owner + the warren relay is all `connect_to_host` needs, so its
+    /// VPN traffic isn't black-holed over a sync gap.
+    #[tokio::test]
+    async fn lookup_vpn_endpoint_falls_back_to_owner_nodeid() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        // A real peer id with an admin-allocated vIP, but no endpoint doc at all.
+        let peer_ep = test_endpoint().await;
+        let peer_id = peer_ep.id();
+        let addr: std::net::Ipv4Addr = "100.64.9.9".parse().unwrap();
+        let mut peer = sample_peer(&peer_id.to_string(), "P");
+        peer.vip = Some(addr.to_string());
+        a.put_peer(&peer).await.unwrap();
+
+        let resolved = a.lookup_vpn_endpoint(addr).await.expect("lookup ok");
+        assert_eq!(
+            resolved.map(|(pk, _)| pk),
+            Some(peer_id),
+            "egress must resolve a member with no endpoint doc via the owner node-id fallback"
+        );
     }
 
     /// MagicDNS for a read-ticket member: B registers its name ONLY in its
