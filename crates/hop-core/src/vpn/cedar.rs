@@ -51,6 +51,11 @@ impl AclEngine {
     ) -> Result<Self> {
         let role_by_name: HashMap<&str, &RoleDefinition> =
             roles.iter().map(|r| (r.name.as_str(), r)).collect();
+        tracing::debug!(
+            "reach engine: built from {} role(s): {:?}",
+            roles.len(),
+            roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>()
+        );
 
         let mut ents: Vec<serde_json::Value> = Vec::with_capacity(peers.len() + host_tags.len() + 2);
 
@@ -62,16 +67,27 @@ impl AclEngine {
         // Principals: each peer with its role flattened onto it, and made a
         // member of the relevant autogroups.
         for p in peers {
-            let (reach_tags, wildcard, admin): (Vec<String>, bool, bool) = match p
-                .role_name
-                .as_deref()
-                .and_then(|n| role_by_name.get(n))
-            {
-                Some(r) => (
-                    r.host_tags.clone(),
-                    r.host_tags.iter().any(|t| t == "*"),
-                    r.admin,
-                ),
+            let (reach_tags, wildcard, admin): (Vec<String>, bool, bool) = match &p.role_name {
+                // Role assigned AND defined → use it (tag-scoped or wildcard).
+                Some(name) if role_by_name.contains_key(name.as_str()) => {
+                    let r = role_by_name[name.as_str()];
+                    (r.host_tags.clone(), r.host_tags.iter().any(|t| t == "*"), r.admin)
+                }
+                // Role assigned but NOT defined/synced (e.g. role-sync lag, or a
+                // warren seeded before the role existed) → reach the warren mesh by
+                // default (wildcard, NOT admin/sudo). An admitted member must never
+                // be silently isolated by a missing role definition — restriction
+                // is opt-in via defined, tag-scoped roles (the arm above). This is
+                // "members reach the warren by default"; the deny-by-default footgun
+                // was the root of much debugging pain.
+                Some(name) => {
+                    tracing::debug!(
+                        "reach engine: peer {} role {name:?} not in role set → warren-mesh default",
+                        p.node_id
+                    );
+                    (vec!["*".to_string()], true, false)
+                }
+                // No role assigned at all → no reach.
                 None => (Vec::new(), false, false),
             };
             let mut parents = vec![serde_json::json!({ "type": "Autogroup", "id": "members" })];

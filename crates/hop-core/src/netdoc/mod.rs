@@ -2456,11 +2456,20 @@ mod tests {
         net.register_host_tags("staginghost", &["production".into()]).await.unwrap();
         assert!(!net.vpn_reach_allowed(src_ip, dst_ip, None).await);
 
-        // A member (no role_name) reaches nothing.
+        // A peer with NO role_name reaches nothing.
         let m_ip = net.claim_virtual_ip("memberpeer").await.unwrap();
         net.put_peer(&sample_peer("memberpeer", "m")).await.unwrap();
         net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
         assert!(!net.vpn_reach_allowed(m_ip, dst_ip, None).await);
+
+        // But a peer WITH a role name that isn't defined/synced still reaches the
+        // warren by default — an admitted member must not be silently isolated by
+        // role-sync lag (the bug behind the macOS warren saga).
+        let u_ip = net.claim_virtual_ip("unsyncedpeer").await.unwrap();
+        let mut u = sample_peer("unsyncedpeer", "u");
+        u.role_name = Some("member".into()); // no "member" role defined in this doc
+        net.put_peer(&u).await.unwrap();
+        assert!(net.vpn_reach_allowed(u_ip, dst_ip, None).await);
     }
 
     #[test]
