@@ -377,7 +377,13 @@ async fn handle_client(
     let host_id =
         PublicKey::from_bytes(&req.host_id).context("invalid host_id in MuxConnect")?;
 
-    tracing::debug!("handle_client: MuxConnect for {} relay={:?}", host_id.fmt_short(), req.relay_url);
+    tracing::debug!("handle_client: MuxConnect for {} relay={:?} evict_first={}", host_id.fmt_short(), req.relay_url, req.evict_first);
+
+    // Reconnect requested a fresh dial: drop any pooled (possibly half-open)
+    // connection so get_connection re-dials rather than handing back a dead path.
+    if req.evict_first {
+        handle.remove_connection(host_id).await;
+    }
 
     // 2. Split IPC early so we can monitor liveness during setup
     let (mut ipc_read, mut ipc_write) = ipc.into_split();
@@ -987,6 +993,7 @@ mod tests {
                 id
             },
             relay_url: None,
+            evict_first: false,
         };
         mux::write_ipc_message(&mut client_write, &connect)
             .await
@@ -1052,6 +1059,7 @@ mod tests {
                     let connect = MuxConnect {
                         host_id: [i as u8; 32],
                         relay_url: None,
+                        evict_first: false,
                     };
                     mux::write_ipc_message(&mut cw, &connect).await.unwrap();
                     let result: MuxResult = mux::read_ipc_message(&mut cr).await.unwrap();

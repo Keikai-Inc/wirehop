@@ -123,6 +123,7 @@ pub async fn try_quick_reconnect(
                 config_dir,
                 &resolved.host_id,
                 resolved.relay_url.as_ref().map(|u| u.to_string()),
+                true, // reconnect: drop any half-open pooled connection, dial fresh
             )
             .await?;
 
@@ -263,6 +264,7 @@ pub async fn show_reconnect_tui_via_agent(
                 config_dir,
                 &resolved.host_id,
                 resolved.relay_url.as_ref().map(|u| u.to_string()),
+                true, // reconnect: drop any half-open pooled connection, dial fresh
             )
             .await?;
 

@@ -24,6 +24,15 @@ pub struct MuxConnect {
     pub host_id: [u8; 32],
     /// Optional relay URL hint for first connection to this host.
     pub relay_url: Option<String>,
+    /// Evict any pooled connection to this host before connecting. Set by the
+    /// reconnect paths: after an abnormal disconnect the pooled connection may be
+    /// half-open (dead path, but `close_reason()` not yet set), and reusing it
+    /// would land the reconnect on the same dead path → another 75s read-deadline
+    /// → an endless reconnect loop. Forcing a fresh dial closes that window
+    /// without waiting for the ~90s relay-health flush. `#[serde(default)]` keeps
+    /// the wire format compatible with older agents/clients.
+    #[serde(default)]
+    pub evict_first: bool,
 }
 
 /// Agent → Client: connection result.
@@ -171,7 +180,7 @@ pub async fn connect_to_host(
         println!("Connecting...");
 
         let (mut ipc_write, ipc_read) =
-            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()))
+            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()), false)
                 .await?;
 
         // Send session request through the transparent pipe
@@ -198,7 +207,7 @@ pub async fn connect_to_host(
         println!("Connecting to host {}...", host_id.fmt_short());
 
         let (mut ipc_write, mut ipc_read) =
-            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()))
+            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()), false)
                 .await?;
 
         // Send invite auth through the transparent pipe
@@ -265,7 +274,7 @@ pub async fn connect_to_host(
     // or in restricted network environments).
     let default_relay = hop_core::net::HOP_RELAY_URL.to_string();
     let (mut ipc_write, ipc_read) =
-        open_agent_stream(config_dir, &host_id, Some(default_relay.clone())).await?;
+        open_agent_stream(config_dir, &host_id, Some(default_relay.clone()), false).await?;
 
     let relay_url: Option<iroh::RelayUrl> = default_relay.parse().ok();
 
@@ -288,20 +297,24 @@ pub async fn open_agent_stream_pub(
     config_dir: &Path,
     host_id: &iroh::PublicKey,
     relay_url: Option<String>,
+    evict_first: bool,
 ) -> Result<(
     tokio::net::unix::OwnedWriteHalf,
     tokio::net::unix::OwnedReadHalf,
 )> {
-    open_agent_stream(config_dir, host_id, relay_url).await
+    open_agent_stream(config_dir, host_id, relay_url, evict_first).await
 }
 
 /// Open a bi-stream to a host through the agent.
 ///
-/// Sends MuxConnect, reads MuxResult::Ready, then splits the socket.
+/// Sends MuxConnect, reads MuxResult::Ready, then splits the socket. When
+/// `evict_first` is set, the agent drops any pooled connection to this host
+/// before dialing (used by reconnect to avoid reusing a half-open connection).
 async fn open_agent_stream(
     config_dir: &Path,
     host_id: &iroh::PublicKey,
     relay_url: Option<String>,
+    evict_first: bool,
 ) -> Result<(
     tokio::net::unix::OwnedWriteHalf,
     tokio::net::unix::OwnedReadHalf,
@@ -311,6 +324,7 @@ async fn open_agent_stream(
     let req = MuxConnect {
         host_id: *host_id.as_bytes(),
         relay_url,
+        evict_first,
     };
     write_ipc_message(&mut ipc, &req).await?;
 
@@ -335,6 +349,7 @@ mod tests {
         let msg = MuxConnect {
             host_id: [7u8; 32],
             relay_url: Some("https://relay.example.com".into()),
+            evict_first: false,
         };
         write_ipc_message(&mut a, &msg).await.unwrap();
         let decoded: MuxConnect = read_ipc_message(&mut b).await.unwrap();
@@ -396,6 +411,7 @@ mod tests {
                         id
                     },
                     relay_url: Some(format!("https://relay-{i}.example.com")),
+                    evict_first: false,
                 };
                 write_ipc_message(&mut a, &msg).await.unwrap();
                 let decoded: MuxConnect = read_ipc_message(&mut b).await.unwrap();
