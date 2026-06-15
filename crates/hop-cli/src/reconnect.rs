@@ -93,6 +93,8 @@ pub async fn try_quick_reconnect(
     resolved: &ResolvedHost,
     session_request: &ClientMessage,
     timeout: Duration,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
 ) -> Option<ReconnectAction> {
     use std::io::Write;
 
@@ -103,22 +105,23 @@ pub async fn try_quick_reconnect(
     let _ = stdout.flush();
 
     let start = Instant::now();
+    let base_request = session_request.clone();
 
-    let session_request = session_request.clone();
-
-    // Retry loop within the timeout window
+    // Retry loop within the timeout window. The dial runs as a future polled
+    // alongside stdin so q (quit) and Enter (escalate to the full dialog) stay
+    // live the WHOLE time — Tier 1 used to ignore stdin entirely for up to its
+    // 5s window, so keystrokes were buffered until it ended. `pending` is shared
+    // with Tier 2 so any paste typed here survives an escalation.
     while start.elapsed() < timeout {
-        let remaining = timeout.saturating_sub(start.elapsed());
-
-        // Update countdown
-        let secs_left = remaining.as_secs();
+        let secs_left = timeout.saturating_sub(start.elapsed()).as_secs();
         let _ = write!(
             stdout,
             "\r\x1b[K\x1b[33m[hop]\x1b[0m Connection lost. Reconnecting... ({secs_left}s)"
         );
         let _ = stdout.flush();
 
-        let connect_result = tokio::time::timeout(remaining.min(Duration::from_secs(15)), async {
+        let session_request = base_request.clone();
+        let connect_fut = async {
             let (mut send, mut recv) = mux::open_agent_stream_pub(
                 config_dir,
                 &resolved.host_id,
@@ -126,50 +129,59 @@ pub async fn try_quick_reconnect(
                 true, // reconnect: drop any half-open pooled connection, dial fresh
             )
             .await?;
-
-            // Send session request + setup messages (WindowSize, SetEnv) before
-            // reading SessionInfo.  The host reads setup messages with a 2-second
-            // timeout per message; if we don't send them here the host falls
-            // through to 80×24 defaults and may resize a resumed PTY incorrectly.
             proto::write_message(&mut send, &session_request).await?;
             send_setup_messages(&mut send).await?;
-
-            let response: hop_core::proto::HostMessage =
-                proto::read_message(&mut recv).await?;
+            let response: hop_core::proto::HostMessage = proto::read_message(&mut recv).await?;
             let new_session_id = match response {
                 hop_core::proto::HostMessage::SessionInfo { session_id, .. } => Some(session_id),
-                hop_core::proto::HostMessage::SessionError(msg) => {
-                    anyhow::bail!("Host error: {msg}");
-                }
+                hop_core::proto::HostMessage::SessionError(msg) => anyhow::bail!("Host error: {msg}"),
                 _ => None,
             };
-
             Ok::<_, anyhow::Error>((send, recv, new_session_id))
-        })
-        .await;
+        };
+        tokio::pin!(connect_fut);
+        // ~2s per attempt; the next loop iteration is the retry pace.
+        let deadline =
+            tokio::time::sleep(Duration::from_secs(2).min(timeout.saturating_sub(start.elapsed())));
+        tokio::pin!(deadline);
 
-        match connect_result {
-            Ok(Ok((send, recv, new_session_id))) => {
-                // Clear banner
-                let _ = write!(stdout, "\r\x1b[K");
-                let _ = stdout.flush();
-                return Some(ReconnectAction::ReconnectedViaAgent {
-                    send,
-                    recv,
-                    new_session_id,
-                    // Quick reconnect never drains the stdin channel; buffered
-                    // input flows naturally into the resumed loop.
-                    buffered_input: Vec::new(),
-                });
+        let outcome = loop {
+            tokio::select! {
+                r = &mut connect_fut => break Some(r),
+                _ = &mut deadline => break None,
+                chunk = stdin_rx.recv() => {
+                    if let Some(data) = chunk {
+                        match classify_chunk(&data, pending) {
+                            PollAction::Quit => {
+                                let _ = write!(stdout, "\r\x1b[K");
+                                let _ = stdout.flush();
+                                return Some(ReconnectAction::Quit);
+                            }
+                            PollAction::RetryNow => {
+                                // Enter: escalate to the full dialog now; `pending`
+                                // carries forward to Tier 2.
+                                let _ = write!(stdout, "\r\x1b[K");
+                                let _ = stdout.flush();
+                                return None;
+                            }
+                            PollAction::None => {}
+                        }
+                    }
+                }
             }
-            _ => {
-                // Brief pause before retrying (100ms catches quick cellular recoveries)
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+        };
+        if let Some(Ok((send, recv, new_session_id))) = outcome {
+            let _ = write!(stdout, "\r\x1b[K");
+            let _ = stdout.flush();
+            return Some(ReconnectAction::ReconnectedViaAgent {
+                send,
+                recv,
+                new_session_id,
+                buffered_input: std::mem::take(pending),
+            });
         }
     }
 
-    // Clear banner before escalating to full TUI
     let _ = write!(stdout, "\r\x1b[K");
     let _ = stdout.flush();
     None
@@ -185,10 +197,13 @@ pub async fn show_reconnect_tui_via_agent(
     session_request: &ClientMessage,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     initial_attempt_offset: u32,
+    pending_input: &mut Vec<u8>,
 ) -> ReconnectAction {
     let mut stdout = io::stdout();
     let _ = stdout.execute(EnterAlternateScreen);
-    let _ = terminal::enable_raw_mode();
+    // Raw mode is held continuously by cmd_connect for the whole interactive
+    // lifecycle, so we don't toggle it here — toggling created cooked-mode gaps
+    // where the stdin reader line-buffered keystrokes (the "q didn't work" bug).
 
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout())).unwrap();
     let _ = term.clear();
@@ -197,11 +212,8 @@ pub async fn show_reconnect_tui_via_agent(
     let mut attempt: u32 = initial_attempt_offset;
     let mut net_watcher = NetWatcher::new();
 
-    // Bytes pulled from stdin_rx while the reconnect dialog is up. Without
-    // this buffer, paste bytes that landed in stdin_rx mid-disconnect would
-    // be silently dropped by the quit-scanner. We replay these to the new
-    // session before returning so the paste survives the reconnect.
-    let mut pending_input: Vec<u8> = Vec::new();
+    // `pending_input` is owned by the caller and shared with Tier 1, so paste
+    // typed during the quick reconnect survives an escalation into this dialog.
 
     loop {
         attempt += 1;
@@ -221,7 +233,7 @@ pub async fn show_reconnect_tui_via_agent(
                     break;
                 }
 
-                match poll_user_action(stdin_rx, &mut pending_input).await {
+                match poll_user_action(stdin_rx, pending_input).await {
                     PollAction::Quit => {
                         cleanup(&mut stdout);
                         return ReconnectAction::Quit;
@@ -297,15 +309,23 @@ pub async fn show_reconnect_tui_via_agent(
                     render_frame(&mut term, attempt, start.elapsed().as_secs(), 0, true);
                 }
                 chunk = stdin_rx.recv() => {
-                    // Keep the dialog escapable mid-dial. Enter ("retry now") is a
-                    // no-op while we're already dialing; q/Ctrl+C quits; any other
-                    // bytes (paste) are buffered for replay on success. `None`
-                    // (stdin closed) just means keep dialing.
-                    if let Some(data) = chunk
-                        && classify_chunk(&data, &mut pending_input) == PollAction::Quit
-                    {
-                        cleanup(&mut stdout);
-                        return ReconnectAction::Quit;
+                    // Keep the dialog fully live mid-dial: q/Ctrl+C quits; Enter
+                    // ABORTS the current dial and retries immediately (attempt = 0
+                    // → next iteration has 0 backoff); other bytes (paste) are
+                    // buffered for replay on success. `None` (stdin closed) just
+                    // means keep dialing.
+                    if let Some(data) = chunk {
+                        match classify_chunk(&data, pending_input) {
+                            PollAction::Quit => {
+                                cleanup(&mut stdout);
+                                return ReconnectAction::Quit;
+                            }
+                            PollAction::RetryNow => {
+                                attempt = 0;
+                                break None;
+                            }
+                            PollAction::None => {}
+                        }
                     }
                 }
             }
@@ -325,7 +345,7 @@ pub async fn show_reconnect_tui_via_agent(
                     send,
                     recv,
                     new_session_id,
-                    buffered_input: std::mem::take(&mut pending_input),
+                    buffered_input: std::mem::take(pending_input),
                 };
             }
             _ => {
@@ -333,7 +353,7 @@ pub async fn show_reconnect_tui_via_agent(
             }
         }
 
-        match poll_user_action(stdin_rx, &mut pending_input).await {
+        match poll_user_action(stdin_rx, pending_input).await {
             PollAction::Quit => {
                 cleanup(&mut stdout);
                 return ReconnectAction::Quit;
@@ -525,7 +545,8 @@ async fn send_setup_messages(
 }
 
 fn cleanup(stdout: &mut Stdout) {
-    let _ = terminal::disable_raw_mode();
+    // Leave the alternate screen but keep raw mode on — cmd_connect owns it for
+    // the whole lifecycle (and disables it once, before exit).
     let _ = stdout.execute(LeaveAlternateScreen);
 }
 

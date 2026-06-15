@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
+        Command::Recover { quiet } => cmd_recover(quiet),
         Command::Invite { user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             std::fs::create_dir_all(&config_dir)
@@ -331,6 +332,97 @@ async fn main() -> Result<()> {
 
 /// Type alias for the reload handle used by the SIGUSR1 debug toggle.
 type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+/// Outcome of the host-daemon restart attempted by `hop recover`.
+enum DaemonRestart {
+    Restarted,
+    NotInstalled,
+    NeedsRoot,
+}
+
+/// `hop recover`: clean up stale runtime state and restart the host daemon onto
+/// the current binary. Idempotent and SAFE — it never touches identity.json or
+/// warren membership (that's the KISS boundary). It (1) kills leftover
+/// `hop agent` processes, which share the machine's node-id and so collide with
+/// the daemon at the relay; (2) removes stale agent sockets/pidfiles; (3)
+/// restarts the host daemon so it rebinds the mux socket and client connects
+/// route through its single endpoint. Also invoked by install.sh after an
+/// upgrade, so installing == recovering.
+fn cmd_recover(quiet: bool) -> Result<()> {
+    // 1. Kill stray client agents. The `[h]op` pattern matches the real process
+    //    but NOT the pgrep/pkill cmdline itself (classic self-match guard).
+    let mut killed = 0usize;
+    #[cfg(unix)]
+    {
+        const PAT: &str = "[h]op agent --daemon";
+        if let Ok(out) = std::process::Command::new("pgrep").args(["-f", PAT]).output() {
+            killed = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+        }
+        let _ = std::process::Command::new("pkill").args(["-f", PAT]).status();
+    }
+
+    // 2. Remove stale agent sockets/pidfiles (the killed agents'). The daemon
+    //    rebinds its own mux socket on restart, so only the user dir matters here.
+    if let Ok(dir) = config::default_config_dir() {
+        for f in ["agent.sock", "agent.pid"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+
+    // 3. Restart the host daemon onto the current binary (if installed).
+    let daemon = restart_host_daemon();
+
+    if !quiet {
+        let ver = env!("CARGO_PKG_VERSION");
+        let daemon_msg = match daemon {
+            DaemonRestart::Restarted => "daemon restarted",
+            DaemonRestart::NotInstalled => "no host daemon installed",
+            DaemonRestart::NeedsRoot => "daemon NOT restarted — re-run with `sudo hop recover`",
+        };
+        let plural = if killed == 1 { "" } else { "s" };
+        println!("hop recovered (v{ver}) — cleared {killed} stale agent{plural}; {daemon_msg}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restart_host_daemon() -> DaemonRestart {
+    if !std::path::Path::new("/Library/LaunchDaemons/com.hop.daemon.plist").exists() {
+        return DaemonRestart::NotInstalled;
+    }
+    if !hop_core::unix_user::is_running_as_root() {
+        return DaemonRestart::NeedsRoot;
+    }
+    let _ = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", "system/com.hop.daemon"])
+        .status();
+    DaemonRestart::Restarted
+}
+
+#[cfg(target_os = "linux")]
+fn restart_host_daemon() -> DaemonRestart {
+    let installed = std::process::Command::new("systemctl")
+        .args(["list-unit-files", "hop.service"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("hop.service"))
+        .unwrap_or(false);
+    if !installed {
+        return DaemonRestart::NotInstalled;
+    }
+    if !hop_core::unix_user::is_running_as_root() {
+        return DaemonRestart::NeedsRoot;
+    }
+    let _ = std::process::Command::new("systemctl").args(["restart", "hop"]).status();
+    DaemonRestart::Restarted
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn restart_host_daemon() -> DaemonRestart {
+    DaemonRestart::NotInstalled
+}
 
 async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
     // If we are the privsep worker, watch the monitor-liveness pipe: should the
@@ -2314,6 +2406,14 @@ async fn cmd_connect(
     // Spawn stdin reader once — shared across reconnections
     let mut stdin_rx = spawn_stdin_reader();
 
+    // Own raw mode for the WHOLE interactive lifecycle (sessions + reconnect
+    // dialogs), held continuously so the background stdin reader never drops to
+    // cooked/line-buffered mode between phases — that gap was why `q` didn't
+    // register on the reconnect screen until you pressed Enter. The guard's Drop
+    // restores the terminal on `?`/panic; the `process::exit` paths below disable
+    // it explicitly first, since exit() skips Drop.
+    let _raw = shell::RawModeGuard::enable()?;
+
     // Bracketed-paste / lost-chunk state, shared across reconnections so a
     // paste interrupted by a reconnect is completed rather than stranded.
     let mut replay = shell::InputReplay::default();
@@ -2330,6 +2430,7 @@ async fn cmd_connect(
     loop {
         match outcome {
             SessionOutcome::Exited(code) => {
+                let _ = crossterm::terminal::disable_raw_mode();
                 std::process::exit(code);
             }
             SessionOutcome::Disconnected => {
@@ -2354,12 +2455,18 @@ async fn cmd_connect(
                     session_id.clone(),
                 );
 
+                // Shared across both reconnect tiers so paste typed during the
+                // quick blip survives an escalation into the full dialog.
+                let mut pending: Vec<u8> = Vec::new();
+
                 let quick_result = if flap_attempt_offset == 0 {
                     reconnect::try_quick_reconnect(
                         config_dir,
                         &resolved,
                         &reconnect_msg,
                         Duration::from_secs(5),
+                        &mut stdin_rx,
+                        &mut pending,
                     )
                     .await
                 } else {
@@ -2381,6 +2488,7 @@ async fn cmd_connect(
                         &reconnect_msg,
                         &mut stdin_rx,
                         flap_attempt_offset,
+                        &mut pending,
                     )
                     .await
                 };
@@ -2419,6 +2527,7 @@ async fn cmd_connect(
                         outcome = out;
                     }
                     reconnect::ReconnectAction::Quit => {
+                        let _ = crossterm::terminal::disable_raw_mode();
                         std::process::exit(1);
                     }
                 }

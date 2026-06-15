@@ -101,6 +101,15 @@ pub enum Command {
         action: Option<ConfigAction>,
     },
 
+    /// Clean up stale hop state and restart the daemon (un-wedge / post-upgrade).
+    /// Kills leftover client agents, removes stale sockets, and restarts the host
+    /// daemon onto the current binary. Never touches identity or membership.
+    Recover {
+        /// Suppress the summary line (used by the installer).
+        #[arg(long)]
+        quiet: bool,
+    },
+
     /// Manage this machine's warren (private network) membership
     Warren {
         #[command(subcommand)]

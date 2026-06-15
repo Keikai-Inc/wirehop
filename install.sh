@@ -209,29 +209,28 @@ info "Installed hop to ${INSTALL_DIR}/hop"
 
 # --- Restart running services ------------------------------------------------
 
-# Stop the client-side multiplexer agent so it restarts with the new binary.
-if command -v hop >/dev/null 2>&1; then
-  if hop agent stop 2>/dev/null; then
-    info "Restarted connection agent (will auto-launch on next use)"
-  fi
-fi
-
-# Restart the host daemon if one is running.
+# Recover onto the new binary: `hop recover` is one idempotent routine that
+# kills leftover client agents (which share this machine's node-id and would
+# keep colliding with the daemon at the relay), removes stale sockets, and
+# restarts the host daemon. It never touches identity or membership. Run with
+# sudo when a system daemon is present so it can actually restart it.
+HOP_BIN="${INSTALL_DIR}/hop"
+DAEMON_PRESENT=false
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  DAEMON_LABEL="com.hop.daemon"
-  if launchctl print "system/${DAEMON_LABEL}" &>/dev/null 2>&1; then
-    info "Restarting hop daemon..."
-    sudo launchctl kickstart -k "system/${DAEMON_LABEL}" 2>/dev/null && \
-      info "Hop daemon restarted." || \
-      warn "Could not restart daemon (try: sudo launchctl kickstart -k system/${DAEMON_LABEL})"
+  launchctl print "system/com.hop.daemon" &>/dev/null 2>&1 && DAEMON_PRESENT=true
+else
+  systemctl is-active --quiet hop 2>/dev/null && DAEMON_PRESENT=true
+fi
+if [[ "${DAEMON_PRESENT}" == "true" ]]; then
+  info "Recovering hop (clearing stale agents, restarting daemon)..."
+  if sudo "${HOP_BIN}" recover --quiet; then
+    info "Hop recovered onto the new version."
+  else
+    warn "Could not fully recover (try: sudo hop recover)"
   fi
 else
-  if systemctl is-active --quiet hop 2>/dev/null; then
-    info "Restarting hop daemon..."
-    sudo systemctl restart hop && \
-      info "Hop daemon restarted." || \
-      warn "Could not restart daemon (try: sudo systemctl restart hop)"
-  fi
+  # Pure client (no daemon): clear any stale agents as the user.
+  "${HOP_BIN}" recover --quiet 2>/dev/null || true
 fi
 
 # --- Daemon setup (--daemon) -------------------------------------------------

@@ -20,11 +20,15 @@ use session_registry::{DetachedSession, RegistryHandle};
 /// RAII guard that restores the terminal from raw mode on drop.
 ///
 /// Ensures the terminal is never left in raw mode even if the shell loop
-/// panics or returns early via `?`.
-struct RawModeGuard;
+/// panics or returns early via `?`. Public so the client can hold raw mode
+/// CONTINUOUSLY across a session → reconnect → session lifecycle: dropping it
+/// between phases (as the per-function guards did) leaves the background stdin
+/// reader's in-flight read in cooked/line-buffered mode, so keystrokes aren't
+/// delivered until Enter — which is why `q` "didn't work" on the reconnect dialog.
+pub struct RawModeGuard;
 
 impl RawModeGuard {
-    fn enable() -> Result<Self> {
+    pub fn enable() -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
         Ok(Self)
     }
@@ -1467,9 +1471,10 @@ pub async fn client_shell_session_v2(
         }
     };
 
-    let _raw_guard = RawModeGuard::enable()?;
+    // Raw mode is owned by the caller (cmd_connect) for the whole interactive
+    // lifecycle, so it stays enabled continuously across reconnects — see
+    // RawModeGuard. Don't toggle it here.
     let result = client_shell_loop(send, &mut recv, stdin_rx, replay).await;
-    drop(_raw_guard);
 
     match result {
         Ok(outcome) => Ok((session_id, outcome)),
@@ -1489,7 +1494,9 @@ pub async fn client_shell_loop_resumed(
     replay: &mut InputReplay,
     to_send: Vec<u8>,
 ) -> Result<SessionOutcome> {
-    let _raw_guard = RawModeGuard::enable()?;
+    // Raw mode is owned by the caller (cmd_connect) for the whole lifecycle —
+    // held continuously across reconnects so the stdin reader never drops to
+    // cooked mode. Don't toggle it here.
     // Replay any input the reconnect logic decided to carry across (the lost
     // in-flight chunk, and/or buffered paste content) before resuming live I/O.
     if !to_send.is_empty() {
@@ -1504,9 +1511,7 @@ pub async fn client_shell_loop_resumed(
             replay.observe(data);
         }
     }
-    let result = client_shell_loop(send, &mut recv, stdin_rx, replay).await;
-    drop(_raw_guard);
-    result
+    client_shell_loop(send, &mut recv, stdin_rx, replay).await
 }
 
 /// Detect sleep/wake by observing wall-clock time jumps.
