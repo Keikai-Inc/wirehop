@@ -1227,18 +1227,42 @@ impl NetDoc {
         dst_ip: std::net::Ipv4Addr,
         port: Option<u16>,
     ) -> bool {
+        // Each deny path logs WHY (debug) — the reach decision was previously a
+        // silent drop, which made "I'm a member but can't reach anything"
+        // impossible to diagnose without a code change.
         let ips = match self.list_virtual_ips().await {
             Ok(v) => v,
-            Err(_) => return false,
+            Err(e) => {
+                tracing::debug!("reach DENY {src_ip}->{dst_ip}: list_virtual_ips failed: {e:#}");
+                return false;
+            }
         };
         let owner = |ip: std::net::Ipv4Addr| ips.iter().find(|(a, _)| *a == ip).map(|(_, n)| n.clone());
         let (Some(src_node), Some(dst_node)) = (owner(src_ip), owner(dst_ip)) else {
+            tracing::debug!(
+                "reach DENY {src_ip}->{dst_ip}: unknown vIP owner (src_known={}, dst_known={}) — \
+                 ip/ table not synced?",
+                owner(src_ip).is_some(),
+                owner(dst_ip).is_some()
+            );
             return false;
         };
         // Cedar reach engine (cached); default-deny on any build failure.
         match self.reach_engine().await {
-            Some(engine) => engine.is_reach_allowed(&src_node, &dst_node, port),
-            None => false,
+            Some(engine) => {
+                let ok = engine.is_reach_allowed(&src_node, &dst_node, port);
+                if !ok {
+                    tracing::debug!(
+                        "reach DENY {src_node} -> {dst_node}: role policy (the src role has no \
+                         reach to the dst's tags — is the role defined + synced with reach?)"
+                    );
+                }
+                ok
+            }
+            None => {
+                tracing::debug!("reach DENY {src_node}->{dst_node}: reach engine unavailable (build failed)");
+                false
+            }
         }
     }
 
@@ -1637,11 +1661,23 @@ impl NetDoc {
             // peer's role doesn't permit to the destination host's tags.
             match crate::vpn::parse_src_ipv4(pkt) {
                 Some(src) if self.vpn_reach_allowed(src, dst, crate::vpn::parse_dest_port(pkt)).await => {}
-                _ => continue,
+                Some(src) => {
+                    // Observability: the reach ACL silently dropping packets is
+                    // exactly the hard-to-debug case (a missing/empty role → reach
+                    // nothing). Say so (debug, opt-in — per-packet under traffic).
+                    tracing::debug!(
+                        "vpn egress: reach DENIED {src} -> {dst} (role policy) — packet dropped"
+                    );
+                    continue;
+                }
+                None => continue,
             }
             let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
                 Ok(Some(v)) => v,
-                _ => continue, // unknown destination — drop
+                _ => {
+                    tracing::debug!("vpn egress: {dst} UNRESOLVED (no endpoint) — packet dropped");
+                    continue;
+                }
             };
             // Prefer the peer's live INBOUND connection (it dialed us — that
             // conn is provably fresh; a rebooted peer redials immediately and
