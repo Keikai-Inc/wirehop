@@ -129,19 +129,45 @@ pub async fn create_tun(addr: Ipv4Addr) -> anyhow::Result<tun::AsyncDevice> {
 /// root (privsep monitor / non-privsep daemon both qualify).
 #[cfg(target_os = "macos")]
 pub fn ensure_warren_route(iface: &str) -> anyhow::Result<()> {
+    // If the /10 route already points at THIS interface, do nothing — the 30s
+    // enforcer calls this repeatedly, and tearing a correct route down even
+    // briefly would drop in-flight packets.
+    if warren_route_iface().as_deref() == Some(iface) {
+        return Ok(());
+    }
+    // Otherwise it's missing OR points at a STALE interface — e.g. a utun from a
+    // SIGKILL'd daemon, whose dead route macOS leaves in the table. A plain
+    // `route add` would fail "route already exists" and leave the stale route in
+    // place (the bug that black-holed traffic after `killall -9`), so delete
+    // whatever's there first, then add it fresh to the current interface.
+    let _ = std::process::Command::new("/sbin/route")
+        .args(["-n", "delete", "-net", "100.64.0.0/10"])
+        .output();
     let out = std::process::Command::new("/sbin/route")
         .args(["-n", "add", "-net", "100.64.0.0/10", "-interface", iface])
         .output()
         .map_err(|e| anyhow::anyhow!("spawning route add: {e}"))?;
-    if out.status.success() {
-        tracing::info!("vpn: installed warren route 100.64.0.0/10 -> {iface}");
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.to_lowercase().contains("exists") {
-        return Ok(()); // route already present → fine
-    }
-    anyhow::bail!("route add 100.64.0.0/10 -> {iface} failed: {}", err.trim());
+    anyhow::ensure!(
+        out.status.success(),
+        "route add 100.64.0.0/10 -> {iface} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    tracing::info!("vpn: installed warren route 100.64.0.0/10 -> {iface}");
+    Ok(())
+}
+
+/// The interface the routing table currently uses for the warren range, if any
+/// (`route -n get` → the `interface:` line). Distinguishes a correct route from
+/// a stale one pointing at a dead utun, and lets the enforcer avoid churn.
+#[cfg(target_os = "macos")]
+fn warren_route_iface() -> Option<String> {
+    let out = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", "100.64.0.1"]) // representative host in 100.64.0.0/10
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
