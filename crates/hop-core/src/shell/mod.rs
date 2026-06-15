@@ -933,7 +933,7 @@ fn spawn_persistent_pty(
 /// disconnects (allowing the session to be preserved for reconnection).
 #[allow(clippy::too_many_arguments)]
 async fn run_attached_loop(
-    send: &mut SendStream,
+    send: SendStream,
     recv: &mut RecvStream,
     input_tx: &mpsc::UnboundedSender<Vec<u8>>,
     output_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -950,6 +950,32 @@ async fn run_attached_loop(
 
     let compress = protocol_version >= 3;
 
+    // Dedicated writer task owns the QUIC send stream so a stalled send window
+    // (a slow or vanished client on a degraded path) can NEVER park this loop —
+    // parking it would stop it reading client Input and freeze the PTY (the
+    // symmetric half of the client-side input-freeze bug). All host->client
+    // writes funnel through it, preserving the exact wire format: Output is
+    // compressed under v3, control messages (WindowSizeAck/Exit) are not. On a
+    // clean Exit the channel closes and the writer flushes `finish()`; on any
+    // write error it reports back so the loop disconnects promptly.
+    let (host_tx, mut host_rx) = mpsc::unbounded_channel::<HostMessage>();
+    let (writer_err_tx, mut writer_err_rx) = mpsc::channel::<()>(1);
+    let writer = tokio::spawn(async move {
+        let mut send = send;
+        while let Some(msg) = host_rx.recv().await {
+            let res = match &msg {
+                HostMessage::Output(_) => write_host_message(&mut send, &msg, compress).await,
+                _ => proto::write_message(&mut send, &msg).await,
+            };
+            if res.is_err() {
+                let _ = writer_err_tx.send(()).await;
+                return; // stream is dead; nothing to finish
+            }
+        }
+        // Channel closed (clean Exit path) — flush a graceful stream close.
+        let _ = send.finish();
+    });
+
     // Process any leftover message from setup phase
     if let Some(msg) = leftover_msg {
         match msg {
@@ -960,7 +986,7 @@ async fn run_attached_loop(
                 cols, rows, pixel_width, pixel_height,
             } => {
                 let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
-                let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
+                let _ = host_tx.send(HostMessage::WindowSizeAck);
             }
             _ => {}
         }
@@ -974,13 +1000,17 @@ async fn run_attached_loop(
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
     tokio::pin!(read_deadline);
 
-    loop {
+    let outcome = loop {
         tokio::select! {
             Some(data) = output_rx.recv() => {
-                if let Err(e) = write_host_message(send, &HostMessage::Output(data), compress).await {
-                    tracing::debug!("Failed to send output: {e}");
-                    return AttachOutcome::Disconnected;
+                if host_tx.send(HostMessage::Output(data)).is_err() {
+                    break AttachOutcome::Disconnected;
                 }
+            }
+            // Writer task hit a send error — the client is gone.
+            Some(()) = writer_err_rx.recv() => {
+                tracing::debug!("Host write failed, client disconnected");
+                break AttachOutcome::Disconnected;
             }
             msg = proto::read_message::<ClientMessage>(recv) => {
                 // Any message from the client means the connection is alive
@@ -994,42 +1024,54 @@ async fn run_attached_loop(
                         cols, rows, pixel_width, pixel_height,
                     }) => {
                         let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
-                        let _ = proto::write_message(send, &HostMessage::WindowSizeAck).await;
+                        let _ = host_tx.send(HostMessage::WindowSizeAck);
                     }
                     Ok(_) => {
                         tracing::warn!("Unexpected message during shell session");
                     }
                     Err(_) => {
                         tracing::debug!("Client disconnected");
-                        return AttachOutcome::Disconnected;
+                        break AttachOutcome::Disconnected;
                     }
                 }
             }
-            // Heartbeat: send empty Output to keep client's read deadline alive
+            // Heartbeat: enqueue empty Output to keep client's read deadline alive
             _ = heartbeat.tick() => {
-                if write_host_message(send, &HostMessage::Output(vec![]), compress).await.is_err() {
-                    tracing::debug!("Heartbeat write failed, client disconnected");
-                    return AttachOutcome::Disconnected;
-                }
+                let _ = host_tx.send(HostMessage::Output(vec![]));
             }
             // Read deadline: no data from client for too long
             () = &mut read_deadline => {
                 tracing::info!("No data from client for {}s, treating as disconnected", READ_DEADLINE.as_secs());
-                return AttachOutcome::Disconnected;
+                break AttachOutcome::Disconnected;
             }
             Ok(()) = exit_rx.changed() => {
                 let exit_code = { *exit_rx.borrow_and_update() };
                 if let Some(code) = exit_code {
-                    // Drain remaining output
+                    // Drain remaining output, then Exit. The writer flushes these
+                    // and calls finish() once we drop host_tx below.
                     while let Ok(data) = output_rx.try_recv() {
-                        let _ = write_host_message(send, &HostMessage::Output(data), compress).await;
+                        let _ = host_tx.send(HostMessage::Output(data));
                     }
-                    let _ = proto::write_message(send, &HostMessage::Exit(code)).await;
-                    return AttachOutcome::Exited;
+                    let _ = host_tx.send(HostMessage::Exit(code));
+                    break AttachOutcome::Exited;
                 }
             }
         }
+    };
+
+    match outcome {
+        AttachOutcome::Exited => {
+            // Close the channel so the writer drains the queued Output+Exit and
+            // calls send.finish(), then wait briefly for that flush to complete.
+            drop(host_tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
+        }
+        AttachOutcome::Disconnected => {
+            // Client is gone; don't wait on a write that may never drain.
+            writer.abort();
+        }
     }
+    outcome
 }
 
 /// Host side: persistent shell session that survives client disconnects.
@@ -1249,9 +1291,10 @@ pub async fn host_shell_session_persistent(
         let _ = resize_tx.send(initial_size);
     }
 
-    // Run the attached I/O loop
+    // Run the attached I/O loop. `send` is moved in: the loop's writer task owns
+    // it and flushes finish() on a clean exit.
     let outcome = run_attached_loop(
-        &mut send,
+        send,
         &mut recv,
         &input_tx,
         &mut client_output_rx,
@@ -1270,7 +1313,9 @@ pub async fn host_shell_session_persistent(
                 }
                 crate::sandbox::broker::cleanup_broker(config_dir, &result.session_id);
             }
-            let _ = send.finish();
+            // `send` was moved into run_attached_loop; its writer task already
+            // flushed Exit and called finish(). Just drain recv so the client
+            // reads the Exit before the stream tears down.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(200),
                 recv.read_to_end(1),
@@ -1346,7 +1391,7 @@ pub async fn client_shell_session(
 
     // v1 has no reconnect, so paste/lost-chunk state is local and discarded.
     let mut replay = InputReplay::default();
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, &mut replay).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, &mut replay).await;
 
     // Always restore terminal
     let _ = terminal::disable_raw_mode();
@@ -1360,7 +1405,7 @@ pub async fn client_shell_session(
 /// sending setup messages. Returns `(session_id, outcome)` so the caller can
 /// store the session ID for reconnection.
 pub async fn client_shell_session_v2(
-    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
@@ -1423,7 +1468,7 @@ pub async fn client_shell_session_v2(
     };
 
     let _raw_guard = RawModeGuard::enable()?;
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, replay).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, replay).await;
     drop(_raw_guard);
 
     match result {
@@ -1438,7 +1483,7 @@ pub async fn client_shell_session_v2(
 /// Used on reconnect paths where the reconnect function has already sent
 /// WindowSize/SetEnv and consumed the SessionInfo response.
 pub async fn client_shell_loop_resumed(
-    mut send: impl tokio::io::AsyncWrite + Unpin,
+    mut send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
@@ -1459,7 +1504,7 @@ pub async fn client_shell_loop_resumed(
             replay.observe(data);
         }
     }
-    let result = client_shell_loop(&mut send, &mut recv, stdin_rx, replay).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, replay).await;
     drop(_raw_guard);
     result
 }
@@ -1479,12 +1524,15 @@ async fn detect_sleep_wake() {
     }
 }
 
-async fn client_shell_loop(
-    send: &mut (impl tokio::io::AsyncWrite + Unpin),
+async fn client_shell_loop<S>(
+    send: S,
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
-) -> Result<SessionOutcome> {
+) -> Result<SessionOutcome>
+where
+    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use crossterm::terminal;
 
     /// Heartbeat interval: send an empty Input so the host knows we're alive,
@@ -1527,6 +1575,28 @@ async fn client_shell_loop(
         }
     });
 
+    // Dedicated SEND writer task. It owns the write half so a stalled QUIC send
+    // window can NEVER park this select loop — parking the loop is what froze
+    // stdin reading and ctrl handling ("type a couple chars, then nothing").
+    // The loop hands it ClientMessages over an unbounded channel and never
+    // awaits the network write itself. On write failure the writer reports the
+    // unsent Input chunk back so the reconnect path can replay it.
+    let (send_tx, mut send_rx) = mpsc::unbounded_channel::<ClientMessage>();
+    let (writer_err_tx, mut writer_err_rx) = mpsc::channel::<Vec<u8>>(1);
+    let writer = tokio::spawn(async move {
+        let mut send = send;
+        while let Some(msg) = send_rx.recv().await {
+            if proto::write_message(&mut send, &msg).await.is_err() {
+                let unsent = match msg {
+                    ClientMessage::Input(data) => data,
+                    _ => Vec::new(),
+                };
+                let _ = writer_err_tx.send(unsent).await;
+                break;
+            }
+        }
+    });
+
     let wake_detect = detect_sleep_wake();
     tokio::pin!(wake_detect);
 
@@ -1538,24 +1608,24 @@ async fn client_shell_loop(
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
     tokio::pin!(read_deadline);
 
-    loop {
+    let outcome = loop {
         tokio::select! {
-            // Stdin -> send to host
+            // Stdin -> enqueue for the writer task (never blocks this loop).
             Some(data) = input_rx.recv() => {
-                let msg = ClientMessage::Input(data);
-                if proto::write_message(send, &msg).await.is_err() {
-                    // Capture the chunk we failed to send so the reconnect can
-                    // replay it — dropping it here is what used to truncate a
-                    // paste and strand the remote terminal mid-bracket.
-                    if let ClientMessage::Input(data) = msg {
-                        replay.unsent = data;
-                    }
-                    return Ok(SessionOutcome::Disconnected);
+                // Observe paste state in enqueue order (== write order). `observe`
+                // SETS in_paste (it doesn't toggle), and in_paste is only consumed
+                // after a reconnect re-observes, so observing before the write is
+                // confirmed is safe and keeps the paste-replay logic intact.
+                replay.observe(&data);
+                if send_tx.send(ClientMessage::Input(data)).is_err() {
+                    break Ok(SessionOutcome::Disconnected);
                 }
-                // Only update paste state once the host has the bytes.
-                if let ClientMessage::Input(data) = &msg {
-                    replay.observe(data);
-                }
+            }
+            // The writer task hit a write error — capture the unsent chunk so the
+            // reconnect replays it, then disconnect.
+            Some(unsent) = writer_err_rx.recv() => {
+                replay.unsent = unsent;
+                break Ok(SessionOutcome::Disconnected);
             }
             // Host messages -> write to stdout
             msg = proto::read_message::<HostMessage>(recv) => {
@@ -1567,7 +1637,7 @@ async fn client_shell_loop(
                         let _ = stdout_tx.send(data);
                     }
                     Ok(HostMessage::Exit(code)) => {
-                        return Ok(SessionOutcome::Exited(code));
+                        break Ok(SessionOutcome::Exited(code));
                     }
                     Ok(HostMessage::WindowSizeAck) => {}
                     Ok(HostMessage::AuthResult { .. }) => {
@@ -1583,48 +1653,48 @@ async fn client_shell_loop(
                     }
                     Ok(HostMessage::SessionError(msg)) => {
                         eprintln!("\r\nHost error: {msg}");
-                        return Ok(SessionOutcome::Disconnected);
+                        break Ok(SessionOutcome::Disconnected);
                     }
                     Err(_) => {
-                        return Ok(SessionOutcome::Disconnected);
+                        break Ok(SessionOutcome::Disconnected);
                     }
                 }
             }
-            // Terminal resized -> send new window size to host
+            // Terminal resized -> enqueue new window size for the host
             Some(()) = resize_rx.recv() => {
                 let (cols, rows, pixel_width, pixel_height) = match terminal::window_size() {
                     Ok(size) => (size.columns, size.rows, size.width, size.height),
                     Err(_) => continue,
                 };
-                let _ = proto::write_message(
-                    send,
-                    &ClientMessage::WindowSize {
-                        cols,
-                        rows,
-                        pixel_width,
-                        pixel_height,
-                    },
-                )
-                .await;
+                let _ = send_tx.send(ClientMessage::WindowSize {
+                    cols,
+                    rows,
+                    pixel_width,
+                    pixel_height,
+                });
             }
-            // Heartbeat: send empty Input to probe connection liveness
+            // Heartbeat: enqueue empty Input to probe connection liveness. The
+            // writer does the actual write; if it fails, writer_err_rx fires.
             _ = heartbeat.tick() => {
-                if proto::write_message(send, &ClientMessage::Input(vec![])).await.is_err() {
-                    return Ok(SessionOutcome::Disconnected);
-                }
+                let _ = send_tx.send(ClientMessage::Input(vec![]));
             }
             // Read deadline: no data from host for too long
             () = &mut read_deadline => {
                 tracing::info!("No data from host for {}s, treating as disconnected", READ_DEADLINE.as_secs());
-                return Ok(SessionOutcome::Disconnected);
+                break Ok(SessionOutcome::Disconnected);
             }
             // Sleep/wake detection — instant disconnect on wake
             () = &mut wake_detect => {
                 tracing::info!("Sleep/wake detected, treating as disconnected");
-                return Ok(SessionOutcome::Disconnected);
+                break Ok(SessionOutcome::Disconnected);
             }
         }
-    }
+    };
+
+    // Tear down the writer task. A stalled write would otherwise keep the task
+    // (and the moved write half) alive parked on a dead connection.
+    writer.abort();
+    outcome
 }
 
 /// Where an exec session's exit code comes from: the local child (`wait()`), or
