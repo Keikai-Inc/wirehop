@@ -389,7 +389,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // re-discovery after 3 consecutive failures. Catches cert expiry / relay
     // crashes the interface watcher misses (the daemon's TCP session can stay
     // ESTABLISHED for hours after the relay link is functionally broken).
-    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone());
+    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), None);
 
     // Network document (Phase 1): spawn the iroh-docs replication stack on its
     // own isolated endpoint and migrate existing peers/roles on first run. This

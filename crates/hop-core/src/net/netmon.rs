@@ -114,7 +114,17 @@ pub fn spawn_interface_watcher(
 /// expired TLS cert, relay process crash, network partition, or a hung iroh
 /// relay-client task. The daemon's existing TCP session can stay ESTABLISHED
 /// long after the relay link is functionally dead — this watcher closes that gap.
-pub fn spawn_relay_health_watcher(endpoint: Endpoint) -> tokio::task::JoinHandle<()> {
+///
+/// `flush_tx` (agent side): when re-discovery is forced, signal the caller to
+/// flush pooled connections. A move between networks that keeps the same local
+/// interface address (e.g. similar DHCP range, or carried while asleep) won't
+/// trip the interface watcher, so the relay probe is the only thing that notices
+/// the path died — and the stale pooled connections must be dropped so the next
+/// connect re-dials instead of proxying onto a dead path.
+pub fn spawn_relay_health_watcher(
+    endpoint: Endpoint,
+    flush_tx: Option<tokio::sync::mpsc::Sender<()>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(RELAY_PROBE_TIMEOUT)
@@ -183,6 +193,13 @@ pub fn spawn_relay_health_watcher(endpoint: Endpoint) -> tokio::task::JoinHandle
                     consecutive_failures
                 );
                 endpoint.network_change().await;
+                if let Some(ref tx) = flush_tx {
+                    // Give QUIC path migration a moment, then drop stale pooled
+                    // connections so the next connect re-dials on the new path.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = tx.send(()).await;
+                    tracing::info!("Signaled connection pool flush after relay re-discovery");
+                }
                 consecutive_failures = 0;
             }
         }

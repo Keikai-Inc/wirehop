@@ -248,13 +248,17 @@ pub async fn show_reconnect_tui_via_agent(
             }
         }
 
-        // Connecting phase
+        // Connecting phase. The dial runs as a future we poll alongside stdin
+        // and a 10s deadline, so `q`/Ctrl+C (quit) and the spinner stay live
+        // WHILE connecting. The old code awaited a bare `timeout(10s, connect)`
+        // with no input polling, so a slow/hung dial trapped the user in the
+        // dialog with no way out (symptom: "stuck on the reconnecting window").
         let elapsed_total = start.elapsed().as_secs();
         render_frame(&mut term, attempt, elapsed_total, 0, true);
 
         let session_request = session_request.clone();
 
-        let connect_result = tokio::time::timeout(Duration::from_secs(10), async {
+        let connect_fut = async {
             let (mut send, mut recv) = mux::open_agent_stream_pub(
                 config_dir,
                 &resolved.host_id,
@@ -277,11 +281,36 @@ pub async fn show_reconnect_tui_via_agent(
             };
 
             Ok::<_, anyhow::Error>((send, recv, new_session_id))
-        })
-        .await;
+        };
+        tokio::pin!(connect_fut);
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+        let mut spinner = tokio::time::interval(Duration::from_millis(120));
+
+        let connect_result = loop {
+            tokio::select! {
+                res = &mut connect_fut => break Some(res),
+                _ = &mut deadline => break None, // timed out — fall through to retry
+                _ = spinner.tick() => {
+                    render_frame(&mut term, attempt, start.elapsed().as_secs(), 0, true);
+                }
+                chunk = stdin_rx.recv() => {
+                    // Keep the dialog escapable mid-dial. Enter ("retry now") is a
+                    // no-op while we're already dialing; q/Ctrl+C quits; any other
+                    // bytes (paste) are buffered for replay on success. `None`
+                    // (stdin closed) just means keep dialing.
+                    if let Some(data) = chunk
+                        && classify_chunk(&data, &mut pending_input) == PollAction::Quit
+                    {
+                        cleanup(&mut stdout);
+                        return ReconnectAction::Quit;
+                    }
+                }
+            }
+        };
 
         match connect_result {
-            Ok(Ok((send, recv, new_session_id))) => {
+            Some(Ok((send, recv, new_session_id))) => {
                 // Drain anything that arrived since the last poll and hand the
                 // buffered bytes back to the caller. The caller applies the
                 // paste-aware replay policy (deliver paste content, drop free
@@ -426,22 +455,32 @@ async fn poll_user_action(
     let mut action = PollAction::None;
     let mut next = Some(first);
     while let Some(data) = next.take() {
-        if data.len() == 1 && pending_input.is_empty() {
-            match data[0] {
-                b'q' | 0x03 => return PollAction::Quit,
-                0x0d | 0x0a => {
-                    action = PollAction::RetryNow;
-                    next = stdin_rx.try_recv().ok();
-                    continue;
-                }
-                _ => {}
-            }
+        match classify_chunk(&data, pending_input) {
+            PollAction::Quit => return PollAction::Quit,
+            PollAction::RetryNow => action = PollAction::RetryNow,
+            PollAction::None => {}
         }
-        pending_input.extend_from_slice(&data);
         next = stdin_rx.try_recv().ok();
     }
 
     action
+}
+
+/// Classify a single stdin chunk during the reconnect dialog. A lone byte with
+/// no paste buffered yet is a deliberate keypress (`q`/Ctrl+C → Quit, CR/LF →
+/// RetryNow, neither is buffered); anything else is appended to `pending_input`
+/// for replay. Shared by the countdown poll and the connect-phase select so
+/// keys behave identically whether the dialog is waiting or actively dialing.
+fn classify_chunk(data: &[u8], pending_input: &mut Vec<u8>) -> PollAction {
+    if data.len() == 1 && pending_input.is_empty() {
+        match data[0] {
+            b'q' | 0x03 => return PollAction::Quit,
+            0x0d | 0x0a => return PollAction::RetryNow,
+            _ => {}
+        }
+    }
+    pending_input.extend_from_slice(data);
+    PollAction::None
 }
 
 /// Send WindowSize + SetEnv setup messages to the host.

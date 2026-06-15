@@ -633,22 +633,39 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
 
     tracing::info!("Agent started (PID {})", std::process::id());
 
-    // Background task: flush stale connections on sleep/wake
+    // Network-change detectors all feed one flush channel: on a detected change
+    // they force iroh path re-discovery and signal a pool flush, so the next
+    // connect re-dials on the new path instead of proxying onto a dead one.
+    let (netmon_flush_tx, mut netmon_flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Sleep/wake: carrying the laptop to a new network is the #1 cause of a
+    // stale path. A wake almost always means the old path is dead, so force
+    // re-discovery AND flush — previously this only flushed, leaving iroh's
+    // endpoint pointed at the old network until its own netwatch caught up.
     let wake_handle = handle.clone();
+    let wake_endpoint = endpoint.clone();
     tokio::spawn(async move {
         loop {
             let before = std::time::Instant::now();
             tokio::time::sleep(Duration::from_secs(3)).await;
             if before.elapsed() > Duration::from_secs(10) {
-                tracing::info!("Agent detected sleep/wake, flushing connection pool");
+                tracing::info!("Agent detected sleep/wake, forcing re-discovery + flushing pool");
+                wake_endpoint.network_change().await;
                 wake_handle.flush_all().await;
             }
         }
     });
 
-    // Network interface change detector — flushes pooled connections on change
-    let (netmon_flush_tx, mut netmon_flush_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), Some(netmon_flush_tx));
+    // Interface-address watcher (calls network_change internally on change).
+    let _netmon =
+        net::netmon::spawn_interface_watcher(endpoint.clone(), Some(netmon_flush_tx.clone()));
+    // Relay-health watcher (parity with the host daemon): catches a dead path
+    // when the local interface address looks unchanged — same DHCP range or
+    // carried while asleep — which the interface watcher cannot see. This is the
+    // gap that made a network move strand the agent on a dead pooled connection.
+    let _relay_health =
+        net::netmon::spawn_relay_health_watcher(endpoint.clone(), Some(netmon_flush_tx));
+
     let netmon_handle = handle.clone();
     tokio::spawn(async move {
         while netmon_flush_rx.recv().await.is_some() {
