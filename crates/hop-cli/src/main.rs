@@ -1116,24 +1116,37 @@ async fn announce_netdoc_author_with_retry(
             return;
         }
     };
+    // Retry until the founder records BOTH our author binding and our self-doc
+    // ticket (the ack reflects both), then re-publish on a slow cadence so a
+    // founder restart, a late membership replication, or a refreshed self-doc
+    // ticket (new addresses after a relay change) re-publishes without needing a
+    // daemon restart. The old version gave up after 8 attempts, so a member that
+    // couldn't reach the founder in its first ~40 min never published its VPN
+    // endpoint until it was restarted — a key reason self-docs were missing.
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
     let mut delay = std::time::Duration::from_secs(5);
-    for attempt in 1..=8u32 {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         match announce_netdoc_author_once(&endpoint, founder_id, author_hex, self_doc.as_deref()).await {
             Ok(true) => {
-                tracing::info!("netdoc announce: founder recorded our author binding");
-                return;
+                tracing::info!("netdoc announce: founder recorded our author binding + self-doc");
+                // Recorded — refresh periodically rather than stopping.
+                tokio::time::sleep(REFRESH_INTERVAL).await;
+                delay = std::time::Duration::from_secs(5);
             }
-            Ok(false) => tracing::debug!(
-                "netdoc announce: acked but not yet recorded (attempt {attempt}); retrying"
-            ),
-            Err(e) => tracing::debug!("netdoc announce: attempt {attempt} failed: {e:#}"),
+            Ok(false) => {
+                tracing::debug!("netdoc announce: acked but not yet recorded (attempt {attempt}); retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(300));
+            }
+            Err(e) => {
+                tracing::debug!("netdoc announce: attempt {attempt} failed: {e:#}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(300));
+            }
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(std::time::Duration::from_secs(300));
     }
-    tracing::warn!(
-        "netdoc announce: gave up; this member's self-keys may be unvalidated under enforce"
-    );
 }
 
 /// One announce round-trip over the main endpoint.
@@ -1389,20 +1402,30 @@ async fn dispatch_session(
             // bindings; any other receiver acks without recording so the member
             // keeps retrying until it reaches the anchor. Best-effort.
             let recorded = if let Some(nd) = &netdoc {
-                let r = match nd.record_peer_author(peer_id, &author).await {
+                let author_ok = match nd.record_peer_author(peer_id, &author).await {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!("netdoc: record_peer_author for {peer_id} failed: {e:#}");
                         false
                     }
                 };
-                // Record the member's self-doc ticket too (per-member self-docs).
-                if let Some(ticket) = self_doc.as_deref()
-                    && let Err(e) = nd.record_peer_self_doc(peer_id, ticket).await
-                {
-                    tracing::warn!("netdoc: record_peer_self_doc for {peer_id} failed: {e:#}");
-                }
-                r
+                // Record the member's self-doc ticket (per-member self-docs) and
+                // FOLD it into the ack: the announce now retries until BOTH the
+                // author binding AND the self-doc are recorded. Previously the ack
+                // reflected only the author, so a member could "succeed" with its
+                // self-doc unrecorded — leaving its VPN endpoint unresolvable to
+                // every peer (the live "no self_doc ticket recorded yet" symptom).
+                let self_doc_ok = match self_doc.as_deref() {
+                    Some(ticket) => match nd.record_peer_self_doc(peer_id, ticket).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("netdoc: record_peer_self_doc for {peer_id} failed: {e:#}");
+                            false
+                        }
+                    },
+                    None => true,
+                };
+                author_ok && self_doc_ok
             } else {
                 false
             };

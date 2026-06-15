@@ -1536,6 +1536,25 @@ impl NetDoc {
                 tracing::warn!("vpn: self-member registration failed: {e:#}");
             }
         }
+        // Self-heal the founder's own self-doc ticket on EVERY bringup. The block
+        // above sets it only when the founder's peer entry is first created, so a
+        // founder whose entry predates per-member self-docs (or whose ticket went
+        // stale after a relay/address change) keeps an empty/old `self_doc`
+        // forever — and since the founder never announces (it's the trust anchor),
+        // nothing else would ever record it, leaving the founder's VPN endpoint
+        // unresolvable to every peer. Idempotent: only rewrites on an actual change.
+        if !self.federated
+            && let Ok(ticket) = self.self_doc_read_ticket().await
+            && let Ok(Some(mut me)) = self.get_peer(host_node_id).await
+            && me.self_doc.as_deref() != Some(ticket.as_str())
+        {
+            me.self_doc = Some(ticket);
+            if let Err(e) = self.put_peer(&me).await {
+                tracing::warn!("vpn: founder self-doc self-heal failed: {e:#}");
+            } else {
+                tracing::info!("vpn: refreshed founder's own self-doc ticket (self-heal)");
+            }
+        }
         let me = std::sync::Arc::clone(self);
         tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
 
