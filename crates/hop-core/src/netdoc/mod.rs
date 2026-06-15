@@ -562,11 +562,31 @@ impl NetDoc {
             Some(meta) => match Self::spawn_inner(endpoint.clone(), store_dir, Bootstrap::Open(meta.namespace), self_ns).await {
                 Ok(net) => (net, false),
                 Err(e) => {
-                    tracing::warn!(
-                        "netdoc: saved namespace {} could not be opened ({e}); creating fresh",
-                        meta.namespace
-                    );
-                    (Self::spawn_inner(endpoint, store_dir, Bootstrap::Create, None).await?, true)
+                    // Opening the persisted namespace failed. NEVER fall back to
+                    // Bootstrap::Create here: that silently replaces the warren
+                    // with a brand-new EMPTY namespace, orphaning this node (lost
+                    // peer roster → vIP→owner resolves to nothing → VPN drops),
+                    // which is the "VPN broke after an upgrade/restart" footgun.
+                    // Instead re-import the SAME warren's join ticket to re-sync
+                    // it; if we have no ticket, FAIL loudly so the node keeps its
+                    // place in the warren and a later restart / re-join recovers
+                    // it — rather than masquerading as joined while alone.
+                    match join {
+                        Some(ticket) => {
+                            tracing::warn!(
+                                "netdoc: saved namespace {} could not be opened ({e}); re-importing its join ticket to re-sync the SAME warren",
+                                meta.namespace
+                            );
+                            (
+                                Self::spawn_inner(endpoint, store_dir, Bootstrap::Import(Box::new(ticket)), None).await?,
+                                true,
+                            )
+                        }
+                        None => anyhow::bail!(
+                            "netdoc: saved namespace {} could not be opened ({e}) and no join ticket is available to re-sync it — refusing to create a fresh namespace (that would orphan this node from its warren). Re-join with the warren invite to recover.",
+                            meta.namespace
+                        ),
+                    }
                 }
             },
             // First run: join an existing network if given a ticket, else create.
