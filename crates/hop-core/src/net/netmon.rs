@@ -156,24 +156,24 @@ pub fn spawn_relay_health_watcher(
             let probe_url = format!("{}generate_204", relay_url.as_str());
 
             match client.get(&probe_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
+                // ANY HTTP response — even 404 — proves the relay host is
+                // REACHABLE: its TLS handshake and HTTP server answered. iroh-relay
+                // does NOT serve `/generate_204` (it 404s), so the old
+                // `is_success()` check counted every single probe as a failure,
+                // tripped the threshold every ~90s, forced `network_change()` + a
+                // connection-pool flush, and dropped the active hop session
+                // ("Connection lost") on a perfectly healthy relay — while the VPN
+                // (which doesn't ride the mux pool) stayed up. Only a
+                // connection-level error means the relay is actually unreachable.
+                Ok(resp) => {
                     if consecutive_failures > 0 {
                         tracing::info!(
-                            "Relay health restored after {} consecutive failures",
+                            "Relay reachable again (HTTP {}) after {} consecutive failures",
+                            resp.status(),
                             consecutive_failures
                         );
                     }
                     consecutive_failures = 0;
-                }
-                Ok(resp) => {
-                    consecutive_failures += 1;
-                    tracing::warn!(
-                        "Relay health probe to {} returned HTTP {} (failure {}/{})",
-                        probe_url,
-                        resp.status(),
-                        consecutive_failures,
-                        RELAY_FAILURE_THRESHOLD
-                    );
                 }
                 Err(e) => {
                     consecutive_failures += 1;
