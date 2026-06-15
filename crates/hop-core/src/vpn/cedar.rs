@@ -34,6 +34,11 @@ pub struct AclEngine {
     policies: PolicySet,
     entities: Entities,
     authorizer: Authorizer,
+    /// node_ids that have a `Peer` principal in `entities`. A reach query for a
+    /// src not in this set cannot be evaluated (no principal → default-deny), so
+    /// callers can distinguish "known principal, genuinely denied" from "principal
+    /// absent because this node doesn't hold the roster" (a leaf member).
+    peer_ids: std::collections::HashSet<String>,
 }
 
 impl AclEngine {
@@ -133,7 +138,16 @@ impl AclEngine {
             .parse()
             .map_err(|e| anyhow::anyhow!("parsing Cedar policies: {e}"))?;
 
-        Ok(Self { policies, entities, authorizer: Authorizer::new() })
+        let peer_ids = peers.iter().map(|p| p.node_id.clone()).collect();
+        Ok(Self { policies, entities, authorizer: Authorizer::new(), peer_ids })
+    }
+
+    /// Whether `node_id` has a `Peer` principal in this engine (i.e. it appears in
+    /// the membership roster this engine was built from). `false` means a reach
+    /// query with this node as src is unevaluable here — typically because this is
+    /// a leaf member that doesn't hold the full peer roster.
+    pub fn knows_peer(&self, node_id: &str) -> bool {
+        self.peer_ids.contains(node_id)
     }
 
     /// May `src_node` (a Peer) reach `dst_node` (a Host) on `port`? The generated

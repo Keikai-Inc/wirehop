@@ -1250,6 +1250,22 @@ impl NetDoc {
         // Cedar reach engine (cached); default-deny on any build failure.
         match self.reach_engine().await {
             Some(engine) => {
+                // Egress trust: this check only runs on the SENDER (the sole caller
+                // is the egress loop). If the local node isn't a known principal in
+                // its own engine, it's a leaf member that doesn't hold the peer
+                // roster — it CANNOT evaluate its own role, so a default-deny here
+                // would silently strand every leaf (the deny-by-default footgun).
+                // A node trusts its own egress onto the warren; reach restriction
+                // stays enforceable on nodes that DO hold the roster (hosts/founders
+                // evaluate their full membership normally). Mirrors the 0.6.74
+                // "members reach the warren by default" posture.
+                if !engine.knows_peer(&src_node) {
+                    tracing::debug!(
+                        "vpn egress: src {src_node} not a known principal locally (leaf member \
+                         without roster) — allowing egress to {dst_node}"
+                    );
+                    return true;
+                }
                 let ok = engine.is_reach_allowed(&src_node, &dst_node, port);
                 if !ok {
                     tracing::debug!(
@@ -2470,6 +2486,16 @@ mod tests {
         u.role_name = Some("member".into()); // no "member" role defined in this doc
         net.put_peer(&u).await.unwrap();
         assert!(net.vpn_reach_allowed(u_ip, dst_ip, None).await);
+
+        // A leaf member owns a vIP but holds NO peer roster — its own node is not
+        // among list_peers (the real-world leaf case: members don't replicate the
+        // full roster). Egress reach can't evaluate its own role, so it must be
+        // ALLOWED rather than silently stranded. (Reach is enforced only on the
+        // sender; nodes that DO hold the roster still evaluate normally — asserted
+        // above.) This is THE bug behind the two-Mac warren's 100% packet loss.
+        let leaf_ip = net.claim_virtual_ip("leafnode").await.unwrap();
+        // deliberately no put_peer("leafnode") → not a known principal locally
+        assert!(net.vpn_reach_allowed(leaf_ip, dst_ip, None).await);
     }
 
     #[test]
