@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Installer for hop
 # Usage:
-#   curl -fsSL https://hop.keik.ai/install.sh | bash
-#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --version 0.1.0
-#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --dir ~/.local/bin
-#   curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --daemon
+#   curl -fsSL https://hop.keikai.ai/install.sh | bash
+#   curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.1.0
+#   curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin
+#   curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --daemon
 #
 # Tiers:
 #   (default)              Client — reach hosts you're invited to. No sudo, no VPN.
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
+BASE_URL="${HOP_CDN_URL:-https://hop.keikai.ai}"
 
 # Release signing public key (security-audit H9). Empty = unsigned releases →
 # checksum-only verification (current behaviour). To enable: generate a keypair

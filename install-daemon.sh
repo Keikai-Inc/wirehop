@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Daemon installer for hop (macOS + Linux)
 # Usage:
-#   curl -fsSL https://hop.keik.ai/install-daemon.sh | bash
+#   curl -fsSL https://hop.keikai.ai/install-daemon.sh | bash
 #
 # macOS:  Downloads the latest .pkg, installs it, starts the LaunchDaemon.
 # Linux:  Installs the binary, creates a systemd service, enables it.
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
+BASE_URL="${HOP_CDN_URL:-https://hop.keikai.ai}"
 
 # Warren primers (parsed below; applied by apply_daemon_primers).
 NO_VPN=false

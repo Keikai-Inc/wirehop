@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hop — Secure P2P Remote Access &amp; Private Network</title>
-  <meta name="description" content="SSH-like shell, file transfer, and a built-in private network (the warren) — direct, encrypted, peer-to-peer. No port forwarding, no VPN appliance, no coordination server. One binary.">
+  <title>hop — Remote access without the headaches</title>
+  <meta name="description" content="Secure peer-to-peer remote access to any machine: shell, file transfer, and your own private network. No servers to run, no ports to forward, no config. One binary — install, invite, connect.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -281,9 +281,9 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> Secure P2P Access &amp; Private Network</div>
-    <h1>Remote access &amp; a private network,<br><span class="gradient">without the headaches</span></h1>
-    <p>SSH-like shell, file transfer, and a built-in private network &mdash; direct, encrypted, peer-to-peer. No port forwarding, no VPN appliance, no coordination server. One binary, one command.</p>
+    <div class="badge"><span class="dot"></span> Secure peer-to-peer remote access</div>
+    <h1>Remote access<br><span class="gradient">without the headaches</span></h1>
+    <p>A secure shell, file transfer, and remote access to any machine &mdash; direct, encrypted, peer-to-peer. No servers to run, no ports to forward, no config. One binary: <strong>install, invite, connect</strong>.</p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Get Started</a>
       <a href="#how-it-works" class="btn btn-ghost">How It Works</a>
@@ -333,36 +333,12 @@
           <p>One download. No runtime dependencies, no accounts to create. The CLI client needs no daemon; always-on hosts run one. Just run it.</p>
         </div>
 
-        <div class="card card-teal">
-          <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 7.5l3 8M16.5 7.5l-3 8M8 6h8"/></svg>
-          </div>
-          <h3>Private Network &mdash; the Warren</h3>
-          <p>Opt a machine into your <strong>warren</strong>: a private peer-to-peer mesh with its own virtual IPs (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">100.64.x.x</code>) and MagicDNS names (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">myhost.hop</code>). Reach is role-based &mdash; and there's <strong>no coordination server</strong>: membership lives in a replicated document, not someone else's cloud.</p>
-        </div>
-
         <div class="card card-green">
           <div class="card-icon card-icon-green">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
           </div>
           <h3>One-Time Invite Links</h3>
           <p>Share a link or token to grant access. Each invite is single-use and cryptographically verified. No shared passwords.</p>
-        </div>
-
-        <div class="card card-red">
-          <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-          </div>
-          <h3>Remote Execution</h3>
-          <p>Run commands without opening a shell. <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop server -- cmd</code> executes remotely and returns the output &mdash; perfect for scripts and automation.</p>
-        </div>
-
-        <div class="card card-teal">
-          <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/><circle cx="12" cy="15" r="2"/></svg>
-          </div>
-          <h3>AI Orchestration</h3>
-          <p>Let AI agents manage your fleet. <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop mcp</code> exposes a sandboxed JavaScript runtime and skill library to tools like Claude Code&mdash;run commands, transfer files, and manage roles through natural language.</p>
         </div>
 
         <div class="card card-amber">
@@ -381,54 +357,14 @@
           <p>Your shell survives disconnects. If your connection drops, hop reconnects and resumes where you left off &mdash; no tmux needed.</p>
         </div>
 
-        <div class="card card-red">
-          <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="9" height="9" rx="1"/><rect x="13" y="2" width="9" height="9" rx="1"/><rect x="2" y="13" width="9" height="9" rx="1"/><rect x="13" y="13" width="9" height="9" rx="1"/></svg>
-          </div>
-          <h3>Fleet Management</h3>
-          <p>Manage dozens to thousands of machines with role-based access, tagging, and aggregate invites. <a href="fleet.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">Learn more &rarr;</a></p>
-        </div>
-
-        <div class="card card-teal">
-          <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </div>
-          <h3>Encrypted Secrets</h3>
-          <p>Store API keys and OAuth tokens encrypted at rest. ChaCha20-Poly1305 with keys derived from your Ed25519 identity. Access from CLI, JS runtime, or MCP.</p>
-        </div>
-
-        <div class="card card-amber">
-          <div class="card-icon card-icon-amber">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          </div>
-          <h3>Built-in Automation</h3>
-          <p>Schedule cron jobs, enable capabilities like health monitoring and email briefings. <code>hop cap enable email-monitor</code> runs daily AI-powered email triage.</p>
-        </div>
-
-        <div class="card card-green">
-          <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-          </div>
-          <h3>API Integration</h3>
-          <p>Call any HTTP API directly from JS scripts. <code>hop.http()</code> with bearer tokens, JSON bodies, and sandbox-aware networking. No curl needed.</p>
-        </div>
-
-        <div class="card card-green">
-          <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </div>
-          <h3>Kernel-Level Sandboxing</h3>
-          <p>Restrict peers to read-only, no-network, or scoped paths. OS-native enforcement via macOS Seatbelt and Linux Landlock. Use presets (<code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code>) or custom policies. Clients can self-restrict for defense-in-depth.</p>
-        </div>
-
-        <div class="card card-amber">
-          <div class="card-icon card-icon-amber">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-          </div>
-          <h3>Terminal Session Audit (tap)</h3>
-          <p>Linux-only sister tool. <strong>tap</strong> is an eBPF terminal-audit utility you can install standalone, or pair with hop for remote access and AI/MCP-driven session monitoring. <a href="https://tap.keikai.ai" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">tap.keikai.ai &rarr;</a></p>
-        </div>
       </div>
+
+      <p style="text-align: center; margin-top: 2.5rem; max-width: 760px; margin-left: auto; margin-right: auto; color: var(--color-text-tertiary); font-size: 0.95rem; line-height: 1.8;">
+        Plus remote command execution, encrypted secrets, scheduled automation, and kernel-level sandboxing (macOS Seatbelt / Linux Landlock) &mdash; with deeper tooling for
+        <a href="fleet.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">fleet management</a>,
+        <a href="orchestration.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">AI orchestration</a>, and
+        <a href="https://tap.keikai.ai" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">terminal session audit (tap)</a>.
+      </p>
     </div>
   </section>
 
@@ -524,22 +460,22 @@
   <section id="how-it-works">
     <div class="container">
       <div class="section-header">
-        <h2>How it works</h2>
-        <p>Shell, file transfer, and a private network in a few commands.</p>
+        <h2>Install, invite, connect</h2>
+        <p>Up and running in under a minute &mdash; no accounts, no servers, no VPN config.</p>
       </div>
 
       <div class="steps">
         <div class="step">
-          <h3>Start a host</h3>
-          <p>Run <code>hop host</code> on the machine you want to access. It generates an identity and starts listening; opt it onto the warren (a virtual IP + <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code>) when you want it on the mesh.</p>
+          <h3>1 &middot; Install</h3>
+          <p>Run one command on the machine you want to reach. It installs hop and prints a one-time <strong>invite</strong>.</p>
         </div>
         <div class="step">
-          <h3>Share an invite</h3>
-          <p>Run <code>hop invite --role developer</code> for a one-time token. Single-use, time-limited, and the role decides what the new member can reach.</p>
+          <h3>2 &middot; Invite</h3>
+          <p>Share the invite, or use it yourself. It's single-use and time-limited, and its role decides exactly what the new member can reach.</p>
         </div>
         <div class="step">
-          <h3>Connect &amp; you're on the network</h3>
-          <p>The other person runs <code>hop connect &lt;token&gt;</code> for a secure shell. Future connections are just <code>hop &lt;name&gt;</code> &mdash; and they're on the warren, reachable by <code>name.hop</code>.</p>
+          <h3>3 &middot; Connect</h3>
+          <p>Redeem it from your laptop with <code>hop connect</code> &mdash; you're in a secure shell. After that, it's just <code>hop &lt;name&gt;</code>.</p>
         </div>
       </div>
 
@@ -590,6 +526,44 @@
     </div>
   </section>
 
+  <!-- Private network (the warren) -->
+  <section id="private-network">
+    <div class="container">
+      <div class="section-header">
+        <h2>Your own private network &mdash; when you need it</h2>
+        <p>Hop also gives you a peer-to-peer private network. Setting up a VPN should be as easy as SSH or scp &mdash; so it is.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">What's a warren?</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's your private group of machines. Add a machine to your warren and it gets a friendly name (<code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">rexmundi.hop</code>) and a private address that only <em>your</em> machines can reach &mdash; from anywhere, with no port-forwarding, no VPN appliance, and no coordination server in someone else's cloud.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Then the tools you already use just work &mdash; SSH, scp, VNC, anything &mdash; with the same ease, simplicity, and reliability as hop.</p>
+          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">One command to opt a machine in: <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-text-secondary);">hop warren join</code></p>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Your machines, reachable by name from anywhere</span>
+<span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">rexmundi.hop</span>
+
+<span class="comment"># Copy a file with the tools you already know</span>
+<span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">rexmundi.hop</span>:~
+
+<span class="comment"># Even a desktop &mdash; VNC over the private network</span>
+<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://rexmundi.hop</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Install -->
   <section id="install">
     <div class="container">
@@ -627,25 +601,28 @@
               <label></label>
               <p id="invite-preview" style="margin: 0; font-size: 0.82rem; color: var(--color-accent-teal);"></p>
             </div>
-            <div class="builder-row node-only">
-              <label>Warren VPN <span class="hint-tag">opt-in</span></label>
-              <div class="seg" id="seg-vpn">
-                <button type="button" class="active" data-val="on">On</button>
-                <button type="button" data-val="off">Off</button>
+            <details class="builder-advanced" id="builder-advanced" style="margin-top: 0.5rem;">
+              <summary style="cursor: pointer; font-size: 0.85rem; color: var(--color-text-secondary); padding: 0.4rem 0; user-select: none;">Advanced options</summary>
+              <div class="builder-row" style="margin-top: 0.75rem;">
+                <label>Warren VPN <span class="hint-tag">opt-in</span></label>
+                <div class="seg" id="seg-vpn">
+                  <button type="button" class="active" data-val="on">On</button>
+                  <button type="button" data-val="off">Off</button>
+                </div>
               </div>
-            </div>
-            <div class="builder-row node-only">
-              <label for="b-tags">Host tags <span class="hint-tag">optional</span></label>
-              <input id="b-tags" type="text" placeholder="production, web" autocomplete="off" spellcheck="false">
-            </div>
-            <div class="builder-row node-only">
-              <label for="b-role">Default invite role</label>
-              <select id="b-role">
-                <option value="member">member (least-privilege)</option>
-                <option value="developer">developer</option>
-                <option value="admin">admin</option>
-              </select>
-            </div>
+              <div class="builder-row">
+                <label for="b-tags">Host tags <span class="hint-tag">optional</span></label>
+                <input id="b-tags" type="text" placeholder="production, web" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="builder-row">
+                <label for="b-role">Default invite role</label>
+                <select id="b-role">
+                  <option value="member">member (least-privilege)</option>
+                  <option value="developer">developer</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+            </details>
           </div>
 
           <p id="builder-hint" style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
@@ -895,10 +872,14 @@
         prevRow.style.display = 'none';
       }
 
-      // Node-only controls are hidden for the client tier (no VPN there).
-      document.querySelectorAll('.builder-row.node-only').forEach(function (el) {
-        el.style.display = isNode ? '' : 'none';
-      });
+      // The advanced (node-only) options are hidden for the client tier (no VPN
+      // there). They live in a collapsed "Advanced options" expander that only
+      // appears once this machine is going on the warren.
+      var adv = document.getElementById('builder-advanced');
+      if (adv) {
+        adv.style.display = isNode ? '' : 'none';
+        if (!isNode) adv.open = false;
+      }
 
       var flags = [];
       if (isNode) flags.push('--host');

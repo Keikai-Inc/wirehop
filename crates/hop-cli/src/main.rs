@@ -5138,7 +5138,7 @@ fn self_upgrade_to_node(
     tier: hop_core::invite::InviteTier,
     assume_yes: bool,
 ) -> Result<()> {
-    let cdn = std::env::var("HOP_CDN_URL").unwrap_or_else(|_| "https://hop.keik.ai".to_string());
+    let cdn = std::env::var("HOP_CDN_URL").unwrap_or_else(|_| "https://hop.keikai.ai".to_string());
     println!();
 
     if system_daemon_installed() {
@@ -5522,7 +5522,7 @@ async fn cmd_warren(
                 println!();
                 println!("A warren ticket is stored. Put this machine on the VPN with:");
                 println!("  hop warren join          # uses the stored ticket");
-                println!("  curl -fsSL https://hop.keik.ai/install.sh | bash -s -- --host");
+                println!("  curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host");
             }
             Ok(())
         }

@@ -43,14 +43,14 @@ already running, hop-tap registers itself as a plugin without touching
 hop's binary or config.
 
 ```bash
-curl -fsSL https://tap.keik.ai/install.sh | bash
+curl -fsSL https://tap.keikai.ai/install.sh | bash
 ```
 
 What it does:
 
 - Linux-only; refuses macOS/Windows with a clear error.
 - Detects x86_64 / arm64.
-- If `hop` isn't installed, delegates to `https://hop.keik.ai/install-daemon.sh`
+- If `hop` isn't installed, delegates to `https://hop.keikai.ai/install-daemon.sh`
   first. If `hop` is installed but its daemon isn't running, exits
   with a "start hop and re-run" message — never tries to start hop
   for you (avoids clobbering manual / user-local / non-systemd
@@ -136,7 +136,7 @@ directly to the daemon's local Unix socket
 (`/run/hop-tap/local.sock`); no hop daemon required. Authentication
 is `SO_PEERCRED`: root sees every session, non-root users see only
 sessions whose opener matches their uid. See
-[tap.keik.ai](https://tap.keik.ai) for the canonical landing page.
+[tap.keikai.ai](https://tap.keikai.ai) for the canonical landing page.
 
 ```bash
 tap list

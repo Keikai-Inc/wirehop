@@ -99,12 +99,12 @@ from the first daemon and grows through invites.
 
 ```
 # Founder — install hop. The network ("warren") auto-creates; founder is Owner.
-curl -fsSL https://hop.keik.ai | bash
+curl -fsSL https://hop.keikai.ai | bash
 
 # Invite anyone (person or server) with a role:
 hop invite --role developer
 #  → prints a one-liner the recipient pastes:
-#     curl -fsSL https://hop.keik.ai | bash -s -- --join <token>
+#     curl -fsSL https://hop.keikai.ai | bash -s -- --join <token>
 #     (drop --join for CLI-only client access)
 
 # Recipient installs + redeems. They're on the warren with developer access —
