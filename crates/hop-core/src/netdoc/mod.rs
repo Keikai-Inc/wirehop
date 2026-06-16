@@ -1914,7 +1914,20 @@ impl NetDoc {
             // be abandoned instead of black-holing every packet onto it forever.
             let inbound = self.vpn_conns.read().await.get(&pubkey.to_string()).cloned();
             let conn = match inbound {
-                Some(c) if c.close_reason().is_none() && rx_fresh => c,
+                Some(c) if c.close_reason().is_none() && rx_fresh => {
+                    // One connection per peer: the peer's inbound connection is
+                    // live, so converge on it and drop our now-redundant outbound
+                    // dial — otherwise two competing connections (26 paths) to one
+                    // peer keep flip-flopping. Only the LOWER-node-id side closes,
+                    // so exactly one of the pair drops its dial (no simultaneous-
+                    // close race that would leave the peer with none).
+                    if self.endpoint.id().as_bytes() < pubkey.as_bytes()
+                        && let Some((old, _)) = conns.remove(&pubkey)
+                    {
+                        old.close(0u32.into(), b"superseded by peer inbound connection");
+                    }
+                    c
+                }
                 _ => match conns.get(&pubkey) {
                     Some((c, dialed))
                         if c.close_reason().is_none()
