@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>hop — Fleet Management</title>
-  <meta name="description" content="Manage fleets of machines with hop. Role-based access, host tagging, and aggregate invites — from a 5-person team to thousands of hosts.">
+  <meta name="description" content="A fleet in hop is your warren, managed at scale: role-based access, host tags, and one-command invites — replicated to every machine, no master server. From a 5-person team to thousands of hosts.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -150,7 +150,7 @@
   <div class="hero">
     <div class="badge"><span class="dot"></span> Fleet Management</div>
     <h1>One tool,<br><span class="gradient">every machine</span></h1>
-    <p>Manage access to your entire infrastructure with roles, tags, and one-command invites. Same hop simplicity, from 5 machines to 5,000.</p>
+    <p>A fleet in hop is just your <strong>warren</strong>, managed at scale &mdash; roles and tags across every machine, replicated to all of them, with no master server. Same hop simplicity, from 5 machines to 5,000.</p>
     <div class="hero-actions">
       <a href="#how-fleet-works" class="btn btn-primary">How It Works</a>
       <a href="index.html" class="btn btn-ghost">&larr; Back to hop</a>
@@ -162,7 +162,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Three concepts, that's it</h2>
-        <p>Fleet management in hop comes down to orchestrators, tags, and roles.</p>
+        <p>Managing a fleet comes down to your warren, tags, and roles.</p>
       </div>
 
       <div class="grid grid-3">
@@ -170,8 +170,8 @@
           <div class="card-icon card-icon-red">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
           </div>
-          <h3>Orchestrator</h3>
-          <p>Any hop host can be an orchestrator. It keeps track of your fleet members, role definitions, and distributes access.</p>
+          <h3>Your warren</h3>
+          <p>Your machines, as one shared list. Every node sees the same membership &mdash; there's no master server to run or lose. Add a machine and it's in the warren; its roles and tags travel with it.</p>
         </div>
 
         <div class="card card-teal">
@@ -187,7 +187,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           </div>
           <h3>Roles</h3>
-          <p>Define what access people get. A role maps to host tags &mdash; "developers access developer + staging hosts." Each person gets their own account.</p>
+          <p>Define what people can reach. A role maps to host tags &mdash; "developers reach developer + staging machines" &mdash; and gates warren VPN reach too. Each person gets their own account.</p>
         </div>
       </div>
     </div>
@@ -203,20 +203,20 @@
 
       <div class="steps steps-2">
         <div class="step">
-          <h3>Install &amp; connect to the orchestrator</h3>
-          <p>Install hop as a daemon on any machine. It prints a <strong>creator invite</strong> on first startup. Redeem it from your laptop with <code>hop connect</code> &mdash; this saves the orchestrator as a known host (e.g. <code>orch-1</code>).</p>
+          <h3>Start your warren</h3>
+          <p>Install hop on any machine. It starts your warren and prints a <strong>creator invite</strong>. Redeem it from your laptop with <code>hop connect</code> &mdash; it's saved as a known host (here, <code>rex</code>).</p>
         </div>
         <div class="step">
           <h3>Define roles</h3>
-          <p>Create roles that map to host tags. Use <code>hop admin &lt;host&gt;</code> to manage the orchestrator remotely, e.g. <code>hop admin orch-1 role create developer</code></p>
+          <p>Roles map host tags to access &mdash; and to warren VPN reach. Manage any host remotely with <code>hop admin &lt;host&gt;</code>, e.g. <code>hop admin rex role create developer</code>.</p>
         </div>
         <div class="step">
-          <h3>Register hosts</h3>
-          <p>Create a fleet invite and use it when installing hop on each machine. Tags are assigned at registration time.</p>
+          <h3>Add machines</h3>
+          <p>One invite registers any number of machines into the warren, with their tags. Membership replicates to every node &mdash; no master list to keep in sync.</p>
         </div>
         <div class="step">
           <h3>Invite your team</h3>
-          <p>Invite people by role. They automatically get access to every matching host &mdash; with their own user account on each.</p>
+          <p>Invite people by role. They reach every matching machine &mdash; by name, over the warren &mdash; each with their own account.</p>
         </div>
       </div>
 
@@ -226,32 +226,31 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — Setting up a fleet</span>
+            <span class="code-title">Terminal — Setting up your warren</span>
           </div>
           <div class="code-body">
-<span class="comment"># 1. Install hop daemon (orchestrator)</span>
+<span class="comment"># 1. Install hop on a host — it starts your warren</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span>
 <span class="output">Creator invite: eyJ0eX...   (valid for 1 hour)</span>
 
-<span class="comment"># 2. Redeem creator invite from your laptop</span>
-<span class="comment">#    This saves the orchestrator as a known host — here it's "orch-1"</span>
+<span class="comment"># 2. Redeem it from your laptop — saved as a known host, "rex"</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
-<span class="output">Saved as known host: orch-1</span>
+<span class="output">Saved as known host: rex</span>
 
-<span class="comment"># 3. Now use "hop admin orch-1" to manage it remotely</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">developer</span> --tags developer,staging
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> role create <span class="flag">ops</span> --tags '*' --sudo
+<span class="comment"># 3. Define roles — they map tags to access AND warren reach</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">developer</span> --tags developer,staging
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">ops</span> --tags '*' --sudo
 
-<span class="comment"># 4. Create a fleet invite for registering hosts</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> fleet-invite --tags developer,web
-<span class="output">Fleet invite: abCdEf...   (100 uses, 24h expiry)</span>
+<span class="comment"># 4. One invite adds any number of machines to the warren</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> fleet-invite --tags developer,web
+<span class="output">Warren invite: abCdEf...   (100 uses, 24h expiry)</span>
 
-<span class="comment"># 5. Register a host (on the host machine)</span>
+<span class="comment"># 5. On each machine — joins the warren with its tags</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span> -s -- --register <span class="flag">abCdEf...</span>
 
-<span class="comment"># 6. Invite a developer</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> invite --role developer --name alice
-<span class="output">Invite: xYz123...   (covers all developer+staging hosts)</span>
+<span class="comment"># 6. Invite a teammate by role</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> invite --role developer --name alice
+<span class="output">Invite: xYz123...   (reaches every developer+staging machine)</span>
           </div>
         </div>
       </div>
@@ -366,7 +365,7 @@
       <div class="concept-grid">
         <div class="concept-info">
           <h3>Three layers of enforcement</h3>
-          <p>Sandbox policies flow through three layers: role definition (orchestrator sets the baseline), invite creation (host can further restrict), and client connection (client can self-restrict). The result is always the strictest combination.</p>
+          <p>Sandbox policies flow through three layers: role definition (the role sets the baseline), invite creation (the host can further restrict), and client connection (the client can self-restrict). The result is always the strictest combination.</p>
           <ul class="concept-list">
             <li><strong>Presets</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code> (read-only, no network, scoped paths), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code> (read-only, no network), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code> (scoped write, dangerous commands blocked)</li>
             <li><strong>Custom policies</strong> &mdash; combine <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--read-only</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-network</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--scope</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--allow-command</code></li>
@@ -408,7 +407,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Using the fleet</h2>
-        <p>Once set up, your team interacts with the fleet using familiar commands.</p>
+        <p>Once set up, your team works with the warren using familiar commands.</p>
       </div>
 
       <div class="grid grid-2">
@@ -454,14 +453,13 @@
 <span class="output">[web-2]     Linux 6.1 x86_64</span>
 <span class="output">[staging-1] Linux 6.1 x86_64</span>
 
-<span class="comment"># Check fleet status</span>
+<span class="comment"># Check warren status</span>
 <span class="prompt">$</span> <span class="cmd">hop fleet status</span>
-<span class="output">Fleet: orch-1</span>
-<span class="output">  3 hosts registered</span>
-<span class="output">  3 online, 0 offline</span>
+<span class="output">Warren: 3a8f...   (replicated to every node)</span>
+<span class="output">  3 machines, 3 online</span>
 
-<span class="comment"># Admin: see all peers</span>
-<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">orch-1</span> peers
+<span class="comment"># Admin: see the members</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> peers
 <span class="output">  alice   developer   online</span>
 <span class="output">  bob     ops         online</span>
           </div>
@@ -484,7 +482,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
           </div>
           <h3>Small Team (5-50)</h3>
-          <p>Single orchestrator, JSON config files, zero infrastructure beyond hop itself. Set up in minutes.</p>
+          <p>Your warren plus JSON config &mdash; zero infrastructure beyond hop itself. Set up in minutes.</p>
         </div>
 
         <div class="card card-teal">
@@ -492,7 +490,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           </div>
           <h3>Growing (50-500)</h3>
-          <p>Same architecture. Role definitions keep access organized. Heartbeats keep fleet status current.</p>
+          <p>Same warren. Roles keep access organized, and membership replicates to every node automatically &mdash; nothing to keep in sync by hand.</p>
         </div>
 
         <div class="card card-amber">
@@ -500,7 +498,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="9" height="9" rx="1"/><rect x="13" y="2" width="9" height="9" rx="1"/><rect x="2" y="13" width="9" height="9" rx="1"/><rect x="13" y="13" width="9" height="9" rx="1"/></svg>
           </div>
           <h3>Large (500+)</h3>
-          <p>Shard orchestrators by region or team. The P2P foundation means no central bottleneck for data transfer.</p>
+          <p>No central server to bottleneck or shard &mdash; the warren replicates peer-to-peer, and data flows directly between machines.</p>
         </div>
       </div>
     </div>
@@ -511,7 +509,7 @@
     <div class="container">
       <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
         <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to get started?</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop. Install the daemon, redeem the creator invite, and you're managing infrastructure.</p>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop &mdash; it's just your warren at scale. Install the daemon, redeem the creator invite, and you're managing every machine.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="index.html#install" class="btn btn-primary">Install hop</a>
         </div>
