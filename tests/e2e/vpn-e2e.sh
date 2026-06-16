@@ -27,7 +27,11 @@ AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target aarch64-unknown-linux-
 cp "$ROOT/target/aarch64-unknown-linux-gnu/release/hop" "$SCRIPT_DIR/hop"
 
 echo "=== building VPN test image ==="
-docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
+# Colima/containerd's buildkit snapshotter intermittently corrupts ("parent
+# snapshot ... does not exist") — an environmental flake unrelated to the test.
+# Prune the build cache and retry so it can't fail an otherwise-good run.
+build_vpn_image() {
+  docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates jq iputils-ping iproute2 dnsutils && rm -rf /var/lib/apt/lists/*
@@ -36,6 +40,14 @@ RUN useradd -m -s /bin/bash hop
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
 DOCKERFILE
+}
+build_ok=0
+for attempt in 1 2 3; do
+  if build_vpn_image; then build_ok=1; break; fi
+  echo "  (docker build failed [attempt $attempt] — pruning buildkit cache + retrying)"
+  docker builder prune -af >/dev/null 2>&1 || true
+done
+[ "$build_ok" = "1" ] || { echo "FATAL: docker build failed after retries"; exit 1; }
 
 docker network create "$NET" >/dev/null
 docker volume create "$VOL" >/dev/null
@@ -70,7 +82,11 @@ docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
   # So the single creator invite = membership + warren join (the unified token).
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
   cp /cfg/creator_invite /shared/invite-a
-  grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-a
+  # Extract THIS host s own vIP from the unambiguous "vpn: enabled, virtual IP
+  # <ip>," line. The old `grep "virtual IP [0-9.]*"` matched zero digits (empty)
+  # when a "virtual IP (<peer-ip>)" resolution log sorted first — an empty vip
+  # silently broke `dig @$VIP` downstream (MagicDNS-name flake).
+  grep -m1 "vpn: enabled" /cfg/log | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1 > /shared/vip-a
   touch /shared/ready-a
   echo "host-a vIP: $(cat /shared/vip-a)"
   tail -f /cfg/log
@@ -98,7 +114,7 @@ docker run -d --name hop-vpn-b "${COMMON[@]}" "$IMG" bash -c '
   # the VPN comes up default-on.
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
-  grep -o "virtual IP [0-9.]*" /cfg/log | head -1 | awk "{print \$3}" > /shared/vip-b
+  grep -m1 "vpn: enabled" /cfg/log | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1 > /shared/vip-b
   touch /shared/ready-b
   echo "host-b vIP: $(cat /shared/vip-b)"
   tail -f /cfg/log
@@ -234,14 +250,24 @@ if docker exec hop-vpn-b ping -c 3 -W 3 "$VIP_A"; then
         A_NAME=$(docker exec hop-vpn-a hostname | tr 'A-Z' 'a-z' | cut -d. -f1)
         echo "=== TEST: MagicDNS resolves founder name '${A_NAME}.hop' from host-b ==="
         NAME_OK=0
-        for attempt in 1 2 3 4 5 6; do
-          R=$(docker exec hop-vpn-b dig +short +time=2 +tries=1 "@$VIP_B" "${A_NAME}.hop" 2>/dev/null | head -1)
+        for attempt in $(seq 1 12); do
+          # `|| true`: a first-query timeout (dig exit 9) must NOT trip `set -e`
+          # under `pipefail` before the retry loop can retry — that killed the
+          # whole run on a slow first DNS response (the MagicDNS-name flake).
+          R=$(docker exec hop-vpn-b dig +short +time=2 +tries=1 "@$VIP_B" "${A_NAME}.hop" 2>/dev/null | head -1 || true)
           if [ "$R" = "$VIP_A" ]; then NAME_OK=1; echo "MAGICDNS NAME OK: ${A_NAME}.hop → $R"; break; fi
           echo "  (attempt $attempt: '${R:-<none>}' ≠ $VIP_A; name sync settling 5s)"; sleep 5
         done
         if [ "$NAME_OK" != "1" ]; then
             echo "VPN E2E FAILED: MagicDNS did not resolve ${A_NAME}.hop → $VIP_A."
-            docker exec hop-vpn-a grep -aE "vpn: MagicDNS serving|name registration" /cfg/log | tail -5 || true
+            echo "--- host-a: MagicDNS serving + name registration ---"
+            docker exec hop-vpn-a grep -aE "vpn: MagicDNS serving|name registration|registered self" /cfg/log | tail -5 || true
+            echo "--- host-b: is its :53 server up + does lookup_name resolve? ---"
+            docker exec hop-vpn-b grep -aE "vpn: MagicDNS serving|DNS bind|resolved via roster|lookup_name|name .* resolved|reconciled [0-9]+ peer" /cfg/log | tail -12 || true
+            echo "--- host-b: does it even hold host-a's peer entry w/ name? ---"
+            docker exec hop-vpn-b sh -c "hop --config /cfg fleet list 2>/dev/null | head" || true
+            echo "--- host-b: direct dig retry (does the :53 server answer at all?) ---"
+            docker exec hop-vpn-b dig +short +time=3 +tries=2 "@$VIP_B" "${A_NAME}.hop" 2>&1 | head -3 || true
             RC=1
         fi
     fi
@@ -439,7 +465,7 @@ if [ "$RC" = "0" ]; then
         # the suite — documented to intermittently take >25s. Give it a wide
         # window so we test "it reconverges", not "within ~24s".
         NA_PING=0
-        for attempt in 1 2 3 4 5 6 7 8; do
+        for attempt in $(seq 1 15); do
           if docker exec hop-vpn-c ping -c 5 -W 3 "$VIP_B"; then NA_PING=1; break; fi
           echo "  (attempt $attempt failed; settling 6s)"; sleep 6
         done
@@ -447,8 +473,10 @@ if [ "$RC" = "0" ]; then
             echo "NO-ADMIN-ONLINE PASSED: read-ticket member re-registered + routes with the founder down."
         else
             echo "PHASE 4 FAILED: no-admin-online routing broken."
-            docker exec hop-vpn-c cat /cfg/log | tail -30 || true
-            docker exec hop-vpn-b cat /cfg/log | tail -20 || true
+            echo "--- host-c egress resolution / dial / ingress (last 40) ---"
+            docker exec hop-vpn-c sh -c "grep -aE 'resolved via|UNRESOLVED|vpn: dial|send_datagram|ingress|deliver|drop|reach|remote_info|conn_type|Connected to|Connecting to' /cfg/log | tail -40" || true
+            echo "--- host-b egress resolution / dial / ingress (last 40) ---"
+            docker exec hop-vpn-b sh -c "grep -aE 'resolved via|UNRESOLVED|vpn: dial|send_datagram|ingress|deliver|drop|reach|remote_info|conn_type|Connected to|Connecting to' /cfg/log | tail -40" || true
             RC=1
         fi
     fi
