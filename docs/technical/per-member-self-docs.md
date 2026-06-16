@@ -24,6 +24,51 @@ Two ways to actually prevent it were considered:
    namespace and is the *only* writer. Forgery is **physically impossible** (no
    write key for anyone else's doc) and there is **no admin-online coupling**.
 
+## Routing via the roster (`peer/N.vpn_endpoint`) — data-plane robustness
+
+> **Added 2026-06-16.** The endpoint is **static**, so routing does not need the
+> per-member self-doc namespace at all — it reads the reliably-replicated admin
+> doc instead. Self-docs stay for genuinely member-dynamic, non-routing state.
+
+**The realization.** `register_vpn_endpoint` writes `"<endpoint_id> <relay>"`, and
+*both halves are static*: the netdoc `endpoint_id` is derived from the persisted
+host key (`derive_netdoc_secret_key`) and the `relay` is configured. iroh
+discovers the live (dynamic) addresses itself at dial time — that never touches
+the doc. So the premise that justified self-docs-for-routing — *"a member's
+endpoint is dynamic; every change needs an admin to write it"* (the reason
+"admin-writes-on-behalf" was rejected) — **is false for the endpoint**. There are
+no dynamic updates to couple to an admin.
+
+**Why it mattered.** Routing depended on importing each owner's **separate
+iroh-docs self-doc namespace** and keeping it synced. That per-namespace sync is
+fragile — it failed live with `NotFound`, churned on relay/address flaps (the
+ticket embeds addresses), and orphaned on leave/rejoin — and a single gap
+**black-holed the whole VPN** (`vpn_peer_ips` collapsed to the local entry only;
+every egress dropped as `UNRESOLVED`). The **admin doc**, by contrast, replicates
+reliably (every node holds the full roster).
+
+**The fix.** Carry the endpoint in the roster beside `peer/N.vip`:
+- New field **`peer/N.vpn_endpoint`** (`config::Peer.vpn_endpoint`), the same
+  static `"<endpoint_id> <relay>"` value.
+- Recorded by the trust anchor from the member's authenticated announce
+  (`record_peer_vpn_endpoint`), exactly like `peer/N.self_doc` /
+  `peer/N.netdoc_author`. `AnnounceNetdocAuthor` carries `vpn_endpoint`
+  (`#[serde(default)]`); the founder self-heals its own on every bringup.
+- `lookup_vpn_endpoint` resolves `peer/N.vpn_endpoint` **first**, then falls back
+  to the self-doc / shared `vpn/` / owner-node-id paths (migration).
+  `refresh_vpn_peer_ips` seeds the ingress map from it. **Zero per-member-namespace
+  dependency on the data path.**
+
+**Security is unchanged.** A member can only set *its own* endpoint string
+(the admin records it keyed to the member's authenticated node-id; addr→owner
+stays the admin-allocated `peer/N.vip`) — the *same* property the self-doc model
+gives, since a member could already write any endpoint string into its own
+self-doc's `vpn/<its-own-vip>`. The one property dropped — "a malicious admin
+can't forge a member's endpoint" — is redundant: the admin already controls
+`peer/N.vip`, membership, and revocation, so it has strictly stronger levers over
+a member's reachability. Verified by `lookup_vpn_endpoint_resolves_via_roster_endpoint`
+(resolves with no self-doc, via an endpoint id distinct from the node-id).
+
 ## Model
 
 Two document classes:

@@ -944,11 +944,21 @@ impl NetDoc {
 
     /// Publish that this host's virtual `addr` is reachable for VPN traffic at
     /// this netdoc endpoint. Value: `"<endpoint_id_hex> <relay_url?>"`.
-    pub async fn register_vpn_endpoint(&self, addr: std::net::Ipv4Addr) -> Result<()> {
+    /// This node's own VPN endpoint, as the static `"<endpoint_id> <relay>"`
+    /// string written to `vpn/<addr>` and recorded in `peer/N.vpn_endpoint`. Both
+    /// halves are stable (the netdoc endpoint id is derived from the persisted
+    /// host key; the relay is configured), so the value never changes once the
+    /// relay is up — which is what lets an admin record it once with no online
+    /// coupling.
+    pub fn own_vpn_endpoint_value(&self) -> String {
         let relay = crate::net::host_relay_url(&self.endpoint)
             .map(|u| u.to_string())
             .unwrap_or_default();
-        let value = format!("{} {relay}", self.endpoint.id());
+        format!("{} {relay}", self.endpoint.id())
+    }
+
+    pub async fn register_vpn_endpoint(&self, addr: std::net::Ipv4Addr) -> Result<()> {
+        let value = self.own_vpn_endpoint_value();
         let key = format!("{KEY_VPN_PREFIX}{addr}");
         // #3b isolation: the endpoint lives ONLY in this node's self-doc — no
         // shared-doc copy for any other member to forge. Readers resolve it from
@@ -1015,7 +1025,23 @@ impl NetDoc {
         // Computed once, reused by the self-doc lookup and the node-id fallback.
         let owner = self.vip_owner(addr).await;
 
-        // Preferred: the addr owner's self-doc (the isolated endpoint source).
+        // Preferred: the owner's endpoint recorded in the admin doc roster
+        // (`peer/N.vpn_endpoint`). Admin-vouched (the peer entry is admin-authored,
+        // rejected otherwise under enforce) and replicated on the one document
+        // every node reliably syncs — so the data plane no longer depends on the
+        // owner's per-member self-doc namespace having converged. The value is
+        // static, so this is always current once recorded.
+        if let Some(ref owner) = owner
+            && let Ok(Some(peer)) = self.get_peer(owner).await
+            && let Some(val) = peer.vpn_endpoint.as_deref()
+            && let Some(v) = parse_vpn_endpoint_value(val.as_bytes())
+        {
+            tracing::debug!("netdoc egress: {addr} resolved via roster vpn_endpoint");
+            return Ok(Some(v));
+        }
+
+        // Fallback: the addr owner's self-doc (the isolated endpoint source) — for
+        // members that announced a self-doc but not yet a roster `vpn_endpoint`.
         if let Some(ref owner) = owner
             && let Some(sd) = self.member_self_doc(owner).await
             && let Ok(Some(entry)) = sd.get_one(mk_query()).await
@@ -1097,17 +1123,28 @@ impl NetDoc {
         // map — it's admin-owned (validated under enforce, so a member can't
         // forge another's), so it overrides the shared `ip/` table (which remains
         // the fallback for legacy members that have no `vip` yet).
+        // Also collect each member's admin-vouched roster endpoint
+        // (`peer/N.vpn_endpoint`) keyed by the addr it owns — the reliable ingress
+        // source that doesn't depend on the member's self-doc namespace syncing.
+        let mut roster_endpoints: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
         for peer in self.list_peers().await.unwrap_or_default() {
             if let Some(vip) = peer.vip.as_deref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()) {
-                ip_owner.insert(vip, peer.node_id);
+                ip_owner.insert(vip, peer.node_id.clone());
+                if let Some(val) = peer.vpn_endpoint.as_deref()
+                    && let Some(id) = val.split_whitespace().next()
+                {
+                    roster_endpoints.push((id.to_string(), vip));
+                }
             }
         }
 
         // vpn/ table → endpoint-id → vIP, each validated against the owner's
-        // vouched author.
+        // vouched author. Seed the map with the roster endpoints first (the base
+        // the shared `vpn/` scan and self-doc override may refine).
         let Ok(stream) = self.doc.get_many(Query::key_prefix(KEY_VPN_PREFIX.as_bytes()).build()).await else { return };
         let mut stream = std::pin::pin!(stream);
-        let mut map = HashMap::new();
+        let mut map: HashMap<String, std::net::Ipv4Addr> =
+            roster_endpoints.into_iter().collect();
         while let Some(Ok(entry)) = stream.next().await {
             if entry.content_len() == 0 {
                 continue;
@@ -1550,29 +1587,45 @@ impl NetDoc {
                 self_doc: self.self_doc_read_ticket().await.ok(),
                 // The founder's admin-allocated vIP (its own claim, #3b).
                 vip: Some(addr.to_string()),
+                // The founder's own VPN endpoint in the roster, so peers resolve
+                // it from the admin doc without importing the founder's self-doc.
+                vpn_endpoint: Some(self.own_vpn_endpoint_value()),
                 sandbox: crate::sandbox::SandboxPolicy::default(),
             };
             if let Err(e) = self.put_peer(&me).await {
                 tracing::warn!("vpn: self-member registration failed: {e:#}");
             }
         }
-        // Self-heal the founder's own self-doc ticket on EVERY bringup. The block
-        // above sets it only when the founder's peer entry is first created, so a
-        // founder whose entry predates per-member self-docs (or whose ticket went
-        // stale after a relay/address change) keeps an empty/old `self_doc`
-        // forever — and since the founder never announces (it's the trust anchor),
-        // nothing else would ever record it, leaving the founder's VPN endpoint
-        // unresolvable to every peer. Idempotent: only rewrites on an actual change.
+        // Self-heal the founder's own roster entries on EVERY bringup. The block
+        // above sets them only when the founder's peer entry is first created, so a
+        // founder whose entry predates these fields (or whose self-doc ticket went
+        // stale after a relay/address change) keeps an empty/old value forever —
+        // and since the founder never announces (it's the trust anchor), nothing
+        // else would ever record it, leaving its VPN endpoint unresolvable to every
+        // peer. Heals BOTH `self_doc` (legacy resolution path) and the new
+        // `vpn_endpoint` (the roster routing path). Idempotent: only writes on an
+        // actual change.
         if !self.federated
-            && let Ok(ticket) = self.self_doc_read_ticket().await
             && let Ok(Some(mut me)) = self.get_peer(host_node_id).await
-            && me.self_doc.as_deref() != Some(ticket.as_str())
         {
-            me.self_doc = Some(ticket);
-            if let Err(e) = self.put_peer(&me).await {
-                tracing::warn!("vpn: founder self-doc self-heal failed: {e:#}");
-            } else {
-                tracing::info!("vpn: refreshed founder's own self-doc ticket (self-heal)");
+            let mut changed = false;
+            if let Ok(ticket) = self.self_doc_read_ticket().await
+                && me.self_doc.as_deref() != Some(ticket.as_str())
+            {
+                me.self_doc = Some(ticket);
+                changed = true;
+            }
+            let ep = self.own_vpn_endpoint_value();
+            if me.vpn_endpoint.as_deref() != Some(ep.as_str()) {
+                me.vpn_endpoint = Some(ep);
+                changed = true;
+            }
+            if changed {
+                if let Err(e) = self.put_peer(&me).await {
+                    tracing::warn!("vpn: founder roster self-heal failed: {e:#}");
+                } else {
+                    tracing::info!("vpn: refreshed founder's own roster entry (self_doc + vpn_endpoint)");
+                }
             }
         }
         let me = std::sync::Arc::clone(self);
@@ -1935,6 +1988,32 @@ impl NetDoc {
         peer.self_doc = Some(ticket.to_string());
         self.put_peer(&peer).await?;
         tracing::info!("netdoc: recorded self-doc for member {}", &node_id[..8.min(node_id.len())]);
+        Ok(true)
+    }
+
+    /// Record an admitted member's VPN endpoint (`peer/N.vpn_endpoint`) from the
+    /// member's authenticated announce. Trust-anchor-only and member-must-exist,
+    /// exactly like [`record_peer_self_doc`]. The value is the static
+    /// `"<endpoint_id> <relay>"` string (validated by parsing). This is what lets
+    /// routing resolve a member's endpoint from the reliably-replicated admin doc
+    /// instead of importing the member's self-doc namespace. Idempotent; returns
+    /// `Ok(false)` when not applicable.
+    pub async fn record_peer_vpn_endpoint(&self, node_id: &str, value: &str) -> Result<bool> {
+        if !self.is_trust_anchor() {
+            return Ok(false);
+        }
+        if parse_vpn_endpoint_value(value.as_bytes()).is_none() {
+            anyhow::bail!("invalid vpn endpoint value");
+        }
+        let Some(mut peer) = self.get_peer(node_id).await? else {
+            return Ok(false);
+        };
+        if peer.vpn_endpoint.as_deref() == Some(value) {
+            return Ok(true);
+        }
+        peer.vpn_endpoint = Some(value.to_string());
+        self.put_peer(&peer).await?;
+        tracing::info!("netdoc: recorded vpn endpoint for member {}", &node_id[..8.min(node_id.len())]);
         Ok(true)
     }
 
@@ -2402,6 +2481,7 @@ mod tests {
             netdoc_author: None,
             self_doc: None,
             vip: None,
+            vpn_endpoint: None,
             sandbox: SandboxPolicy::default(),
         }
     }
@@ -3033,6 +3113,44 @@ mod tests {
             resolved.map(|(pk, _)| pk),
             Some(peer_id),
             "egress must resolve a member with no endpoint doc via the owner node-id fallback"
+        );
+    }
+
+    /// The roster routing path (the structural fix): a member's endpoint recorded
+    /// in the admin-vouched `peer/N.vpn_endpoint` resolves egress with **no
+    /// self-doc and no shared `vpn/` entry** — so the data plane no longer depends
+    /// on the owner's per-member self-doc namespace having synced. Uses an endpoint
+    /// id DISTINCT from the owner's node-id, so a pass can only come from the
+    /// roster entry, not the owner-node-id fallback.
+    #[tokio::test]
+    async fn lookup_vpn_endpoint_resolves_via_roster_endpoint() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let peer_ep = test_endpoint().await;
+        let peer_id = peer_ep.id();
+        let vpn_ep = test_endpoint().await;
+        let vpn_id = vpn_ep.id();
+        assert_ne!(peer_id, vpn_id, "endpoint id must differ from node-id to prove the path");
+        let addr: std::net::Ipv4Addr = "100.64.7.7".parse().unwrap();
+        let mut peer = sample_peer(&peer_id.to_string(), "P");
+        peer.vip = Some(addr.to_string());
+        a.put_peer(&peer).await.unwrap();
+        // Admin records the member's static endpoint (trust-anchor-gated, validated).
+        let value = format!("{vpn_id} ");
+        assert!(
+            a.record_peer_vpn_endpoint(&peer_id.to_string(), &value).await.unwrap(),
+            "trust anchor records peer/N.vpn_endpoint"
+        );
+
+        let resolved = a.lookup_vpn_endpoint(addr).await.expect("lookup ok");
+        assert_eq!(
+            resolved.map(|(pk, _)| pk),
+            Some(vpn_id),
+            "egress must resolve via the admin-vouched roster vpn_endpoint (no self-doc needed)"
         );
     }
 

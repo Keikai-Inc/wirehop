@@ -32,8 +32,19 @@ use hop_core::shell::{self, SessionOutcome};
 use hop_core::shell::session_registry::{self as session_registry, RegistryHandle};
 use hop_core::transfer::{self, PathSpec};
 
+// Heap profiling (build with `--features dhat-heap`): replace the global
+// allocator so dhat records every allocation's call-site + live bytes.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Heap profiler: held for the whole process; on a clean exit (SIGTERM, which
+    // the daemon handles by returning) its Drop writes dhat-heap.json.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     // Broker shim detection: when invoked via symlink (e.g., "ps"),
     // argv[0] won't be "hop". Enter broker client mode immediately.
     if let Some(argv0) = std::env::args().next() {
@@ -724,12 +735,15 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         let fnode = fnode.trim().to_string();
                         let author = net.author_hex();
                         // Also announce this node's self-doc read ticket so the
-                        // founder records peer/N.self_doc (per-member self-docs).
+                        // founder records peer/N.self_doc (per-member self-docs),
+                        // and its static VPN endpoint so the founder records
+                        // peer/N.vpn_endpoint (the roster routing path).
                         let self_doc = net.self_doc_read_ticket().await.ok();
+                        let vpn_endpoint = Some(net.own_vpn_endpoint_value());
                         if !fnode.is_empty() && fnode != host_node_id {
                             let ep = main_endpoint.clone();
                             tokio::spawn(async move {
-                                announce_netdoc_author_with_retry(ep, &fnode, &author, self_doc).await;
+                                announce_netdoc_author_with_retry(ep, &fnode, &author, self_doc, vpn_endpoint).await;
                             });
                         }
                     }
@@ -1200,6 +1214,7 @@ async fn announce_netdoc_author_with_retry(
     founder_node_hex: &str,
     author_hex: &str,
     self_doc: Option<String>,
+    vpn_endpoint: Option<String>,
 ) {
     let founder_id: iroh::PublicKey = match founder_node_hex.parse() {
         Ok(id) => id,
@@ -1220,9 +1235,9 @@ async fn announce_netdoc_author_with_retry(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match announce_netdoc_author_once(&endpoint, founder_id, author_hex, self_doc.as_deref()).await {
+        match announce_netdoc_author_once(&endpoint, founder_id, author_hex, self_doc.as_deref(), vpn_endpoint.as_deref()).await {
             Ok(true) => {
-                tracing::info!("netdoc announce: founder recorded our author binding + self-doc");
+                tracing::info!("netdoc announce: founder recorded our author binding + self-doc + vpn endpoint");
                 // Recorded — refresh periodically rather than stopping.
                 tokio::time::sleep(REFRESH_INTERVAL).await;
                 delay = std::time::Duration::from_secs(5);
@@ -1247,6 +1262,7 @@ async fn announce_netdoc_author_once(
     founder_id: iroh::PublicKey,
     author_hex: &str,
     self_doc: Option<&str>,
+    vpn_endpoint: Option<&str>,
 ) -> Result<bool> {
     let (conn, _) = hop_core::net::connect_to_host_with_alpn(
         endpoint,
@@ -1261,6 +1277,7 @@ async fn announce_netdoc_author_once(
         &ClientMessage::AnnounceNetdocAuthor {
             author: author_hex.to_string(),
             self_doc: self_doc.map(String::from),
+            vpn_endpoint: vpn_endpoint.map(String::from),
         },
     )
     .await?;
@@ -1488,7 +1505,7 @@ async fn dispatch_session(
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
-        Some(ClientMessage::AnnounceNetdocAuthor { author, self_doc }) => {
+        Some(ClientMessage::AnnounceNetdocAuthor { author, self_doc, vpn_endpoint }) => {
             // A warren member announced its doc author (+ self-doc read ticket).
             // Only the founder/admin (the C1 trust anchor) records the admin-owned
             // bindings; any other receiver acks without recording so the member
@@ -1517,7 +1534,20 @@ async fn dispatch_session(
                     },
                     None => true,
                 };
-                author_ok && self_doc_ok
+                // Record the member's static VPN endpoint in the roster
+                // (peer/N.vpn_endpoint) — the reliable routing path — and fold it
+                // into the ack so the announce retries until it's recorded too.
+                let vpn_endpoint_ok = match vpn_endpoint.as_deref() {
+                    Some(val) => match nd.record_peer_vpn_endpoint(peer_id, val).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("netdoc: record_peer_vpn_endpoint for {peer_id} failed: {e:#}");
+                            false
+                        }
+                    },
+                    None => true,
+                };
+                author_ok && self_doc_ok && vpn_endpoint_ok
             } else {
                 false
             };

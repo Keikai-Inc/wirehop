@@ -35,6 +35,13 @@ rand.workspace = true
 sha2.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 base64.workspace = true
+dhat = { version = "0.3", optional = true }
+
+[features]
+# Heap-profile the daemon: build with `--features dhat-heap`, run the daemon,
+# generate traffic, then SIGTERM it — writes dhat-heap.json (live bytes by
+# allocation call-site). For pinning the multipath/forwarding leak.
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 tempfile.workspace = true

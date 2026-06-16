@@ -234,6 +234,7 @@ mod tests {
             netdoc_author: None,
             self_doc: None,
             vip: None,
+            vpn_endpoint: None,
             sandbox: SandboxPolicy::default(),
         }
     }

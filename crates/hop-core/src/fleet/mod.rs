@@ -932,6 +932,7 @@ mod tests {
             netdoc_author: None,
             self_doc: None,
             vip: vip.map(String::from),
+            vpn_endpoint: None,
             sandbox: SandboxPolicy::default(),
         }
     }

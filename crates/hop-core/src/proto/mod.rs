@@ -107,6 +107,12 @@ pub enum ClientMessage {
         author: String,
         #[serde(default)]
         self_doc: Option<String>,
+        /// The member's VPN endpoint `"<endpoint_id> <relay>"` (static), so the
+        /// founder records `peer/N.vpn_endpoint` and routing resolves from the
+        /// admin doc instead of the member's self-doc namespace. `#[serde(default)]`
+        /// so pre-roster-endpoint senders still decode.
+        #[serde(default)]
+        vpn_endpoint: Option<String>,
     },
 }
 

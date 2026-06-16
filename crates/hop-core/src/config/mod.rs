@@ -288,6 +288,18 @@ pub struct Peer {
     /// (falls back to the shared `ip/` table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip: Option<String>,
+    /// The peer's VPN endpoint as `"<endpoint_id> <relay_url>"` — the netdoc
+    /// endpoint that serves `hop/vpn/1`. Recorded by the admin from this member's
+    /// authenticated announce (admin-vouched, exactly like `self_doc`/
+    /// `netdoc_author`). The value is **static** — a derived, key-stable endpoint
+    /// id + the configured relay — so there is no admin-online coupling: routing
+    /// resolves it straight from the reliably-replicated admin doc instead of
+    /// importing the owner's per-member self-doc namespace (which the data plane
+    /// black-holed on whenever that fragile per-namespace sync gapped). `None` =
+    /// legacy member that hasn't announced one yet (falls back to the owner's
+    /// self-doc, then the shared `vpn/` table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_endpoint: Option<String>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -336,6 +348,7 @@ impl PeersStore {
                 netdoc_author: None,
                 self_doc: None,
                 vip: None,
+                vpn_endpoint: None,
                 sandbox,
             });
         }
