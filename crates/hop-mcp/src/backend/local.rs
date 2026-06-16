@@ -43,7 +43,7 @@ impl LocalBackend {
         let (host_id_bytes, relay_url) = resolve_target(&self.config_dir, host)?;
 
         // Send MuxConnect (bincode IPC)
-        write_ipc(&mut ipc, &IpcMuxConnect { host_id: host_id_bytes, relay_url }).await?;
+        write_ipc(&mut ipc, &IpcMuxConnect { host_id: host_id_bytes, relay_url, evict_first: false }).await?;
 
         // Read MuxResult
         let result: IpcMuxResult = read_ipc(&mut ipc).await?;
@@ -144,6 +144,13 @@ impl LocalBackend {
 struct IpcMuxConnect {
     host_id: [u8; 32],
     relay_url: Option<String>,
+    /// Must mirror `hop-cli`'s `mux::MuxConnect` field-for-field: the daemon mux
+    /// service decodes the IPC frame as `MuxConnect` via **bincode**, which is not
+    /// self-describing — a missing trailing field is a hard decode error, not a
+    /// `serde(default)`. The JS/MCP exec path never reconnect-evicts, so this is
+    /// always `false`; it exists solely to keep the wire layout in lockstep.
+    #[serde(default)]
+    evict_first: bool,
 }
 
 #[derive(serde::Deserialize)]
