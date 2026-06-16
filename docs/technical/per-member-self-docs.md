@@ -59,6 +59,14 @@ reliably (every node holds the full roster).
   `refresh_vpn_peer_ips` seeds the ingress map from it. **Zero per-member-namespace
   dependency on the data path.**
 
+**MagicDNS names too.** `lookup_name` had the same fragility — it scanned the
+`name/<name>` entry across the main doc + imported self-docs, so a peer's `*.hop`
+name didn't resolve until its `name/` entry synced (the `vpn-e2e` MagicDNS-name
+flake). The roster already carries each peer's **name** *and* **vip** (both
+admin-authored), so `lookup_name` now resolves name→vip from the roster first
+(bare-label, case-insensitive), `name/` scan as the legacy fallback. Verified by
+`lookup_name_resolves_via_roster`.
+
 **Security is unchanged.** A member can only set *its own* endpoint string
 (the admin records it keyed to the member's authenticated node-id; addr→owner
 stays the admin-allocated `peer/N.vip`) — the *same* property the self-doc model

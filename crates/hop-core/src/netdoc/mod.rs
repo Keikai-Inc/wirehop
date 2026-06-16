@@ -1692,7 +1692,26 @@ impl NetDoc {
     /// self-doc. Self-doc coverage grows as the node syncs/routes to peers; a
     /// not-yet-imported member's name won't resolve until its self-doc lands.
     pub async fn lookup_name(&self, name: &str) -> Result<Option<std::net::Ipv4Addr>> {
-        let key = format!("name/{}", name.to_lowercase());
+        let q = name.to_lowercase();
+
+        // Roster-first (reliable): the admin doc carries each peer's name AND its
+        // admin-allocated vip — both admin-authored (validated under enforce, so a
+        // member can't forge another's) and replicated on the one document every
+        // node syncs. Resolve name→vip straight from the roster so MagicDNS doesn't
+        // wait on the owner's per-member `name/` self-doc entry converging (the
+        // same fragility the endpoint roster move fixed). Match the bare host label
+        // the way `register_name` does (lowercased, DNS suffix stripped).
+        for peer in self.list_peers().await.unwrap_or_default() {
+            let label = peer.name.split('.').next().unwrap_or(&peer.name).to_lowercase();
+            if label == q
+                && let Some(vip) = peer.vip.as_deref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            {
+                tracing::debug!("netdoc: name {q} resolved via roster peer.name → {vip}");
+                return Ok(Some(vip));
+            }
+        }
+
+        let key = format!("name/{}", q);
         let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
 
         // [main doc] then [each imported member self-doc].
@@ -3204,6 +3223,30 @@ mod tests {
             Some(vpn_id),
             "egress must resolve via the admin-vouched roster vpn_endpoint (no self-doc needed)"
         );
+    }
+
+    /// MagicDNS resolves from the roster (`peer.name` → `peer.vip`) with NO
+    /// `name/` doc entry and no self-doc — so name resolution doesn't wait on the
+    /// owner's per-member self-doc converging. Case-insensitive, bare-label match.
+    #[tokio::test]
+    async fn lookup_name_resolves_via_roster() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let addr: std::net::Ipv4Addr = "100.64.5.5".parse().unwrap();
+        let mut peer = sample_peer(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "Laptop",
+        );
+        peer.vip = Some(addr.to_string());
+        a.put_peer(&peer).await.unwrap();
+
+        assert_eq!(a.lookup_name("laptop").await.unwrap(), Some(addr), "lowercase query");
+        assert_eq!(a.lookup_name("Laptop").await.unwrap(), Some(addr), "mixed-case query");
+        assert_eq!(a.lookup_name("nope").await.unwrap(), None, "unknown name");
     }
 
     /// MagicDNS for a read-ticket member: B registers its name ONLY in its
