@@ -2,13 +2,57 @@
 
 pub mod netmon;
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use iroh::address_lookup::AddrFilter;
 use iroh::endpoint::{Connection, QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
+
+/// True if `ip` falls in hop's VPN overlay range (`100.64.0.0/10`, CGNAT).
+///
+/// Such an address is the VPN *overlay* — reachable only THROUGH the hop tunnel,
+/// never a valid *underlay* transport path. See [`hop_addr_filter`].
+fn is_cgnat_v4(ip: IpAddr) -> bool {
+    match ip {
+        // 100.64.0.0/10 == 100.64.0.0 – 100.127.255.255 (second octet 64..=127).
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Address filter applied to every hop endpoint: drop the VPN overlay range
+/// (`100.64.0.0/10`) from the addresses this node publishes.
+///
+/// The VPN virtual IP lives on the `utun`/TUN device — it is the overlay, only
+/// reachable *through* the hop tunnel. If a node advertises it as an iroh direct
+/// address, peers try to hole-punch to each other through the tunnel itself (a
+/// routing loop: the target IP routes straight back into `100.64.0.0/10` → utun).
+/// Those dead/loop paths pile up against `max_concurrent_multipath_paths`, so
+/// after a network change iroh can't establish the real new path ("maximum number
+/// of concurrent paths reached") and the connection can't migrate — which flapped
+/// the control/session (hop/3) connections. Relays, real IPs, and custom
+/// transports pass through unchanged.
+fn hop_addr_filter() -> AddrFilter {
+    AddrFilter::new(|addrs: &BTreeSet<TransportAddr>| {
+        addrs
+            .iter()
+            .filter(|a| match a {
+                TransportAddr::Ip(sa) => !is_cgnat_v4(sa.ip()),
+                // Relays + custom transports (the enum is #[non_exhaustive]): keep.
+                _ => true,
+            })
+            .cloned()
+            .collect()
+    })
+}
 
 /// Hop's own relay server.
 pub const HOP_RELAY_URL: &str = "https://relay.keik.ai";
@@ -85,6 +129,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
+        .addr_filter(hop_addr_filter())
         .alpns(vec![ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
@@ -113,6 +158,7 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
+        .addr_filter(hop_addr_filter())
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
@@ -155,6 +201,7 @@ pub async fn create_netdoc_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .secret_key(secret_key)
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
+        .addr_filter(hop_addr_filter())
         .bind()
         .await
         .context("Failed to bind netdoc endpoint")?;
@@ -245,4 +292,50 @@ pub fn negotiated_protocol_version(conn: &Connection) -> u8 {
 /// Get the EndpointId (public key) of an endpoint.
 pub fn endpoint_id(endpoint: &Endpoint) -> EndpointId {
     endpoint.id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn cgnat_range_detection() {
+        let cg = |s: &str| is_cgnat_v4(s.parse().unwrap());
+        // Inside 100.64.0.0/10 (the VPN overlay) — must be filtered.
+        assert!(cg("100.64.0.0"));
+        assert!(cg("100.93.75.76")); // the address observed looping in the wild
+        assert!(cg("100.127.255.255"));
+        assert!(cg("100.100.1.1"));
+        // Just outside the /10 — must NOT be filtered.
+        assert!(!cg("100.63.255.255"));
+        assert!(!cg("100.128.0.0"));
+        assert!(!cg("99.64.0.1"));
+        assert!(!cg("10.0.0.1"));
+        assert!(!cg("136.38.27.175")); // a real public peer addr from the same trace
+        assert!(!cg("127.0.0.1"));
+        // IPv6 is never in the (IPv4-only) VPN range.
+        assert!(!is_cgnat_v4("2605:a601:a9dd:ee00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn addr_filter_drops_only_vpn_ips() {
+        let mk_ip = |s: &str| {
+            let sa: SocketAddr = format!("{s}:51820").parse().unwrap();
+            TransportAddr::Ip(sa)
+        };
+        let relay = TransportAddr::Relay(HOP_RELAY_URL.parse().unwrap());
+        let vpn = mk_ip("100.93.75.76"); // overlay — drop
+        let public = mk_ip("136.38.27.175"); // real — keep
+        let lan = mk_ip("192.168.1.10"); // real — keep
+
+        let input: BTreeSet<TransportAddr> =
+            [relay.clone(), vpn.clone(), public.clone(), lan.clone()].into_iter().collect();
+        let kept = hop_addr_filter().apply(&input);
+
+        assert!(kept.contains(&relay), "relay must survive");
+        assert!(kept.contains(&public), "public IP must survive");
+        assert!(kept.contains(&lan), "LAN IP must survive");
+        assert!(!kept.contains(&vpn), "VPN overlay IP must be filtered out");
+    }
 }

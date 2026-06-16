@@ -42,6 +42,19 @@ Rationale:
 - **3s keepalive**: aggressive enough for responsive detection, light enough for metered links.
 - **300ms initial RTT**: prevents aggressive retransmission on cellular before QUIC measures actual RTT.
 
+### Address filter — never advertise the VPN overlay IP
+
+Every hop endpoint (host, client, netdoc) sets an iroh `addr_filter` (`hop_addr_filter`)
+that **drops the VPN overlay range `100.64.0.0/10` from the addresses it publishes**.
+The VPN virtual IP lives on the `utun`/TUN device — it is the *overlay*, reachable
+only *through* the hop tunnel. If a node advertised it as an iroh direct address,
+peers would try to hole-punch to each other through the tunnel itself — a routing
+loop (the target IP routes straight back into `utun`). Those dead/loop paths pile up
+against `max_concurrent_multipath_paths`, so after a network change iroh can't
+establish the real new path (`maximum number of concurrent paths reached`) and the
+connection can't migrate — which flapped the control/session (hop/3) connections.
+Relays, real IPs, and custom transports pass through unchanged.
+
 ## Relay URL
 
 hop uses a single custom relay server:
