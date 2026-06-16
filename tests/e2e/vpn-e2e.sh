@@ -329,10 +329,22 @@ if [ "$RC" = "0" ]; then
       if docker exec hop-vpn-b ping -c 5 -W 3 "$VIP_A"; then PING_OK=1; break; fi
       echo "  (re-ping attempt $attempt failed; settling 5s)"; sleep 5
     done
-    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$VPNUP_AFTER" -gt "$VPNUP_BEFORE" ] 2>/dev/null && [ "$PING_OK" = "1" ]; then
-        echo "REBOOT TEST PASSED: same warren reopened, VPN re-enabled, routing intact (privsep restart releases the datastore lock cleanly)."
+    # Layer 3 (one-worker clean handoff): a restart must release the datastore lock
+    # and bring up the successor without the old and new workers overlapping. The
+    # fingerprint of overlap is a redb lock-contention error ("Database already
+    # open"); with the lock-before-endpoint guard a successor that can't get the
+    # lock exits before binding the node-id, so it can neither collide at the relay
+    # nor spam this error. Assert there were ZERO such errors across the restart.
+    LOCK_ERRS=$(count_in_b 'Database already open')
+    if [ "$NS_BEFORE" = "$NS_AFTER" ] && [ "$VPNUP_AFTER" -gt "$VPNUP_BEFORE" ] 2>/dev/null \
+       && [ "$PING_OK" = "1" ] && [ "$LOCK_ERRS" = "0" ] 2>/dev/null; then
+        echo "REBOOT TEST PASSED: same warren reopened, VPN re-enabled, routing intact, clean datastore-lock handoff (no worker overlap)."
     else
-        echo "REBOOT TEST FAILED."
+        echo "REBOOT TEST FAILED (ns_match=$([ "$NS_BEFORE" = "$NS_AFTER" ] && echo y || echo n) vpn_up=$VPNUP_AFTER/$VPNUP_BEFORE ping=$PING_OK lock_errs=$LOCK_ERRS)."
+        if [ "$LOCK_ERRS" != "0" ]; then
+            echo "--- datastore lock-contention (worker overlap) ---"
+            docker exec hop-vpn-b grep -a 'Database already open' /cfg/log | tail -5 || true
+        fi
         docker exec hop-vpn-b cat /cfg/log | tail -30 || true
         RC=1
     fi

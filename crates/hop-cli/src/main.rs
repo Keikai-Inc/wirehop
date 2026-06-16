@@ -442,6 +442,26 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     hop_core::privsep::spawn_monitor_liveness_watcher();
     let public_key = secret_key.public();
     let secrets_key = hop_core::datastore::derive_secrets_key(&secret_key.to_bytes());
+
+    // One-worker guard (Layer 3): acquire the datastore lock BEFORE binding the
+    // iroh endpoint. redb takes an exclusive file lock on open; if another live
+    // worker still holds it, fail here and exit WITHOUT ever binding the endpoint.
+    // Binding first (the old order) briefly put a second endpoint with this
+    // machine's node-id on the relay while a predecessor was still alive, and the
+    // relay prune-storms the two against each other — the collision that interrupts
+    // netdoc sync and black-holes the VPN until a human restarts. The lock is what
+    // guarantees exactly one worker owns the node-id, so it must come first.
+    let ds_path = config_dir.join("datastore.redb");
+    let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)
+        .with_context(|| {
+            format!(
+                "could not open datastore at {} — another hop host is already running and holds \
+                 the lock. Refusing to start a second worker (it would collide this machine's \
+                 node-id at the relay). If no daemon is running, remove a stale lock and retry.",
+                ds_path.display()
+            )
+        })?;
+
     // Derive the netdoc endpoint key before the host secret is moved into the
     // host endpoint. The netdoc stack runs on its own isolated endpoint.
     let netdoc_key = net::derive_netdoc_secret_key(&secret_key);
@@ -898,9 +918,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         });
     }
 
-    // Open datastore once; share with socket listener, cron scheduler, and admin handler
-    let ds_path = config_dir.join("datastore.redb");
-    let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)?;
+    // (datastore was opened at the top of cmd_host — its lock is the one-worker
+    // guard that must be held before the endpoint is bound. Shared below with the
+    // socket listener, cron scheduler, and admin handler.)
 
     // Discover hop extensions installed on this host. The registry only
     // loads manifests at startup; connections to each extension's IPC

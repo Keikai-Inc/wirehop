@@ -147,6 +147,36 @@ sends no CLOSE frame). The outbound loop therefore:
   that with no inbound datagram it's treated as silently-dead and redialed.
   Closed connections are reaped during the keepalive pass.
 
+**Reliability under partial netdoc sync (degrade-don't-die).** The data plane
+depends on the replicated roster, but iroh-docs syncs entry *keys* and *blob
+content* separately — content can lag (or an interrupted sync can leave an entry
+key present with its content missing, `entity not found`). Three layers keep a
+transient gap from black-holing the tunnel rather than only degrading it:
+
+- **Read-path resilience.** `list_prefix` skips a single entry whose content
+  hasn't synced (or is malformed) instead of failing the whole read — one lagging
+  blob never empties the roster. `refresh_vpn_peer_ips` keeps the
+  last-known-good ingress map on a roster read error or an empty computed map
+  (a transient gap can't wipe working routes). Egress resolution
+  (`lookup_vpn_endpoint`) falls through to the vIP owner's **node-id** when no
+  endpoint blob is available, and `vpn_reach_allowed` **fails open** on a roster
+  read error — safe because delivery is still gated by endpoint resolution (an
+  unknown vIP has no endpoint and is dropped there, so fail-open can't reach a
+  non-member).
+- **Active content heal.** `ensure_content_synced` (slow periodic sweep + on the
+  unauthenticated-ingress signal) finds roster entries whose blob content is
+  missing locally and re-fetches it from a current doc sync peer via the
+  iroh-blobs `Downloader`. Plain re-sync won't do this (no entry diff once the
+  key reconciled). Strictly best-effort: it only *adds* missing content, so it
+  can never regress the data plane; a cheap no-op once everything is present.
+- **One worker owns the node-id.** `cmd_host` acquires the datastore's exclusive
+  lock **before** binding the iroh endpoint. A successor that can't get the lock
+  (a predecessor is still alive — e.g. an overlapping restart/upgrade) exits
+  *before* binding, so it can never put a second endpoint with this machine's
+  node-id on the relay. Two endpoints sharing a node-id get prune-stormed by the
+  relay, which is what interrupts sync and strands content in the first place;
+  the lock is the guarantee that exactly one worker exists.
+
 **Off by default, fail-safe.** As of v0.6.37 the VPN is off unless explicitly
 enabled (`--host` / `HOP_VPN=1` / `hop config set vpn on`) — the default was
 reverted while the warren's write-authorization trust model is hardened (see

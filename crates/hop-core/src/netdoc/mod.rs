@@ -1054,14 +1054,16 @@ impl NetDoc {
         }
 
         // Fallback 1: the shared `vpn/` table (legacy / self-doc not yet imported).
-        if let Some(entry) = self.doc.get_one(mk_query()).await.context("get_one vpn")?
+        // Best-effort: a doc read error or a not-yet-synced blob must fall THROUGH
+        // to the node-id fallback below, never abort the whole lookup (which would
+        // black-hole egress that the node-id fallback could have resolved).
+        if let Ok(Some(entry)) = self.doc.get_one(mk_query()).await
             && entry.content_len() > 0
+            && let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await
+            && let Some(v) = parse_vpn_endpoint_value(&bytes)
         {
-            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
-            if let Some(v) = parse_vpn_endpoint_value(&bytes) {
-                tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
-                return Ok(Some(v));
-            }
+            tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
+            return Ok(Some(v));
         }
 
         // Fallback 2: the vIP OWNER's node-id alone. We already know who owns this
@@ -1127,7 +1129,20 @@ impl NetDoc {
         // (`peer/N.vpn_endpoint`) keyed by the addr it owns — the reliable ingress
         // source that doesn't depend on the member's self-doc namespace syncing.
         let mut roster_endpoints: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
-        for peer in self.list_peers().await.unwrap_or_default() {
+        // A roster READ failure (doc-level, not a missing blob — those are skipped
+        // per-entry in `list_prefix`) must keep the last-known-good ingress map, not
+        // rebuild from an empty roster and overwrite working routes. Bail; the next
+        // tick retries.
+        let peers = match self.list_peers().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "netdoc refresh: list_peers failed ({e:#}); keeping last-known-good vpn_peer_ips"
+                );
+                return;
+            }
+        };
+        for peer in peers {
             if let Some(vip) = peer.vip.as_deref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()) {
                 ip_owner.insert(vip, peer.node_id.clone());
                 if let Some(val) = peer.vpn_endpoint.as_deref()
@@ -1215,7 +1230,93 @@ impl NetDoc {
             map.iter().map(|(id, a)| format!("{}→{a}", &id[..10.min(id.len())])).collect::<Vec<_>>(),
             ip_owner.len()
         );
+        // Never discard a working ingress map because this refresh came up empty —
+        // that's almost always a transient sync gap (blob content not yet
+        // re-fetched), not a genuine "zero peers". Keep last-known-good; Layer 2's
+        // content re-fetch + the next refresh rebuild it. (A node that legitimately
+        // drops to zero peers keeps a few stale endpoint→vIP entries, which is
+        // harmless: a departed endpoint-id can no longer connect.)
+        if map.is_empty() {
+            let prev_len = self.vpn_peer_ips.read().await.len();
+            if prev_len > 0 {
+                tracing::warn!(
+                    "netdoc refresh: computed empty vpn_peer_ips but {prev_len} route(s) known — \
+                     keeping last-known-good (transient sync gap)"
+                );
+                return;
+            }
+        }
         *self.vpn_peer_ips.write().await = map;
+    }
+
+    /// Layer 2 — active self-heal of missing blob content. iroh-docs downloads an
+    /// entry's content only while reconciling a *changed* entry; if a download was
+    /// interrupted (e.g. a connection churned mid-sync) the entry key is present
+    /// but `get_bytes` returns `NotFound`, and plain re-sync never re-fetches it
+    /// (no entry diff). This sweep finds such gaps in the roster prefixes and pulls
+    /// the content from a current sync peer (who holds it).
+    ///
+    /// STRICTLY best-effort: every failure is logged and swallowed. It can only
+    /// *add* missing content — never remove, deny, or block — so it can't regress
+    /// the data plane beyond Layer 1's last-known-good behavior. A no-op (cheap)
+    /// once everything is present.
+    #[cfg(unix)]
+    pub async fn ensure_content_synced(&self) {
+        // Providers: the peers we're actively syncing the doc with — they hold the
+        // content and the endpoint already knows how to reach them. None → nothing
+        // to fetch from yet.
+        let providers: Vec<iroh::PublicKey> = match self.doc.get_sync_peers().await {
+            Ok(Some(peers)) => peers
+                .iter()
+                .filter_map(|b| iroh::PublicKey::from_bytes(b).ok())
+                .collect(),
+            _ => return,
+        };
+        if providers.is_empty() {
+            return;
+        }
+
+        // Find roster entries whose content hasn't landed locally yet.
+        let mut missing: std::collections::HashSet<iroh_blobs::Hash> = std::collections::HashSet::new();
+        for prefix in [KEY_PEER_PREFIX, KEY_IP_PREFIX, KEY_VPN_PREFIX] {
+            let Ok(stream) = self.doc.get_many(Query::key_prefix(prefix.as_bytes()).build()).await
+            else {
+                continue;
+            };
+            let mut stream = std::pin::pin!(stream);
+            while let Some(Ok(entry)) = stream.next().await {
+                if entry.content_len() == 0 {
+                    continue; // tombstone — no content expected
+                }
+                let hash = entry.content_hash();
+                if self.fs_store.get_bytes(hash).await.is_err() {
+                    missing.insert(hash);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+
+        tracing::warn!(
+            "netdoc: {} roster blob(s) missing content locally — re-fetching from {} sync peer(s)",
+            missing.len(),
+            providers.len()
+        );
+        let downloader = iroh_blobs::api::downloader::Downloader::new(&self.fs_store, &self.endpoint);
+        for hash in missing {
+            let dl = downloader.download(
+                hash,
+                iroh_blobs::api::downloader::Shuffled::new(providers.clone()),
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(20), dl).await {
+                Ok(Ok(())) => tracing::debug!("netdoc: re-fetched missing content {hash}"),
+                Ok(Err(e)) => tracing::debug!("netdoc: content re-fetch for {hash} failed: {e:#}"),
+                Err(_) => tracing::debug!("netdoc: content re-fetch for {hash} timed out"),
+            }
+        }
+        // Freshly-fetched content is now readable — nudge a refresh to pick it up.
+        self.vpn_refresh.notify_one();
     }
 
     // ── Host tags + role-derived reach (Steps 3 & 5) ─────────────────────
@@ -1322,8 +1423,18 @@ impl NetDoc {
         let ips = match self.list_virtual_ips().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("reach DENY {src_ip}->{dst_ip}: list_virtual_ips failed: {e:#}");
-                return false;
+                // Fail OPEN on a roster READ error (a doc-level failure — missing
+                // blobs are skipped per-entry, not errors). Hard-denying all egress
+                // over a transient read is the "dead until restart" footgun. Safe:
+                // delivery is still gated by lookup_vpn_endpoint (an unknown vIP has
+                // no endpoint → dropped there), so fail-open can't reach a
+                // non-member. Kick a refresh and allow.
+                tracing::warn!(
+                    "reach ALLOW(read-error) {src_ip}->{dst_ip}: list_virtual_ips failed ({e:#}) — \
+                     refreshing rather than blackholing"
+                );
+                self.vpn_refresh.notify_one();
+                return true;
             }
         };
         let owner = |ip: std::net::Ipv4Addr| ips.iter().find(|(a, _)| *a == ip).map(|(_, n)| n.clone());
@@ -1533,6 +1644,19 @@ impl NetDoc {
                 }
             });
         }
+        // Layer 2: a slow content-heal sweep that re-fetches any roster blob whose
+        // content didn't land (interrupted sync) so a member never stays
+        // unreachable waiting for the next entry change or a restart. Best-effort
+        // and a cheap no-op once everything is present.
+        {
+            let me = std::sync::Arc::clone(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    me.ensure_content_synced().await;
+                }
+            });
+        }
         // On-demand refresh: `VpnInbound` signals when a packet arrives from a
         // peer it can't yet authenticate (e.g. just after that peer rebooted and
         // re-registered). Refresh immediately so reconvergence doesn't wait for
@@ -1545,6 +1669,10 @@ impl NetDoc {
                 loop {
                     notify.notified().await;
                     me.refresh_vpn_peer_ips().await;
+                    // An unauthenticated-ingress signal often means a peer's content
+                    // hasn't synced — kick a content-heal so it converges now, not on
+                    // the slow tick. Best-effort; no-op if nothing is missing.
+                    me.ensure_content_synced().await;
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
@@ -2327,8 +2455,20 @@ impl NetDoc {
             if !self.validate_entry(entry.key(), entry.author()) {
                 continue;
             }
-            if let Some(value) = self.decode_entry::<T>(&entry).await? {
-                out.push(value);
+            // Per-entry resilience (Layer 1): a single entry whose blob content
+            // hasn't synced yet (`entity not found`) — or a malformed value — must
+            // NOT fail the whole prefix read. Failing here empties the roster and
+            // black-holes the VPN over one lagging entry; instead skip it (Layer 2
+            // re-fetches missing content) and return everything else.
+            match self.decode_entry::<T>(&entry).await {
+                Ok(Some(value)) => out.push(value),
+                Ok(None) => {} // tombstone
+                Err(e) => {
+                    tracing::warn!(
+                        "netdoc: skipping entry {} under prefix {prefix}: {e:#}",
+                        String::from_utf8_lossy(entry.key())
+                    );
+                }
             }
         }
         Ok(out)
@@ -3235,6 +3375,60 @@ mod tests {
             resolved.map(|(pk, _)| pk),
             Some(vpn_id),
             "egress must resolve via the admin-vouched roster vpn_endpoint (no self-doc needed)"
+        );
+    }
+
+    /// Layer 1: egress resolution falls through to the vIP owner's node-id when the
+    /// member published neither a roster `vpn_endpoint`, a self-doc, nor a shared
+    /// `vpn/` entry — so a doc/blob sync gap can't black-hole reachable traffic that
+    /// the node-id fallback could dial.
+    #[tokio::test]
+    async fn lookup_vpn_endpoint_falls_back_to_owner_node_id() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        let peer_ep = test_endpoint().await;
+        let peer_id = peer_ep.id();
+        let addr: std::net::Ipv4Addr = "100.64.9.9".parse().unwrap();
+        let mut peer = sample_peer(&peer_id.to_string(), "P");
+        peer.vip = Some(addr.to_string());
+        a.put_peer(&peer).await.unwrap();
+        // Deliberately publish NO vpn_endpoint, NO self-doc, NO shared vpn/ entry.
+
+        let resolved = a.lookup_vpn_endpoint(addr).await.expect("lookup ok");
+        assert_eq!(
+            resolved.map(|(pk, _)| pk),
+            Some(peer_id),
+            "egress must fall back to the vIP owner's node-id when no endpoint is published"
+        );
+    }
+
+    /// Layer 1: a refresh that computes an empty roster (a transient sync gap — e.g.
+    /// blob content not yet re-fetched) must NOT wipe the working ingress map. The
+    /// VPN keeps routing on last-known-good rather than black-holing until restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_keeps_last_known_good_when_roster_empties() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        a.record_founder_anchor(None);
+
+        // Seed a known-good ingress route, as a prior successful refresh would have.
+        let addr: std::net::Ipv4Addr = "100.64.3.3".parse().unwrap();
+        a.vpn_peer_ips.write().await.insert("deadbeef".to_string(), addr);
+
+        // The doc has no peer/ip/vpn entries → this refresh computes an empty map.
+        a.refresh_vpn_peer_ips().await;
+
+        assert_eq!(
+            a.vpn_peer_ips.read().await.get("deadbeef"),
+            Some(&addr),
+            "an empty refresh must keep the last-known-good route, not wipe it"
         );
     }
 
