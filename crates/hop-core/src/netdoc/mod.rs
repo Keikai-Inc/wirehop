@@ -1801,15 +1801,55 @@ impl NetDoc {
         // while the first reply is still in flight. Otherwise we re-dial. Both ends
         // run this, so a silently-dead path recovers on whichever side is sending.
         const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
-        const DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+        // Cold-reconnect window: a freshly-dialed connection — especially a
+        // relay-only path re-established with no founder online (the no-admin
+        // case) — needs time to validate a path before the first keepalive/reply
+        // arrives. Keep using it until then instead of redialing; redialing
+        // mid-establishment was the reconnect storm that prevented any connection
+        // from ever stabilizing.
+        const DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        // App-level keepalive: every KEEPALIVE_INTERVAL send a heartbeat datagram
+        // to each peer connection. Keeps the QUIC path validated/warm and the
+        // remote's `last_rx` fresh, so a live-but-idle connection is never
+        // mistaken for silently-dead and redialed (the original rationale for
+        // multipath — a failover lands on an already-warm path). Both ends run
+        // this, so the liveness signal stays bidirectional.
+        const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         let mut buf = vec![0u8; 65535];
+        let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let n = match tun.recv(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!("vpn: TUN read error, stopping forwarder: {e}");
-                    break;
+            let n = tokio::select! {
+                _ = keepalive.tick() => {
+                    let hb = bytes::Bytes::from_static(crate::vpn::VPN_KEEPALIVE);
+                    // Warm every live connection; reap closed ones in the same
+                    // pass so dead entries don't linger in the caches until the
+                    // next send error.
+                    conns.retain(|_, (conn, _)| {
+                        if conn.close_reason().is_none() {
+                            let _ = conn.send_datagram(hb.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    self.vpn_conns.write().await.retain(|_, conn| {
+                        if conn.close_reason().is_none() {
+                            let _ = conn.send_datagram(hb.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    continue;
                 }
+                r = tun.recv(&mut buf) => match r {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("vpn: TUN read error, stopping forwarder: {e}");
+                        break;
+                    }
+                },
             };
             let pkt = &buf[..n];
             let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
@@ -1902,11 +1942,23 @@ impl NetDoc {
                 },
             };
             if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(pkt)) {
-                tracing::debug!("vpn: send_datagram failed: {e}");
-                conns.remove(&pubkey);
-                let mut shared = self.vpn_conns.write().await;
-                if shared.get(&pubkey.to_string()).map(|c| c.stable_id()) == Some(conn.stable_id()) {
-                    shared.remove(&pubkey.to_string());
+                // Only abandon the connection if it's genuinely CLOSED. A
+                // transient send failure — no validated path yet on a
+                // freshly-dialed multipath connection, or an over-MTU packet —
+                // must NOT tear it down: doing so dropped the connection on the
+                // first packet and the next packet redialed, a tight storm that
+                // never let any connection finish establishing (the no-admin
+                // reconnect failure). A live connection recovers on its own; a
+                // truly-dead one is caught by the rx-staleness gate + keepalive.
+                if conn.close_reason().is_some() {
+                    tracing::debug!("vpn: connection to {pubkey} closed ({e}); dropping from cache");
+                    conns.remove(&pubkey);
+                    let mut shared = self.vpn_conns.write().await;
+                    if shared.get(&pubkey.to_string()).map(|c| c.stable_id()) == Some(conn.stable_id()) {
+                        shared.remove(&pubkey.to_string());
+                    }
+                } else {
+                    tracing::trace!("vpn: transient send failure to {pubkey} ({e}); keeping connection");
                 }
             }
         }

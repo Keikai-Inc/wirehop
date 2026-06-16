@@ -122,6 +122,31 @@ an as-yet-unknown peer, so a node that just rebooted reconverges quickly. This
 closes the prior gap where any node could inject packets with a spoofed source
 vIP.
 
+**Connection liveness — keepalive + stable redial.** The data plane runs on
+QUIC datagrams, which return `Ok` on send even over a dead path, so
+`close_reason()` alone never detects a silently-dead connection (a rebooted peer
+sends no CLOSE frame). The outbound loop therefore:
+
+- **Keepalive (every 5 s):** sends a `VPN_KEEPALIVE` heartbeat datagram (a
+  non-IP marker — leading `0xFF`, so it can never be injected to the TUN even if
+  the ingress marker check is bypassed) to every peer connection. This keeps the
+  QUIC path validated/warm and the remote's `last_rx` fresh, so a *live-but-idle*
+  connection is never mistaken for dead and redialed. It's also what makes a
+  multipath failover land on an already-warm path rather than cold-validating a
+  new one.
+- **No teardown on transient send failure:** a `send_datagram` error drops the
+  connection from the cache **only if `close_reason().is_some()`** (genuinely
+  closed). A transient failure — no validated path yet on a freshly-dialed
+  multipath connection, or an over-MTU packet — is kept. Tearing down on the
+  first failed packet previously caused a redial storm (drop → next packet
+  redials → drop → …) that prevented any cold connection from finishing
+  establishment (the no-admin-online reconnect failure).
+- **Liveness-gated reuse:** a connection is reused while it's open and either
+  `last_rx` is fresh (within `STALE_AFTER` = 20 s, i.e. ≤4 missed heartbeats) or
+  it was dialed within `DIAL_GRACE` = 30 s (the cold-reconnect window). Past
+  that with no inbound datagram it's treated as silently-dead and redialed.
+  Closed connections are reaped during the keepalive pass.
+
 **Off by default, fail-safe.** As of v0.6.37 the VPN is off unless explicitly
 enabled (`--host` / `HOP_VPN=1` / `hop config set vpn on`) — the default was
 reverted while the warren's write-authorization trust model is hardened (see

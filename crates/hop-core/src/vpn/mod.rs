@@ -12,6 +12,14 @@ use std::net::Ipv4Addr;
 /// ALPN for the VPN packet plane (QUIC datagrams carrying L3 IP packets).
 pub const VPN_ALPN: &[u8] = b"hop/vpn/1";
 
+/// Keepalive heartbeat datagram. Sent periodically to every peer connection to
+/// keep the QUIC path validated/warm and the remote's `last_rx` fresh, so a
+/// live-but-idle connection is never mistaken for silently-dead and redialed.
+/// The leading `0xFF` is not a valid IP version (4/6), so even if the marker
+/// check is bypassed the ingress IP-parse rejects it safely (never injected to
+/// the TUN).
+pub const VPN_KEEPALIVE: &[u8] = b"\xffhKA1";
+
 /// TUN MTU. QUIC's effective datagram payload (~1232B after framing) bounds
 /// this; 1280 leaves headroom and matches the IPv6 minimum-MTU convention.
 pub const VPN_MTU: u16 = 1280;
@@ -324,6 +332,13 @@ pub async fn pump_vpn_datagrams(
         // alive right now. The outbound forwarder uses this to tell a working
         // pooled connection from a silently-dead one and recover from the latter.
         last_rx.write().await.insert(remote.clone(), std::time::Instant::now());
+        // Keepalive heartbeat: it already served its purpose (the `last_rx`
+        // update above proves the path is live). Don't try to parse it as an IP
+        // packet — skip cleanly so it never triggers a spurious refresh or TUN
+        // write.
+        if dg.as_ref() == VPN_KEEPALIVE {
+            continue;
+        }
         // Look up the peer's authorized vIP *per datagram* (not once up front)
         // so a refresh mid-connection — e.g. after the peer reboots and
         // re-registers — takes effect without dropping the connection.
@@ -404,6 +419,19 @@ mod tests {
         let p = ipv4([100, 64, 0, 1], [100, 64, 7, 42]);
         assert_eq!(parse_dest_ipv4(&p), Some(Ipv4Addr::new(100, 64, 7, 42)));
         assert_eq!(parse_src_ipv4(&p), Some(Ipv4Addr::new(100, 64, 0, 1)));
+    }
+
+    #[test]
+    fn keepalive_marker_is_not_a_valid_ip_packet() {
+        // Defense in depth: even if the explicit marker check in
+        // `pump_vpn_datagrams` were bypassed, the heartbeat must never parse as
+        // an IP packet — so it can't be injected into the TUN or pass the
+        // source-vIP anti-spoof check. Its leading byte is not IPv4 (0x4_) or
+        // IPv6 (0x6_).
+        assert_eq!(parse_src_ipv4(VPN_KEEPALIVE), None);
+        assert_eq!(parse_dest_ipv4(VPN_KEEPALIVE), None);
+        assert_ne!(VPN_KEEPALIVE[0] >> 4, 4);
+        assert_ne!(VPN_KEEPALIVE[0] >> 4, 6);
     }
 
     #[test]
