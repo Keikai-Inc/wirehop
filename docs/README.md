@@ -12,7 +12,7 @@ What hop does — user-facing behavior, CLI commands, JS APIs.
 | [orchestration.md](product/orchestration.md) | Secrets store, HTTP binding, OAuth proxy, email monitoring |
 | [js-api.md](product/js-api.md) | Complete `hop.*` JS runtime reference (all bindings) |
 | [datastore.md](product/datastore.md) | KV, time-series, cron scheduling, secrets, retention |
-| [fleet.md](product/fleet.md) | Fleet management, roles, aggregate invites |
+| [fleet.md](product/fleet.md) | Fleet management = your warren at scale — RBAC roles, tags, aggregate invites over replicated (no-orchestrator) membership |
 | [warren.md](product/warren.md) | **(Product design)** The warren — hop's zero-config private network: client vs node, role-is-the-access model, onboarding, roadmap |
 | [warren-gaps.md](product/warren-gaps.md) | **(Living)** Consistency gaps between the warren docs and the implementation, triaged (resolved-by-decision / doc-fix / open work) |
 | [transfer.md](product/transfer.md) | `hop cp`, `hop sync`, delta transfer, compression |
@@ -35,11 +35,9 @@ How hop works — protocols, algorithms, internal architecture.
 | [transfer.md](technical/transfer.md) | Delta algorithm, negotiation, privilege-separated helper |
 | [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |
 | [networking.md](technical/networking.md) | iroh endpoint, relay, netmon, **warren netdoc + VPN data plane**, agent/mux IPC, reconnection |
-| [p2p-network.md](technical/p2p-network.md) | **(Shipped MVP + design)** Orchestratorless P2P VPN — iroh-docs state, virtual IPs, TUN data plane, MagicDNS, decentralized invites/roles; commercial control plane (Planned) |
-| [acl-vs-tailscale.md](technical/acl-vs-tailscale.md) | **(Comparison)** hop's warren ACL (role→tag reach + OS-sandbox confinement) vs Tailscale's ACL/grants/app-capabilities — distribution, expressiveness, the capability gap |
-| [acl-cedar-plan.md](technical/acl-cedar-plan.md) | **(Shipped)** Cedar standard policy engine, Tailscale-ACL importer, and the closed feature gaps (port/proto, explainability, app capabilities, posture, autogroups) |
-| [security-audit.md](technical/security-audit.md) | **(Action report + remediation status, 2026-06-03)** Source-level security + dead-code audit — write-capable warren ticket, VPN ingress spoofing, sandbox-bypass in transfer/MCP, secrets-at-rest KDF, vestigial code; severities + fixes + what shipped in v0.6.37 and what's **deferred** (C1 write-auth, H8 KDF, H10 root redeem) with rationale |
-| [install-and-invite-tiers.md](technical/install-and-invite-tiers.md) | **(Design / Planned)** Unified one-install convention (client by default; daemon as an on-demand self-upgrade) + explicit invite capability tiers (client / warren-only / node / admin) mapped to customer personas; sequenced against the C1 read/write-ticket work |
-| [per-member-self-docs.md](technical/per-member-self-docs.md) | C1 warren write-isolation: each member owns its own write-isolated iroh-docs namespace for self-state; admin doc holds membership + `peer/N.vip`/`.self_doc`. Foundation + data-plane override shipped; addr→owner authority decision recorded |
-| [per-member-self-docs-3b-plan.md](technical/per-member-self-docs-3b-plan.md) | **(Execution plan)** Fresh-context, phased plan for #3b — read-ticket members + full self-state isolation (admin-allocated `peer/N.vip`), with per-phase e2e gates and the risky steps last |
+| [p2p-network.md](technical/p2p-network.md) | **(Shipped + design)** Orchestratorless P2P VPN — iroh-docs state, virtual IPs, TUN data plane, MagicDNS, decentralized invites/roles, write-isolation (C1); the 13 design decisions + rationale |
+| [acl-vs-tailscale.md](technical/acl-vs-tailscale.md) | **(Comparison + shipped ACL)** hop's warren ACL (role→tag reach via a Cedar policy engine + OS-sandbox confinement) vs Tailscale's ACL/grants/app-capabilities — distribution, expressiveness, the capability gap. (Canonical ACL reference; the Cedar engine + Tailscale-ACL importer shipped.) |
+| [security-audit.md](technical/security-audit.md) | **(Action report + remediation status)** Source-level security + dead-code audit — write-capable warren ticket, VPN ingress spoofing, sandbox-bypass in transfer/MCP, secrets-at-rest KDF; severities + fixes + what shipped and what's still **deferred** (C1 enforce-default flip, H8 KDF, H10 root redeem) with rationale |
+| [install-and-invite-tiers.md](technical/install-and-invite-tiers.md) | **(Largely shipped)** Unified one-install convention (client by default; daemon as an on-demand self-upgrade) + invite capability tiers (client / warren-only / node / admin); the C1 enforce-default flip is the remaining deferred gate |
+| [per-member-self-docs.md](technical/per-member-self-docs.md) | **(Shipped)** C1 warren write-isolation: each member owns a write-isolated iroh-docs namespace for self-state; admin doc holds membership + `peer/N.vip`/`.vpn_endpoint`. Includes the convergence-blocker root-cause analysis |
 | [tap.md](technical/tap.md) | hop-tap internals — eBPF program, CO-RE, off-screen emulator, streaming dispatcher |

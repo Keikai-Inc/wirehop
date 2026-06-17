@@ -101,10 +101,11 @@ working report to act on**, not a sign-off.
 
 **Keep (verified FINE):** `role_reaches` (live in `hop acl check` + Cedar's test oracle); `PeerRole`/`Creator` (load-bearing — gates admin auth, invite TTL, root mapping); all dependencies (no unused deps found, incl. the iroh-docs/gossip/blobs stack); the `eprintln!` logging (intentional, not debug leftovers).
 
-**Doc drift:**
-- `docs/README.md:40` — lists `acl-cedar-plan.md` as "(Planned)"; it's shipped. Update to "(Shipped)".
-- `docs/product/orchestration.md:199` — "OAuth Proxy Flow (`hop auth`) (Planned)" — `hop auth <provider>` is shipped. Drop "(Planned)".
-- The module docstrings in `vpn/mod.rs`/`netdoc/mod.rs` still say the VPN is "experimental / opt-in / off by default" — it is **default-on** (`main.rs:424`). Update to avoid a dangerously misleading security posture.
+**Doc drift (all since resolved):** the drift found here has been corrected — the
+`acl-cedar-plan` doc has been retired as a completed plan (the Cedar engine
+shipped), `orchestration.md`'s `hop auth` "(Planned)" marker was dropped, and the
+VPN module docstrings now match reality: the VPN was reverted to **off by
+default** (P0a below), so "opt-in / off by default" is accurate.
 
 ## Prioritized remediation plan
 

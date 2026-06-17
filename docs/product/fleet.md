@@ -1,46 +1,42 @@
 # Fleet Management
 
-hop supports fleet operations where any `hop host` can act as an orchestrator. Fleet features are integrated -- there is no separate fleet server. Fleet data is stored alongside normal host configuration.
+A fleet in hop is just your **[warren](warren.md)**, managed at scale. Any `hop host` can issue invites and define roles, but there is **no orchestrator and no master member list**: membership, roles, tags, and ACLs live in a **replicated network document** (iroh-docs) that every node holds its own copy of. Fleet features are integrated into `hop host` — there is no separate fleet server.
 
-> **Direction (largely shipped):** the "orchestrator" model below still works as
-> described. Under the [warren](warren.md) it has become mostly decentralized:
-> membership/role/tag state now also lives in a **replicated network document**
-> (iroh-docs) that federates across hosts via a join ticket (`--join` /
-> `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke
-> another's entries. Role definitions and role-based (aggregate) invites are kept
-> and extended (roles now drive warren VPN reach). The one piece still **planned**
-> is making write authority a cryptographic Owner/Admin capability (today the
-> join path hands out an iroh-docs write ticket). See [warren.md](warren.md).
+The warren federates across hosts via a join ticket (carried by `node`/`admin` invites; `--join` / `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke another's entries. Roles drive both host access (RBAC) **and** warren VPN reach. Writes are gated by an admin/owner author binding (C1; see [security-audit.md](../technical/security-audit.md) and [per-member-self-docs.md](../technical/per-member-self-docs.md)) — author validation ships in **observe** mode by default, with **enforce** opt-in (`HOP_NETDOC_VALIDATION`) pending a multi-node federated rollout.
 
 ## Architecture
 
-```
- Orchestrator (hop host)
-   fleet.json              ─── members, tags, heartbeats
-   roles.json              ─── RBAC role definitions
-   aggregate_invites.json  ─── reusable role-based invites
+Membership and policy live in the replicated warren document — every node sees the same view, with no central registry:
 
- Member (hop host)
-   fleet_registrations.json ── one entry per orchestrator
+```
+ Warren network document (iroh-docs, replicated to every node)
+   peer/<node>        ─── members: node id, name, tags, vIP
+   role/<name>        ─── RBAC role definitions (admin-authored)
+   acl/ + tag/        ─── role→tag reach policy + host tags
+   revocation/<node>  ─── tombstones (additive-only)
+
+ Each member also owns a write-isolated self-doc
+   (its own name / tag / posture / endpoint — see per-member-self-docs.md)
 ```
 
-- **Orchestrator**: any hop host that issues fleet invites and manages members
-- **Member**: a hop host registered with an orchestrator via a fleet invite
-- Members store their registration(s) locally; a host can belong to multiple fleets
+- **No orchestrator of record.** Any host with admin rights issues invites and writes roles; the document replicates the result to every node. There is no master copy to keep in sync.
+- **Members** are warren nodes — not "hosts registered with an orchestrator." A read-only mirror (`WarrenSnapshot`) is exported to `warren-members.json` so `hop fleet list/status` works without holding the store open or needing admin rights.
+- Legacy `roles.json` is retained as a human-readable, git-committable source for role definitions (infrastructure-as-code). The old `fleet_registrations.json` is gone; `fleet.json` survives only behind legacy admin handlers.
 
 ## Fleet Members
 
-### FleetMember fields (orchestrator side)
+Members are the warren's `peer/<node>` entries, exported into the read-only `WarrenSnapshot` that `hop fleet` reads.
 
 | Field | Type | Description |
 |---|---|---|
 | `node_id` | string | Member's iroh PublicKey |
 | `hostname` | string | System hostname |
 | `tags` | vec | Grouping labels (e.g. `["web", "production"]`) |
-| `registered_at` | string | Registration timestamp |
-| `last_heartbeat` | string? | Last heartbeat timestamp |
-| `relay_url` | string? | Relay URL for direct connection |
-| `online` | bool | Current connectivity status |
+| `vip` | string? | Warren virtual IP (admin-allocated) |
+| `relay_url` | string? | Relay URL hint for connection |
+| `last_seen` | string? | Liveness from iroh-docs gossip activity |
+
+Liveness comes from gossip (`last_seen`), **not** a polling heartbeat — the old `online` / `last_heartbeat` fields were never wired and have been removed.
 
 ### Tag-Based Grouping
 
@@ -48,22 +44,22 @@ Members are organized by tags. Tags are free-form strings used for targeting fle
 
 ```bash
 # Create a fleet invite with tags
-hop admin <orchestrator> fleet-invite --tags web,production
+hop admin <host> fleet-invite --tags web,production
 
 # List members filtered by tag
-hop admin <orchestrator> fleet-list --tag web
+hop admin <host> fleet-list --tag web
 
 # Update tags on a member
-hop admin <orchestrator> fleet-tag <node-id-prefix> --add staging --remove production
+hop admin <host> fleet-tag <node-id-prefix> --add staging --remove production
 ```
 
 ## Fleet Invites
 
-Fleet invites are Creator-role invites issued by the orchestrator. When a host accepts a fleet invite, it becomes a trusted fleet member.
+Fleet invites are Creator-role invites issued by an admin host. When a host accepts a fleet invite, it becomes a trusted fleet member.
 
 ```bash
-# Create a fleet invite (orchestrator side, requires creator role)
-hop admin <orchestrator> fleet-invite --tags web,production --max-uses 0 --expiry 86400
+# Create a fleet invite (admin side; requires creator role)
+hop admin <host> fleet-invite --tags web,production --max-uses 0 --expiry 86400
 ```
 
 | Flag | Default | Description |
@@ -77,9 +73,9 @@ hop admin <orchestrator> fleet-invite --tags web,production --max-uses 0 --expir
 Aggregate invites are role-based, reusable invites that grant access to all fleet members matching a role's host tags. They expire after 7 days.
 
 Flow:
-1. Orchestrator creates an aggregate invite for a role + peer name
-2. Peer redeems the invite against the orchestrator
-3. Orchestrator resolves matching fleet members (online hosts whose tags match the role's `host_tags`)
+1. An admin host creates an aggregate invite for a role + peer name
+2. The peer redeems the invite against that host
+3. The host resolves matching members (whose tags match the role's `host_tags`)
 4. Per-host invites are created for the peer
 
 ## CLI Commands
@@ -104,7 +100,7 @@ hop fleet add <host-alias> --tags web,production
 
 ### Admin-side: `hop admin`
 
-All fleet admin commands require creator role on the target orchestrator.
+All fleet admin commands require creator role on the target host.
 
 ```bash
 # Fleet member management
@@ -140,7 +136,7 @@ Roles define what fleet members a peer can access and what capabilities they hav
 
 ### Default Roles (5 built-in)
 
-Seeded on first orchestrator startup via `roles.json`:
+Seeded on first host startup via `roles.json`:
 
 | Role | host_tags | sudo | admin | user_mode | groups | sandbox |
 |---|---|---|---|---|---|---|
@@ -172,4 +168,4 @@ hop admin <target> role delete temp-role
 
 `roles.json` is designed to be human-readable (pretty-printed JSON) and git-committable, enabling infrastructure-as-code workflows.
 
-*Last updated: v0.6.33*
+*Last updated: v0.6.90*

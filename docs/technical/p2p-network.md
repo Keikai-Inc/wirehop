@@ -16,15 +16,19 @@
 > for later phases and are documented here only so the schema and trust model
 > don't have to be reworked when we get there.
 
-> **Trust model (current limitation).** The warren shared document is still
-> **write-open**: every member's invite carries an iroh-docs *write* ticket, so
-> per-author write validation is not yet enforced. A malicious member could
-> rewrite `vpn/`/`name/`/`ip/`/role entries in the doc. This is tracked as **C1**
-> in `security-audit.md`; the v0.6.37 mitigations are (1) VPN off-by-default
-> (only opted-in nodes join a writable doc) and (2) data-plane ingress
-> authentication (a forged `vpn/` registration still can't source authenticated
-> packets). Per-author write authorization (read-ticket members + author-bound
-> keys) is the next major hardening pass.
+> **Trust model (C1).** Write-isolation is now **shipped**: `node`/`warren-only`
+> invites carry a **read** ticket (not a write ticket), and each member writes
+> only its own **write-isolated self-doc** — the shared admin doc (membership,
+> roles, `peer/N.vip`/`.vpn_endpoint`) is admin-authored. Per-author write
+> validation runs against the founder/admin author binding. What remains
+> **deferred** is flipping that validation from **observe** to **enforce** by
+> *default* (it's opt-in today via `HOP_NETDOC_VALIDATION`, pending a multi-node
+> federated rollout so mixed-version co-admins aren't partitioned) and the full
+> cryptographic Owner/Admin write *capability* (vs the current author binding).
+> Defence-in-depth still applies: VPN off-by-default and data-plane ingress
+> authentication (a forged registration can't source authenticated packets).
+> See **C1** in [security-audit.md](security-audit.md) and
+> [per-member-self-docs.md](per-member-self-docs.md).
 
 ## Goal
 

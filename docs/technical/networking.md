@@ -30,17 +30,21 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint>
 ```rust
 fn hop_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        .max_idle_timeout(15s)     // Detect dead peers in 15s (iroh default: 30s)
-        .keep_alive_interval(3s)   // ~40 bytes/3s, 5 missed probes = dead
-        .initial_rtt(300ms)        // Cellular-friendly initial estimate
+        .max_idle_timeout(60s)               // survive WiFi/cellular handoffs; still detect dead peers in ~1 min
+        .keep_alive_interval(5s)             // 12 missed probes before death; ~40 bytes/5s is negligible
+        .initial_rtt(300ms)                  // cellular-friendly initial estimate
+        .max_concurrent_multipath_paths(13)  // keep WiFi/cellular/relay paths warm for instant failover
+        .default_path_keep_alive_interval(5s)
+        .default_path_max_idle_timeout(20s)
         .build()
 }
 ```
 
 Rationale:
-- **15s idle timeout**: survives 10s cellular stalls while detecting dead peers in half the time of iroh's 30s default.
-- **3s keepalive**: aggressive enough for responsive detection, light enough for metered links.
-- **300ms initial RTT**: prevents aggressive retransmission on cellular before QUIC measures actual RTT.
+- **60s idle timeout**: survives WiFi handoffs (5-15s), cellular tower switches (10-30s), and brief relay hiccups, while still detecting a truly dead peer in ~1 minute.
+- **5s keepalive**: 12 missed probes before death — responsive without being chatty on metered links.
+- **300ms initial RTT**: prevents aggressive retransmission on cellular before QUIC measures the actual RTT.
+- **Multipath (13 paths)**: keep several validated paths (WiFi, cellular, relay) alive at once so a network move is absorbed by an already-warm backup instead of a full reconnect. (This was briefly dropped to 1 to dodge a per-packet leak in the QUIC engine; that leak is fixed in the vendored `noq-proto`, so concurrent multipath is restored.)
 
 ### Address filter — never advertise the VPN overlay IP
 
