@@ -504,6 +504,15 @@ pub enum LanAction {
     },
     /// List routes this machine advertises and routes available in the warren.
     Ls,
+    /// Act as an app connector for a domain: resolve it and advertise its current
+    /// IP(s) as routes, so warren traffic to that domain egresses from here.
+    Connector {
+        /// The domain to resolve + advertise (e.g. `api.example.com`).
+        domain: String,
+        /// Tags gating which roles may reach it (defaults to the host's tags).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1194,20 +1194,28 @@ impl NetDoc {
         let mut cidrs = Vec::new();
         let mut gw_routes = Vec::new();
         for rc in routes {
-            let cidr = crate::fleet::RoutesStore::effective_cidr(rc);
-            let advert = RouteAdvert {
-                cidr: cidr.clone(),
-                tags: rc.tags.clone(),
-                snat: rc.snat,
-                kind: if rc.exit { RouteKind::Exit } else { RouteKind::Subnet },
-                advertised_at: now_timestamp(),
+            // One config entry expands to one or more CIDRs: a static subnet/exit
+            // route, or — for an app connector (`domain`) — a /32 per resolved IP.
+            let kind = if rc.exit && rc.domain.is_none() {
+                RouteKind::Exit
+            } else {
+                RouteKind::Subnet
             };
-            if let Err(e) = self.advertise_route(node_id, &advert).await {
-                tracing::warn!("vpn gateway: advertising {cidr} failed (continuing): {e:#}");
-                continue;
+            for cidr in rc.resolved_cidrs() {
+                let advert = RouteAdvert {
+                    cidr: cidr.clone(),
+                    tags: rc.tags.clone(),
+                    snat: rc.snat,
+                    kind,
+                    advertised_at: now_timestamp(),
+                };
+                if let Err(e) = self.advertise_route(node_id, &advert).await {
+                    tracing::warn!("vpn gateway: advertising {cidr} failed (continuing): {e:#}");
+                    continue;
+                }
+                cidrs.push((cidr.clone(), rc.tags.clone()));
+                gw_routes.push(crate::vpn::gateway::GatewayRoute { cidr, snat: rc.snat });
             }
-            cidrs.push((cidr.clone(), rc.tags.clone()));
-            gw_routes.push(crate::vpn::gateway::GatewayRoute { cidr, snat: rc.snat });
         }
         self.set_gateway_routes(cidrs.clone());
         let tun_name = {

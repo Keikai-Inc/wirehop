@@ -5076,6 +5076,7 @@ fn cmd_lan(action: cli::LanAction, config_dir: &std::path::Path) -> Result<()> {
                 tags,
                 snat: !no_snat,
                 exit,
+                domain: None,
             };
             let eff = RoutesStore::effective_cidr(&rc);
             // Replace any existing advert for the same effective CIDR.
@@ -5113,19 +5114,48 @@ fn cmd_lan(action: cli::LanAction, config_dir: &std::path::Path) -> Result<()> {
             } else {
                 println!("Routes advertised by this machine (routes.json):");
                 for r in &store.routes {
-                    let kind = if r.exit { "exit" } else { "subnet" };
                     let tags = if r.tags.is_empty() {
                         "(host tags)".to_string()
                     } else {
                         r.tags.join(",")
                     };
-                    println!(
-                        "  {:<18} {kind:<7} snat={:<5} tags={tags}",
-                        RoutesStore::effective_cidr(r),
-                        r.snat
-                    );
+                    let (what, kind) = match &r.domain {
+                        Some(d) => (d.clone(), "connector"),
+                        None if r.exit => ("0.0.0.0/0".to_string(), "exit"),
+                        None => (RoutesStore::effective_cidr(r), "subnet"),
+                    };
+                    println!("  {what:<22} {kind:<9} snat={:<5} tags={tags}", r.snat);
                 }
             }
+            Ok(())
+        }
+        LanAction::Connector { domain, tags } => {
+            let mut store = RoutesStore::load(config_dir)?;
+            store.routes.retain(|r| r.domain.as_deref() != Some(domain.as_str()));
+            store.routes.push(RouteConfig {
+                cidr: String::new(),
+                tags,
+                snat: true,
+                exit: false,
+                domain: Some(domain.clone()),
+            });
+            store.save(config_dir)?;
+            let probe = RouteConfig {
+                cidr: String::new(),
+                tags: vec![],
+                snat: true,
+                exit: false,
+                domain: Some(domain.clone()),
+            };
+            let ips = probe.resolved_cidrs();
+            println!(
+                "App connector for {domain} → {}. Takes effect on next daemon start.",
+                if ips.is_empty() {
+                    "(no IPv4 resolved yet)".to_string()
+                } else {
+                    ips.join(", ")
+                }
+            );
             Ok(())
         }
     }

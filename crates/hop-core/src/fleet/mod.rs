@@ -205,6 +205,37 @@ pub struct RouteConfig {
     /// Advertise as an internet exit node (`0.0.0.0/0`) rather than a subnet.
     #[serde(default)]
     pub exit: bool,
+    /// App connector (P4): a domain name to resolve and advertise as `/32`
+    /// route(s) for its current IP(s), so warren traffic to that domain egresses
+    /// from this connector's stable address. When set, `cidr`/`exit` are ignored.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+impl RouteConfig {
+    /// The `/32` CIDRs this entry advertises right now. For an app-connector
+    /// (`domain` set) this resolves the domain to its current IPv4(s); otherwise
+    /// it's the single effective CIDR.
+    pub fn resolved_cidrs(&self) -> Vec<String> {
+        if let Some(domain) = &self.domain {
+            use std::net::ToSocketAddrs;
+            return (domain.as_str(), 0u16)
+                .to_socket_addrs()
+                .map(|addrs| {
+                    let mut v: Vec<String> = addrs
+                        .filter_map(|a| match a.ip() {
+                            std::net::IpAddr::V4(ip) => Some(format!("{ip}/32")),
+                            std::net::IpAddr::V6(_) => None,
+                        })
+                        .collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                })
+                .unwrap_or_default();
+        }
+        vec![RoutesStore::effective_cidr(self)]
+    }
 }
 
 /// Gateway routes this host advertises, persisted as `routes.json`.
