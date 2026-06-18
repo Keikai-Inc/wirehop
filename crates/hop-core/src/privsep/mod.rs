@@ -67,6 +67,10 @@ pub enum MonitorRequest {
     /// so the dropped worker delegates it. The monitor allowlists `dev` to a TUN
     /// interface (`tun*`/`utun*`). Replies `Ok` (no fd).
     ModifyClientRoute { cidr: String, dev: String, add: bool },
+    /// Pin a `/32` host route `dst → via <gateway>` (not the TUN). Used by an exit
+    /// node to keep the warren relay reachable past the split-default, so the
+    /// tunnel doesn't loop through the exit. Privileged. Reverted on worker exit.
+    PinHostRoute { dst: [u8; 4], via: [u8; 4], add: bool },
     /// Spawn a session command on a fresh PTY and return the PTY **master** fd.
     /// The worker has already resolved `argv` (including the `login`/`su` and
     /// sandbox wrapper), so the monitor only performs the privileged act —
@@ -921,18 +925,12 @@ pub fn setup_gateway(routes: &[crate::vpn::gateway::GatewayRoute]) -> Result<()>
     }
 }
 
-/// Install a client route `cidr → dev` (an accepted subnet route), delegating the
-/// privileged `ip route add` to the monitor under privsep. The collision guard
-/// (unprivileged) runs here first: returns `Ok(false)` without touching the kernel
-/// if `cidr` would hijack the local LAN.
-pub fn install_client_route(cidr: &str, dev: &str) -> Result<bool> {
-    if crate::vpn::gateway::route_collides(cidr) {
-        tracing::warn!(
-            "vpn route: NOT installing {cidr} — it covers a local address (would hijack the \
-             local LAN). Use a narrower /32 device route to reach a specific host."
-        );
-        return Ok(false);
-    }
+/// Add a route `cidr → dev` (the warren TUN), delegating the privileged
+/// `ip route add` to the monitor under privsep. No collision check — callers that
+/// need it (subnet routes) run `route_collides` first; exit-node split-default
+/// routes deliberately skip it (they capture everything, with more-specific routes
+/// for the vIP/LAN/relay as the exceptions).
+pub fn add_tun_route(cidr: &str, dev: &str) -> Result<()> {
     match worker_control_fd() {
         Some(ctrl) => {
             let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -946,14 +944,122 @@ pub fn install_client_route(cidr: &str, dev: &str) -> Result<bool> {
             )
             .context("requesting client route from privsep monitor")?;
             match recv_msg::<MonitorReply>(ctrl)? {
-                MonitorReply::Ok => Ok(true),
+                MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ModifyClientRoute"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused ModifyClientRoute: {message}")
                 }
             }
         }
-        None => crate::vpn::gateway::add_route_raw(cidr, dev).map(|()| true),
+        None => crate::vpn::gateway::add_route_raw(cidr, dev),
+    }
+}
+
+/// Install a subnet route `cidr → dev` with the collision guard (returns
+/// `Ok(false)` without touching the kernel if `cidr` would hijack the local LAN).
+pub fn install_client_route(cidr: &str, dev: &str) -> Result<bool> {
+    if crate::vpn::gateway::route_collides(cidr) {
+        tracing::warn!(
+            "vpn route: NOT installing {cidr} — it covers a local address (would hijack the \
+             local LAN). Use a narrower /32 device route to reach a specific host."
+        );
+        return Ok(false);
+    }
+    add_tun_route(cidr, dev).map(|()| true)
+}
+
+/// Install exit-node routing: a **split default** (`0.0.0.0/1` + `128.0.0.0/1`,
+/// which together cover everything but are more specific than the real default, so
+/// they override it without replacing it) onto the warren TUN. The node's own vIP
+/// (`100.64/10`) and local LAN keep their more-specific routes, so warren + LAN
+/// traffic doesn't loop through the exit.
+///
+/// LIMITATION (follow-up): the warren relay's public IP is not yet pinned via the
+/// original gateway, so a node that reaches the exit **only over the relay** (no
+/// direct path) would loop. Reaching the exit over a direct path (same LAN, or any
+/// route more specific than `/1`) is fine. Relay-pinning needs a route-via-gateway
+/// monitor primitive.
+pub fn install_exit_route(dev: &str) -> Result<()> {
+    // Pin the warren relay(s) via the ORIGINAL gateway first, so the connection
+    // that reaches the exit survives the split-default (else it loops/dies — the
+    // exact failure the exit-node e2e caught).
+    match crate::vpn::gateway::default_gateway_v4() {
+        Some(gw) => {
+            let relays = crate::vpn::gateway::resolve_relay_ips();
+            if relays.is_empty() {
+                tracing::warn!(
+                    "vpn exit: could not resolve the warren relay to pin — a relay-only path \
+                     to the exit will loop"
+                );
+            }
+            for relay in relays {
+                if let Err(e) = pin_host_route(relay, gw, true) {
+                    tracing::warn!("vpn exit: pinning relay {relay} via {gw} failed: {e:#}");
+                }
+            }
+        }
+        None => tracing::warn!("vpn exit: no default gateway found to pin the relay — exit may loop"),
+    }
+    add_tun_route("0.0.0.0/1", dev)?;
+    add_tun_route("128.0.0.0/1", dev)?;
+    tracing::info!(
+        "vpn exit: routing default traffic via the warren exit node (split-default + relay pin)"
+    );
+    Ok(())
+}
+
+/// Tear down exit-node routing (best-effort): remove the split-default + relay pins.
+pub fn uninstall_exit_route(dev: &str) {
+    uninstall_client_route("0.0.0.0/1", dev);
+    uninstall_client_route("128.0.0.0/1", dev);
+    if let Some(gw) = crate::vpn::gateway::default_gateway_v4() {
+        for relay in crate::vpn::gateway::resolve_relay_ips() {
+            let _ = pin_host_route(relay, gw, false);
+        }
+    }
+}
+
+/// Pin (or unpin) a `/32` host route `dst → via <gateway>`, delegating to the
+/// monitor under privsep.
+fn pin_host_route(dst: std::net::Ipv4Addr, via: std::net::Ipv4Addr, add: bool) -> Result<()> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            send_msg(
+                ctrl,
+                &MonitorRequest::PinHostRoute { dst: dst.octets(), via: via.octets(), add },
+            )
+            .context("requesting relay pin from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::Ok => Ok(()),
+                MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for PinHostRoute"),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused PinHostRoute: {message}")
+                }
+            }
+        }
+        None => {
+            let cidr = format!("{dst}/32");
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("ip").args(["route", "del", &cidr]).status();
+                if add {
+                    let st = std::process::Command::new("ip")
+                        .args(["route", "add", &cidr, "via", &via.to_string()])
+                        .status()
+                        .context("ip route add (pin)")?;
+                    if !st.success() {
+                        anyhow::bail!("pinning {cidr} via {via} failed");
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (via, add, cidr);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1289,6 +1395,8 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // Whether we've applied LAN-bridging gateway forwarding (nft + ip_forward),
     // so it's torn down when the worker exits rather than leaking nftables rules.
     let mut gateway_active = false;
+    // Exit-node relay pins (`<ip>/32` host routes) to remove on worker exit.
+    let mut kept_pins: Vec<String> = Vec::new();
 
     loop {
         let req: MonitorRequest = match recv_msg(mon_fd) {
@@ -1383,6 +1491,34 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                         crate::vpn::gateway::remove_route_raw(&cidr, &tun);
                         let _ = send_msg(mon_fd, &MonitorReply::Ok);
                     }
+                }
+            }
+            MonitorRequest::PinHostRoute { dst, via, add } => {
+                let cidr = format!("{}/32", std::net::Ipv4Addr::from(dst));
+                let via = std::net::Ipv4Addr::from(via).to_string();
+                let _ = std::process::Command::new("ip").args(["route", "del", &cidr]).status();
+                if add {
+                    match std::process::Command::new("ip")
+                        .args(["route", "add", &cidr, "via", &via])
+                        .status()
+                    {
+                        Ok(s) if s.success() => {
+                            if !kept_pins.contains(&cidr) {
+                                kept_pins.push(cidr);
+                            }
+                            let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                        }
+                        _ => {
+                            tracing::warn!("privsep monitor: PinHostRoute add failed for {cidr} via {via}");
+                            let _ = send_msg(
+                                mon_fd,
+                                &MonitorReply::Error { message: "ip route add (pin) failed".into() },
+                            );
+                        }
+                    }
+                } else {
+                    kept_pins.retain(|c| c != &cidr);
+                    let _ = send_msg(mon_fd, &MonitorReply::Ok);
                 }
             }
             MonitorRequest::SpawnSession {
@@ -1495,6 +1631,9 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // the worker (a respawning worker re-applies on bring-up).
     if gateway_active {
         crate::vpn::gateway::teardown_gateway();
+    }
+    for pin in kept_pins.drain(..) {
+        let _ = std::process::Command::new("ip").args(["route", "del", &pin]).status();
     }
 
     if uptime < HEALTHY_UPTIME {

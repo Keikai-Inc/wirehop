@@ -200,6 +200,54 @@ pub fn add_route_raw(cidr: &str, dev: &str) -> Result<()> {
     }
 }
 
+/// The current default-route IPv4 gateway — used to pin the warren relay past an
+/// exit node's split-default so the tunnel doesn't loop through the exit itself.
+/// Linux-only for now (macOS exit-node pinning is a follow-up).
+pub fn default_gateway_v4() -> Option<std::net::Ipv4Addr> {
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("ip").args(["route", "show", "default"]).output().ok()?;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut it = line.split_whitespace();
+            while let Some(tok) = it.next() {
+                if tok == "via"
+                    && let Some(ip) = it.next()
+                    && let Ok(v4) = ip.parse::<std::net::Ipv4Addr>()
+                {
+                    return Some(v4);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Resolve the warren relay host (`HOP_RELAY_URL`) to its IPv4 address(es), so an
+/// exit-node client can pin them via the original gateway (keeping the relay
+/// reachable outside the tunnel it bootstraps).
+pub fn resolve_relay_ips() -> Vec<std::net::Ipv4Addr> {
+    use std::net::ToSocketAddrs;
+    let host = crate::net::HOP_RELAY_URL
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = host.split(['/', ':']).next().unwrap_or(host);
+    (host, 443u16)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .filter_map(|a| match a.ip() {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Remove a kernel route `cidr → dev` (privileged; best-effort).
 pub fn remove_route_raw(cidr: &str, dev: &str) {
     #[cfg(target_os = "linux")]

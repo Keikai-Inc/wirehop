@@ -1250,16 +1250,39 @@ impl NetDoc {
     async fn accepted_route_endpoints(
         &self,
     ) -> Vec<(String, iroh::PublicKey, Option<iroh::RelayUrl>)> {
-        if std::env::var_os("HOP_ACCEPT_ROUTES").is_none() {
+        let accept_subnets = std::env::var_os("HOP_ACCEPT_ROUTES").is_some();
+        // Exit-node use is a SEPARATE explicit opt-in (it routes ALL traffic, not a
+        // specific subnet): `HOP_EXIT_NODE` = a gateway node-id prefix, or `auto`
+        // for the first advertised exit. Subnet acceptance never implies it.
+        let exit_pref = std::env::var("HOP_EXIT_NODE").ok().filter(|s| !s.is_empty());
+        if !accept_subnets && exit_pref.is_none() {
             return Vec::new();
         }
         let me = self.endpoint.id().to_string();
         let mut out = Vec::new();
+        let mut took_exit = false;
         for (gw, advert) in self.list_routes().await.unwrap_or_default() {
             if gw == me {
-                continue; // don't route our own LAN back through ourselves
+                continue; // don't route our own LAN/exit back through ourselves
+            }
+            let is_exit = advert.cidr == "0.0.0.0/0";
+            let accept = if is_exit {
+                // One exit at a time; it must match the configured gateway.
+                !took_exit
+                    && match &exit_pref {
+                        Some(p) => p == "auto" || gw.starts_with(p.as_str()),
+                        None => false,
+                    }
+            } else {
+                accept_subnets
+            };
+            if !accept {
+                continue;
             }
             if let Some((pk, relay)) = self.lookup_endpoint_for_node(&gw).await {
+                if is_exit {
+                    took_exit = true;
+                }
                 out.push((advert.cidr, pk, relay));
             }
         }
@@ -2252,8 +2275,24 @@ impl NetDoc {
         };
         let mut accepted_routes: Vec<(String, iroh::PublicKey, Option<iroh::RelayUrl>)> =
             self.accepted_route_endpoints().await;
+        // Exit routes (0.0.0.0/0) install a split-default + relay handling; subnet
+        // routes install the CIDR directly (collision-guarded).
+        let install_route = |cidr: &str| {
+            if cidr == "0.0.0.0/0" {
+                let _ = crate::privsep::install_exit_route(&tun_name);
+            } else {
+                let _ = crate::privsep::install_client_route(cidr, &tun_name);
+            }
+        };
+        let uninstall_route = |cidr: &str| {
+            if cidr == "0.0.0.0/0" {
+                crate::privsep::uninstall_exit_route(&tun_name);
+            } else {
+                crate::privsep::uninstall_client_route(cidr, &tun_name);
+            }
+        };
         for (cidr, _, _) in &accepted_routes {
-            let _ = crate::privsep::install_client_route(cidr, &tun_name);
+            install_route(cidr);
         }
         let mut route_refresh = tokio::time::interval(ROUTE_REFRESH);
         route_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2288,12 +2327,12 @@ impl NetDoc {
                     // advertised. Both idempotent + collision-guarded.
                     for (cidr, _, _) in &fresh {
                         if !accepted_routes.iter().any(|(c, _, _)| c == cidr) {
-                            let _ = crate::privsep::install_client_route(cidr, &tun_name);
+                            install_route(cidr);
                         }
                     }
                     for (cidr, _, _) in &accepted_routes {
                         if !fresh.iter().any(|(c, _, _)| c == cidr) {
-                            crate::privsep::uninstall_client_route(cidr, &tun_name);
+                            uninstall_route(cidr);
                         }
                     }
                     accepted_routes = fresh;
