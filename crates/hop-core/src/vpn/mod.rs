@@ -90,6 +90,35 @@ pub fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
     Some((Ipv4Addr::from(u32::from(ip) & mask), len))
 }
 
+/// hop's 4via6-style ULA prefix (first 64 bits) for overlapping-subnet routing
+/// (P3). A device's real IPv4 at a given site is reached via a unique IPv6 that
+/// embeds `(site_id, ipv4)`; the gateway translates it back to the real v4 on the
+/// far LAN. This lets two sites that both use e.g. `192.168.1.0/24` coexist —
+/// the address that would collide in v4 is unambiguous in v6. Address layout:
+/// `<64-bit hop prefix> : <32-bit site id> : <32-bit embedded IPv4>`. The prefix
+/// bytes spell `fd 'hopvia6'` (`0xfd` makes it a ULA, `fc00::/7`).
+const VIA6_PREFIX: [u8; 8] = [0xfd, 0x68, 0x6f, 0x70, 0x76, 0x69, 0x61, 0x36];
+
+/// Build the 4via6 IPv6 address for `ipv4` at site `site_id` (overlap routing).
+pub fn via6_encode(site_id: u32, ipv4: Ipv4Addr) -> std::net::Ipv6Addr {
+    let mut o = [0u8; 16];
+    o[0..8].copy_from_slice(&VIA6_PREFIX);
+    o[8..12].copy_from_slice(&site_id.to_be_bytes());
+    o[12..16].copy_from_slice(&ipv4.octets());
+    std::net::Ipv6Addr::from(o)
+}
+
+/// Decode a 4via6 address back to `(site_id, ipv4)`, or `None` if it doesn't carry
+/// hop's via6 prefix (an ordinary IPv6 destination).
+pub fn via6_decode(addr: std::net::Ipv6Addr) -> Option<(u32, Ipv4Addr)> {
+    let o = addr.octets();
+    if o[0..8] != VIA6_PREFIX {
+        return None;
+    }
+    let site_id = u32::from_be_bytes([o[8], o[9], o[10], o[11]]);
+    Some((site_id, Ipv4Addr::new(o[12], o[13], o[14], o[15])))
+}
+
 /// HA gateway failover rule: from same-route `candidates`, return the index of the
 /// first one for which `is_live` holds (a gateway we've heard from recently); if
 /// none is live (cold start, or all silent), index 0. So traffic prefers a live
@@ -654,5 +683,27 @@ mod tests {
         assert_eq!(select_live(&gws, |g| *g == "backup"), 1);
         // Both live → prefer the first (stable; no needless flapping).
         assert_eq!(select_live(&gws, |_| true), 0);
+    }
+
+    #[test]
+    fn via6_roundtrips_and_disambiguates_overlap() {
+        // The SAME real v4 at two different sites encodes to DIFFERENT v6 — the
+        // whole point of 4via6 for overlapping subnets.
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        let a = via6_encode(1, ip);
+        let b = via6_encode(2, ip);
+        assert_ne!(a, b);
+        assert_eq!(via6_decode(a), Some((1, ip)));
+        assert_eq!(via6_decode(b), Some((2, ip)));
+        // Round-trip a few values.
+        for (site, ip) in [
+            (0u32, Ipv4Addr::new(10, 0, 0, 1)),
+            (65535, Ipv4Addr::new(192, 168, 1, 127)),
+            (0xDEAD_BEEF, Ipv4Addr::new(255, 255, 255, 255)),
+        ] {
+            assert_eq!(via6_decode(via6_encode(site, ip)), Some((site, ip)));
+        }
+        // A non-via6 IPv6 address (e.g. localhost) is not decoded.
+        assert_eq!(via6_decode(std::net::Ipv6Addr::LOCALHOST), None);
     }
 }
