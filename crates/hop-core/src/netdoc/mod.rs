@@ -1208,7 +1208,7 @@ impl NetDoc {
             self.vpn_tun.read().await.as_ref().and_then(|d| d.tun_name().ok())
         };
         match tun_name {
-            Some(tun) => match crate::vpn::gateway::setup_gateway(&tun, None, &gw_routes) {
+            Some(tun) => match crate::vpn::gateway::setup_gateway(&tun, &gw_routes) {
                 Ok(()) => tracing::info!(
                     "vpn gateway: forwarding {} route(s) live: {:?}",
                     cidrs.len(),
@@ -2260,23 +2260,30 @@ impl NetDoc {
             let pkt = &buf[..n];
             let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
             let (pubkey, relay) = if crate::vpn::is_virtual_addr(dst) {
-                // Member-to-member: role-derived reach (Step 5; default-deny),
-                // then resolve the destination vIP's owner endpoint.
+                // dst is a warren member. Enforce the member-to-member reach ACL
+                // (Step 5; default-deny) only when the SOURCE is also a member
+                // vIP. A non-virtual source is return traffic from a LAN subnet we
+                // gateway for — the destination member already had reach to that
+                // route, and conntrack on the gateway gates it to established
+                // flows — so it bypasses the member ACL (which keys on vIP→role
+                // and would otherwise drop the reply for an unknown source).
                 match crate::vpn::parse_src_ipv4(pkt) {
-                    Some(src)
-                        if self
+                    None => continue, // malformed — drop
+                    Some(src) if crate::vpn::is_virtual_addr(src) => {
+                        if !self
                             .vpn_reach_allowed(src, dst, crate::vpn::parse_dest_port(pkt))
-                            .await => {}
-                    Some(src) => {
-                        // Observability: the reach ACL silently dropping packets is
-                        // exactly the hard-to-debug case (a missing/empty role →
-                        // reach nothing). Say so (debug; per-packet under traffic).
-                        tracing::debug!(
-                            "vpn egress: reach DENIED {src} -> {dst} (role policy) — packet dropped"
-                        );
-                        continue;
+                            .await
+                        {
+                            // Observability: the reach ACL silently dropping
+                            // packets is the hard-to-debug case (a missing/empty
+                            // role → reach nothing). Say so (debug; per-packet).
+                            tracing::debug!(
+                                "vpn egress: reach DENIED {src} -> {dst} (role policy) — dropped"
+                            );
+                            continue;
+                        }
                     }
-                    None => continue,
+                    Some(_) => {} // LAN-sourced reply for a gatewayed route
                 }
                 match self.lookup_vpn_endpoint(dst).await {
                     Ok(Some(v)) => v,
