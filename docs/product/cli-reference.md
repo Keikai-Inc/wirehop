@@ -34,7 +34,7 @@ reach). It is **off by default** as of v0.6.37 — opt in with `--host`,
 `HOP_VPN=1`, or `hop config set vpn on`. (The default was on in v0.6.32–0.6.36
 and was reverted while the warren's write-authorization trust model is hardened;
 see [security.md](security.md) and the C1 note in
-[../technical/security-audit.md](../technical/security-audit.md).) Bringup is
+[../technical/security.md](../technical/security.md).) Bringup is
 best-effort and never blocks core access — if a TUN can't be created (no
 privilege / no `/dev/net/tun`) or the CGNAT range is already in use by another
 overlay (e.g. Tailscale), the VPN is skipped and `hop exec`/shell/transfer work
@@ -117,7 +117,7 @@ ticket (it can never self-upgrade). `warren-only` puts the machine on the VPN
 (vIP/MagicDNS) but refuses host sessions (`network_only` role). `node` is a full
 warren member. `admin` redeems with creator access. Warren tiers pin the founder
 trust anchor (C1). (The read- vs write-scoped ticket split is tracked separately;
-see `docs/technical/install-and-invite-tiers.md` §10.)
+see `docs/technical/warren-internals.md` §10.)
 
 The invited peer joins with the given role; the role's host tags decide what it
 can reach over the warren VPN (default-deny). Elevate later with `hop admin

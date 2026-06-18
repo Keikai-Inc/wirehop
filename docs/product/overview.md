@@ -99,7 +99,7 @@ default** (since v0.6.37) — opt in with `--host`, `HOP_VPN=1`, or `hop config 
 vpn on`. (It was default-on in v0.6.32–0.6.36; the default was reverted while the
 warren's write-authorization trust model is hardened — see [security.md](security.md)
 and the warren trust note in
-[../technical/p2p-network.md](../technical/p2p-network.md).) Bringup is fail-safe
+[../technical/warren-internals.md](../technical/warren-internals.md).) Bringup is fail-safe
 — if a TUN can't be created or the CGNAT range conflicts (e.g. Tailscale), it's
 skipped and shell/exec/transfer are unaffected. See [warren.md](warren.md).
 

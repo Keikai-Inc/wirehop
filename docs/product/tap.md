@@ -281,6 +281,6 @@ session with a honeypot.
   dispatcher, lock ordering.
 - [`docs/product/security.md`](security.md) — hop's broader security
   model, peer roles, and the trust boundary tap inherits.
-- [`docs/product/sessions.md`](sessions.md) — hop's own shell-session
+- [`docs/product/remote-access.md`](remote-access.md) — hop's own shell-session
   machinery, complementary to tap (sessions are *driven*, tap
   *observes*).

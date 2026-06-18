@@ -1,8 +1,225 @@
-# JavaScript API Reference
+# AI & Scripting
+
+The MCP server (tools, skills, AI-agent integration) and the complete `hop.*` JS runtime API.
+
+
+---
+
+## MCP Server
+
+hop includes an MCP (Model Context Protocol) server for AI agent integration. It exposes hop's capabilities as structured tools over JSON-RPC 2.0 on stdio.
+
+### Starting the Server
+
+```bash
+hop mcp
+```
+
+This starts the MCP server on stdin/stdout, suitable for use as a subprocess by AI agent frameworks (e.g. Claude Desktop, Cursor).
+
+### Tools
+
+The server registers up to 4 tools. The `hop_data` and `hop_cron` tools are only available when a datastore is present (host mode).
+
+#### hop_exec
+
+Execute JavaScript in a sandboxed runtime with `hop.*` fleet management bindings.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `code` | string | yes | JavaScript code; top-level `await` supported |
+| `timeout_secs` | integer | no | Execution timeout (default: 30, max: 300) |
+
+The `hop` global object provides access to `exec()`, `fleet`, `admin`, `roles`, and file transfer APIs. Call `hop_skills` first to learn the available API.
+
+**Error handling**: timeout errors suggest increasing `timeout_secs`; memory errors indicate the 64 MB limit was hit.
+
+```json
+{
+  "name": "hop_exec",
+  "arguments": {
+    "code": "const result = await hop.exec('web-01', 'uptime'); return result;",
+    "timeout_secs": 60
+  }
+}
+```
+
+#### hop_data
+
+Store and query data in hop's embedded datastore. Supports key-value, time-series, and encrypted secrets.
+
+| Parameter | Type | Required for | Description |
+|---|---|---|---|
+| `action` | string | all | Operation (see table below) |
+| `namespace` | string | kv_* | KV namespace |
+| `key` | string | kv_get/set/delete | KV key |
+| `value` | any | kv_set, ts_insert, secrets_set | Value to store |
+| `content_type` | string | | MIME type (default: `application/json`) |
+| `prefix` | string | | Key prefix filter for kv_list |
+| `metric` | string | ts_* | Metric name |
+| `start` | integer | | Start timestamp (unix ms) |
+| `end` | integer | | End timestamp (unix ms) |
+| `tags` | object | | Tags for ts_insert or filter for ts_query |
+| `limit` | integer | | Max results for ts_query |
+| `name` | string | secrets_* | Secret name |
+
+**Actions**:
+
+| Action | Description |
+|---|---|
+| `kv_get` | Get a KV entry by namespace + key |
+| `kv_set` | Set a KV entry |
+| `kv_delete` | Delete a KV entry |
+| `kv_list` | List KV entries in a namespace (optional prefix) |
+| `ts_insert` | Insert a time-series data point (value must be a number) |
+| `ts_query` | Query time-series range |
+| `ts_latest` | Get most recent data point for a metric |
+| `secrets_get` | Decrypt and return a secret |
+| `secrets_set` | Encrypt and store a secret |
+| `secrets_delete` | Delete a secret |
+| `secrets_list` | List secret names (not values) |
+
+```json
+{
+  "name": "hop_data",
+  "arguments": {
+    "action": "kv_set",
+    "namespace": "config",
+    "key": "deploy_target",
+    "value": "production"
+  }
+}
+```
+
+#### hop_cron
+
+Manage scheduled cron jobs that execute JavaScript in hop's sandboxed runtime.
+
+| Parameter | Type | Required for | Description |
+|---|---|---|---|
+| `action` | string | all | Operation (see table below) |
+| `job_id` | string | get/delete/enable/disable | Job ID |
+| `name` | string | create/ensure | Human-readable name |
+| `schedule` | string | create/ensure | 6-field cron expression |
+| `script` | string | create/ensure | JavaScript source |
+| `tags` | array | | Fleet targeting tags |
+| `tag_filter` | string | | Filter for list |
+| `targets` | string | | Fleet target tag; matching hosts injected as `hop.targets` |
+| `catalog_id` | string | ensure (required) | Dedup identifier |
+| `sandbox_preset` | string | | `monitor`, `audit`, or `deploy` |
+
+**Actions**:
+
+| Action | Description |
+|---|---|
+| `create` | Create a new cron job |
+| `ensure` | Idempotent create -- returns existing job if `catalog_id` matches |
+| `list` | List jobs (optional `tag_filter`) |
+| `get` | Get full job details |
+| `enable` | Enable a job (recomputes next_run) |
+| `disable` | Disable a job |
+| `delete` | Remove a job |
+
+```json
+{
+  "name": "hop_cron",
+  "arguments": {
+    "action": "ensure",
+    "catalog_id": "fleet-health",
+    "name": "Fleet Health Check",
+    "schedule": "0 */5 * * * *",
+    "script": "const hosts = await hop.fleet.list(); for (const h of hosts) { await hop.ts.insert('health.' + h.hostname, 1); }",
+    "targets": "web",
+    "sandbox_preset": "monitor"
+  }
+}
+```
+
+#### hop_skills
+
+Look up hop documentation, code examples, and operational recipes. Call this before writing `hop_exec` code to understand available APIs.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | no | Natural language search (e.g. `"check disk usage across fleet"`) |
+| `category` | string | no | Browse by category (see list below) |
+| `skill_id` | string | no | Direct lookup (e.g. `"monitor/cpu-usage"`) |
+
+**Priority**: `skill_id` > `category` > `query`. With no arguments, lists all categories.
+
+```json
+{
+  "name": "hop_skills",
+  "arguments": {
+    "query": "deploy application to fleet"
+  }
+}
+```
+
+---
+
+### Skills Library
+
+The skills library is an embedded reference system with operational recipes and code examples. Skills are organized into categories and searchable by keyword.
+
+#### Categories
+
+| Category | Description |
+|---|---|
+| `getting-started` | First-time setup and basic usage |
+| `fleet` | Fleet operations and management |
+| `roles` | RBAC role configuration |
+| `admin` | Remote administration |
+| `discover` | Host discovery and inventory |
+| `install` | Package installation (multi-OS) |
+| `services` | Service management |
+| `monitor` | System monitoring and metrics |
+| `security` | Security auditing and baselines |
+| `files` | File transfer and management |
+| `troubleshoot` | Debugging and diagnostics |
+| `recipes` | Multi-step operational workflows |
+| `datastore` | KV, time-series, and secrets usage |
+
+#### Skill Structure
+
+Each skill contains:
+
+| Field | Description |
+|---|---|
+| `id` | Unique identifier (e.g. `monitor/cpu-usage`) |
+| `category` | Category name |
+| `title` | Human-readable title |
+| `description` | What the skill covers |
+| `tags` | Search keywords |
+| `prerequisites` | Required skills or setup |
+| `examples` | Code examples with expected output |
+| `pitfalls` | Common mistakes to avoid |
+| `related` | Links to related skills |
+| `sub_skills` | Child skills (for intent/parent skills) |
+
+#### How Agents Use Skills
+
+1. Call `hop_skills` with no arguments to see available categories
+2. Browse a category or search by keyword to find relevant skills
+3. Look up a specific skill by ID to get code examples
+4. Use the examples to write `hop_exec` code
+
+Parent skills (like `install/package`) automatically inline their sub-skills (e.g. `install/package-apt`, `install/package-brew`) when looked up by ID.
+
+#### Search
+
+Keyword search scores matches across title (3x), ID (2.5x), tags (2x), description (1x), and example code (0.5x). Returns top N results ranked by relevance.
+
+*Last updated: v0.6.33*
+
+
+---
+
+## JavaScript API Reference
 
 hop embeds a QuickJS runtime that exposes the `hop.*` global object. Scripts run in cron jobs and MCP `hop_exec` invocations. All calls are synchronous (no async/await).
 
-## Availability Matrix
+### Availability Matrix
 
 | Binding group | Requires backend | Requires datastore | Available in cron | Available in MCP |
 |---|---|---|---|---|
@@ -23,9 +240,9 @@ hop embeds a QuickJS runtime that exposes the `hop.*` global object. Scripts run
 
 ---
 
-## Execution
+### Execution
 
-### `hop.exec(host, command)`
+#### `hop.exec(host, command)`
 
 Execute a shell command on a remote host.
 
@@ -44,7 +261,7 @@ hop.log(r.stdout);            // "Linux myhost 5.15..."
 if (r.exit_code !== 0) hop.log("ERROR: " + r.stderr);
 ```
 
-### `hop.local(command)`
+#### `hop.local(command)`
 
 Execute a shell command on the local machine (where the daemon runs).
 
@@ -63,9 +280,9 @@ hop.log(r.stdout);
 
 ---
 
-## Fleet
+### Fleet
 
-### `hop.fleet.list(tag?)`
+#### `hop.fleet.list(tag?)`
 
 List fleet members, optionally filtered by tag.
 
@@ -84,7 +301,7 @@ for (var i = 0; i < hosts.length; i++) {
 }
 ```
 
-### `hop.fleet.exec(group, command)`
+#### `hop.fleet.exec(group, command)`
 
 Execute a command on all hosts in a fleet group.
 
@@ -103,9 +320,9 @@ var results = hop.fleet.exec("web", "systemctl status nginx");
 
 ---
 
-## Admin
+### Admin
 
-### `hop.admin.status(host)`
+#### `hop.admin.status(host)`
 
 Get status of a remote host.
 
@@ -122,7 +339,7 @@ var s = hop.admin.status("myhost");
 hop.log("Version: " + s.version);
 ```
 
-### `hop.admin.peers(host)`
+#### `hop.admin.peers(host)`
 
 List authorized peers on a remote host.
 
@@ -138,7 +355,7 @@ List authorized peers on a remote host.
 var peers = hop.admin.peers("myhost");
 ```
 
-### `hop.admin.invite(host, username?, role?)`
+#### `hop.admin.invite(host, username?, role?)`
 
 Create an invite token on a remote host.
 
@@ -156,7 +373,7 @@ Create an invite token on a remote host.
 var token = hop.admin.invite("myhost", "alice");
 ```
 
-### `hop.admin.removePeer(host, prefix)`
+#### `hop.admin.removePeer(host, prefix)`
 
 Remove a peer from a remote host.
 
@@ -175,9 +392,9 @@ hop.admin.removePeer("myhost", "abc123");
 
 ---
 
-## Roles
+### Roles
 
-### `hop.roles.list(host)`
+#### `hop.roles.list(host)`
 
 List all roles on a remote host.
 
@@ -193,7 +410,7 @@ List all roles on a remote host.
 var roles = hop.roles.list("orch");
 ```
 
-### `hop.roles.delete(host, name)`
+#### `hop.roles.delete(host, name)`
 
 Delete a role on a remote host.
 
@@ -212,9 +429,9 @@ hop.roles.delete("orch", "intern");
 
 ---
 
-## Datastore: Key-Value
+### Datastore: Key-Value
 
-### `hop.kv.get(namespace, key)`
+#### `hop.kv.get(namespace, key)`
 
 Get a value by key.
 
@@ -231,7 +448,7 @@ Get a value by key.
 var val = hop.kv.get("default", "config:theme");
 ```
 
-### `hop.kv.set(namespace, key, value, contentType?)`
+#### `hop.kv.set(namespace, key, value, contentType?)`
 
 Set a key-value pair.
 
@@ -251,7 +468,7 @@ hop.kv.set("default", "config:theme", "dark");
 hop.kv.set("default", "stats:today", { visits: 42, errors: 0 });
 ```
 
-### `hop.kv.delete(namespace, key)`
+#### `hop.kv.delete(namespace, key)`
 
 Delete a key.
 
@@ -268,7 +485,7 @@ Delete a key.
 hop.kv.delete("default", "temp:data");
 ```
 
-### `hop.kv.list(namespace, prefix?)`
+#### `hop.kv.list(namespace, prefix?)`
 
 List entries matching an optional prefix.
 
@@ -287,9 +504,9 @@ var entries = hop.kv.list("default", "cap:health:");
 
 ---
 
-## Datastore: Time Series
+### Datastore: Time Series
 
-### `hop.ts.insert(metric, value, tags?)`
+#### `hop.ts.insert(metric, value, tags?)`
 
 Insert a data point.
 
@@ -308,7 +525,7 @@ hop.ts.insert("health.load", 1.5, { host: "web-01" });
 hop.ts.insert("requests", 42);
 ```
 
-### `hop.ts.query(metric, start, end, options?)`
+#### `hop.ts.query(metric, start, end, options?)`
 
 Query data points in a time range.
 
@@ -332,7 +549,7 @@ var filtered = hop.ts.query("health.load", now - 3600000, now, {
 });
 ```
 
-### `hop.ts.latest(metric)`
+#### `hop.ts.latest(metric)`
 
 Get the most recent data point.
 
@@ -351,9 +568,9 @@ if (latest) hop.log("Current load: " + latest.value);
 
 ---
 
-## Datastore: Cron
+### Datastore: Cron
 
-### `hop.cron.list()`
+#### `hop.cron.list()`
 
 List all cron jobs.
 
@@ -370,9 +587,9 @@ for (var i = 0; i < jobs.length; i++) {
 
 ---
 
-## Secrets
+### Secrets
 
-### `hop.secrets.get(name)`
+#### `hop.secrets.get(name)`
 
 Get a secret's decrypted value.
 
@@ -388,7 +605,7 @@ Get a secret's decrypted value.
 var key = hop.secrets.get("ANTHROPIC_API_KEY");
 ```
 
-### `hop.secrets.set(name, value)`
+#### `hop.secrets.set(name, value)`
 
 Store an encrypted secret.
 
@@ -405,7 +622,7 @@ Store an encrypted secret.
 hop.secrets.set("gmail_access_token", newToken);
 ```
 
-### `hop.secrets.delete(name)`
+#### `hop.secrets.delete(name)`
 
 Delete a secret.
 
@@ -421,7 +638,7 @@ Delete a secret.
 hop.secrets.delete("old_token");
 ```
 
-### `hop.secrets.list()`
+#### `hop.secrets.list()`
 
 List all secret names (not values).
 
@@ -435,9 +652,9 @@ var names = hop.secrets.list();
 
 ---
 
-## HTTP
+### HTTP
 
-### `hop.http(url, options?)`
+#### `hop.http(url, options?)`
 
 Make an HTTP request.
 
@@ -465,7 +682,7 @@ server-side request forgery:
 Unrestricted (owner/full-access) automation is unchanged and may still reach
 internal services intentionally.
 
-#### Options
+##### Options
 
 | Field | Type | Description |
 |---|---|---|
@@ -489,19 +706,19 @@ var resp = hop.http("https://api.example.com/submit", {
 });
 ```
 
-### `hop.http.get(url, options?)`
+#### `hop.http.get(url, options?)`
 
 Shorthand for `hop.http(url, { method: "GET", ...options })`.
 
-### `hop.http.post(url, options?)`
+#### `hop.http.post(url, options?)`
 
 Shorthand for `hop.http(url, { method: "POST", ...options })`.
 
-### `hop.http.put(url, options?)`
+#### `hop.http.put(url, options?)`
 
 Shorthand for `hop.http(url, { method: "PUT", ...options })`.
 
-### `hop.http.delete(url, options?)`
+#### `hop.http.delete(url, options?)`
 
 Shorthand for `hop.http(url, { method: "DELETE", ...options })`.
 
@@ -509,9 +726,9 @@ Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD. Timeout: 30 seconds per 
 
 ---
 
-## Metrics
+### Metrics
 
-### `hop.metrics.push(points)`
+#### `hop.metrics.push(points)`
 
 Push metric points to the orchestrator.
 
@@ -531,9 +748,9 @@ hop.metrics.push([
 
 ---
 
-## Utility
+### Utility
 
-### `hop.log(message...)`
+#### `hop.log(message...)`
 
 Write a message to stderr (visible to the operator, not to the MCP client).
 
@@ -548,7 +765,7 @@ hop.log("Processing", items.length, "items");
 // Output: [hop.log] Processing 5 items
 ```
 
-### `hop.sleep(ms)`
+#### `hop.sleep(ms)`
 
 Sleep for the specified number of milliseconds.
 
@@ -562,7 +779,7 @@ Sleep for the specified number of milliseconds.
 hop.sleep(1000);  // sleep 1 second
 ```
 
-### `hop.id()`
+#### `hop.id()`
 
 Get the current node's identity.
 
@@ -576,19 +793,19 @@ var nodeId = hop.id();
 
 ---
 
-## File System (Planned)
+### File System (Planned)
 
-### `hop.fs.push()` (Planned)
+#### `hop.fs.push()` (Planned)
 
 Push files to a remote host. Not yet implemented in MCP mode.
 
-### `hop.fs.pull()` (Planned)
+#### `hop.fs.pull()` (Planned)
 
 Pull files from a remote host. Not yet implemented in MCP mode.
 
 ---
 
-## Injected Globals
+### Injected Globals
 
 These are set by the cron scheduler before script execution, not by user code:
 

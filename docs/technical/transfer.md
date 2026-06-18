@@ -37,7 +37,7 @@ For `hop/0`, `NegotiatedParams::legacy()` is used: no compression, 64 KiB chunks
 
 ## TransferMsg Enum
 
-See [protocol.md](protocol.md) for the full `TransferMsg` definition. Key message flows:
+See [Architecture & Protocol](architecture.md) for the full `TransferMsg` definition. Key message flows:
 
 ### Copy Push (client -> host)
 

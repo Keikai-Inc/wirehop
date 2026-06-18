@@ -132,7 +132,7 @@ Since Phase 1 (0.6.26), authorization is **doc-aware**: membership lives in a
 replicated network document, with `peers.json` kept as a synced mirror and
 fallback. A peer in `peers.json` is always allowed (no lockout); the document is
 consulted for peers not locally known. See
-[../technical/p2p-network.md](../technical/p2p-network.md) and
+[../technical/warren-internals.md](../technical/warren-internals.md) and
 [warren.md](warren.md).
 
 ### Peer Roles
@@ -185,7 +185,7 @@ bringup past the conflict guard; `HOP_VPN=0` is a recovery escape hatch.
 **Why off by default.** The warren's shared document is currently a *write-open*
 trust model — every member holds a `ShareMode::Write` ticket, so per-author write
 authorization is not yet enforced (tracked as **C1** in
-[../technical/security-audit.md](../technical/security-audit.md)). Defaulting the
+[../technical/security.md](../technical/security.md)). Defaulting the
 VPN off shrinks the blast radius to nodes that have deliberately opted in while
 that trust model is hardened.
 

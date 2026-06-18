@@ -671,6 +671,6 @@ development; the full path uses `hop <host> tap ...`).
 - [`docs/product/tap.md`](../product/tap.md) — user-facing description.
 - [`docs/technical/architecture.md`](architecture.md) — hop core's
   crate layout, extension framework's place in the picture.
-- [`docs/technical/protocol.md`](protocol.md) — hop's wire protocol;
+- [`docs/technical/architecture.md`](architecture.md) — hop's wire protocol;
   Extension* peer-op variants are defined there.
 - [hop-tap repository](https://github.com/keik-ai/hop-tap) — source.
