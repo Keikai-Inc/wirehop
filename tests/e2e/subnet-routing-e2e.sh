@@ -15,10 +15,11 @@
 #
 # PASS = `ping 192.168.77.10` from host-b succeeds (only possible via the route).
 #
-# Runs NON-privsep (single root process): the gateway's nft/ip_forward calls are
-# privileged and the dropped worker can't do them yet (routing them through the
-# monitor, like CreateTun/BindPrivPort, is a follow-up). HOP_ACCEPT_ROUTES opts
-# the client into route acceptance (off by default, like Tailscale --accept-routes).
+# Runs UNDER privsep (HOP_PRIVSEP_DROP, the real daemon's mode): the gateway's
+# nft/ip_forward calls are privileged and the dropped worker delegates them to the
+# root monitor via the SetupGateway primitive (like CreateTun/BindPrivPort). This
+# exercises that whole path. HOP_ACCEPT_ROUTES opts the client into route
+# acceptance (off by default, like Tailscale --accept-routes).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,7 +72,7 @@ docker run -d --name hop-sr-lan --network "$LANNET" --ip "$LAN_TARGET" "$IMG" sl
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
         --sysctl net.ipv4.ip_forward=1
         -v "$VOL:/shared" -e RUST_LOG="${HOP_E2E_LOG:-hop=info,hop_core=info}"
-        -e HOP_VPN=1 --user root)
+        -e HOP_VPN=1 -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1 --user root)
 
 echo "=== starting gateway host-a (advertises $LAN_CIDR) ==="
 docker run -d --name hop-sr-a "${COMMON[@]}" "$IMG" bash -c "

@@ -154,68 +154,87 @@ fn apply_nft(ruleset: &str) -> Result<()> {
 }
 
 
-/// Install a kernel route sending `cidr` through the warren TUN, so traffic to a
-/// gateway-advertised subnet leaves via the VPN. **Collision guard:** skips
-/// (returns `Ok(false)`) if `cidr` already covers one of this host's own
-/// interface addresses — refusing to hijack the local LAN (the overlap footgun).
-/// A `/32` device route generally won't collide and still wins over the local
-/// `/24`. Idempotent.
-pub fn install_client_route(cidr: &str, tun: &str) -> Result<bool> {
-    let locals = crate::net::netmon::current_interface_addrs();
-    for ip in &locals {
-        if let std::net::IpAddr::V4(v4) = ip
-            && crate::vpn::cidr_contains_v4(cidr, *v4)
-        {
-            tracing::warn!(
-                "vpn route: NOT installing {cidr} — it covers local address {v4} (would hijack \
-                 the local LAN). Use a narrower /32 device route to reach a specific host."
-            );
-            return Ok(false);
-        }
-    }
+/// Whether `cidr` covers one of this host's own interface addresses — installing
+/// it as a tunnel route would hijack the local LAN (the overlap footgun). The
+/// **unprivileged** half of route installation; the worker checks this itself
+/// before delegating the privileged `add_route_raw` under privsep.
+pub fn route_collides(cidr: &str) -> bool {
+    crate::net::netmon::current_interface_addrs().iter().any(|ip| {
+        matches!(ip, std::net::IpAddr::V4(v4) if crate::vpn::cidr_contains_v4(cidr, *v4))
+    })
+}
+
+/// Add a kernel route `cidr → dev` (the **privileged** half; no collision check —
+/// the caller must have cleared `route_collides`). Idempotent.
+pub fn add_route_raw(cidr: &str, dev: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("ip").args(["route", "del", cidr, "dev", tun]).status();
+        let _ = std::process::Command::new("ip").args(["route", "del", cidr, "dev", dev]).status();
         let st = std::process::Command::new("ip")
-            .args(["route", "add", cidr, "dev", tun])
+            .args(["route", "add", cidr, "dev", dev])
             .status()
             .context("ip route add")?;
         if !st.success() {
-            anyhow::bail!("`ip route add {cidr} dev {tun}` failed");
+            anyhow::bail!("`ip route add {cidr} dev {dev}` failed");
         }
-        tracing::info!("vpn route: installed {cidr} via {tun}");
-        Ok(true)
+        tracing::info!("vpn route: installed {cidr} via {dev}");
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("route").args(["-n", "delete", cidr]).status();
         let st = std::process::Command::new("route")
-            .args(["-n", "add", "-net", cidr, "-interface", tun])
+            .args(["-n", "add", "-net", cidr, "-interface", dev])
             .status()
             .context("route add")?;
         if !st.success() {
-            anyhow::bail!("`route add -net {cidr} -interface {tun}` failed");
+            anyhow::bail!("`route add -net {cidr} -interface {dev}` failed");
         }
-        tracing::info!("vpn route: installed {cidr} via {tun}");
-        Ok(true)
+        tracing::info!("vpn route: installed {cidr} via {dev}");
+        Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (cidr, tun);
-        Ok(false)
+        let _ = (cidr, dev);
+        Ok(())
     }
 }
 
-/// Remove a previously-installed client route (best-effort).
-pub fn uninstall_client_route(cidr: &str, _tun: &str) {
+/// Remove a kernel route `cidr → dev` (privileged; best-effort).
+pub fn remove_route_raw(cidr: &str, dev: &str) {
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("ip").args(["route", "del", cidr, "dev", _tun]).status();
+        let _ = std::process::Command::new("ip").args(["route", "del", cidr, "dev", dev]).status();
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = dev;
         let _ = std::process::Command::new("route").args(["-n", "delete", cidr]).status();
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (cidr, dev);
+    }
+}
+
+/// Install a client route with the collision guard (returns `false` if it would
+/// hijack the local LAN). Convenience for the non-privsep direct path; under
+/// privsep the worker uses `route_collides` + delegates `add_route_raw`.
+pub fn install_client_route(cidr: &str, tun: &str) -> Result<bool> {
+    if route_collides(cidr) {
+        tracing::warn!(
+            "vpn route: NOT installing {cidr} — it covers a local address (would hijack the \
+             local LAN). Use a narrower /32 device route to reach a specific host."
+        );
+        return Ok(false);
+    }
+    add_route_raw(cidr, tun)?;
+    Ok(true)
+}
+
+/// Remove a previously-installed client route (best-effort).
+pub fn uninstall_client_route(cidr: &str, tun: &str) {
+    remove_route_raw(cidr, tun);
 }
 
 #[cfg(test)]

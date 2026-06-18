@@ -1215,7 +1215,7 @@ impl NetDoc {
             self.vpn_tun.read().await.as_ref().and_then(|d| d.tun_name().ok())
         };
         match tun_name {
-            Some(tun) => match crate::vpn::gateway::setup_gateway(&tun, &gw_routes) {
+            Some(_tun) => match crate::privsep::setup_gateway(&gw_routes) {
                 Ok(()) => tracing::info!(
                     "vpn gateway: forwarding {} route(s) live: {:?}",
                     cidrs.len(),
@@ -2253,7 +2253,7 @@ impl NetDoc {
         let mut accepted_routes: Vec<(String, iroh::PublicKey, Option<iroh::RelayUrl>)> =
             self.accepted_route_endpoints().await;
         for (cidr, _, _) in &accepted_routes {
-            let _ = crate::vpn::gateway::install_client_route(cidr, &tun_name);
+            let _ = crate::privsep::install_client_route(cidr, &tun_name);
         }
         let mut route_refresh = tokio::time::interval(ROUTE_REFRESH);
         route_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2288,12 +2288,12 @@ impl NetDoc {
                     // advertised. Both idempotent + collision-guarded.
                     for (cidr, _, _) in &fresh {
                         if !accepted_routes.iter().any(|(c, _, _)| c == cidr) {
-                            let _ = crate::vpn::gateway::install_client_route(cidr, &tun_name);
+                            let _ = crate::privsep::install_client_route(cidr, &tun_name);
                         }
                     }
                     for (cidr, _, _) in &accepted_routes {
                         if !fresh.iter().any(|(c, _, _)| c == cidr) {
-                            crate::vpn::gateway::uninstall_client_route(cidr, &tun_name);
+                            crate::privsep::uninstall_client_route(cidr, &tun_name);
                         }
                     }
                     accepted_routes = fresh;

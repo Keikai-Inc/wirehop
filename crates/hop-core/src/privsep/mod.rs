@@ -57,6 +57,16 @@ pub enum MonitorRequest {
     /// `resolvectl`), so the worker delegates it. The monitor remembers the
     /// domain and reverts it when it exits. Replies `Ok` (no fd).
     ConfigureResolver { domain: String, vip: [u8; 4] },
+    /// Set up Tier 1 LAN-bridging gateway forwarding for `routes` (`(cidr, snat)`):
+    /// enable `ip_forward` + apply the nftables NAT/forward ruleset. Privileged
+    /// (writes `/proc/sys/net`, runs `nft`), so the dropped worker delegates it.
+    /// The monitor reverts it on exit. Replies `Ok` (no fd).
+    SetupGateway { routes: Vec<(String, bool)> },
+    /// Add (`add=true`) or remove a kernel route `cidr → dev` through the warren
+    /// TUN, so an accepted subnet route leaves via the VPN. Privileged (`ip route`),
+    /// so the dropped worker delegates it. The monitor allowlists `dev` to a TUN
+    /// interface (`tun*`/`utun*`). Replies `Ok` (no fd).
+    ModifyClientRoute { cidr: String, dev: String, add: bool },
     /// Spawn a session command on a fresh PTY and return the PTY **master** fd.
     /// The worker has already resolved `argv` (including the `login`/`su` and
     /// sandbox wrapper), so the monitor only performs the privileged act —
@@ -888,6 +898,87 @@ pub fn configure_resolver(domain: &str, vip: std::net::Ipv4Addr) -> Result<()> {
     }
 }
 
+/// Set up Tier 1 LAN-bridging gateway forwarding for `routes`, delegating to the
+/// monitor when this is the dropped worker (`nft`/`ip_forward` are privileged).
+/// Mirrors [`configure_resolver`]; a non-privsep host applies it directly.
+pub fn setup_gateway(routes: &[crate::vpn::gateway::GatewayRoute]) -> Result<()> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let wire: Vec<(String, bool)> =
+                routes.iter().map(|r| (r.cidr.clone(), r.snat)).collect();
+            send_msg(ctrl, &MonitorRequest::SetupGateway { routes: wire })
+                .context("requesting gateway setup from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::Ok => Ok(()),
+                MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for SetupGateway"),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused SetupGateway: {message}")
+                }
+            }
+        }
+        None => crate::vpn::gateway::setup_gateway("", routes),
+    }
+}
+
+/// Install a client route `cidr → dev` (an accepted subnet route), delegating the
+/// privileged `ip route add` to the monitor under privsep. The collision guard
+/// (unprivileged) runs here first: returns `Ok(false)` without touching the kernel
+/// if `cidr` would hijack the local LAN.
+pub fn install_client_route(cidr: &str, dev: &str) -> Result<bool> {
+    if crate::vpn::gateway::route_collides(cidr) {
+        tracing::warn!(
+            "vpn route: NOT installing {cidr} — it covers a local address (would hijack the \
+             local LAN). Use a narrower /32 device route to reach a specific host."
+        );
+        return Ok(false);
+    }
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            send_msg(
+                ctrl,
+                &MonitorRequest::ModifyClientRoute {
+                    cidr: cidr.to_string(),
+                    dev: dev.to_string(),
+                    add: true,
+                },
+            )
+            .context("requesting client route from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::Ok => Ok(true),
+                MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ModifyClientRoute"),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused ModifyClientRoute: {message}")
+                }
+            }
+        }
+        None => crate::vpn::gateway::add_route_raw(cidr, dev).map(|()| true),
+    }
+}
+
+/// Remove a client route `cidr → dev` (best-effort), delegating under privsep.
+pub fn uninstall_client_route(cidr: &str, dev: &str) {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if send_msg(
+                ctrl,
+                &MonitorRequest::ModifyClientRoute {
+                    cidr: cidr.to_string(),
+                    dev: dev.to_string(),
+                    add: false,
+                },
+            )
+            .is_ok()
+            {
+                let _ = recv_msg::<MonitorReply>(ctrl);
+            }
+        }
+        None => crate::vpn::gateway::remove_route_raw(cidr, dev),
+    }
+}
+
 /// Worker side of `SpawnSession`: ask the monitor to spawn `argv` (the
 /// worker-resolved `login`/`su`/shell command) on a PTY and return the master
 /// fd. Only meaningful in privsep-worker mode; callers gate on
@@ -1195,6 +1286,9 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     // Resolver domains we pointed at MagicDNS for this worker; reverted below when
     // the worker exits so a stale split-DNS entry never outlives the daemon.
     let mut kept_resolvers: Vec<String> = Vec::new();
+    // Whether we've applied LAN-bridging gateway forwarding (nft + ip_forward),
+    // so it's torn down when the worker exits rather than leaking nftables rules.
+    let mut gateway_active = false;
 
     loop {
         let req: MonitorRequest = match recv_msg(mon_fd) {
@@ -1244,6 +1338,50 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     Err(e) => {
                         tracing::warn!("privsep monitor: ConfigureResolver denied: {e:#}");
                         let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                    }
+                }
+            }
+            MonitorRequest::SetupGateway { routes } => {
+                let gw: Vec<crate::vpn::gateway::GatewayRoute> = routes
+                    .into_iter()
+                    .map(|(cidr, snat)| crate::vpn::gateway::GatewayRoute { cidr, snat })
+                    .collect();
+                match crate::vpn::gateway::setup_gateway("monitor", &gw) {
+                    Ok(()) => {
+                        gateway_active = true;
+                        let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                    }
+                    Err(e) => {
+                        tracing::warn!("privsep monitor: SetupGateway denied: {e:#}");
+                        let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                    }
+                }
+            }
+            MonitorRequest::ModifyClientRoute { cidr, dev: _, add } => {
+                use tun::AbstractDevice;
+                // Route onto the warren TUN the monitor itself created — the worker
+                // can't reliably read the device name from a passed fd, so we don't
+                // trust its `dev`; we use ours (inherently the warren overlay, so
+                // this can never point a route at an arbitrary interface).
+                match kept_tuns.last().and_then(|t| t.tun_name().ok()) {
+                    None => {
+                        let _ = send_msg(
+                            mon_fd,
+                            &MonitorReply::Error { message: "no warren TUN to route onto".into() },
+                        );
+                    }
+                    Some(tun) if add => match crate::vpn::gateway::add_route_raw(&cidr, &tun) {
+                        Ok(()) => {
+                            let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                        }
+                        Err(e) => {
+                            tracing::warn!("privsep monitor: ModifyClientRoute add failed: {e:#}");
+                            let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                        }
+                    },
+                    Some(tun) => {
+                        crate::vpn::gateway::remove_route_raw(&cidr, &tun);
+                        let _ = send_msg(mon_fd, &MonitorReply::Ok);
                     }
                 }
             }
@@ -1352,6 +1490,11 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
         if let Err(e) = crate::vpn::resolver::remove(&domain) {
             tracing::warn!("privsep: reverting resolver for {domain} failed: {e:#}");
         }
+    }
+    // Tear down LAN-bridging gateway forwarding so nftables rules don't outlive
+    // the worker (a respawning worker re-applies on bring-up).
+    if gateway_active {
+        crate::vpn::gateway::teardown_gateway();
     }
 
     if uptime < HEALTHY_UPTIME {
