@@ -46,6 +46,9 @@ const KEY_ROLE_PREFIX: &str = "role/";
 const KEY_REVOCATION_PREFIX: &str = "revocation/";
 const KEY_IP_PREFIX: &str = "ip/";
 const KEY_VPN_PREFIX: &str = "vpn/";
+/// Subnet/exit routes advertised by gateway nodes (Tier 1 LAN bridging):
+/// `route/<node_id_hex>/<cidr>` (slash in the CIDR encoded as `-`).
+const KEY_ROUTE_PREFIX: &str = "route/";
 
 /// Base of the CGNAT range `100.64.0.0/10` (Tailscale-style), as a u32.
 const CGNAT_BASE: u32 = 0x6440_0000; // 100.64.0.0
@@ -64,6 +67,48 @@ pub fn deterministic_ip(node_id: &str) -> std::net::Ipv4Addr {
     let raw = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
     let offset = 1 + (raw % (CGNAT_SIZE - 2));
     std::net::Ipv4Addr::from(CGNAT_BASE + offset)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Kind of advertised route (Tier 1 LAN bridging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteKind {
+    /// A specific LAN CIDR (or `/32` device) the gateway bridges onto its
+    /// physical network.
+    Subnet,
+    /// The default route (`0.0.0.0/0`) — the gateway acts as an internet exit
+    /// node.
+    Exit,
+}
+
+/// A subnet/exit route advertised by a gateway node. Stored in the gateway's
+/// self-doc under `route/<node_id>/<cidr>`; the rest of the warren reads it to
+/// decide what to tunnel through that gateway. Inert until a peer *accepts* the
+/// route and the gateway is set up to forward — advertising alone changes
+/// nothing on the data plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteAdvert {
+    /// Advertised CIDR in canonical form, e.g. `192.168.1.0/24` or `0.0.0.0/0`.
+    pub cidr: String,
+    /// Tags gating reach to this route (Cedar resource tags). Empty = inherit
+    /// the gateway node's own host tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Whether the gateway SNATs (masquerades) forwarded traffic to its LAN IP.
+    /// Default true: replies return to the gateway with zero changes on the
+    /// target LAN. `false` preserves the client's source IP but requires return
+    /// routes on the target side (power-user / site-to-site).
+    #[serde(default = "default_true")]
+    pub snat: bool,
+    /// Subnet vs. exit-node.
+    pub kind: RouteKind,
+    /// Epoch-seconds when advertised (audit/debug).
+    #[serde(default)]
+    pub advertised_at: String,
 }
 
 /// Persisted pointer to the host's network namespace (`netdoc.json`).
@@ -1360,6 +1405,58 @@ impl NetDoc {
             let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
             let tags: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
             out.insert(node.to_string(), tags);
+        }
+        Ok(out)
+    }
+
+    // ── Subnet routes (Tier 1 LAN bridging) ─────────────────────────────
+
+    /// Advertise that `node_id` can route `advert.cidr` onto its physical LAN
+    /// (or the default route, for an exit node). Written to this node's self-doc
+    /// under `route/<node_id>/<cidr>`. Advertising is inert by itself — a peer
+    /// must *accept* the route and the gateway must be set up to forward.
+    pub async fn advertise_route(&self, node_id: &str, advert: &RouteAdvert) -> Result<()> {
+        let key = format!("{KEY_ROUTE_PREFIX}{node_id}/{}", advert.cidr.replace('/', "-"));
+        let value = serde_json::to_vec(advert).context("serializing route advert")?;
+        self.put_self(&key, value).await.context("advertising route")?;
+        self.invalidate_reach_cache().await;
+        Ok(())
+    }
+
+    /// Withdraw a previously-advertised route (empty-value tombstone).
+    pub async fn withdraw_route(&self, node_id: &str, cidr: &str) -> Result<()> {
+        let key = format!("{KEY_ROUTE_PREFIX}{node_id}/{}", cidr.replace('/', "-"));
+        self.put_self(&key, Vec::new()).await.context("withdrawing route")?;
+        self.invalidate_reach_cache().await;
+        Ok(())
+    }
+
+    /// All advertised routes across the warren as `(gateway_node_id, RouteAdvert)`.
+    /// Reads the shared doc plus each imported member self-doc (a read-ticket
+    /// member's routes live only in its self-doc), deduped by `(node, cidr)`.
+    pub async fn list_routes(&self) -> Result<Vec<(String, RouteAdvert)>> {
+        let member_docs: Vec<Doc> =
+            self.member_docs.read().await.values().map(|(d, _)| d.clone()).collect();
+        let mut out: Vec<(String, RouteAdvert)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for doc in std::iter::once(&self.doc).chain(member_docs.iter()) {
+            let query = Query::key_prefix(KEY_ROUTE_PREFIX.as_bytes()).build();
+            let stream = doc.get_many(query).await.context("get_many route")?;
+            let mut stream = std::pin::pin!(stream);
+            while let Some(entry) = stream.next().await {
+                let entry = entry.context("reading route entry")?;
+                if entry.content_len() == 0 {
+                    continue;
+                }
+                let key = String::from_utf8_lossy(entry.key()).into_owned();
+                let Some(rest) = key.strip_prefix(KEY_ROUTE_PREFIX) else { continue };
+                let Some((node_id, _cidr_key)) = rest.split_once('/') else { continue };
+                let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+                let Ok(advert) = serde_json::from_slice::<RouteAdvert>(&bytes) else { continue };
+                if seen.insert((node_id.to_string(), advert.cidr.clone())) {
+                    out.push((node_id.to_string(), advert));
+                }
+            }
         }
         Ok(out)
     }

@@ -76,6 +76,48 @@ pub fn is_virtual_addr(addr: Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+/// Parse an IPv4 CIDR `"a.b.c.d/n"` into `(network, prefix_len)` with the host
+/// bits masked off. `None` if malformed or `n > 32`. (Tier 1 LAN bridging.)
+pub fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, len) = s.split_once('/')?;
+    let ip: Ipv4Addr = ip.trim().parse().ok()?;
+    let len: u8 = len.trim().parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    Some((Ipv4Addr::from(u32::from(ip) & mask), len))
+}
+
+/// Whether `cidr` (an IPv4 CIDR string) contains `ip`. Malformed CIDR → false.
+pub fn cidr_contains_v4(cidr: &str, ip: Ipv4Addr) -> bool {
+    let Some((net, len)) = parse_cidr_v4(cidr) else {
+        return false;
+    };
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(ip) & mask) == u32::from(net)
+}
+
+/// From an iterator of `(cidr, value)`, return the value whose CIDR contains
+/// `ip` with the **longest** prefix (most specific). Ties broken by iteration
+/// order. `None` if nothing matches. Used to resolve which gateway routes a
+/// given destination (a `/32` device route wins over a `/24` subnet route).
+pub fn longest_prefix_match<'a, T>(
+    routes: impl IntoIterator<Item = (&'a str, T)>,
+    ip: Ipv4Addr,
+) -> Option<T> {
+    let mut best: Option<(u8, T)> = None;
+    for (cidr, value) in routes {
+        if let Some((_, len)) = parse_cidr_v4(cidr)
+            && cidr_contains_v4(cidr, ip)
+            && best.as_ref().is_none_or(|(blen, _)| len > *blen)
+        {
+            best = Some((len, value));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
 /// If another network interface already holds an address in `100.64.0.0/10`,
 /// return it. hop's virtual network shares the CGNAT range with Tailscale and
 /// some carrier-grade NATs, so when the VPN is left at its default (auto) we
@@ -449,5 +491,44 @@ mod tests {
         assert!(!is_virtual_addr(Ipv4Addr::new(100, 63, 0, 1)));
         assert!(!is_virtual_addr(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(!is_virtual_addr(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn cidr_parse_and_contains() {
+        assert_eq!(
+            parse_cidr_v4("192.168.1.0/24"),
+            Some((Ipv4Addr::new(192, 168, 1, 0), 24))
+        );
+        // host bits are masked off in the returned network
+        assert_eq!(
+            parse_cidr_v4("192.168.1.128/24"),
+            Some((Ipv4Addr::new(192, 168, 1, 0), 24))
+        );
+        assert_eq!(parse_cidr_v4("0.0.0.0/0"), Some((Ipv4Addr::new(0, 0, 0, 0), 0)));
+        assert_eq!(parse_cidr_v4("10.0.0.5/32"), Some((Ipv4Addr::new(10, 0, 0, 5), 32)));
+        assert_eq!(parse_cidr_v4("nonsense"), None);
+        assert_eq!(parse_cidr_v4("1.2.3.4/33"), None);
+
+        assert!(cidr_contains_v4("192.168.1.0/24", Ipv4Addr::new(192, 168, 1, 128)));
+        assert!(!cidr_contains_v4("192.168.1.0/24", Ipv4Addr::new(192, 168, 2, 1)));
+        assert!(cidr_contains_v4("0.0.0.0/0", Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(cidr_contains_v4("10.0.0.5/32", Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(!cidr_contains_v4("10.0.0.5/32", Ipv4Addr::new(10, 0, 0, 6)));
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        // a /32 device route must win over a covering /24 and the default route
+        let routes = [
+            ("0.0.0.0/0", "exit"),
+            ("192.168.1.0/24", "subnet"),
+            ("192.168.1.128/32", "device"),
+        ];
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(192, 168, 1, 128));
+        assert_eq!(hit, Some("device"));
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(hit, Some("subnet"));
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(hit, Some("exit"));
     }
 }
