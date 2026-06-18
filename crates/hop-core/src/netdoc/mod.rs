@@ -2384,25 +2384,52 @@ impl NetDoc {
                     }
                 }
             } else {
-                // Tier 1 LAN bridging: a non-vIP destination is routed to a
-                // gateway when we've accepted a covering route (longest-prefix
-                // wins, so a /32 device route beats a /24 beats the exit route).
-                // Acceptance already gated reach; the gateway re-authorizes on
-                // ingress. No accepted route → not ours to forward → drop (the
-                // pre-LAN-bridging behavior for non-virtual destinations).
-                match crate::vpn::longest_prefix_match(
-                    accepted_routes.iter().map(|(c, pk, r)| (c.as_str(), (*pk, r.clone()))),
-                    dst,
-                ) {
-                    Some((pk, relay)) => {
-                        tracing::debug!(
-                            "vpn egress: {dst} routed via gateway {} (subnet route)",
-                            pk.fmt_short()
-                        );
-                        (pk, relay)
+                // Tier 1 LAN bridging + HA: gather every accepted gateway whose
+                // route covers `dst` at the LONGEST prefix (a /32 device beats a
+                // /24 beats the 0.0.0.0/0 exit). When several advertise the SAME
+                // longest-prefix route (HA subnet routers), prefer a gateway we've
+                // heard from recently and fail over to a backup when the primary
+                // goes silent. Acceptance already gated reach; the gateway
+                // re-authorizes on ingress. No covering route → drop.
+                let mut best_len: Option<u8> = None;
+                let mut candidates: Vec<(iroh::PublicKey, Option<iroh::RelayUrl>)> = Vec::new();
+                for (cidr, pk, relay) in &accepted_routes {
+                    if let Some((_, len)) = crate::vpn::parse_cidr_v4(cidr)
+                        && crate::vpn::cidr_contains_v4(cidr, dst)
+                    {
+                        match best_len {
+                            Some(bl) if len < bl => {}
+                            Some(bl) if len == bl => candidates.push((*pk, relay.clone())),
+                            _ => {
+                                best_len = Some(len);
+                                candidates = vec![(*pk, relay.clone())];
+                            }
+                        }
                     }
-                    None => continue,
                 }
+                if candidates.is_empty() {
+                    continue;
+                }
+                // Failover: pick a live gateway (fresh inbound datagram) if any;
+                // else the first (cold start — the send path below dials it).
+                let chosen = {
+                    let last_rx = self.vpn_last_rx.read().await;
+                    let idx = crate::vpn::select_live(&candidates, |(pk, _)| {
+                        last_rx
+                            .get(&pk.to_string())
+                            .map(|t| t.elapsed() < STALE_AFTER)
+                            .unwrap_or(false)
+                    });
+                    candidates[idx].clone()
+                };
+                if candidates.len() > 1 {
+                    tracing::debug!(
+                        "vpn egress: {dst} routed via gateway {} ({} HA candidates)",
+                        chosen.0.fmt_short(),
+                        candidates.len()
+                    );
+                }
+                chosen
             };
             // Have we received a datagram from this peer recently? That's the only
             // trustworthy liveness signal on the datagram data plane.

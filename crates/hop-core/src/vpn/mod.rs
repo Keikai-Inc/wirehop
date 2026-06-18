@@ -90,6 +90,15 @@ pub fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
     Some((Ipv4Addr::from(u32::from(ip) & mask), len))
 }
 
+/// HA gateway failover rule: from same-route `candidates`, return the index of the
+/// first one for which `is_live` holds (a gateway we've heard from recently); if
+/// none is live (cold start, or all silent), index 0. So traffic prefers a live
+/// gateway and falls over to a backup when the primary goes silent, deterministic
+/// on a cold start.
+pub fn select_live<T>(candidates: &[T], is_live: impl Fn(&T) -> bool) -> usize {
+    candidates.iter().position(is_live).unwrap_or(0)
+}
+
 /// Whether `cidr` (an IPv4 CIDR string) contains `ip`. Malformed CIDR → false.
 pub fn cidr_contains_v4(cidr: &str, ip: Ipv4Addr) -> bool {
     let Some((net, len)) = parse_cidr_v4(cidr) else {
@@ -632,5 +641,18 @@ mod tests {
         }];
         assert!(gateway_forwards(&gated, alice, dst));
         assert!(!gateway_forwards(&gated, bob, dst));
+    }
+
+    #[test]
+    fn ha_failover_prefers_live_gateway() {
+        let gws = ["primary", "backup"];
+        // Cold start (none live) → the first (deterministic).
+        assert_eq!(select_live(&gws, |_| false), 0);
+        // Primary live → primary.
+        assert_eq!(select_live(&gws, |g| *g == "primary"), 0);
+        // Primary silent, backup live → fail over to the backup.
+        assert_eq!(select_live(&gws, |g| *g == "backup"), 1);
+        // Both live → prefer the first (stable; no needless flapping).
+        assert_eq!(select_live(&gws, |_| true), 0);
     }
 }
