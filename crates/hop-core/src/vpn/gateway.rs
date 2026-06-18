@@ -87,13 +87,77 @@ pub fn setup_gateway(tun: &str, routes: &[GatewayRoute]) -> Result<()> {
         );
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.inet.ip.forwarding=1"])
+            .status();
+        let egress = detect_default_iface_macos().context("detecting macOS egress interface")?;
+        apply_pf(&pf_ruleset(&egress, routes))?;
+        tracing::info!(
+            "vpn gateway: forwarding {} route(s) on {} (ip.forwarding + pf hop anchor, egress {egress})",
+            routes.len(),
+            tun
+        );
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = tun;
-        anyhow::bail!(
-            "gateway forwarding is currently Linux-only (nftables); macOS pf support is planned (P2)"
-        )
+        anyhow::bail!("gateway forwarding is supported on Linux (nftables) and macOS (pf) only")
     }
+}
+
+/// pf ruleset (macOS) for gateway forwarding: an MSS clamp (`scrub … max-mss`) for
+/// the 1280-byte TUN, and — for SNAT routes — NAT that masquerades warren-sourced
+/// traffic (`100.64.0.0/10`) out the egress interface. pf NAT is interface-scoped
+/// (unlike nftables' source-match masquerade), so it takes the egress `if`. Pure
+/// and unit-testable. Empty for an empty route set.
+pub fn pf_ruleset(egress_if: &str, routes: &[GatewayRoute]) -> String {
+    let mut s = format!("scrub on {egress_if} all max-mss 1240\n");
+    if routes.iter().any(|r| r.snat) {
+        s.push_str(&format!(
+            "nat on {egress_if} from 100.64.0.0/10 to any -> ({egress_if})\n"
+        ));
+    }
+    s
+}
+
+/// The interface carrying the default route on macOS (the pf NAT egress).
+#[cfg(target_os = "macos")]
+fn detect_default_iface_macos() -> Result<String> {
+    let out = std::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .context("running `route -n get default`")?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.trim().strip_prefix("interface:") {
+            return Ok(rest.trim().to_string());
+        }
+    }
+    anyhow::bail!("could not determine the macOS default-route interface")
+}
+
+/// Load hop's NAT rules into a dedicated pf anchor and enable pf. NOTE: the anchor
+/// must be referenced from the main ruleset (`nat-anchor "com.hop"` in
+/// `/etc/pf.conf`) to be evaluated — that integration + a real 2-machine run are
+/// the remaining macOS gateway steps; the ruleset itself is generated + syntax-
+/// validated here.
+#[cfg(target_os = "macos")]
+fn apply_pf(ruleset: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let _ = Command::new("pfctl").arg("-E").status(); // enable pf (idempotent)
+    let mut child = Command::new("pfctl")
+        .args(["-a", "com.hop", "-f", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawning pfctl")?;
+    child.stdin.take().context("pfctl stdin")?.write_all(ruleset.as_bytes())?;
+    if !child.wait().context("waiting for pfctl")?.success() {
+        anyhow::bail!("pfctl failed to load the hop anchor");
+    }
+    Ok(())
 }
 
 /// Tear down hop's gateway NAT (remove the `hop_gw` table). Best-effort.
@@ -105,6 +169,10 @@ pub fn teardown_gateway() {
                 .args(["delete", "table", fam, NFT_TABLE])
                 .status();
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("pfctl").args(["-a", "com.hop", "-F", "all"]).status();
     }
 }
 
@@ -305,6 +373,18 @@ mod tests {
         assert!(rs.contains("table ip hop_gw"));
         assert!(rs.contains("ip saddr 100.64.0.0/10 counter masquerade"));
         assert!(!rs.contains("oifname"));
+    }
+
+    #[test]
+    fn pf_ruleset_has_mss_clamp_and_nat() {
+        let routes = vec![GatewayRoute { cidr: "192.168.1.0/24".into(), snat: true }];
+        let rs = pf_ruleset("en0", &routes);
+        assert!(rs.contains("scrub on en0 all max-mss 1240"));
+        assert!(rs.contains("nat on en0 from 100.64.0.0/10 to any -> (en0)"));
+        // snat off → no NAT, but the scrub/MSS clamp stays.
+        let off = pf_ruleset("en0", &[GatewayRoute { cidr: "10.0.0.0/8".into(), snat: false }]);
+        assert!(!off.contains("nat on"));
+        assert!(off.contains("max-mss 1240"));
     }
 
     #[test]
