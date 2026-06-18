@@ -2305,7 +2305,13 @@ impl NetDoc {
                     accepted_routes.iter().map(|(c, pk, r)| (c.as_str(), (*pk, r.clone()))),
                     dst,
                 ) {
-                    Some(v) => v,
+                    Some((pk, relay)) => {
+                        tracing::debug!(
+                            "vpn egress: {dst} routed via gateway {} (subnet route)",
+                            pk.fmt_short()
+                        );
+                        (pk, relay)
+                    }
                     None => continue,
                 }
             };

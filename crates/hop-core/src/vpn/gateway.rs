@@ -41,22 +41,31 @@ pub struct GatewayRoute {
 /// only hands advertised-CIDR datagrams to the TUN); here we just enable the
 /// forward path + NAT. An empty `routes` slice means no masquerade.
 pub fn nftables_ruleset(routes: &[GatewayRoute]) -> String {
-    let mut nat = String::new();
-    if routes.iter().any(|r| r.snat) {
-        nat.push_str("    ip saddr 100.64.0.0/10 masquerade\n");
-    }
-    format!(
+    // Forward path + MSS clamp in an `inet` table (applies to v4+v6 forwarding).
+    let mut s = format!(
         "table inet {NFT_TABLE} {{\n\
          \x20 chain forward {{\n\
          \x20   type filter hook forward priority 0; policy accept;\n\
          \x20   tcp flags syn tcp option maxseg size set rt mtu\n\
          \x20 }}\n\
-         \x20 chain postrouting {{\n\
-         \x20   type nat hook postrouting priority srcnat;\n\
-         {nat}\
-         \x20 }}\n\
          }}\n"
-    )
+    );
+    // SNAT/masquerade in an **IPv4 (`ip`) family** table — the broadly-supported
+    // place for masquerade. NAT in an `inet` table needs kernel ≥ 5.2 and silently
+    // no-ops on older/containerized kernels (the bug the subnet-routing e2e hit:
+    // packets forwarded but never SNAT'd, so replies to a 100.64/10 source were
+    // lost). `counter` makes a hit visible in `nft list table ip hop_gw`.
+    if routes.iter().any(|r| r.snat) {
+        s.push_str(&format!(
+            "table ip {NFT_TABLE} {{\n\
+             \x20 chain postrouting {{\n\
+             \x20   type nat hook postrouting priority srcnat; policy accept;\n\
+             \x20   ip saddr 100.64.0.0/10 counter masquerade\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+    }
+    s
 }
 
 /// Enable kernel IPv4 forwarding and apply the NAT/forward ruleset for `routes`.
@@ -91,16 +100,30 @@ pub fn setup_gateway(tun: &str, routes: &[GatewayRoute]) -> Result<()> {
 pub fn teardown_gateway() {
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("nft")
-            .args(["delete", "table", "inet", NFT_TABLE])
-            .status();
+        for fam in ["inet", "ip"] {
+            let _ = std::process::Command::new("nft")
+                .args(["delete", "table", fam, NFT_TABLE])
+                .status();
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 fn enable_ip_forward_linux() -> Result<()> {
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
-        .context("enabling net.ipv4.ip_forward (need CAP_NET_ADMIN / root)")?;
+    const P: &str = "/proc/sys/net/ipv4/ip_forward";
+    // Already enabled — by the host, a sysctl, or a container runtime? Then we're
+    // done. This also covers a read-only `/proc/sys` (common in containers) where
+    // the write would EROFS even though forwarding is already on: don't fail when
+    // the desired state already holds.
+    if std::fs::read_to_string(P).map(|s| s.trim() == "1").unwrap_or(false) {
+        return Ok(());
+    }
+    std::fs::write(P, "1").with_context(|| {
+        format!(
+            "enabling {P} (need CAP_NET_ADMIN + a writable /proc/sys, or set \
+             net.ipv4.ip_forward=1 externally e.g. via sysctl)"
+        )
+    })?;
     Ok(())
 }
 
@@ -108,10 +131,10 @@ fn enable_ip_forward_linux() -> Result<()> {
 fn apply_nft(ruleset: &str) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    // Replace any prior table first so re-apply is idempotent.
-    let _ = Command::new("nft")
-        .args(["delete", "table", "inet", NFT_TABLE])
-        .status();
+    // Replace any prior tables first so re-apply is idempotent (both families).
+    for fam in ["inet", "ip"] {
+        let _ = Command::new("nft").args(["delete", "table", fam, NFT_TABLE]).status();
+    }
     let mut child = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
@@ -206,13 +229,15 @@ mod tests {
             GatewayRoute { cidr: "10.0.0.5/32".into(), snat: true },
         ];
         let rs = nftables_ruleset(&routes);
+        // inet table carries the forward path + MSS clamp
         assert!(rs.contains("table inet hop_gw"));
         assert!(rs.contains("type filter hook forward priority 0; policy accept;"));
-        // interface-agnostic masquerade for SNAT routes (matches by source range)
-        assert!(rs.contains("ip saddr 100.64.0.0/10 masquerade"));
-        assert!(!rs.contains("oifname")); // no fragile LAN-interface scoping
-        // MSS clamp for the 1280 TUN
         assert!(rs.contains("tcp option maxseg size set rt mtu"));
+        // NAT lives in an ip-family table (compatible masquerade), matched by
+        // source range — no fragile LAN-interface scoping.
+        assert!(rs.contains("table ip hop_gw"));
+        assert!(rs.contains("ip saddr 100.64.0.0/10 counter masquerade"));
+        assert!(!rs.contains("oifname"));
     }
 
     #[test]
@@ -220,6 +245,7 @@ mod tests {
         let routes = vec![GatewayRoute { cidr: "192.168.1.0/24".into(), snat: false }];
         let rs = nftables_ruleset(&routes);
         assert!(!rs.contains("masquerade"));
+        assert!(!rs.contains("table ip hop_gw")); // no NAT table without SNAT routes
         // the forward path (ip_forward + accept policy + MSS clamp) is still set up
         assert!(rs.contains("policy accept;"));
         assert!(rs.contains("maxseg size set rt mtu"));

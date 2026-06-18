@@ -414,6 +414,14 @@ pub async fn pump_vpn_datagrams(
         // datagram rather than blackholing it indefinitely.
         match parse_src_ipv4(&dg) {
             Some(src) if src == expected => {}
+            // Return traffic from a LAN subnet a gateway peer forwards for us has
+            // a non-virtual source (the real LAN device), which legitimately won't
+            // match the peer's vIP. Accept it: a non-virtual address can't
+            // impersonate a warren member (members are all in 100.64/10), and the
+            // destination check below still confines it to our vIP / our own
+            // gatewayed routes. (P1 follow-up: tighten to "only from a peer whose
+            // route we accepted", alongside per-role route gating.)
+            Some(src) if !is_virtual_addr(src) => {}
             _ => {
                 refresh.notify_one();
                 continue;
@@ -434,6 +442,12 @@ pub async fn pump_vpn_datagrams(
             });
             if !for_us && !for_gateway {
                 continue;
+            }
+            if for_gateway && !for_us {
+                tracing::debug!(
+                    "vpn ingress: forwarding {:?} → LAN (gateway route); kernel will NAT",
+                    dst
+                );
             }
         }
         if let Some(tun) = tun.read().await.clone() {
