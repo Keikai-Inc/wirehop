@@ -252,6 +252,13 @@ pub struct NetDoc {
     /// pooled connection (still `Ok` on send, but no replies) and re-dial.
     #[cfg(unix)]
     vpn_last_rx: crate::vpn::VpnLastRx,
+    /// Gateway-advertised CIDRs (Tier 1 LAN bridging), shared with the VPN
+    /// inbound pump so a datagram for an advertised subnet is forwarded (the
+    /// kernel NATs it onto the LAN) instead of dropped as "not for our vIP".
+    /// Filled by `set_gateway_cidrs` after the daemon reads `routes.json`; empty
+    /// for a non-gateway node.
+    #[cfg(unix)]
+    vpn_gateway_cidrs: crate::vpn::GatewayCidrs,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -384,6 +391,9 @@ impl NetDoc {
         // (i.e. the VPN is explicitly enabled). Off by default → no-op. It
         // authenticates ingress against the shared peer-IP map (security-audit C2).
         #[cfg(unix)]
+        let vpn_gateway_cidrs: crate::vpn::GatewayCidrs =
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+        #[cfg(unix)]
         {
             builder = builder.accept(
                 crate::vpn::VPN_ALPN,
@@ -394,6 +404,7 @@ impl NetDoc {
                     vpn_refresh.clone(),
                     vpn_conns.clone(),
                     vpn_last_rx.clone(),
+                    vpn_gateway_cidrs.clone(),
                 ),
             );
         }
@@ -424,6 +435,8 @@ impl NetDoc {
             vpn_conns,
             #[cfg(unix)]
             vpn_last_rx,
+            #[cfg(unix)]
+            vpn_gateway_cidrs,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1128,6 +1141,122 @@ impl NetDoc {
 
         tracing::debug!("netdoc egress: {addr} UNRESOLVED (no self-doc, no shared entry, no owner)");
         Ok(None)
+    }
+
+    /// Resolve a **gateway node's** VPN endpoint by node-id, for routing to a
+    /// gateway (which, unlike a member vIP, isn't itself the packet's
+    /// destination). Mirrors `lookup_vpn_endpoint`'s roster-then-node-id path.
+    async fn lookup_endpoint_for_node(
+        &self,
+        node_id: &str,
+    ) -> Option<(iroh::PublicKey, Option<iroh::RelayUrl>)> {
+        if let Ok(Some(peer)) = self.get_peer(node_id).await
+            && let Some(val) = peer.vpn_endpoint.as_deref()
+            && let Some(v) = parse_vpn_endpoint_value(val.as_bytes())
+        {
+            return Some(v);
+        }
+        // Node-id + warren relay is enough to dial the VPN ALPN.
+        if let Ok(pubkey) = node_id.parse::<iroh::PublicKey>() {
+            return Some((pubkey, crate::net::HOP_RELAY_URL.parse().ok()));
+        }
+        None
+    }
+
+    /// Set the gateway-advertised CIDRs this node forwards (Tier 1 LAN bridging),
+    /// shared with the VPN inbound pump. Called by the daemon after reading
+    /// `routes.json`.
+    #[cfg(unix)]
+    pub fn set_gateway_cidrs(&self, cidrs: Vec<String>) {
+        if let Ok(mut g) = self.vpn_gateway_cidrs.write() {
+            *g = cidrs;
+        }
+    }
+
+    /// Bring up this node as a gateway for `routes` (Tier 1 LAN bridging): publish
+    /// each route to the warren, register the CIDRs with the inbound pump, and
+    /// program the kernel (ip_forward + nftables NAT) using the live TUN. Called
+    /// by the daemon after `enable_vpn` when `routes.json` is non-empty. Inert
+    /// (returns immediately) for an empty route set. Best-effort: a failed
+    /// advertise/setup logs and continues — it never blocks serving.
+    #[cfg(unix)]
+    pub async fn setup_gateway_routes(&self, node_id: &str, routes: &[crate::fleet::RouteConfig]) {
+        if routes.is_empty() {
+            return;
+        }
+        let mut cidrs = Vec::new();
+        let mut gw_routes = Vec::new();
+        for rc in routes {
+            let cidr = crate::fleet::RoutesStore::effective_cidr(rc);
+            let advert = RouteAdvert {
+                cidr: cidr.clone(),
+                tags: rc.tags.clone(),
+                snat: rc.snat,
+                kind: if rc.exit { RouteKind::Exit } else { RouteKind::Subnet },
+                advertised_at: now_timestamp(),
+            };
+            if let Err(e) = self.advertise_route(node_id, &advert).await {
+                tracing::warn!("vpn gateway: advertising {cidr} failed (continuing): {e:#}");
+                continue;
+            }
+            cidrs.push(cidr.clone());
+            gw_routes.push(crate::vpn::gateway::GatewayRoute { cidr, snat: rc.snat });
+        }
+        self.set_gateway_cidrs(cidrs.clone());
+        let tun_name = {
+            use tun::AbstractDevice;
+            self.vpn_tun.read().await.as_ref().and_then(|d| d.tun_name().ok())
+        };
+        match tun_name {
+            Some(tun) => match crate::vpn::gateway::setup_gateway(&tun, None, &gw_routes) {
+                Ok(()) => tracing::info!(
+                    "vpn gateway: forwarding {} route(s) live: {:?}",
+                    cidrs.len(),
+                    cidrs
+                ),
+                Err(e) => tracing::warn!(
+                    "vpn gateway: advertised {:?} but kernel forwarding setup failed \
+                     (continuing): {e:#}",
+                    cidrs
+                ),
+            },
+            None => tracing::warn!(
+                "vpn gateway: TUN not up — advertised {:?} but skipped kernel forwarding",
+                cidrs
+            ),
+        }
+    }
+
+    /// Build the client-side **accepted-route** table — every warren-advertised
+    /// subnet/exit route (except our own) resolved to its gateway's endpoint, as
+    /// `(cidr, gateway_pubkey, relay)`. The forwarder caches this and matches a
+    /// non-vIP destination against it (longest-prefix) to route via the gateway.
+    ///
+    /// Route acceptance is **opt-in** (`HOP_ACCEPT_ROUTES`) because installing a
+    /// route mutates the host's routing table — off by default, like Tailscale's
+    /// `--accept-routes`.
+    ///
+    /// WIP (plan P1 slice 4): not yet reach-gated per role — any accepted route
+    /// is reachable by this node. Per-role gating via Cedar route resources, plus
+    /// the gateway-side authorization check, is the security follow-up.
+    #[cfg(unix)]
+    async fn accepted_route_endpoints(
+        &self,
+    ) -> Vec<(String, iroh::PublicKey, Option<iroh::RelayUrl>)> {
+        if std::env::var_os("HOP_ACCEPT_ROUTES").is_none() {
+            return Vec::new();
+        }
+        let me = self.endpoint.id().to_string();
+        let mut out = Vec::new();
+        for (gw, advert) in self.list_routes().await.unwrap_or_default() {
+            if gw == me {
+                continue; // don't route our own LAN back through ourselves
+            }
+            if let Some((pk, relay)) = self.lookup_endpoint_for_node(&gw).await {
+                out.push((advert.cidr, pk, relay));
+            }
+        }
+        out
     }
 
     /// Refresh the `endpoint-id-hex → vIP` map used for VPN ingress
@@ -2062,6 +2191,22 @@ impl NetDoc {
         let mut buf = vec![0u8; 65535];
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Tier 1 LAN bridging: accepted subnet/exit routes (cidr → gateway
+        // endpoint), local to the forwarder like `conns` (no shared state). Empty
+        // unless HOP_ACCEPT_ROUTES is set. Refreshed every ROUTE_REFRESH; each
+        // accepted CIDR also gets a kernel route → TUN (collision-guarded).
+        const ROUTE_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+        let tun_name = {
+            use tun::AbstractDevice;
+            tun.tun_name().unwrap_or_default()
+        };
+        let mut accepted_routes: Vec<(String, iroh::PublicKey, Option<iroh::RelayUrl>)> =
+            self.accepted_route_endpoints().await;
+        for (cidr, _, _) in &accepted_routes {
+            let _ = crate::vpn::gateway::install_client_route(cidr, &tun_name);
+        }
+        let mut route_refresh = tokio::time::interval(ROUTE_REFRESH);
+        route_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let n = tokio::select! {
                 _ = keepalive.tick() => {
@@ -2087,6 +2232,23 @@ impl NetDoc {
                     });
                     continue;
                 }
+                _ = route_refresh.tick() => {
+                    let fresh = self.accepted_route_endpoints().await;
+                    // Install newly-accepted CIDRs, withdraw routes no longer
+                    // advertised. Both idempotent + collision-guarded.
+                    for (cidr, _, _) in &fresh {
+                        if !accepted_routes.iter().any(|(c, _, _)| c == cidr) {
+                            let _ = crate::vpn::gateway::install_client_route(cidr, &tun_name);
+                        }
+                    }
+                    for (cidr, _, _) in &accepted_routes {
+                        if !fresh.iter().any(|(c, _, _)| c == cidr) {
+                            crate::vpn::gateway::uninstall_client_route(cidr, &tun_name);
+                        }
+                    }
+                    accepted_routes = fresh;
+                    continue;
+                }
                 r = tun.recv(&mut buf) => match r {
                     Ok(n) => n,
                     Err(e) => {
@@ -2097,29 +2259,47 @@ impl NetDoc {
             };
             let pkt = &buf[..n];
             let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
-            if !crate::vpn::is_virtual_addr(dst) {
-                continue;
-            }
-            // Role-derived reach (Step 5; default-deny). Drop packets the source
-            // peer's role doesn't permit to the destination host's tags.
-            match crate::vpn::parse_src_ipv4(pkt) {
-                Some(src) if self.vpn_reach_allowed(src, dst, crate::vpn::parse_dest_port(pkt)).await => {}
-                Some(src) => {
-                    // Observability: the reach ACL silently dropping packets is
-                    // exactly the hard-to-debug case (a missing/empty role → reach
-                    // nothing). Say so (debug, opt-in — per-packet under traffic).
-                    tracing::debug!(
-                        "vpn egress: reach DENIED {src} -> {dst} (role policy) — packet dropped"
-                    );
-                    continue;
+            let (pubkey, relay) = if crate::vpn::is_virtual_addr(dst) {
+                // Member-to-member: role-derived reach (Step 5; default-deny),
+                // then resolve the destination vIP's owner endpoint.
+                match crate::vpn::parse_src_ipv4(pkt) {
+                    Some(src)
+                        if self
+                            .vpn_reach_allowed(src, dst, crate::vpn::parse_dest_port(pkt))
+                            .await => {}
+                    Some(src) => {
+                        // Observability: the reach ACL silently dropping packets is
+                        // exactly the hard-to-debug case (a missing/empty role →
+                        // reach nothing). Say so (debug; per-packet under traffic).
+                        tracing::debug!(
+                            "vpn egress: reach DENIED {src} -> {dst} (role policy) — packet dropped"
+                        );
+                        continue;
+                    }
+                    None => continue,
                 }
-                None => continue,
-            }
-            let (pubkey, relay) = match self.lookup_vpn_endpoint(dst).await {
-                Ok(Some(v)) => v,
-                _ => {
-                    tracing::debug!("vpn egress: {dst} UNRESOLVED (no endpoint) — packet dropped");
-                    continue;
+                match self.lookup_vpn_endpoint(dst).await {
+                    Ok(Some(v)) => v,
+                    _ => {
+                        tracing::debug!(
+                            "vpn egress: {dst} UNRESOLVED (no endpoint) — packet dropped"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                // Tier 1 LAN bridging: a non-vIP destination is routed to a
+                // gateway when we've accepted a covering route (longest-prefix
+                // wins, so a /32 device route beats a /24 beats the exit route).
+                // Acceptance already gated reach; the gateway re-authorizes on
+                // ingress. No accepted route → not ours to forward → drop (the
+                // pre-LAN-bridging behavior for non-virtual destinations).
+                match crate::vpn::longest_prefix_match(
+                    accepted_routes.iter().map(|(c, pk, r)| (c.as_str(), (*pk, r.clone()))),
+                    dst,
+                ) {
+                    Some(v) => v,
+                    None => continue,
                 }
             };
             // Have we received a datagram from this peer recently? That's the only
@@ -2175,16 +2355,17 @@ impl NetDoc {
                                 // dialed (QUIC datagrams are bidirectional), and
                                 // without a reader those replies are discarded.
                                 {
-                                    let (conn2, tun2, ips2, lip2, rfr2, rx2) = (
+                                    let (conn2, tun2, ips2, lip2, rfr2, rx2, gw2) = (
                                         c.clone(),
                                         self.vpn_tun.clone(),
                                         self.vpn_peer_ips.clone(),
                                         self.vpn_local_ip.clone(),
                                         self.vpn_refresh.clone(),
                                         self.vpn_last_rx.clone(),
+                                        self.vpn_gateway_cidrs.clone(),
                                     );
                                     tokio::spawn(async move {
-                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2, &rx2).await;
+                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2, &rx2, &gw2).await;
                                     });
                                 }
                                 conns.insert(pubkey, (c.clone(), std::time::Instant::now()));

@@ -744,6 +744,12 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                                     "vpn: bringup failed, continuing without it (core access unaffected): {e:#}"
                                 ),
                             }
+                            // Tier 1 LAN bridging: if this host advertises gateway
+                            // routes (routes.json), publish them to the warren and
+                            // program forwarding. Inert when routes.json is empty.
+                            let routes =
+                                hop_core::fleet::RoutesStore::load(&cfg).unwrap_or_default();
+                            net.setup_gateway_routes(&host_node_id, &routes.routes).await;
                         }
                     }
 

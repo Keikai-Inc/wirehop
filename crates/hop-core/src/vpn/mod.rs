@@ -330,7 +330,16 @@ pub struct VpnInbound {
     refresh: VpnRefresh,
     conns: VpnConns,
     last_rx: VpnLastRx,
+    /// CIDRs this node advertises as a gateway (Tier 1 LAN bridging). An inbound
+    /// datagram destined into one of these is written to the TUN so the kernel
+    /// forwards + NATs it onto the physical LAN, instead of being dropped as "not
+    /// for our vIP". Settable (filled after the daemon reads `routes.json`);
+    /// empty for a non-gateway node.
+    gateway_cidrs: GatewayCidrs,
 }
+
+/// Shared, settable set of gateway-advertised CIDRs (see `VpnInbound`).
+pub type GatewayCidrs = std::sync::Arc<std::sync::RwLock<Vec<String>>>;
 
 #[cfg(unix)]
 impl std::fmt::Debug for VpnInbound {
@@ -348,8 +357,9 @@ impl VpnInbound {
         refresh: VpnRefresh,
         conns: VpnConns,
         last_rx: VpnLastRx,
+        gateway_cidrs: GatewayCidrs,
     ) -> Self {
-        Self { tun, peer_ips, local_ip, refresh, conns, last_rx }
+        Self { tun, peer_ips, local_ip, refresh, conns, last_rx, gateway_cidrs }
     }
 }
 
@@ -367,6 +377,7 @@ pub async fn pump_vpn_datagrams(
     local_ip: &VpnLocalIp,
     refresh: &VpnRefresh,
     last_rx: &VpnLastRx,
+    gateway_cidrs: &std::sync::RwLock<Vec<String>>,
 ) {
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
@@ -408,11 +419,22 @@ pub async fn pump_vpn_datagrams(
                 continue;
             }
         }
-        // The datagram must be destined for *us* (our virtual IP).
-        if let Some(local) = *local_ip.read().await
-            && parse_dest_ipv4(&dg) != Some(local)
-        {
-            continue;
+        // The datagram must be destined for *us* (our virtual IP) — OR, if we're
+        // a gateway, for one of our advertised LAN subnets, in which case we hand
+        // it to the TUN and the kernel forwards + NATs it onto the physical LAN.
+        // NOTE (plan P1 slice 4): forwarding here is gated only to advertised
+        // CIDRs + the anti-spoof'd sender vIP above; per-role authorization of
+        // *which* members may reach a route (the gateway-side Cedar check) is the
+        // security follow-up before this leaves the branch.
+        if let Some(local) = *local_ip.read().await {
+            let dst = parse_dest_ipv4(&dg);
+            let for_us = dst == Some(local);
+            let for_gateway = dst.is_some_and(|d| {
+                gateway_cidrs.read().is_ok_and(|c| c.iter().any(|cidr| cidr_contains_v4(cidr, d)))
+            });
+            if !for_us && !for_gateway {
+                continue;
+            }
         }
         if let Some(tun) = tun.read().await.clone() {
             let _ = tun.send(&dg).await;
@@ -432,7 +454,16 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
         // connection, not a silently-dead cached dial.
         let my_id = conn.stable_id();
         self.conns.write().await.insert(remote.clone(), conn.clone());
-        pump_vpn_datagrams(&conn, &self.tun, &self.peer_ips, &self.local_ip, &self.refresh, &self.last_rx).await;
+        pump_vpn_datagrams(
+            &conn,
+            &self.tun,
+            &self.peer_ips,
+            &self.local_ip,
+            &self.refresh,
+            &self.last_rx,
+            &self.gateway_cidrs,
+        )
+        .await;
         // Connection ended — unregister, unless a newer one already replaced it.
         {
             let mut conns = self.conns.write().await;
