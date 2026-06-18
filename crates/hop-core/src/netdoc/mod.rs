@@ -1167,9 +1167,16 @@ impl NetDoc {
     /// shared with the VPN inbound pump. Called by the daemon after reading
     /// `routes.json`.
     #[cfg(unix)]
-    pub fn set_gateway_cidrs(&self, cidrs: Vec<String>) {
+    pub fn set_gateway_routes(&self, routes: Vec<(String, Vec<String>)>) {
         if let Ok(mut g) = self.vpn_gateway_cidrs.write() {
-            *g = cidrs;
+            *g = routes
+                .into_iter()
+                .map(|(cidr, tags)| crate::vpn::GatewayRouteEntry {
+                    cidr,
+                    tags,
+                    allowed_vips: Default::default(),
+                })
+                .collect();
         }
     }
 
@@ -1199,10 +1206,10 @@ impl NetDoc {
                 tracing::warn!("vpn gateway: advertising {cidr} failed (continuing): {e:#}");
                 continue;
             }
-            cidrs.push(cidr.clone());
+            cidrs.push((cidr.clone(), rc.tags.clone()));
             gw_routes.push(crate::vpn::gateway::GatewayRoute { cidr, snat: rc.snat });
         }
-        self.set_gateway_cidrs(cidrs.clone());
+        self.set_gateway_routes(cidrs.clone());
         let tun_name = {
             use tun::AbstractDevice;
             self.vpn_tun.read().await.as_ref().and_then(|d| d.tun_name().ok())
@@ -1421,6 +1428,49 @@ impl NetDoc {
             }
         }
         *self.vpn_peer_ips.write().await = map;
+
+        // Tier 1 LAN bridging: recompute per-route reach gates on the same tick.
+        self.refresh_gateway_acl().await;
+    }
+
+    /// Recompute, for each locally-advertised **tagged** gateway route, the set of
+    /// member vIPs whose role reaches it (the gateway-side authorization for Tier 1
+    /// LAN bridging). Untagged routes stay open to any member. Cheap and off the
+    /// per-packet path — the pump just does a set lookup. No tagged routes → no-op.
+    async fn refresh_gateway_acl(&self) {
+        // Snapshot (cidr, tags) without holding the std lock across `.await`.
+        let snapshot: Vec<(String, Vec<String>)> = match self.vpn_gateway_cidrs.read() {
+            Ok(rs) => rs.iter().map(|r| (r.cidr.clone(), r.tags.clone())).collect(),
+            Err(_) => return,
+        };
+        if !snapshot.iter().any(|(_, t)| !t.is_empty()) {
+            return;
+        }
+        let engine = self.reach_engine().await;
+        let vips = self.list_virtual_ips().await.unwrap_or_default();
+        let mut allow: std::collections::HashMap<String, std::collections::HashSet<std::net::Ipv4Addr>> =
+            std::collections::HashMap::new();
+        if let Some(eng) = engine {
+            for (cidr, tags) in &snapshot {
+                if tags.is_empty() {
+                    continue;
+                }
+                let mut set = std::collections::HashSet::new();
+                for (vip, node) in &vips {
+                    if eng.reaches_tags(node, tags) {
+                        set.insert(*vip);
+                    }
+                }
+                allow.insert(cidr.clone(), set);
+            }
+        }
+        if let Ok(mut routes) = self.vpn_gateway_cidrs.write() {
+            for r in routes.iter_mut() {
+                if let Some(set) = allow.remove(&r.cidr) {
+                    r.allowed_vips = set;
+                }
+            }
+        }
     }
 
     /// Layer 2 — active self-heal of missing blob content. iroh-docs downloads an

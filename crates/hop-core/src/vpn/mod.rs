@@ -338,8 +338,32 @@ pub struct VpnInbound {
     gateway_cidrs: GatewayCidrs,
 }
 
-/// Shared, settable set of gateway-advertised CIDRs (see `VpnInbound`).
-pub type GatewayCidrs = std::sync::Arc<std::sync::RwLock<Vec<String>>>;
+/// A gateway-advertised route plus its per-role reach gate (Tier 1 LAN bridging).
+#[derive(Clone, Debug, Default)]
+pub struct GatewayRouteEntry {
+    /// The advertised CIDR this gateway forwards onto its LAN.
+    pub cidr: String,
+    /// Cedar reach tags gating the route. **Empty = reachable by any warren
+    /// member** (the permissive default); non-empty = only members whose role
+    /// reaches these tags.
+    pub tags: Vec<String>,
+    /// Member vIPs allowed to reach this route, recomputed on the peer-IP refresh
+    /// from the reach engine. Consulted only when `tags` is non-empty.
+    pub allowed_vips: std::collections::HashSet<Ipv4Addr>,
+}
+
+/// Shared, settable gateway routing table (see `VpnInbound`).
+pub type GatewayCidrs = std::sync::Arc<std::sync::RwLock<Vec<GatewayRouteEntry>>>;
+
+/// Whether this gateway should forward a datagram from `src_vip` to `dst`: there
+/// is an advertised route covering `dst`, AND either it's untagged (any member) or
+/// `src_vip` is in its reach-gated allow-set. (Tier 1 LAN bridging.)
+pub fn gateway_forwards(routes: &[GatewayRouteEntry], src_vip: Ipv4Addr, dst: Ipv4Addr) -> bool {
+    routes.iter().any(|r| {
+        cidr_contains_v4(&r.cidr, dst)
+            && (r.tags.is_empty() || r.allowed_vips.contains(&src_vip))
+    })
+}
 
 #[cfg(unix)]
 impl std::fmt::Debug for VpnInbound {
@@ -377,7 +401,7 @@ pub async fn pump_vpn_datagrams(
     local_ip: &VpnLocalIp,
     refresh: &VpnRefresh,
     last_rx: &VpnLastRx,
-    gateway_cidrs: &std::sync::RwLock<Vec<String>>,
+    gateway_cidrs: &std::sync::RwLock<Vec<GatewayRouteEntry>>,
 ) {
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
@@ -437,9 +461,13 @@ pub async fn pump_vpn_datagrams(
         if let Some(local) = *local_ip.read().await {
             let dst = parse_dest_ipv4(&dg);
             let for_us = dst == Some(local);
-            let for_gateway = dst.is_some_and(|d| {
-                gateway_cidrs.read().is_ok_and(|c| c.iter().any(|cidr| cidr_contains_v4(cidr, d)))
-            });
+            // Forward only if an advertised route covers `dst` AND the sending
+            // member (`expected`, its anti-spoof'd vIP) is permitted to reach it
+            // (untagged routes = any member; tagged = role-gated). This is the
+            // gateway-side authorization — egress trust alone is insufficient for a
+            // non-member destination.
+            let for_gateway = dst
+                .is_some_and(|d| gateway_cidrs.read().is_ok_and(|rs| gateway_forwards(&rs, expected, d)));
             if !for_us && !for_gateway {
                 continue;
             }
@@ -576,5 +604,33 @@ mod tests {
         assert_eq!(hit, Some("subnet"));
         let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(8, 8, 8, 8));
         assert_eq!(hit, Some("exit"));
+    }
+
+    #[test]
+    fn gateway_gate_enforces_route_tags() {
+        use std::collections::HashSet;
+        let alice = Ipv4Addr::new(100, 64, 0, 1);
+        let bob = Ipv4Addr::new(100, 64, 0, 2);
+        let dst = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Untagged route → reachable by any member.
+        let open = vec![GatewayRouteEntry {
+            cidr: "192.168.1.0/24".into(),
+            tags: vec![],
+            allowed_vips: HashSet::new(),
+        }];
+        assert!(gateway_forwards(&open, alice, dst));
+        assert!(gateway_forwards(&open, bob, dst));
+        // …but only for destinations inside an advertised route.
+        assert!(!gateway_forwards(&open, alice, Ipv4Addr::new(10, 0, 0, 1)));
+
+        // Tagged route → only members in the role-derived allow-set (alice, not bob).
+        let gated = vec![GatewayRouteEntry {
+            cidr: "192.168.1.0/24".into(),
+            tags: vec!["media".into()],
+            allowed_vips: HashSet::from([alice]),
+        }];
+        assert!(gateway_forwards(&gated, alice, dst));
+        assert!(!gateway_forwards(&gated, bob, dst));
     }
 }

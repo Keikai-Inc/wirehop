@@ -39,6 +39,10 @@ pub struct AclEngine {
     /// callers can distinguish "known principal, genuinely denied" from "principal
     /// absent because this node doesn't hold the roster" (a leaf member).
     peer_ids: std::collections::HashSet<String>,
+    /// Each peer's flattened role reach-tags (`*` = wildcard), for tag-level reach
+    /// queries that have no `Host` resource — e.g. gating a Tier 1 subnet route by
+    /// the route's tags (`reaches_tags`).
+    reach_by_node: HashMap<String, Vec<String>>,
 }
 
 impl AclEngine {
@@ -63,6 +67,7 @@ impl AclEngine {
         );
 
         let mut ents: Vec<serde_json::Value> = Vec::with_capacity(peers.len() + host_tags.len() + 2);
+        let mut reach_by_node: HashMap<String, Vec<String>> = HashMap::new();
 
         // Autogroups (Phase 7): membership groups authored policies can target
         // (`principal in Autogroup::"members"` / `"admin"`).
@@ -95,6 +100,7 @@ impl AclEngine {
                 // No role assigned at all → no reach.
                 None => (Vec::new(), false, false),
             };
+            reach_by_node.insert(p.node_id.clone(), reach_tags.clone());
             let mut parents = vec![serde_json::json!({ "type": "Autogroup", "id": "members" })];
             if admin {
                 parents.push(serde_json::json!({ "type": "Autogroup", "id": "admin" }));
@@ -139,7 +145,17 @@ impl AclEngine {
             .map_err(|e| anyhow::anyhow!("parsing Cedar policies: {e}"))?;
 
         let peer_ids = peers.iter().map(|p| p.node_id.clone()).collect();
-        Ok(Self { policies, entities, authorizer: Authorizer::new(), peer_ids })
+        Ok(Self { policies, entities, authorizer: Authorizer::new(), peer_ids, reach_by_node })
+    }
+
+    /// Whether `node_id`'s role reaches a resource tagged `tags` (the same
+    /// reach_tags/wildcard semantics as the default policy, but for a tag set with
+    /// no `Host` entity — e.g. a Tier 1 subnet route gated by its tags). A node
+    /// not in the roster, or with no role, reaches nothing.
+    pub fn reaches_tags(&self, node_id: &str, tags: &[String]) -> bool {
+        self.reach_by_node
+            .get(node_id)
+            .is_some_and(|reach| super::acl::role_reaches(reach, tags))
     }
 
     /// Whether `node_id` has a `Peer` principal in this engine (i.e. it appears in
