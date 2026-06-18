@@ -183,6 +183,65 @@ impl FleetStore {
 
 // --- Roles store ---
 
+fn route_default_true() -> bool {
+    true
+}
+
+/// A subnet/exit route this host advertises as a **gateway** (Tier 1 LAN
+/// bridging). Persisted in `routes.json` (git-committable infra-as-code) and
+/// materialized into the netdoc + gateway forwarding when the daemon starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteConfig {
+    /// CIDR to bridge, e.g. `192.168.1.0/24`, or a `/32` device. Ignored for an
+    /// exit route (which always advertises `0.0.0.0/0`).
+    pub cidr: String,
+    /// Tags gating reach to this route (Cedar resource tags). Empty = inherit
+    /// the gateway node's own host tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// SNAT (masquerade) forwarded traffic to the gateway's LAN IP. Default on.
+    #[serde(default = "route_default_true")]
+    pub snat: bool,
+    /// Advertise as an internet exit node (`0.0.0.0/0`) rather than a subnet.
+    #[serde(default)]
+    pub exit: bool,
+}
+
+/// Gateway routes this host advertises, persisted as `routes.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RoutesStore {
+    pub routes: Vec<RouteConfig>,
+}
+
+impl RoutesStore {
+    pub fn load(config_dir: &Path) -> Result<Self> {
+        let path = config_dir.join("routes.json");
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok(serde_json::from_str(&data)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn save(&self, config_dir: &Path) -> Result<()> {
+        let path = config_dir.join("routes.json");
+        let data = serde_json::to_string_pretty(self)?;
+        write_shared_file(&path, &data)?;
+        Ok(())
+    }
+
+    /// The canonical CIDR a route resolves to (`0.0.0.0/0` for an exit node).
+    pub fn effective_cidr(rc: &RouteConfig) -> String {
+        if rc.exit {
+            "0.0.0.0/0".to_string()
+        } else {
+            rc.cidr.clone()
+        }
+    }
+}
+
 /// Orchestrator-side role definitions, persisted as `roles.json`.
 /// This file is designed to be git-committable for infrastructure-as-code.
 #[derive(Debug, Default, Serialize, Deserialize)]

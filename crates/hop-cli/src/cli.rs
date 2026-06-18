@@ -122,6 +122,13 @@ pub enum Command {
         action: AclAction,
     },
 
+    /// Bridge a physical LAN into the warren: advertise subnet/exit routes so
+    /// warren members can reach devices that don't run hop (Tier 1 LAN bridging)
+    Lan {
+        #[command(subcommand)]
+        action: LanAction,
+    },
+
     /// List authorized peers or known hosts
     Peers {
         #[command(subcommand)]
@@ -467,6 +474,36 @@ pub enum OnWarrenConflict {
     MultiHome,
     /// Keep the current warren; do nothing.
     Abort,
+}
+
+/// `hop lan` — gateway subnet/exit route management (Tier 1 LAN bridging).
+#[derive(Subcommand)]
+pub enum LanAction {
+    /// Advertise a LAN subnet (or exit node) this machine will route for. Writes
+    /// `routes.json`; the daemon materializes it into the warren + sets up
+    /// forwarding on (re)start.
+    Advertise {
+        /// CIDR to bridge, e.g. `192.168.1.0/24`, or a single device `192.168.1.50/32`.
+        /// Omit with `--exit` to advertise the default route.
+        cidr: Option<String>,
+        /// Tags gating which roles may reach this route (defaults to the host's tags).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Don't masquerade forwarded traffic (preserve client source IP; requires
+        /// return routes on the target LAN — power-user / site-to-site).
+        #[arg(long)]
+        no_snat: bool,
+        /// Advertise as an internet exit node (`0.0.0.0/0`) instead of a subnet.
+        #[arg(long)]
+        exit: bool,
+    },
+    /// Stop advertising a previously-advertised route.
+    Withdraw {
+        /// The CIDR (or `0.0.0.0/0` for the exit route) to withdraw.
+        cidr: String,
+    },
+    /// List routes this machine advertises and routes available in the warren.
+    Ls,
 }
 
 #[derive(Subcommand)]

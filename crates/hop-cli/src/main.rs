@@ -180,6 +180,10 @@ async fn main() -> Result<()> {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             cmd_acl(action, &config_dir)
         }
+        Command::Lan { action } => {
+            let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
+            cmd_lan(action, &config_dir)
+        }
         Command::Peers { action } => {
             let host_config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let user_config_dir = config::default_config_dir()?;
@@ -5040,6 +5044,85 @@ fn set_host_config_value(config_dir: &std::path::Path, key: &str, value: &str) -
     };
     cfg.save(config_dir)?;
     Ok(msg)
+}
+
+/// `hop lan` — manage gateway subnet/exit routes (Tier 1 LAN bridging). File-based
+/// (`routes.json`); the daemon materializes routes into the warren and sets up
+/// forwarding on (re)start, mirroring how `roles.json` is applied.
+fn cmd_lan(action: cli::LanAction, config_dir: &std::path::Path) -> Result<()> {
+    use cli::LanAction;
+    use hop_core::fleet::{RouteConfig, RoutesStore};
+    match action {
+        LanAction::Advertise { cidr, tags, no_snat, exit } => {
+            if !exit {
+                let Some(ref c) = cidr else {
+                    anyhow::bail!(
+                        "a CIDR is required (e.g. `hop lan advertise 192.168.1.0/24`), or pass --exit"
+                    );
+                };
+                if hop_core::vpn::parse_cidr_v4(c).is_none() {
+                    anyhow::bail!("invalid CIDR '{c}' — expected a.b.c.d/n (e.g. 192.168.1.0/24)");
+                }
+            }
+            let mut store = RoutesStore::load(config_dir)?;
+            let rc = RouteConfig {
+                cidr: cidr.unwrap_or_else(|| "0.0.0.0/0".to_string()),
+                tags,
+                snat: !no_snat,
+                exit,
+            };
+            let eff = RoutesStore::effective_cidr(&rc);
+            // Replace any existing advert for the same effective CIDR.
+            store.routes.retain(|r| RoutesStore::effective_cidr(r) != eff);
+            store.routes.push(rc);
+            store.save(config_dir)?;
+            println!(
+                "Advertising {eff} (snat={}). Takes effect on next daemon start \
+                 (data-plane forwarding lands in a later slice).",
+                !no_snat
+            );
+            Ok(())
+        }
+        LanAction::Withdraw { cidr } => {
+            let mut store = RoutesStore::load(config_dir)?;
+            let before = store.routes.len();
+            store
+                .routes
+                .retain(|r| RoutesStore::effective_cidr(r) != cidr && r.cidr != cidr);
+            if store.routes.len() == before {
+                println!("No advertised route matching '{cidr}'.");
+            } else {
+                store.save(config_dir)?;
+                println!("Withdrew {cidr}. Takes effect on next daemon start.");
+            }
+            Ok(())
+        }
+        LanAction::Ls => {
+            let store = RoutesStore::load(config_dir)?;
+            if store.routes.is_empty() {
+                println!(
+                    "This machine advertises no LAN routes.\n\
+                     Add one with `hop lan advertise 192.168.1.0/24`."
+                );
+            } else {
+                println!("Routes advertised by this machine (routes.json):");
+                for r in &store.routes {
+                    let kind = if r.exit { "exit" } else { "subnet" };
+                    let tags = if r.tags.is_empty() {
+                        "(host tags)".to_string()
+                    } else {
+                        r.tags.join(",")
+                    };
+                    println!(
+                        "  {:<18} {kind:<7} snat={:<5} tags={tags}",
+                        RoutesStore::effective_cidr(r),
+                        r.snat
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
