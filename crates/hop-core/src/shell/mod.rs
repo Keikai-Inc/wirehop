@@ -1543,9 +1543,13 @@ where
     /// Heartbeat interval: send an empty Input so the host knows we're alive,
     /// and so our write path detects a dead connection quickly.
     const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-    /// Read deadline: if no message arrives from the host within this time, treat as dead.
-    /// Must be above QUIC idle timeout (60s) + margin for lossy-network resilience.
-    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
+    /// Read deadline: if no message arrives from the host within this time, treat
+    /// as dead and reconnect. With a 10s heartbeat, this is 3 missed beats — a
+    /// genuinely stalled path. Deliberately *below* the 60s QUIC idle timeout so a
+    /// dead path surfaces in ~30s instead of freezing the user for 75s: the server
+    /// persists the PTY (its own deadline is 75s) so a "premature" reconnect just
+    /// re-attaches and repaints rather than losing the session.
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Channel for SIGWINCH resize events (Unix only)
     let (resize_tx, mut resize_rx) = mpsc::channel::<()>(1);

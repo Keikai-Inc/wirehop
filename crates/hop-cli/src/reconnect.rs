@@ -219,44 +219,59 @@ pub async fn show_reconnect_tui_via_agent(
         attempt += 1;
         let backoff = backoff_secs(attempt);
 
-        // Countdown phase (skip entirely when backoff is 0)
+        // Countdown phase (skip entirely when backoff is 0). Poll stdin in a
+        // select! — exactly like the connecting phase below — so Enter (retry now)
+        // and q/Ctrl+C are instant during the wait. The old code blocked up to
+        // 250ms per stdin poll between re-renders, so a keypress could sit
+        // unhandled for a noticeable beat (the "Enter does nothing during the
+        // countdown" feel). A 150ms render tick keeps the remaining-seconds
+        // display moving and paces the network-change check.
         if backoff > 0 {
             let countdown_start = Instant::now();
-            loop {
-                let elapsed_in_countdown = countdown_start.elapsed().as_secs_f64();
-                let remaining = (backoff as f64 - elapsed_in_countdown).max(0.0);
-                let elapsed_total = start.elapsed().as_secs();
+            let countdown_deadline = tokio::time::sleep(Duration::from_secs(backoff));
+            tokio::pin!(countdown_deadline);
+            let mut tick = tokio::time::interval(Duration::from_millis(150));
+            'countdown: loop {
+                let remaining =
+                    (backoff as f64 - countdown_start.elapsed().as_secs_f64()).max(0.0);
+                render_frame(
+                    &mut term,
+                    attempt,
+                    start.elapsed().as_secs(),
+                    remaining.ceil() as u64,
+                    false,
+                );
 
-                render_frame(&mut term, attempt, elapsed_total, remaining.ceil() as u64, false);
-
-                if remaining <= 0.0 {
-                    break;
-                }
-
-                match poll_user_action(stdin_rx, pending_input).await {
-                    PollAction::Quit => {
-                        cleanup(&mut stdout);
-                        return ReconnectAction::Quit;
+                tokio::select! {
+                    _ = &mut countdown_deadline => break 'countdown,
+                    _ = tick.tick() => {
+                        if net_watcher.changed() {
+                            // Network just changed (wifi rejoined, VPN flipped,
+                            // ethernet plugged in) — the single best moment for a
+                            // reconnect to succeed. Bail out of the backoff and
+                            // start fresh.
+                            attempt = 0;
+                            break 'countdown;
+                        }
                     }
-                    PollAction::RetryNow => {
-                        // User pressed Enter — they want a try right now and
-                        // they want subsequent tries to be quick too. Reset
-                        // the counter so this loop iteration ends, the next
-                        // becomes attempt 1 (0s backoff), and the exponential
-                        // ladder starts over from scratch.
-                        attempt = 0;
-                        break;
+                    chunk = stdin_rx.recv() => {
+                        // Instant response: Enter retries now (and resets the
+                        // ladder so subsequent tries stay quick); q/Ctrl+C quits;
+                        // paste is buffered for replay on success.
+                        if let Some(data) = chunk {
+                            match classify_chunk(&data, pending_input) {
+                                PollAction::Quit => {
+                                    cleanup(&mut stdout);
+                                    return ReconnectAction::Quit;
+                                }
+                                PollAction::RetryNow => {
+                                    attempt = 0;
+                                    break 'countdown;
+                                }
+                                PollAction::None => {}
+                            }
+                        }
                     }
-                    PollAction::None => {}
-                }
-
-                if net_watcher.changed() {
-                    // Network just changed (wifi rejoined, VPN flipped,
-                    // ethernet plugged in). This is the single best moment
-                    // for a reconnect to actually succeed; bail out of the
-                    // backoff and start fresh.
-                    attempt = 0;
-                    break;
                 }
             }
         }
@@ -369,15 +384,18 @@ pub async fn show_reconnect_tui_via_agent(
     }
 }
 
-/// Compute backoff delay for a given attempt: 0, 1, 2, 4, 8, 16, 30, 30, ...
+/// Compute backoff delay for a given attempt: 0, 0, 1, 2, 4, 5, 5, ...
 ///
-/// First attempt has zero backoff for instant reconnection after wake.
+/// Tuned for interactive sessions: the first two attempts are instant (the common
+/// case is a brief blip), then a short exponential ramp capped at 5s. Reattach is
+/// cheap and the server persists the PTY, so aggressive retry is the right default
+/// — long 16/30s waits just feel like the session was abandoned.
 fn backoff_secs(attempt: u32) -> u64 {
-    if attempt <= 1 {
+    if attempt <= 2 {
         return 0;
     }
-    let secs = 1u64.checked_shl(attempt.saturating_sub(2)).unwrap_or(30);
-    secs.min(30)
+    let secs = 1u64.checked_shl(attempt.saturating_sub(3)).unwrap_or(5);
+    secs.min(5)
 }
 
 /// Render one frame of the reconnection TUI.
@@ -556,20 +574,19 @@ mod tests {
 
     #[test]
     fn backoff_progression() {
-        // attempt 1: zero backoff for instant reconnect
+        // attempts 1 & 2: zero backoff for instant reconnect on a brief blip
         assert_eq!(backoff_secs(1), 0);
-        // then exponential: 1, 2, 4, 8, 16, 30, 30...
-        assert_eq!(backoff_secs(2), 1);
-        assert_eq!(backoff_secs(3), 2);
-        assert_eq!(backoff_secs(4), 4);
-        assert_eq!(backoff_secs(5), 8);
-        assert_eq!(backoff_secs(6), 16);
-        assert_eq!(backoff_secs(7), 30);
-        assert_eq!(backoff_secs(8), 30);
+        assert_eq!(backoff_secs(2), 0);
+        // then a short exponential ramp: 1, 2, 4, capped at 5
+        assert_eq!(backoff_secs(3), 1);
+        assert_eq!(backoff_secs(4), 2);
+        assert_eq!(backoff_secs(5), 4);
+        assert_eq!(backoff_secs(6), 5);
+        assert_eq!(backoff_secs(7), 5);
         // edge: attempt 0 also gets zero
         assert_eq!(backoff_secs(0), 0);
-        // very large attempt stays capped at 30
-        assert_eq!(backoff_secs(100), 30);
+        // very large attempt stays capped at 5
+        assert_eq!(backoff_secs(100), 5);
     }
 
     /// A paste arriving as one chunk must be preserved byte-for-byte,
