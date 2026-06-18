@@ -513,6 +513,14 @@ pub enum LanAction {
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
     },
+    /// Split-DNS: resolve `<domain>` via a LAN nameserver (reachable over a warren
+    /// route) instead of MagicDNS. Applied on next daemon start.
+    Dns {
+        /// The domain suffix to route, e.g. `corp.example.com`.
+        domain: String,
+        /// The LAN nameserver IP to send those queries to.
+        nameserver: String,
+    },
 }
 
 #[derive(Subcommand)]

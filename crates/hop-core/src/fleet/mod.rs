@@ -238,10 +238,21 @@ impl RouteConfig {
     }
 }
 
-/// Gateway routes this host advertises, persisted as `routes.json`.
+/// A split-DNS rule (P4): send queries for `domain` to `nameserver` (a LAN DNS
+/// server, typically reachable via an accepted subnet route) instead of MagicDNS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitDns {
+    pub domain: String,
+    pub nameserver: String,
+}
+
+/// Gateway routes + DNS config this host applies, persisted as `routes.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RoutesStore {
     pub routes: Vec<RouteConfig>,
+    /// Split-DNS rules this node applies to its own resolver (P4).
+    #[serde(default)]
+    pub split_dns: Vec<SplitDns>,
 }
 
 impl RoutesStore {

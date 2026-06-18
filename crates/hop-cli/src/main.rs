@@ -750,6 +750,29 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                             let routes =
                                 hop_core::fleet::RoutesStore::load(&cfg).unwrap_or_default();
                             net.setup_gateway_routes(&host_node_id, &routes.routes).await;
+                            // Split-DNS (P4): point each configured domain at its
+                            // LAN nameserver (reachable via a warren route), reusing
+                            // the same resolver primitive as MagicDNS.
+                            for sd in &routes.split_dns {
+                                match sd.nameserver.parse::<std::net::Ipv4Addr>() {
+                                    Ok(ns) => {
+                                        if let Err(e) =
+                                            hop_core::privsep::configure_resolver(&sd.domain, ns)
+                                        {
+                                            tracing::warn!(
+                                                "split-dns: .{} → {ns} failed: {e:#}",
+                                                sd.domain
+                                            );
+                                        } else {
+                                            tracing::info!("split-dns: .{} → {ns}:53", sd.domain);
+                                        }
+                                    }
+                                    Err(_) => tracing::warn!(
+                                        "split-dns: invalid nameserver {:?}",
+                                        sd.nameserver
+                                    ),
+                                }
+                            }
                         }
                     }
 
@@ -5155,6 +5178,23 @@ fn cmd_lan(action: cli::LanAction, config_dir: &std::path::Path) -> Result<()> {
                 } else {
                     ips.join(", ")
                 }
+            );
+            Ok(())
+        }
+        LanAction::Dns { domain, nameserver } => {
+            if nameserver.parse::<std::net::Ipv4Addr>().is_err() {
+                anyhow::bail!("invalid nameserver IP '{nameserver}' — expected an IPv4 address");
+            }
+            let mut store = RoutesStore::load(config_dir)?;
+            store.split_dns.retain(|s| s.domain != domain);
+            store.split_dns.push(hop_core::fleet::SplitDns {
+                domain: domain.clone(),
+                nameserver: nameserver.clone(),
+            });
+            store.save(config_dir)?;
+            println!(
+                "Split-DNS: .{domain} → {nameserver}:53. Takes effect on next daemon start \
+                 (make sure this node has a warren route to {nameserver})."
             );
             Ok(())
         }
