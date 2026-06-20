@@ -1218,12 +1218,14 @@ impl NetDoc {
             }
         }
         self.set_gateway_routes(cidrs.clone());
-        let tun_name = {
-            use tun::AbstractDevice;
-            self.vpn_tun.read().await.as_ref().and_then(|d| d.tun_name().ok())
-        };
-        match tun_name {
-            Some(_tun) => match crate::privsep::setup_gateway(&gw_routes) {
+        // Presence check only — NOT the interface name. On macOS the utun arrives
+        // as a bare fd from the privsep monitor, so `tun_name()` fails even though
+        // the device is fully up; gating on the name wrongly skips forwarding.
+        // `setup_gateway` programs the kernel by egress interface + ip_forward and
+        // never needs the utun name, so `is_some()` is the correct gate.
+        let tun_up = self.vpn_tun.read().await.is_some();
+        match tun_up {
+            true => match crate::privsep::setup_gateway(&gw_routes) {
                 Ok(()) => tracing::info!(
                     "vpn gateway: forwarding {} route(s) live: {:?}",
                     cidrs.len(),
@@ -1235,7 +1237,7 @@ impl NetDoc {
                     cidrs
                 ),
             },
-            None => tracing::warn!(
+            false => tracing::warn!(
                 "vpn gateway: TUN not up — advertised {:?} but skipped kernel forwarding",
                 cidrs
             ),

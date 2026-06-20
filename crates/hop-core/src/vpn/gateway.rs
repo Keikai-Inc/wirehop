@@ -144,19 +144,66 @@ fn detect_default_iface_macos() -> Result<String> {
 /// the remaining macOS gateway steps; the ruleset itself is generated + syntax-
 /// validated here.
 #[cfg(target_os = "macos")]
-fn apply_pf(ruleset: &str) -> Result<()> {
+const PF_CONF: &str = "/etc/pf.conf";
+
+/// Build a main pf ruleset that references hop's `com.hop` anchor — preserving the
+/// existing `com.apple` anchors — by injecting `*-anchor "com.hop"` lines after the
+/// matching `com.apple` ones in the system `/etc/pf.conf`. An anchor loaded with
+/// `pfctl -a com.hop -f` is **inert** until the main ruleset points at it (this was
+/// the macOS-gateway bug a 2-machine e2e surfaced: nat rule present, `Evaluations:
+/// 0`). Returns `None` if the anchor is already referenced (idempotent) or the file
+/// can't be read. Keeps pf's grammar order (scrub → nat → rdr → filter).
+#[cfg(target_os = "macos")]
+fn pf_main_ruleset_with_hop_anchor() -> Option<String> {
+    let conf = std::fs::read_to_string(PF_CONF).ok()?;
+    if conf.contains("\"com.hop\"") {
+        return None; // already referenced — the running main ruleset is fine
+    }
+    let mut out = String::new();
+    for line in conf.lines() {
+        out.push_str(line);
+        out.push('\n');
+        match line.trim() {
+            "scrub-anchor \"com.apple/*\"" => out.push_str("scrub-anchor \"com.hop\"\n"),
+            "nat-anchor \"com.apple/*\"" => out.push_str("nat-anchor \"com.hop\"\n"),
+            "anchor \"com.apple/*\"" => out.push_str("anchor \"com.hop\"\n"),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+#[cfg(target_os = "macos")]
+fn pfctl_load(anchor: Option<&str>, ruleset: &str) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let _ = Command::new("pfctl").arg("-E").status(); // enable pf (idempotent)
-    let mut child = Command::new("pfctl")
-        .args(["-a", "com.hop", "-f", "-"])
+    let mut cmd = Command::new("pfctl");
+    if let Some(a) = anchor {
+        cmd.args(["-a", a]);
+    }
+    let mut child = cmd
+        .args(["-f", "-"])
         .stdin(Stdio::piped())
         .spawn()
         .context("spawning pfctl")?;
     child.stdin.take().context("pfctl stdin")?.write_all(ruleset.as_bytes())?;
     if !child.wait().context("waiting for pfctl")?.success() {
-        anyhow::bail!("pfctl failed to load the hop anchor");
+        anyhow::bail!("pfctl -f failed (anchor {anchor:?})");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_pf(ruleset: &str) -> Result<()> {
+    use std::process::Command;
+    let _ = Command::new("pfctl").arg("-E").status(); // enable pf (idempotent)
+    // Point the main ruleset at com.hop (so the anchor's rules are evaluated),
+    // preserving the com.apple anchors. Idempotent: skipped if already referenced.
+    if let Some(main) = pf_main_ruleset_with_hop_anchor() {
+        pfctl_load(None, &main).context("referencing com.hop from the main pf ruleset")?;
+    }
+    // Load hop's nat/scrub rules into the (now-referenced) com.hop anchor.
+    pfctl_load(Some("com.hop"), ruleset).context("loading the com.hop anchor")?;
     Ok(())
 }
 
@@ -173,6 +220,9 @@ pub fn teardown_gateway() {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("pfctl").args(["-a", "com.hop", "-F", "all"]).status();
+        // Drop the com.hop anchor references we injected by reloading the pristine
+        // system main ruleset (re-reads /etc/pf.conf, which has only com.apple).
+        let _ = std::process::Command::new("pfctl").args(["-f", PF_CONF]).status();
     }
 }
 
