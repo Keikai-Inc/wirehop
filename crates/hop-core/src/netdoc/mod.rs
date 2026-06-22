@@ -2910,6 +2910,15 @@ impl NetDoc {
                         "netdoc: skipping entry {} under prefix {prefix}: {e:#}",
                         String::from_utf8_lossy(entry.key())
                     );
+                    // A roster entry whose blob content didn't land (interrupted
+                    // sync after a peer restart) is exactly what the Layer-2 heal
+                    // re-fetches — kick it NOW (event-driven) instead of waiting for
+                    // the 30s sweep. Without this, egress to a just-restarted peer
+                    // skipped the lagging entry every read but never triggered the
+                    // heal (it only fired on inbound unauth packets, which don't
+                    // arrive during egress) — so recovery waited ~80s for the sweep.
+                    // The heal task is rate-limited (1/s) and a no-op once present.
+                    self.vpn_refresh.notify_one();
                 }
             }
         }
