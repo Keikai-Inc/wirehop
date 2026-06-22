@@ -2486,6 +2486,24 @@ impl NetDoc {
                         c.clone()
                     }
                     _ => {
+                        // Re-dialing because the cached/inbound paths are stale
+                        // (no datagram within STALE_AFTER) or past DIAL_GRACE.
+                        // Explicitly CLOSE + drop the dead connections first, so the
+                        // dial below is a genuinely FRESH connection. QUIC datagram
+                        // sends return Ok on a silently-dead path (close_reason never
+                        // trips), so without this the dial can hand back the dead
+                        // pooled connection and the peer stays unreachable until the
+                        // ~60s idle timeout — the intermittent multi-minute stall on
+                        // founder restart / network flap (esp. relay-routed cross-
+                        // site, where there's no mDNS shortcut).
+                        if let Some((old, _)) = conns.remove(&pubkey) {
+                            old.close(0u32.into(), b"stale path, redialing fresh");
+                        }
+                        if let Some(old) =
+                            self.vpn_conns.write().await.remove(&pubkey.to_string())
+                        {
+                            old.close(0u32.into(), b"stale path, redialing fresh");
+                        }
                         match crate::net::connect_to_host_with_alpn_timeout(
                             &self.endpoint,
                             pubkey,

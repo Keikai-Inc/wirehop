@@ -112,8 +112,17 @@ fn hop_transport_config() -> QuicTransportConfig {
 /// relays causes our relay to be ignored.  Using only our relay guarantees
 /// hop traffic flows through infrastructure we control.  If the relay is
 /// unreachable, iroh still falls back to discovery-based direct connections.
+/// The warren relay URL: `HOP_RELAY_URL` env override if set (self-hosting a relay,
+/// or a local relay in tests), else the built-in [`HOP_RELAY_URL`] constant.
+pub fn hop_relay_url() -> String {
+    std::env::var("HOP_RELAY_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| HOP_RELAY_URL.to_string())
+}
+
 fn hop_relay_mode() -> RelayMode {
-    let hop_relay: RelayUrl = HOP_RELAY_URL.parse().expect("valid relay URL");
+    let hop_relay: RelayUrl = hop_relay_url().parse().expect("valid relay URL");
     RelayMode::custom([hop_relay])
 }
 
