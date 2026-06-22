@@ -2271,6 +2271,12 @@ impl NetDoc {
         // multipath — a failover lands on an already-warm path). Both ends run
         // this, so the liveness signal stays bidirectional.
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        // VPN re-dial timeout — short so a dial to a peer whose address is briefly
+        // stale (just after it restarted/roamed, before discovery catches up) fails
+        // fast and retries on the next packet, instead of blocking one 30s dial
+        // (the slow, variable half of founder-restart recovery). Well above a
+        // hole-punch/relay RTT, so a healthy dial still completes first try.
+        const VPN_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
         let mut buf = vec![0u8; 65535];
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2480,11 +2486,12 @@ impl NetDoc {
                         c.clone()
                     }
                     _ => {
-                        match crate::net::connect_to_host_with_alpn(
+                        match crate::net::connect_to_host_with_alpn_timeout(
                             &self.endpoint,
                             pubkey,
                             relay.as_ref(),
                             crate::vpn::VPN_ALPN,
+                            VPN_DIAL_TIMEOUT,
                         )
                         .await
                         {

@@ -17,7 +17,10 @@ hop-vt = { path = "crates/hop-vt" }
 # iroh referenced as a crates.io version so the [patch.crates-io] below redirects
 # it AND the transitive iroh deps of iroh-docs/blobs/gossip to our fork (single
 # iroh instance). The fork is iroh 0.97.0 + our relay-cascade fix.
-iroh = "0.97"
+# `address-lookup-mdns`: local-network (mDNS) peer discovery so same-LAN warren
+# members find each other's CURRENT address directly — fast recovery after a peer
+# restarts/roams without waiting on n0 DNS propagation or a relay hairpin.
+iroh = { version = "0.97", features = ["address-lookup-mdns"] }
 # iroh-docs CRDT + its mandatory companions (content-addressed values via blobs,
 # live replication via gossip). Stable lockstep matched to iroh 0.97.
 iroh-docs = "0.97"

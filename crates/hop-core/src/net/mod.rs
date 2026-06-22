@@ -121,6 +121,25 @@ fn hop_relay_mode() -> RelayMode {
 ///
 /// Waits for the endpoint to come online (connected to relay, address published
 /// to discovery) before returning.
+/// Best-effort: add local-network (mDNS) address lookup to `endpoint`, concurrent
+/// with the n0 DNS lookup from `presets::N0`. Same-LAN warren members then discover
+/// each other's CURRENT address directly — so a peer that restarts or roams is
+/// re-found in seconds (n0 DNS/pkarr propagation lags, and the relay can't hairpin
+/// two peers behind one NAT). n0 DNS still covers cross-internet peers. Never fatal
+/// (no multicast permission / unsupported network → just logged).
+fn enable_local_discovery(endpoint: &Endpoint) {
+    match iroh::address_lookup::MdnsAddressLookup::builder().build(endpoint.id()) {
+        Ok(mdns) => match endpoint.address_lookup() {
+            Ok(al) => {
+                al.add(mdns);
+                tracing::debug!("local (mDNS) address lookup enabled");
+            }
+            Err(e) => tracing::debug!("local discovery: address_lookup unavailable: {e}"),
+        },
+        Err(e) => tracing::debug!("local discovery: mDNS build failed: {e}"),
+    }
+}
+
 pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     // presets::N0 matches iroh 0.96's default builder (n0 DNS/pkarr address
     // lookup so peers are findable by EndpointId). hop overrides the relay below
@@ -134,6 +153,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
+    enable_local_discovery(&endpoint);
 
     // Wait until connected to relay and address is published to discovery.
     // Without this, clients cannot find us. Timeout after 30s to avoid
@@ -162,6 +182,7 @@ pub async fn create_client_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
+    enable_local_discovery(&endpoint);
 
     if tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online())
         .await
@@ -205,6 +226,7 @@ pub async fn create_netdoc_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .bind()
         .await
         .context("Failed to bind netdoc endpoint")?;
+    enable_local_discovery(&endpoint);
 
     if tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online())
         .await
@@ -242,6 +264,30 @@ pub async fn connect_to_host_with_alpn(
     relay_url: Option<&RelayUrl>,
     alpn: &[u8],
 ) -> Result<(Connection, bool)> {
+    // Default patience for interactive/control connects (`hop connect`, agent),
+    // where a host may be slow to come online and 30s avoids spurious failure.
+    connect_to_host_with_alpn_timeout(
+        endpoint,
+        remote_id,
+        relay_url,
+        alpn,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Like [`connect_to_host_with_alpn`] but with an explicit dial timeout. The VPN
+/// data plane uses a SHORT timeout so a dial to a peer whose address is briefly
+/// stale (e.g. just after it restarted/roamed, before discovery catches up) fails
+/// fast and is retried on the next packet — rather than blocking on one 30s dial,
+/// which was the slow, variable half of founder-restart recovery.
+pub async fn connect_to_host_with_alpn_timeout(
+    endpoint: &Endpoint,
+    remote_id: PublicKey,
+    relay_url: Option<&RelayUrl>,
+    alpn: &[u8],
+    dial_timeout: std::time::Duration,
+) -> Result<(Connection, bool)> {
     let addr = if let Some(relay) = relay_url {
         EndpointAddr::from(remote_id).with_relay_url(relay.clone())
     } else {
@@ -257,16 +303,14 @@ pub async fn connect_to_host_with_alpn(
         remote_id.fmt_short(), relay_url.is_some(),
         std::str::from_utf8(alpn).unwrap_or("?"));
 
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        endpoint.connect(addr, alpn),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!(
-        "Connection timed out after 30s. The host may be offline, behind a strict firewall, \
-         or unable to reach the relay. Check that the host daemon is running and has network access."
-    ))?
-    .context("Failed to connect to host")?;
+    let conn = tokio::time::timeout(dial_timeout, endpoint.connect(addr, alpn))
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "Connection timed out after {}s. The host may be offline, behind a strict firewall, \
+             or unable to reach the relay. Check that the host daemon is running and has network access.",
+            dial_timeout.as_secs()
+        ))?
+        .context("Failed to connect to host")?;
 
     tracing::info!("Connected to {} ({})", remote_id.fmt_short(),
         std::str::from_utf8(conn.alpn()).unwrap_or("?"));
