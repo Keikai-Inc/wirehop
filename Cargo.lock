@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.97.0"
-source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97-nodepathreset#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
 dependencies = [
  "backon",
  "bytes",
@@ -2582,7 +2582,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.97.0"
-source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97-nodepathreset#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -2752,7 +2752,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.97.0"
-source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97-nodepathreset#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
+source = "git+https://github.com/thedracle/iroh.git?branch=hop-relay-fix-0.97#ff74c6bebb91747e2f81668b0cf0aa7407d5b0e5"
 dependencies = [
  "blake3",
  "bytes",
