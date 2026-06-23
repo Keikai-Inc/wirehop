@@ -60,6 +60,11 @@ const KEY_SITEID_PREFIX: &str = "siteid/";
 const CGNAT_BASE: u32 = 0x6440_0000; // 100.64.0.0
 /// Number of host addresses in a /10 (2^22).
 const CGNAT_SIZE: u32 = 1 << 22;
+/// Virtual-IP allocatable space: the `/10` minus the reserved 4via6 SIIT source
+/// pool (the top `/16`, `100.127.0.0/16` — see `vpn::SIIT_POOL_BASE`). vIP
+/// allocation wraps over this reduced range so a member vIP never lands in the
+/// pool.
+const VIP_ALLOC_SIZE: u32 = CGNAT_SIZE - (1 << 16);
 /// Cap on linear-probe attempts when claiming a virtual IP.
 const MAX_IP_PROBES: u32 = 256;
 
@@ -280,6 +285,11 @@ pub struct NetDoc {
     /// for a non-gateway node.
     #[cfg(unix)]
     vpn_gateway_cidrs: crate::vpn::GatewayCidrs,
+    /// 4via6 SIIT state (Tier 3a — overlapping-subnet routing). Shared between the
+    /// ingress pump (translate v6→v4 for our site) and the outbound forwarder
+    /// (translate a pooled-address reply v4→v6). Empty + inert on a non-via6 node.
+    #[cfg(unix)]
+    vpn_siit: crate::vpn::SiitSlot,
     /// Cached Cedar reach engine + when it was built. Rebuilt lazily when older
     /// than `REACH_CACHE_TTL` so the per-packet forwarding path never rebuilds
     /// the policy/entity set inline.
@@ -415,6 +425,8 @@ impl NetDoc {
         let vpn_gateway_cidrs: crate::vpn::GatewayCidrs =
             std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
         #[cfg(unix)]
+        let vpn_siit: crate::vpn::SiitSlot = std::sync::Arc::new(std::sync::RwLock::new(Default::default()));
+        #[cfg(unix)]
         {
             builder = builder.accept(
                 crate::vpn::VPN_ALPN,
@@ -426,6 +438,7 @@ impl NetDoc {
                     vpn_conns.clone(),
                     vpn_last_rx.clone(),
                     vpn_gateway_cidrs.clone(),
+                    vpn_siit.clone(),
                 ),
             );
         }
@@ -458,6 +471,8 @@ impl NetDoc {
             vpn_last_rx,
             #[cfg(unix)]
             vpn_gateway_cidrs,
+            #[cfg(unix)]
+            vpn_siit,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -862,10 +877,14 @@ impl NetDoc {
         if let Some(ip) = self.get_virtual_ip(node_id).await? {
             return Ok(ip);
         }
-        let start = u32::from(deterministic_ip(node_id));
+        // Allocate within the /10 MINUS the reserved 4via6 SIIT source pool (the
+        // top /16): a member vIP must never land there or it would collide with a
+        // gateway's translated sources. Reducing the modulus (rather than skipping
+        // pool candidates) keeps every probe in-range — skipping would exhaust all
+        // probes for a node whose deterministic candidate falls inside the pool.
+        let start = (u32::from(deterministic_ip(node_id)).wrapping_sub(CGNAT_BASE)) % VIP_ALLOC_SIZE;
         for i in 0..MAX_IP_PROBES {
-            // Wrap within the /10 range.
-            let off = ((start.wrapping_sub(CGNAT_BASE)).wrapping_add(i)) % CGNAT_SIZE;
+            let off = start.wrapping_add(i) % VIP_ALLOC_SIZE;
             let cand = std::net::Ipv4Addr::from(CGNAT_BASE + off);
             let key = format!("{KEY_IP_PREFIX}{cand}");
             match self.lookup_ip_owner(&key).await? {
@@ -1020,6 +1039,22 @@ impl NetDoc {
             }
         }
         Ok(None)
+    }
+
+    /// Resolve a decoded via6 `site_id` to the owning gateway's VPN endpoint —
+    /// the `(pubkey, relay)` a via6 packet for that site is tunnelled to. Maps
+    /// `site_id → gateway node → its vIP → endpoint` (reusing the roster-first
+    /// `lookup_vpn_endpoint` path). `None` if the site is unclaimed or the
+    /// gateway has no resolvable endpoint yet.
+    #[cfg(unix)]
+    pub async fn resolve_site_endpoint(
+        &self,
+        site_id: u32,
+    ) -> Option<(iroh::PublicKey, Option<iroh::RelayUrl>)> {
+        let node = self.resolve_site_gateway(site_id).await.ok().flatten()?;
+        let vip = self.get_peer(&node).await.ok().flatten()?.vip?;
+        let vip: std::net::Ipv4Addr = vip.parse().ok()?;
+        self.lookup_vpn_endpoint(vip).await.ok().flatten()
     }
 
     // ── Sync resumption (robustness across restarts) ─────────────────────
@@ -2207,6 +2242,16 @@ impl NetDoc {
                 }
             }
         }
+        // 4via6 gateway identity (Tier 3a): publish this node's own site id into
+        // the shared SIIT state so inbound via6 datagrams for our site translate
+        // (the ingress pump reads `my_site`). Unconditional + inert — a node with
+        // no advertised route never authorizes any via6 forward.
+        if let Ok(Some(site)) = self.get_site_id(host_node_id).await
+            && let Ok(mut s) = self.vpn_siit.write()
+        {
+            s.my_site = Some(site);
+        }
+
         // 4via6 client routing (Tier 3a), opt-in via `HOP_VIA6`. Assign this node's
         // own via6 source address to the TUN and route the via6 destination prefix
         // into it, so traffic to a `via6(site, ip)` address (or a `-via-` MagicDNS
@@ -2559,8 +2604,56 @@ impl NetDoc {
                 },
             };
             let pkt = &buf[..n];
-            let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) else { continue };
-            let (pubkey, relay) = if crate::vpn::is_virtual_addr(dst) {
+            let version = pkt.first().map(|b| b >> 4).unwrap_or(0);
+            // Resolve the destination peer + the (possibly translated) payload.
+            // 4via6 (Tier 3a) adds two arms: an IPv6 packet to a via6 destination
+            // (client egress → tunnel as-is to the owning gateway), and an IPv4
+            // reply routed to a SIIT pool address (gateway reverse-translate v4→v6
+            // back to the originating client). Everything else is the v4 path.
+            let (pubkey, relay, out_pkt): (
+                iroh::PublicKey,
+                Option<iroh::RelayUrl>,
+                std::borrow::Cow<[u8]>,
+            ) = if version == 6 {
+                let Some(dst_v6) = crate::vpn::parse_dest_ipv6(pkt) else { continue };
+                let Some((site, _)) = crate::vpn::via6_decode(dst_v6) else { continue };
+                match self.resolve_site_endpoint(site).await {
+                    Some((pk, r)) => (pk, r, std::borrow::Cow::Borrowed(pkt)),
+                    None => {
+                        tracing::debug!("via6 egress: site {site} UNRESOLVED — packet dropped");
+                        continue;
+                    }
+                }
+            } else if let Some(dst) = crate::vpn::parse_dest_ipv4(pkt)
+                && crate::vpn::is_siit_pool_addr(dst)
+            {
+                // Gateway reply path: a LAN device's reply, reverse-masqueraded by
+                // the kernel to the SIIT pool address we used as its source, is
+                // routed back to our TUN. Reverse-translate it to the via6 form and
+                // tunnel it to the originating client.
+                let client_v6 = match self.vpn_siit.read().ok().and_then(|s| s.client_for_pool(dst)) {
+                    Some(c) => c,
+                    None => continue, // no mapping — stale/unknown pool address
+                };
+                let my_site = self.vpn_siit.read().ok().and_then(|s| s.my_site);
+                let Some(my_site) = my_site else { continue };
+                let Some(real_src) = crate::vpn::parse_src_ipv4(pkt) else { continue };
+                let new_src = crate::vpn::via6_encode(my_site, real_src);
+                let Some(v6pkt) = crate::vpn::siit::translate_v4_to_v6(pkt, new_src, client_v6) else {
+                    continue;
+                };
+                // The client is identified by the vIP embedded in its client_v6.
+                let client_vip = std::net::Ipv4Addr::new(
+                    client_v6.octets()[12], client_v6.octets()[13], client_v6.octets()[14], client_v6.octets()[15],
+                );
+                match self.lookup_vpn_endpoint(client_vip).await {
+                    Ok(Some((pk, r))) => (pk, r, std::borrow::Cow::Owned(v6pkt)),
+                    _ => {
+                        tracing::debug!("via6 reply: client {client_vip} UNRESOLVED — dropped");
+                        continue;
+                    }
+                }
+            } else if let Some(dst) = crate::vpn::parse_dest_ipv4(pkt).filter(|d| crate::vpn::is_virtual_addr(*d)) {
                 // dst is a warren member. Enforce the member-to-member reach ACL
                 // (Step 5; default-deny) only when the SOURCE is also a member
                 // vIP. A non-virtual source is return traffic from a LAN subnet we
@@ -2587,7 +2680,7 @@ impl NetDoc {
                     Some(_) => {} // LAN-sourced reply for a gatewayed route
                 }
                 match self.lookup_vpn_endpoint(dst).await {
-                    Ok(Some(v)) => v,
+                    Ok(Some((pk, r))) => (pk, r, std::borrow::Cow::Borrowed(pkt)),
                     _ => {
                         tracing::debug!(
                             "vpn egress: {dst} UNRESOLVED (no endpoint) — packet dropped"
@@ -2595,7 +2688,7 @@ impl NetDoc {
                         continue;
                     }
                 }
-            } else {
+            } else if let Some(dst) = crate::vpn::parse_dest_ipv4(pkt) {
                 // Tier 1 LAN bridging + HA: gather every accepted gateway whose
                 // route covers `dst` at the LONGEST prefix (a /32 device beats a
                 // /24 beats the 0.0.0.0/0 exit). When several advertise the SAME
@@ -2641,7 +2734,9 @@ impl NetDoc {
                         candidates.len()
                     );
                 }
-                chosen
+                (chosen.0, chosen.1, std::borrow::Cow::Borrowed(pkt))
+            } else {
+                continue; // unparseable / non-IP packet
             };
             // Have we received a datagram from this peer recently? That's the only
             // trustworthy liveness signal on the datagram data plane.
@@ -2724,7 +2819,7 @@ impl NetDoc {
                                 // dialed (QUIC datagrams are bidirectional), and
                                 // without a reader those replies are discarded.
                                 {
-                                    let (conn2, tun2, ips2, lip2, rfr2, rx2, gw2) = (
+                                    let (conn2, tun2, ips2, lip2, rfr2, rx2, gw2, siit2) = (
                                         c.clone(),
                                         self.vpn_tun.clone(),
                                         self.vpn_peer_ips.clone(),
@@ -2732,9 +2827,10 @@ impl NetDoc {
                                         self.vpn_refresh.clone(),
                                         self.vpn_last_rx.clone(),
                                         self.vpn_gateway_cidrs.clone(),
+                                        self.vpn_siit.clone(),
                                     );
                                     tokio::spawn(async move {
-                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2, &rx2, &gw2).await;
+                                        crate::vpn::pump_vpn_datagrams(&conn2, &tun2, &ips2, &lip2, &rfr2, &rx2, &gw2, &siit2).await;
                                     });
                                 }
                                 conns.insert(pubkey, (c.clone(), std::time::Instant::now()));
@@ -2748,7 +2844,7 @@ impl NetDoc {
                     }
                 },
             };
-            if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(pkt)) {
+            if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(&out_pkt)) {
                 // Only abandon the connection if it's genuinely CLOSED. A
                 // transient send failure — no validated path yet on a
                 // freshly-dialed multipath connection, or an over-MTU packet —

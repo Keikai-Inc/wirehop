@@ -73,10 +73,34 @@ pub fn parse_src_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]))
 }
 
+/// Parse the destination IPv6 address from a raw L3 packet (bytes 24..40), or
+/// `None` for non-IPv6/truncated. (4via6, Tier 3a.)
+pub fn parse_dest_ipv6(packet: &[u8]) -> Option<std::net::Ipv6Addr> {
+    if packet.len() < 40 || (packet[0] >> 4) != 6 {
+        return None;
+    }
+    Some(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?))
+}
+
 /// Whether an address falls in hop's virtual range `100.64.0.0/10`.
 pub fn is_virtual_addr(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+/// The 4via6 SIIT source pool: the top `/16` of the warren `/10`
+/// (`100.127.0.0/16`). A gateway maps each via6 client to a stable v4 in this
+/// range as the source of the translated (v6→v4) packet; the kernel then
+/// masquerades it onto the LAN exactly like any warren source (it's inside the
+/// `100.64/10` the gateway already NATs), and a reply routed back to it on the
+/// TUN is recognized for reverse translation. Reserved from vIP allocation so a
+/// pooled address can never collide with a real member's vIP.
+pub const SIIT_POOL_BASE: Ipv4Addr = Ipv4Addr::new(100, 127, 0, 0);
+
+/// Whether `addr` is in the 4via6 SIIT source pool (`100.127.0.0/16`).
+pub fn is_siit_pool_addr(addr: Ipv4Addr) -> bool {
+    let o = addr.octets();
+    o[0] == 100 && o[1] == 127
 }
 
 /// Parse an IPv4 CIDR `"a.b.c.d/n"` into `(network, prefix_len)` with the host
@@ -431,6 +455,10 @@ pub struct VpnInbound {
     /// for our vIP". Settable (filled after the daemon reads `routes.json`);
     /// empty for a non-gateway node.
     gateway_cidrs: GatewayCidrs,
+    /// 4via6 SIIT state (Tier 3a). Inbound via6 datagrams destined to this
+    /// gateway's site are translated to IPv4 here before the TUN write; empty +
+    /// inert on a node with no site / no via6 traffic.
+    siit: SiitSlot,
 }
 
 /// A gateway-advertised route plus its per-role reach gate (Tier 1 LAN bridging).
@@ -449,6 +477,65 @@ pub struct GatewayRouteEntry {
 
 /// Shared, settable gateway routing table (see `VpnInbound`).
 pub type GatewayCidrs = std::sync::Arc<std::sync::RwLock<Vec<GatewayRouteEntry>>>;
+
+/// Gateway-side 4via6 SIIT translation state (Tier 3a — overlapping-subnet
+/// routing). Holds this gateway's own `site_id` and a coarse, stable per-client
+/// source mapping: each via6 **client** (its `client_v6` source) is assigned one
+/// IPv4 from the SIIT pool (`100.127.0.0/16`). The kernel's conntrack handles the
+/// *connection* state; this map only needs one entry per client, so the reverse
+/// (v4→v6) translation can recover which client a reply belongs to. Empty + inert
+/// on a node that owns no site / receives no via6 traffic.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct SiitState {
+    /// This gateway's allocated site id (from its admin-owned `peer.site_id`).
+    /// `None` until known — inbound via6 is dropped until then.
+    pub my_site: Option<u32>,
+    /// Next pool index to hand out (1.. within `100.127.0.0/16`; 0 skipped).
+    next: u32,
+    /// `client_v6 → pooled_v4` (allocate-on-first-use, forward path).
+    by_client: std::collections::HashMap<std::net::Ipv6Addr, Ipv4Addr>,
+    /// `pooled_v4 → client_v6` (reverse path: a reply routed to the pool address).
+    by_pool: std::collections::HashMap<Ipv4Addr, std::net::Ipv6Addr>,
+}
+
+#[cfg(unix)]
+impl SiitState {
+    /// Map a via6 client's source address to its stable pooled IPv4, allocating
+    /// the next free pool address on first use. `None` if the pool is exhausted
+    /// (65 534 distinct clients per gateway).
+    pub fn map_client(&mut self, client_v6: std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+        if let Some(v4) = self.by_client.get(&client_v6) {
+            return Some(*v4);
+        }
+        // Probe forward for a free pool slot (skip .0 network + .255.255 edges).
+        let base = u32::from(SIIT_POOL_BASE);
+        for _ in 0..0xffff {
+            self.next = self.next.wrapping_add(1) & 0xffff;
+            if self.next == 0 {
+                continue;
+            }
+            let cand = Ipv4Addr::from(base + self.next);
+            if !self.by_pool.contains_key(&cand) {
+                self.by_client.insert(client_v6, cand);
+                self.by_pool.insert(cand, client_v6);
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// The via6 client a reply destined to `pooled_v4` belongs to (reverse path).
+    pub fn client_for_pool(&self, pooled_v4: Ipv4Addr) -> Option<std::net::Ipv6Addr> {
+        self.by_pool.get(&pooled_v4).copied()
+    }
+}
+
+/// Shared, settable gateway SIIT state (Tier 3a). Shared between the ingress pump
+/// (allocates a client mapping + translates v6→v4) and the outbound forwarder
+/// (recognizes a pooled-address reply + translates v4→v6).
+#[cfg(unix)]
+pub type SiitSlot = std::sync::Arc<std::sync::RwLock<SiitState>>;
 
 /// Whether this gateway should forward a datagram from `src_vip` to `dst`: there
 /// is an advertised route covering `dst`, AND either it's untagged (any member) or
@@ -469,6 +556,7 @@ impl std::fmt::Debug for VpnInbound {
 
 #[cfg(unix)]
 impl VpnInbound {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tun: TunSlot,
         peer_ips: VpnPeerIps,
@@ -477,8 +565,9 @@ impl VpnInbound {
         conns: VpnConns,
         last_rx: VpnLastRx,
         gateway_cidrs: GatewayCidrs,
+        siit: SiitSlot,
     ) -> Self {
-        Self { tun, peer_ips, local_ip, refresh, conns, last_rx, gateway_cidrs }
+        Self { tun, peer_ips, local_ip, refresh, conns, last_rx, gateway_cidrs, siit }
     }
 }
 
@@ -489,6 +578,7 @@ impl VpnInbound {
 /// connections, so replies sent back over the *same* connection a peer dialed
 /// are actually read — the old accept-only pump silently discarded them.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub async fn pump_vpn_datagrams(
     conn: &iroh::endpoint::Connection,
     tun: &TunSlot,
@@ -497,6 +587,7 @@ pub async fn pump_vpn_datagrams(
     refresh: &VpnRefresh,
     last_rx: &VpnLastRx,
     gateway_cidrs: &std::sync::RwLock<Vec<GatewayRouteEntry>>,
+    siit: &SiitSlot,
 ) {
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
@@ -510,6 +601,58 @@ pub async fn pump_vpn_datagrams(
         // packet — skip cleanly so it never triggers a spurious refresh or TUN
         // write.
         if dg.as_ref() == VPN_KEEPALIVE {
+            continue;
+        }
+        // 4via6 (Tier 3a): an IPv6 datagram is either a via6 request to translate
+        // (we're the destination gateway) or a translated reply to deliver (we're
+        // the client). Handled before the v4 anti-spoof path (which would drop it).
+        if (dg.first().copied().unwrap_or(0) >> 4) == 6 {
+            if dg.len() < 40 {
+                continue;
+            }
+            let dst_v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&dg[24..40]).unwrap());
+            let src_v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&dg[8..24]).unwrap());
+            // Gateway path: dst is a via6 address for OUR site → SIIT v6→v4 → TUN,
+            // then the kernel forwards + masquerades onto the LAN (the P1 path).
+            if let Some((site, real_v4)) = via6_decode(dst_v6) {
+                let mine = siit.read().map(|s| s.my_site) .unwrap_or(None) == Some(site);
+                if mine {
+                    // Reach authorization (parity with the v4 gateway path): the
+                    // sending client (its vIP is embedded in client_v6) must be
+                    // permitted to reach `real_v4` via an advertised route.
+                    if !is_client_v6(src_v6) {
+                        continue;
+                    }
+                    let client_vip = Ipv4Addr::new(
+                        src_v6.octets()[12], src_v6.octets()[13], src_v6.octets()[14], src_v6.octets()[15],
+                    );
+                    let authorized = gateway_cidrs
+                        .read()
+                        .is_ok_and(|rs| gateway_forwards(&rs, client_vip, real_v4));
+                    if !authorized {
+                        tracing::debug!("via6 ingress: DROP — {client_vip} not authorized for {real_v4}");
+                        continue;
+                    }
+                    let pooled = match siit.write().ok().and_then(|mut s| s.map_client(src_v6)) {
+                        Some(p) => p,
+                        None => continue, // pool exhausted
+                    };
+                    if let Some(v4pkt) = siit::translate_v6_to_v4(&dg, pooled, real_v4)
+                        && let Some(tun) = tun.read().await.clone()
+                    {
+                        let _ = tun.send(&v4pkt).await;
+                    }
+                    continue;
+                }
+            }
+            // Client path: dst is OUR own via6 client address → it's a translated
+            // reply; write the v6 packet to the TUN so the local app receives it.
+            let my_client_v6 = local_ip.read().await.map(client_v6);
+            if my_client_v6 == Some(dst_v6)
+                && let Some(tun) = tun.read().await.clone()
+            {
+                let _ = tun.send(&dg).await;
+            }
             continue;
         }
         // Look up the peer's authorized vIP *per datagram* (not once up front)
@@ -599,6 +742,7 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
             &self.refresh,
             &self.last_rx,
             &self.gateway_cidrs,
+            &self.siit,
         )
         .await;
         // Connection ended — unregister, unless a newer one already replaced it.
@@ -786,6 +930,35 @@ mod tests {
         assert_eq!(parse_via_name("192-168-1-256-via-7"), None); // octet > 255
         assert_eq!(parse_via_name("192-168-1-50-via-"), None); // empty site
         assert_eq!(parse_via_name("192-168-1-50-via-abc"), None); // non-numeric site
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn siit_pool_maps_clients_stably_and_reverses() {
+        let mut s = SiitState::default();
+        let c1 = client_v6(Ipv4Addr::new(100, 64, 0, 9));
+        let c2 = client_v6(Ipv4Addr::new(100, 64, 0, 10));
+        let p1 = s.map_client(c1).unwrap();
+        // Stable: the same client always maps to the same pool address.
+        assert_eq!(s.map_client(c1).unwrap(), p1);
+        // Pooled addresses are in the reserved /16 and distinct per client.
+        assert!(is_siit_pool_addr(p1));
+        let p2 = s.map_client(c2).unwrap();
+        assert_ne!(p1, p2);
+        // Reverse lookup recovers the client for a reply routed to the pool addr.
+        assert_eq!(s.client_for_pool(p1), Some(c1));
+        assert_eq!(s.client_for_pool(p2), Some(c2));
+        assert_eq!(s.client_for_pool(Ipv4Addr::new(100, 127, 9, 9)), None);
+    }
+
+    #[test]
+    fn siit_pool_addrs_excluded_from_virtual_membership_check() {
+        // A pool address is still inside the warren /10 (so the gateway's existing
+        // masquerade covers it) but is recognized as pool, not a member vIP.
+        let p = Ipv4Addr::new(100, 127, 0, 5);
+        assert!(is_virtual_addr(p));
+        assert!(is_siit_pool_addr(p));
+        assert!(!is_siit_pool_addr(Ipv4Addr::new(100, 64, 0, 9)));
     }
 
     #[test]
