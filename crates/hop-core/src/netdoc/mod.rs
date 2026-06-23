@@ -2207,6 +2207,22 @@ impl NetDoc {
                 }
             }
         }
+        // 4via6 client routing (Tier 3a), opt-in via `HOP_VIA6`. Assign this node's
+        // own via6 source address to the TUN and route the via6 destination prefix
+        // into it, so traffic to a `via6(site, ip)` address (or a `-via-` MagicDNS
+        // name) is tunnelled to the owning gateway. Gated + best-effort: inert
+        // until a gateway + SIIT (Phase D) actually forward. The address/route are
+        // the only kernel mutation, delegated through the privsep monitor.
+        if std::env::var_os("HOP_VIA6").is_some() {
+            use tun::AbstractDevice;
+            let tun_name = tun.tun_name().unwrap_or_default();
+            let v6 = crate::vpn::client_v6(addr);
+            match crate::privsep::configure_tun_v6(v6, &tun_name) {
+                Ok(()) => tracing::info!("vpn via6: client routing enabled ({v6} on {tun_name})"),
+                Err(e) => tracing::warn!("vpn via6: client TUN v6 config failed: {e:#}"),
+            }
+        }
+
         let me = std::sync::Arc::clone(self);
         tokio::spawn(async move { me.vpn_outbound_loop(tun).await });
 

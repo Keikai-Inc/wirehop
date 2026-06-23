@@ -318,6 +318,54 @@ pub fn add_route_raw(cidr: &str, dev: &str) -> Result<()> {
     }
 }
 
+/// Configure IPv6 on the warren TUN for 4via6 client routing (Tier 3a): assign
+/// the client's own source address `addr/128` and route the via6 destination
+/// prefix (`VIA6_ROUTE_CIDR`) into `dev`. Privileged; idempotent (deletes a stale
+/// route/addr first). The address makes the kernel accept translated reply
+/// packets; the route sends via6-destined traffic out the tunnel.
+pub fn configure_tun_v6(addr: std::net::Ipv6Addr, dev: &str) -> Result<()> {
+    let route = crate::vpn::VIA6_ROUTE_CIDR;
+    #[cfg(target_os = "linux")]
+    {
+        // Address (ignore "exists"); enable v6 on the iface implicitly via addr add.
+        let _ = std::process::Command::new("ip")
+            .args(["-6", "addr", "add", &format!("{addr}/64"), "dev", dev])
+            .status();
+        let _ = std::process::Command::new("ip").args(["-6", "route", "del", route]).status();
+        let st = std::process::Command::new("ip")
+            .args(["-6", "route", "add", route, "dev", dev])
+            .status()
+            .context("ip -6 route add")?;
+        if !st.success() {
+            anyhow::bail!("`ip -6 route add {route} dev {dev}` failed");
+        }
+        tracing::info!("vpn via6: configured {addr}/64 + route {route} on {dev}");
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: assign the v6 addr to the utun, then route the prefix at it.
+        let _ = std::process::Command::new("ifconfig")
+            .args([dev, "inet6", &addr.to_string(), "prefixlen", "128", "alias"])
+            .status();
+        let _ = std::process::Command::new("route").args(["-inet6", "-n", "delete", route]).status();
+        let st = std::process::Command::new("route")
+            .args(["-inet6", "-n", "add", "-net", route, "-interface", dev])
+            .status()
+            .context("route -inet6 add")?;
+        if !st.success() {
+            anyhow::bail!("`route -inet6 add -net {route} -interface {dev}` failed");
+        }
+        tracing::info!("vpn via6: configured {addr} + route {route} on {dev}");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (addr, dev, route);
+        Ok(())
+    }
+}
+
 /// The current default-route IPv4 gateway — used to pin the warren relay past an
 /// exit node's split-default so the tunnel doesn't loop through the exit itself.
 /// Linux-only for now (macOS exit-node pinning is a follow-up).

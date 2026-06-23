@@ -67,6 +67,12 @@ pub enum MonitorRequest {
     /// so the dropped worker delegates it. The monitor allowlists `dev` to a TUN
     /// interface (`tun*`/`utun*`). Replies `Ok` (no fd).
     ModifyClientRoute { cidr: String, dev: String, add: bool },
+    /// Configure IPv6 on the warren TUN for 4via6 client routing (Tier 3a): assign
+    /// the client's own source address `addr` and route the via6 destination prefix
+    /// into the TUN. Privileged (`ip -6`/`ifconfig`/`route`), so the dropped worker
+    /// delegates it. The monitor validates `addr` is in the via6 client prefix and
+    /// routes onto the TUN it created. Replies `Ok` (no fd).
+    ConfigureTunV6 { addr: [u8; 16] },
     /// Pin a `/32` host route `dst → via <gateway>` (not the TUN). Used by an exit
     /// node to keep the warren relay reachable past the split-default, so the
     /// tunnel doesn't loop through the exit. Privileged. Reverted on worker exit.
@@ -955,6 +961,27 @@ pub fn add_tun_route(cidr: &str, dev: &str) -> Result<()> {
     }
 }
 
+/// Configure IPv6 on the warren TUN for 4via6 client routing (Tier 3a),
+/// delegating the privileged address/route setup to the monitor under privsep.
+/// `addr` is the client's own via6 source address; `dev` is the warren TUN.
+pub fn configure_tun_v6(addr: std::net::Ipv6Addr, dev: &str) -> Result<()> {
+    match worker_control_fd() {
+        Some(ctrl) => {
+            let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            send_msg(ctrl, &MonitorRequest::ConfigureTunV6 { addr: addr.octets() })
+                .context("requesting via6 TUN config from privsep monitor")?;
+            match recv_msg::<MonitorReply>(ctrl)? {
+                MonitorReply::Ok => Ok(()),
+                MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ConfigureTunV6"),
+                MonitorReply::Error { message } => {
+                    anyhow::bail!("privsep monitor refused ConfigureTunV6: {message}")
+                }
+            }
+        }
+        None => crate::vpn::gateway::configure_tun_v6(addr, dev),
+    }
+}
+
 /// Install a subnet route `cidr → dev` with the collision guard (returns
 /// `Ok(false)` without touching the kernel if `cidr` would hijack the local LAN).
 pub fn install_client_route(cidr: &str, dev: &str) -> Result<bool> {
@@ -1490,6 +1517,35 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                     Some(tun) => {
                         crate::vpn::gateway::remove_route_raw(&cidr, &tun);
                         let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                    }
+                }
+            }
+            MonitorRequest::ConfigureTunV6 { addr } => {
+                use tun::AbstractDevice;
+                let v6 = std::net::Ipv6Addr::from(addr);
+                // Defensive: only ever assign a v6 address in our own client prefix.
+                if !crate::vpn::is_client_v6(v6) {
+                    let _ = send_msg(
+                        mon_fd,
+                        &MonitorReply::Error { message: format!("refusing ConfigureTunV6 for {v6}: not in the via6 client prefix") },
+                    );
+                } else {
+                    match kept_tuns.last().and_then(|t| t.tun_name().ok()) {
+                        None => {
+                            let _ = send_msg(
+                                mon_fd,
+                                &MonitorReply::Error { message: "no warren TUN to configure v6 on".into() },
+                            );
+                        }
+                        Some(tun) => match crate::vpn::gateway::configure_tun_v6(v6, &tun) {
+                            Ok(()) => {
+                                let _ = send_msg(mon_fd, &MonitorReply::Ok);
+                            }
+                            Err(e) => {
+                                tracing::warn!("privsep monitor: ConfigureTunV6 failed: {e:#}");
+                                let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
+                            }
+                        },
                     }
                 }
             }

@@ -101,6 +101,35 @@ pub fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
 /// bytes spell `fd 'hopvia6'` (`0xfd` makes it a ULA, `fc00::/7`).
 const VIA6_PREFIX: [u8; 8] = [0xfd, 0x68, 0x6f, 0x70, 0x76, 0x69, 0x61, 0x36];
 
+/// The via6 **destination** prefix as a routable CIDR. A client routes this `/64`
+/// into the warren TUN so packets to any `via6(site, ipv4)` are forwarded over
+/// the tunnel to the owning gateway. (The prefix is 64 bits; the low 64 carry the
+/// `site_id`+`ipv4` payload.)
+pub const VIA6_ROUTE_CIDR: &str = "fd68:6f70:7669:6136::/64";
+
+/// hop's via6 **client-source** prefix (first 64 bits) — a sibling ULA of the
+/// destination prefix, used for a client's own TUN IPv6 source address so it never
+/// overlaps a via6 destination. The bytes spell `fd 'hopvia5'`.
+const CLIENT_V6_PREFIX: [u8; 8] = [0xfd, 0x68, 0x6f, 0x70, 0x76, 0x69, 0x61, 0x35];
+
+/// The client's own TUN IPv6 source address (4via6, Tier 3a), derived from its
+/// warren vIP so it is stable and unique per node: `<client prefix>::<vip>`. This
+/// is the address a client sends via6 traffic *from* and the gateway maps replies
+/// back *to*; assigning it to the TUN makes the kernel accept the translated
+/// reply packets.
+pub fn client_v6(vip: Ipv4Addr) -> std::net::Ipv6Addr {
+    let mut o = [0u8; 16];
+    o[0..8].copy_from_slice(&CLIENT_V6_PREFIX);
+    o[12..16].copy_from_slice(&vip.octets());
+    std::net::Ipv6Addr::from(o)
+}
+
+/// Whether `addr` falls in the via6 client-source prefix (defensive validation at
+/// the privsep boundary — the monitor only assigns a TUN v6 address in this range).
+pub fn is_client_v6(addr: std::net::Ipv6Addr) -> bool {
+    addr.octets()[0..8] == CLIENT_V6_PREFIX
+}
+
 /// Build the 4via6 IPv6 address for `ipv4` at site `site_id` (overlap routing).
 pub fn via6_encode(site_id: u32, ipv4: Ipv4Addr) -> std::net::Ipv6Addr {
     let mut o = [0u8; 16];
@@ -757,6 +786,19 @@ mod tests {
         assert_eq!(parse_via_name("192-168-1-256-via-7"), None); // octet > 255
         assert_eq!(parse_via_name("192-168-1-50-via-"), None); // empty site
         assert_eq!(parse_via_name("192-168-1-50-via-abc"), None); // non-numeric site
+    }
+
+    #[test]
+    fn client_v6_is_stable_unique_and_recognized() {
+        let a = client_v6(Ipv4Addr::new(100, 64, 0, 9));
+        // Stable + embeds the vIP in the low bytes.
+        assert_eq!(a, client_v6(Ipv4Addr::new(100, 64, 0, 9)));
+        assert_eq!(&a.octets()[12..16], &[100, 64, 0, 9]);
+        // Different vIP → different client address.
+        assert_ne!(a, client_v6(Ipv4Addr::new(100, 64, 0, 10)));
+        // Recognized as a client-prefix address, and distinct from a via6 dest.
+        assert!(is_client_v6(a));
+        assert!(!is_client_v6(via6_encode(7, Ipv4Addr::new(192, 168, 1, 50))));
     }
 
     #[test]
