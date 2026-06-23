@@ -251,6 +251,7 @@ mod tests {
             self_doc: None,
             vip: None,
             vpn_endpoint: None,
+            site_id: None,
             sandbox: SandboxPolicy::default(),
         }
     }

@@ -1034,6 +1034,7 @@ mod tests {
             self_doc: None,
             vip: vip.map(String::from),
             vpn_endpoint: None,
+            site_id: None,
             sandbox: SandboxPolicy::default(),
         }
     }

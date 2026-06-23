@@ -49,6 +49,12 @@ const KEY_VPN_PREFIX: &str = "vpn/";
 /// Subnet/exit routes advertised by gateway nodes (Tier 1 LAN bridging):
 /// `route/<node_id_hex>/<cidr>` (slash in the CIDR encoded as `-`).
 const KEY_ROUTE_PREFIX: &str = "route/";
+/// Shared 4via6 site-id allocation table (overlapping-subnet routing, Tier 3a):
+/// `siteid/<id_decimal> -> node_id`. The authoritative mapping is the admin-owned
+/// `peer/<n>.site_id`; this table is the collision/probe space and the self-claim
+/// fallback when no admin has allocated yet — exactly mirroring `ip/` vs
+/// `peer/<n>.vip`.
+const KEY_SITEID_PREFIX: &str = "siteid/";
 
 /// Base of the CGNAT range `100.64.0.0/10` (Tailscale-style), as a u32.
 const CGNAT_BASE: u32 = 0x6440_0000; // 100.64.0.0
@@ -67,6 +73,21 @@ pub fn deterministic_ip(node_id: &str) -> std::net::Ipv4Addr {
     let raw = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
     let offset = 1 + (raw % (CGNAT_SIZE - 2));
     std::net::Ipv4Addr::from(CGNAT_BASE + offset)
+}
+
+/// Deterministic candidate **site id** for a node id (4via6, Tier 3a). The site
+/// id is a 32-bit value embedded in every via6 address that names a device on
+/// this gateway's LAN, so it must be unique per warren; like the vIP, the
+/// deterministic candidate is hashed from the node id and a doc-coordinated claim
+/// resolves the rare collision. `0` is reserved (an all-zero site segment is
+/// treated as "unset"), so candidates are mapped into `1..=u32::MAX`.
+pub fn deterministic_site_id(node_id: &str) -> u32 {
+    use sha2::{Digest, Sha256};
+    // Salt distinctly from `deterministic_ip` so a node's site id and vIP don't
+    // derive from the same hash bytes (defensive; they live in different spaces).
+    let h = Sha256::digest([b"hop-via6-site:", node_id.as_bytes()].concat());
+    let raw = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+    1 + (raw % (u32::MAX - 1))
 }
 
 fn default_true() -> bool {
@@ -736,6 +757,18 @@ impl NetDoc {
                 ),
             }
         }
+        if p.site_id.is_none() && self.is_trust_anchor() {
+            // 4via6 site id (Tier 3a). Allocated for every member like the vIP so
+            // any node can become an overlapping-subnet gateway without an admin
+            // round-trip; harmless for members that never advertise a route.
+            match self.claim_site_id(&p.node_id).await {
+                Ok(id) => p.site_id = Some(id),
+                Err(e) => tracing::warn!(
+                    "netdoc via6: site-id claim for {} failed: {e:#}",
+                    &p.node_id[..8.min(p.node_id.len())]
+                ),
+            }
+        }
         self.put_peer(&p).await
     }
 
@@ -888,6 +921,105 @@ impl NetDoc {
             out.push((addr, String::from_utf8_lossy(&bytes).into_owned()));
         }
         Ok(out)
+    }
+
+    // ── 4via6 site ids (Tier 3a — overlapping-subnet routing) ────────────
+
+    /// Claim a stable 4via6 site id for `node_id`, idempotently. Mirrors
+    /// [`Self::claim_virtual_ip`]: returns the already-claimed id if present, else
+    /// claims the deterministic candidate (linear-probing on collision) in the
+    /// shared `siteid/<id> -> node_id` table. On a concurrent claim of the same id
+    /// (only possible once federated), the lower node_id wins and the loser
+    /// re-probes. Used by the trust anchor at admission; a member self-claims here
+    /// only as the offline fallback.
+    pub async fn claim_site_id(&self, node_id: &str) -> Result<u32> {
+        if let Some(id) = self.get_site_id(node_id).await? {
+            return Ok(id);
+        }
+        let start = deterministic_site_id(node_id);
+        for i in 0..MAX_IP_PROBES {
+            // Probe forward, wrapping over `1..=u32::MAX` (0 stays reserved).
+            let cand = {
+                let off = (start.wrapping_sub(1)).wrapping_add(i) % (u32::MAX - 1);
+                1 + off
+            };
+            let key = format!("{KEY_SITEID_PREFIX}{cand}");
+            match self.lookup_ip_owner(&key).await? {
+                Some(owner) if owner == node_id => return Ok(cand),
+                Some(_) => continue, // taken by another node — probe next
+                None => {
+                    self.doc
+                        .set_bytes(self.author, key.clone().into_bytes(), node_id.as_bytes().to_vec())
+                        .await
+                        .context("claiming site id")?;
+                    if let Some(owner) = self.lookup_ip_owner(&key).await?
+                        && owner != node_id
+                    {
+                        continue;
+                    }
+                    return Ok(cand);
+                }
+            }
+        }
+        anyhow::bail!("no free site id after {MAX_IP_PROBES} probes")
+    }
+
+    /// The site id currently allocated to `node_id`, preferring the admin-owned
+    /// authority (`peer/<n>.site_id`) and falling back to the shared `siteid/`
+    /// table. Mirrors the vIP authority resolution (`peer/<n>.vip` then `ip/`).
+    pub async fn get_site_id(&self, node_id: &str) -> Result<Option<u32>> {
+        if let Some(peer) = self.get_peer(node_id).await?
+            && let Some(id) = peer.site_id
+        {
+            return Ok(Some(id));
+        }
+        for (id, owner) in self.list_site_ids().await? {
+            if owner == node_id {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// All `(site_id, node_id)` allocations in the shared `siteid/` table.
+    pub async fn list_site_ids(&self) -> Result<Vec<(u32, String)>> {
+        let query = Query::key_prefix(KEY_SITEID_PREFIX.as_bytes()).build();
+        let stream = self.doc.get_many(query).await.context("get_many siteid")?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.context("reading siteid entry")?;
+            if !self.validate_entry(entry.key(), entry.author()) {
+                continue;
+            }
+            if entry.content_len() == 0 {
+                continue;
+            }
+            let key = String::from_utf8_lossy(entry.key());
+            let Some(id_str) = key.strip_prefix(KEY_SITEID_PREFIX) else { continue };
+            let Ok(id) = id_str.parse::<u32>() else { continue };
+            let bytes = self.fs_store.get_bytes(entry.content_hash()).await?;
+            out.push((id, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        Ok(out)
+    }
+
+    /// Resolve a decoded via6 `site_id` to the gateway node that owns it — the
+    /// node a via6 packet for that site must be forwarded to. Prefers the
+    /// admin-owned `peer/<n>.site_id` authority; falls back to the shared
+    /// `siteid/` table. `None` = no node claims this site (stale/forged address).
+    pub async fn resolve_site_gateway(&self, site_id: u32) -> Result<Option<String>> {
+        for peer in self.list_peers().await? {
+            if peer.site_id == Some(site_id) {
+                return Ok(Some(peer.node_id));
+            }
+        }
+        for (id, owner) in self.list_site_ids().await? {
+            if id == site_id {
+                return Ok(Some(owner));
+            }
+        }
+        Ok(None)
     }
 
     // ── Sync resumption (robustness across restarts) ─────────────────────
@@ -2027,6 +2159,9 @@ impl NetDoc {
                 // The founder's own VPN endpoint in the roster, so peers resolve
                 // it from the admin doc without importing the founder's self-doc.
                 vpn_endpoint: Some(self.own_vpn_endpoint_value()),
+                // The founder's own 4via6 site id (its own claim), so it can act
+                // as an overlapping-subnet gateway.
+                site_id: self.claim_site_id(host_node_id).await.ok(),
                 sandbox: crate::sandbox::SandboxPolicy::default(),
             };
             if let Err(e) = self.put_peer(&me).await {
@@ -2057,11 +2192,18 @@ impl NetDoc {
                 me.vpn_endpoint = Some(ep);
                 changed = true;
             }
+            // Heal the 4via6 site id for a founder whose entry predates the field.
+            if me.site_id.is_none()
+                && let Ok(id) = self.claim_site_id(host_node_id).await
+            {
+                me.site_id = Some(id);
+                changed = true;
+            }
             if changed {
                 if let Err(e) = self.put_peer(&me).await {
                     tracing::warn!("vpn: founder roster self-heal failed: {e:#}");
                 } else {
-                    tracing::info!("vpn: refreshed founder's own roster entry (self_doc + vpn_endpoint)");
+                    tracing::info!("vpn: refreshed founder's own roster entry (self_doc + vpn_endpoint + site_id)");
                 }
             }
         }
@@ -2210,7 +2352,26 @@ impl NetDoc {
         self_entry_author_ok(owner.as_deref(), name_author, &bindings, ValidationMode::Enforce)
     }
 
-    /// MagicDNS server: answer `A` queries for `*.hop` on the virtual interface.
+    /// Resolve a MagicDNS host label (warren domain already stripped) to an IP.
+    ///
+    /// A **4via6 name** (`<a>-<b>-<c>-<d>-via-<site>`, Tier 3a) resolves to the
+    /// IPv6 `via6(site, a.b.c.d)` — but only when `site` actually corresponds to a
+    /// known gateway (so a forged/stale site name is `NXDOMAIN`, not a black hole).
+    /// The embedded IPv4 is never returned as an `A` record: that would hand the
+    /// client the colliding real address and defeat overlap routing. Any other
+    /// label falls through to the ordinary host → vIP (`A`) lookup.
+    pub async fn resolve_magicdns(&self, host: &str) -> Option<std::net::IpAddr> {
+        if let Some((site_id, ipv4)) = crate::vpn::parse_via_name(host) {
+            match self.resolve_site_gateway(site_id).await {
+                Ok(Some(_)) => return Some(std::net::IpAddr::V6(crate::vpn::via6_encode(site_id, ipv4))),
+                _ => return None, // no gateway owns this site → name doesn't exist
+            }
+        }
+        self.lookup_name(host).await.ok().flatten().map(std::net::IpAddr::V4)
+    }
+
+    /// MagicDNS server: answer `A`/`AAAA` queries for `*.hop` on the virtual
+    /// interface (`AAAA` covers 4via6 `-via-` names).
     #[cfg(unix)]
     async fn vpn_dns_loop(&self, addr: std::net::Ipv4Addr) {
         // Under privsep-drop the worker is unprivileged and cannot bind :53, so
@@ -2233,8 +2394,8 @@ impl NetDoc {
                 Err(_) => continue,
             };
             let Some(query) = crate::vpn::dns::parse_query(&buf[..n]) else { continue };
-            let resolved = match query.name.strip_suffix(&suffix) {
-                Some(host) => self.lookup_name(host).await.ok().flatten(),
+            let resolved: Option<std::net::IpAddr> = match query.name.strip_suffix(&suffix) {
+                Some(host) => self.resolve_magicdns(host).await,
                 None => None,
             };
             let resp = crate::vpn::dns::build_response(&query, resolved);
@@ -3012,7 +3173,7 @@ impl NetDoc {
 /// forgery vectors (traffic interception, vIP theft, MagicDNS spoofing) all
 /// hijack one of these.
 fn is_self_owned_key(key: &[u8]) -> bool {
-    const SELF_PREFIXES: &[&[u8]] = &[b"vpn/", b"ip/", b"name/", b"tag/", b"posture/"];
+    const SELF_PREFIXES: &[&[u8]] = &[b"vpn/", b"ip/", b"name/", b"tag/", b"posture/", b"siteid/"];
     SELF_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
@@ -3185,6 +3346,7 @@ mod tests {
             self_doc: None,
             vip: None,
             vpn_endpoint: None,
+            site_id: None,
             sandbox: SandboxPolicy::default(),
         }
     }
@@ -3415,6 +3577,54 @@ mod tests {
         // Lookups agree.
         assert_eq!(net.get_virtual_ip("a1").await.unwrap(), Some(ip_a1));
         assert_eq!(net.list_virtual_ips().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn claim_site_id_is_idempotent_unique_and_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = test_endpoint().await;
+        let net = NetDoc::spawn(ep, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+
+        let s_a = net.claim_site_id("gw-a").await.unwrap();
+        // Idempotent + never the reserved 0.
+        assert_ne!(s_a, 0);
+        assert_eq!(net.claim_site_id("gw-a").await.unwrap(), s_a);
+        // Different node → different site id.
+        let s_b = net.claim_site_id("gw-b").await.unwrap();
+        assert_ne!(s_a, s_b);
+        // Shared-table lookups agree.
+        assert_eq!(net.get_site_id("gw-a").await.unwrap(), Some(s_a));
+        // Reverse resolution: site id → owning gateway node.
+        assert_eq!(net.resolve_site_gateway(s_a).await.unwrap().as_deref(), Some("gw-a"));
+        assert_eq!(net.resolve_site_gateway(s_b).await.unwrap().as_deref(), Some("gw-b"));
+        // An unclaimed site id resolves to nobody.
+        let unclaimed = s_a.wrapping_add(s_b).wrapping_add(123_456);
+        if unclaimed != s_a && unclaimed != s_b {
+            assert_eq!(net.resolve_site_gateway(unclaimed).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_peer_allocates_site_id_and_authority_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = test_endpoint().await;
+        let net = NetDoc::spawn(ep, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+        net.record_founder_anchor(None); // make this node the trust anchor
+        // The trust anchor admits a member; the peer entry should carry both an
+        // admin-allocated vIP and a site id.
+        let p = sample_peer("member-1", "laptop");
+        net.admit_peer(&p).await.unwrap();
+        let admitted = net.get_peer("member-1").await.unwrap().expect("peer present");
+        let site = admitted.site_id.expect("admin allocated a site id");
+        assert_ne!(site, 0);
+        // The admin-owned peer.site_id is the authority resolve_site_gateway uses.
+        assert_eq!(net.resolve_site_gateway(site).await.unwrap().as_deref(), Some("member-1"));
+        // get_site_id prefers the peer authority too.
+        assert_eq!(net.get_site_id("member-1").await.unwrap(), Some(site));
     }
 
     /// Federation safety (Step 4): a federated host must NOT revoke peers it

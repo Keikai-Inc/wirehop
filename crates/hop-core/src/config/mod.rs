@@ -300,6 +300,15 @@ pub struct Peer {
     /// self-doc, then the shared `vpn/` table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_endpoint: Option<String>,
+    /// The peer's admin-allocated **4via6 site id** (overlapping-subnet routing,
+    /// Tier 3a). Like `vip`, the admin claims it once at admission and records it
+    /// here (admin-owned ⇒ the authoritative site→gateway mapping readers trust).
+    /// A device on this peer's LAN at real IPv4 `d` is reached warren-wide via the
+    /// IPv6 `via6(site_id, d)`; the decode resolves `site_id` → this gateway. Static
+    /// (no admin-online coupling). `None` = legacy member (falls back to the shared
+    /// `siteid/` table, then a deterministic self-claim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_id: Option<u32>,
     /// Sandbox restrictions for this peer (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: crate::sandbox::SandboxPolicy,
@@ -349,6 +358,7 @@ impl PeersStore {
                 self_doc: None,
                 vip: None,
                 vpn_endpoint: None,
+                site_id: None,
                 sandbox,
             });
         }

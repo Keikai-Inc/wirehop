@@ -120,6 +120,32 @@ pub fn via6_decode(addr: std::net::Ipv6Addr) -> Option<(u32, Ipv4Addr)> {
     Some((site_id, Ipv4Addr::new(o[12], o[13], o[14], o[15])))
 }
 
+/// MagicDNS label for a via6 device, Tailscale's `-via-` convention:
+/// `via6(7, 192.168.1.50)` → `192-168-1-50-via-7` (the host part; the warren
+/// domain is appended by the resolver). Lets users/apps name an overlapping-subnet
+/// device without typing the IPv6.
+pub fn via_name(site_id: u32, ipv4: Ipv4Addr) -> String {
+    let o = ipv4.octets();
+    format!("{}-{}-{}-{}-via-{}", o[0], o[1], o[2], o[3], site_id)
+}
+
+/// Parse a `<a>-<b>-<c>-<d>-via-<site>` MagicDNS label back to `(site_id, ipv4)`.
+/// `None` if it isn't a via name or the octets/site don't parse. Case/strictness:
+/// the four octets must each be `0..=255` and the site id a valid `u32`.
+pub fn parse_via_name(host: &str) -> Option<(u32, Ipv4Addr)> {
+    let (ip_part, site_part) = host.rsplit_once("-via-")?;
+    let site_id: u32 = site_part.parse().ok()?;
+    let mut it = ip_part.split('-');
+    let a = it.next()?.parse::<u8>().ok()?;
+    let b = it.next()?.parse::<u8>().ok()?;
+    let c = it.next()?.parse::<u8>().ok()?;
+    let d = it.next()?.parse::<u8>().ok()?;
+    if it.next().is_some() {
+        return None; // trailing junk after the four octets
+    }
+    Some((site_id, Ipv4Addr::new(a, b, c, d)))
+}
+
 /// HA gateway failover rule: from same-route `candidates`, return the index of the
 /// first one for which `is_live` holds (a gateway we've heard from recently); if
 /// none is live (cold start, or all silent), index 0. So traffic prefers a live
@@ -706,5 +732,41 @@ mod tests {
         }
         // A non-via6 IPv6 address (e.g. localhost) is not decoded.
         assert_eq!(via6_decode(std::net::Ipv6Addr::LOCALHOST), None);
+    }
+
+    #[test]
+    fn via_name_roundtrips() {
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        assert_eq!(via_name(7, ip), "192-168-1-50-via-7");
+        assert_eq!(parse_via_name("192-168-1-50-via-7"), Some((7, ip)));
+        // Round-trip across sites/ips.
+        for (site, ip) in [
+            (1u32, Ipv4Addr::new(10, 0, 0, 1)),
+            (4_000_000_000, Ipv4Addr::new(255, 254, 253, 252)),
+        ] {
+            assert_eq!(parse_via_name(&via_name(site, ip)), Some((site, ip)));
+        }
+    }
+
+    #[test]
+    fn parse_via_name_rejects_malformed() {
+        assert_eq!(parse_via_name("laptop"), None); // ordinary host
+        assert_eq!(parse_via_name("192-168-1-via-7"), None); // only 3 octets
+        assert_eq!(parse_via_name("192-168-1-50-1-via-7"), None); // 5 octets
+        assert_eq!(parse_via_name("192-168-1-256-via-7"), None); // octet > 255
+        assert_eq!(parse_via_name("192-168-1-50-via-"), None); // empty site
+        assert_eq!(parse_via_name("192-168-1-50-via-abc"), None); // non-numeric site
+    }
+
+    #[test]
+    fn deterministic_site_id_is_stable_nonzero_and_distinct() {
+        use crate::netdoc::deterministic_site_id;
+        let a = deterministic_site_id("node-aaaa");
+        // Stable for the same node id.
+        assert_eq!(a, deterministic_site_id("node-aaaa"));
+        // Never the reserved 0.
+        assert_ne!(a, 0);
+        // Different nodes get different candidates (overwhelmingly likely).
+        assert_ne!(a, deterministic_site_id("node-bbbb"));
     }
 }
