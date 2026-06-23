@@ -2256,7 +2256,11 @@ impl NetDoc {
         // (proves the path is live), or, for one we just dialed, within DIAL_GRACE
         // while the first reply is still in flight. Otherwise we re-dial. Both ends
         // run this, so a silently-dead path recovers on whichever side is sending.
-        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+        // 12s = ~2.4× the 5s keepalive: a live peer sends a keepalive every 5s so it
+        // never reads stale, but a genuinely-dead path is detected fast — which is
+        // when we re-dial + reset_node, bounding founder-restart recovery under the
+        // 30s SLA. (Was 20s, which pushed reset-driven recovery to ~27-34s.)
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(12);
         // Cold-reconnect window: a freshly-dialed connection — especially a
         // relay-only path re-established with no founder online (the no-admin
         // case) — needs time to validate a path before the first keepalive/reply
@@ -2277,6 +2281,21 @@ impl NetDoc {
         // (the slow, variable half of founder-restart recovery). Well above a
         // hole-punch/relay RTT, so a healthy dial still completes first try.
         const VPN_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        // Per-node path reset on peer-loss: closing our stale connection (active-
+        // close, below) doesn't make iroh forget the peer's dead path — while a
+        // path stays selected, iroh won't re-resolve the peer's CURRENT address, so
+        // a peer that restarted on a new port stays unreachable until the stale path
+        // ages out (~60-80s). `endpoint.reset_node()` (fork API) clears that
+        // selection so iroh re-resolves + re-holepunches now. Rate-limited (the
+        // re-dial arm fires per packet during a stall); fire-and-forget.
+        // Long cooldown: a reset must get an UNINTERRUPTED convergence window. Firing
+        // it repeatedly (every few seconds) during a stall re-clears the selection
+        // right as holepunch is about to settle → livelock (observed: a stuck >280s
+        // recovery under rapid restarts). One reset per stall, then leave it alone.
+        const PATH_RESET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut last_path_reset = std::time::Instant::now()
+            .checked_sub(PATH_RESET_COOLDOWN)
+            .unwrap_or_else(std::time::Instant::now);
         let mut buf = vec![0u8; 65535];
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2503,6 +2522,15 @@ impl NetDoc {
                             self.vpn_conns.write().await.remove(&pubkey.to_string())
                         {
                             old.close(0u32.into(), b"stale path, redialing fresh");
+                        }
+                        // Make iroh forget this peer's stale (dead) path so the dial
+                        // below re-resolves its CURRENT address instead of pinning
+                        // the port it left behind when it restarted. Rate-limited;
+                        // fire-and-forget (see PATH_RESET_COOLDOWN).
+                        if last_path_reset.elapsed() >= PATH_RESET_COOLDOWN {
+                            last_path_reset = std::time::Instant::now();
+                            let ep = self.endpoint.clone();
+                            tokio::spawn(async move { ep.reset_node(pubkey).await });
                         }
                         match crate::net::connect_to_host_with_alpn_timeout(
                             &self.endpoint,

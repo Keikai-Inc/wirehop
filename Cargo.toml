@@ -95,9 +95,9 @@ tempfile = "3"
 # must be patched together — iroh-docs/blobs/gossip pull iroh-base/iroh-relay
 # from crates.io, and mixing those with the fork's copies yields two iroh_base
 # versions (PublicKey type mismatch).
-iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
-iroh-base = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
-iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97-nodepathreset" }
+iroh-base = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97-nodepathreset" }
+iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97-nodepathreset" }
 # noq-proto (n0's quinn fork, the QUIC engine under iroh 0.97) vendored + patched:
 # SentPacket.largest_acked was an FxHashMap<PathId,u64> allocated per sent packet
 # and retained ×concurrent-paths → a multi-GB leak under multipath. Our copy makes

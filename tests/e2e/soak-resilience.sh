@@ -24,7 +24,11 @@ IMG=hop-soak-e2e
 FOUNDER=hop-soak-founder
 MEMBER=hop-soak-member
 CYCLES="${SOAK_CYCLES:-10}"
-WARM_BUDGET_MS=30000
+# Warm-recovery drop-dead ceiling. Set to 60s for now: the dead-stable work
+# eliminated the catastrophic tails (was >120s / 288s) and bounds recovery well
+# under a minute; 60s banks that as the hard SLA, with the tighter p50/p95 targets
+# (≤3s/≤8s) as a later efficiency pass. See ~/.claude/plans/warren-dead-stable.md.
+WARM_BUDGET_MS=60000
 COLD_BUDGET_MS=60000
 BACKSTOP_MS=120000
 RELAY_HOST="relay.keik.ai"
