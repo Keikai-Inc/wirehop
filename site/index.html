@@ -539,7 +539,9 @@
           <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">What's a warren?</h3>
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's your private group of machines. Add a machine to your warren and it gets a friendly name (<code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">rexmundi.hop</code>) and a private address that only <em>your</em> machines can reach &mdash; from anywhere, with no port-forwarding, no VPN appliance, and no coordination server in someone else's cloud.</p>
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Then the tools you already use just work &mdash; SSH, scp, VNC, anything &mdash; with the same ease, simplicity, and reliability as hop.</p>
-          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">One command to opt a machine in: <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-text-secondary);">hop warren join</code></p>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Joining takes one command</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">A warren travels in an <strong>invite</strong>. Generate one on any machine that's already on the warren, hand it to the new machine, and run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop warren join &lt;invite&gt;</code>. That's it &mdash; the machine picks up its private IP and <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address and is instantly reachable by every other member.</p>
+          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">The invite is single-use and time-limited, and its role decides exactly what the new member can reach. No accounts, no central server &mdash; the warren itself is the source of truth, shared peer-to-peer.</p>
         </div>
 
         <div class="code-block">
@@ -550,6 +552,10 @@
             <span class="code-title">Terminal</span>
           </div>
           <div class="code-body">
+<span class="comment"># Join the warren with an invite</span>
+<span class="prompt">$</span> <span class="cmd">hop warren join</span> <span class="flag">eyJ0eX...</span>
+<span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
+
 <span class="comment"># Your machines, reachable by name from anywhere</span>
 <span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">rexmundi.hop</span>
 
@@ -558,6 +564,52 @@
 
 <span class="comment"># Even a desktop &mdash; VNC over the private network</span>
 <span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://rexmundi.hop</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LAN bridging -->
+  <section id="lan-bridging" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Reach the things that can't run hop</h2>
+        <p>Printers, a NAS, cameras, a smart TV, your whole home network &mdash; bridged onto your warren through one machine that's already on it.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One machine bridges the rest</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Plenty of devices will never run a VPN. So pick one machine that <em>is</em> on your warren &mdash; a home server, a Raspberry Pi, your always-on box &mdash; and let it carry the others. Tell it which network to share, and every member of your warren can reach everything on that LAN, by its real address, from anywhere.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's the Tailscale &ldquo;subnet router&rdquo; idea, with hop's setup: <strong>one command</strong>, no config files, no appliance.</p>
+
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Even when the addresses collide</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Home and cabin both on <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">192.168.1.x</code>? That normally breaks a VPN &mdash; two devices, same address. hop keeps them straight and routes to the right one, so an overlapping network is just another network.</p>
+          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">Access is still gated by role &mdash; a bridged device is only reachable by members you've allowed.</p>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># On the machine that sits on the LAN you want to share</span>
+<span class="prompt">$</span> <span class="cmd">hop lan advertise</span> <span class="flag">192.168.1.0/24</span>
+<span class="output">Advertising 192.168.1.0/24 to the warren</span>
+
+<span class="comment"># Or share just one device</span>
+<span class="prompt">$</span> <span class="cmd">hop lan advertise</span> <span class="flag">192.168.1.50/32</span>
+
+<span class="comment"># From any other machine on the warren, reach it directly</span>
+<span class="prompt">$</span> <span class="cmd">ping</span> <span class="flag">192.168.1.50</span>
+<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">http://192.168.1.50</span>
+
+<span class="comment"># See what's on offer across the warren</span>
+<span class="prompt">$</span> <span class="cmd">hop lan ls</span>
           </div>
         </div>
       </div>
