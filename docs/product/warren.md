@@ -164,10 +164,15 @@ So the VPN comes up *as a side effect of joining* — there is no separate
 "connect to VPN" step. Every member runs the hop daemon (the one-liner installs
 it), exactly as Tailscale runs `tailscaled` everywhere.
 
-> **(Remaining polish.)** Today membership (redeeming a `hop invite`) and the
-> warren join ticket (`--join`) are two values. The planned refinement folds the
-> join ticket *into* the invite token so a single redeem does both — the
-> mechanism is shipped; only the one-token UX is pending.
+> **One token does both (Shipped).** A warren-carrying invite embeds the join
+> ticket, so a single redeem performs membership **and** brings up the warren — no
+> separate `--join` value. Redeem it with either `hop warren join <invite>` or just
+> `hop connect <invite>`: consuming a warren invite puts the machine on the warren
+> and self-upgrades it to a node (a plain `client` invite stays reach-only). If the
+> machine is already on a *different* warren, the invite's warren is adopted only
+> when the current one is solo (no other members); a populated warren is never
+> switched without an explicit choice. (`--join`/`HOP_VPN_JOIN_TICKET`/
+> `netdoc-join.ticket` remain as the lower-level ticket inputs for the daemon.)
 
 ### The role model
 

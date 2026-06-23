@@ -68,6 +68,20 @@ hop connect myhost
 hop connect myhost --read-only --scope /var/log
 ```
 
+**Consuming a warren invite also puts this machine on the warren.** If the invite
+carries a warren (any `node`/`admin`/`warren-only` invite — i.e. not a plain
+`client` invite), `hop connect <invite>` joins the warren as a side effect of the
+connection and self-upgrades this machine to a **node** (brings up the daemon +
+TUN; needs privilege). No separate `hop warren join` is required. A plain
+`client` invite is reach-only and never joins. The join follows the same
+conflict rules as `hop warren join` (see [`hop warren`](#hop-warren-joinstatus)
+below) — adopt when you're on no warren or a solo one, never switch a populated
+warren silently. Because `hop
+connect` takes no `--on-warren-conflict` flag, a conflict with a *populated*
+warren prompts interactively (Keep/Switch) or, non-interactively, is **skipped**
+with a message (the shell session still proceeds — the warren upgrade is
+best-effort and never blocks the connection).
+
 ### `hop on <target>`
 
 Shorthand for `hop connect`.
@@ -242,9 +256,14 @@ hop warren status
 > join` upgrades it to a **node** on the warren (needs sudo to bring up the TUN;
 > on a fresh machine, `install.sh --host` does the privileged setup).
 
+This same membership-from-an-invite path runs whether you redeem with `hop warren
+join <invite>` **or** `hop connect <invite>` — both consume the invite's warren
+ticket. (`hop connect` can't pass `--on-warren-conflict`, so a populated-warren
+conflict there prompts interactively or is skipped; see [`hop connect`](#hop-connect-target).)
+
 **Already on a warren?** Consuming an invite for a *different* warren resolves as:
-> - **No other members** (the current warren is solo) → the invite's warren is
->   **adopted automatically** — no prompt.
+> - **Not on a warren, or the current one is solo** (no other members) → the
+>   invite's warren is **adopted automatically** — no prompt.
 > - **Has other members** → it is **never switched silently**. Interactively you
 >   choose **Keep** (default) or **Switch**; non-interactively you must pass
 >   `--on-warren-conflict switch` (alias `replace`) or `abort`. `Switch` leaves the
