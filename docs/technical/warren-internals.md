@@ -210,6 +210,49 @@ best-effort: if the TUN can't be created or `cgnat_range_in_use()` finds the
 VPN is skipped and the daemon serves normally. `HOP_VPN=1` forces past the
 conflict guard; `HOP_VPN=0` is a recovery escape hatch.
 
+#### 4via6 overlapping-subnet routing (Tier 3a)
+
+Plain subnet routing (Tier 1) fails when the client's own LAN uses the **same**
+IPv4 subnet as the remote LAN it wants to reach — e.g. a cabin and a home both on
+`192.168.1.0/24`. **4via6** (after Tailscale's feature of the same name) solves it
+by addressing each remote device through a unique **IPv6** that embeds
+`(site_id, real_ipv4)`; the gateway translates it back to the real IPv4 on the far
+LAN, so the same `192.168.1.50` at two sites is unambiguous in v6.
+
+- **Address layout** (`vpn::via6_encode`): `fd68:6f70:7669:6136 : <32-bit site id>
+  : <32-bit embedded IPv4>` — a ULA under `fc00::/7`. A client also gets a TUN
+  source address in the sibling `…6135::/64` prefix (`vpn::client_v6`, derived from
+  its vIP).
+- **site_id** is admin-allocated exactly like the vIP: a deterministic candidate
+  (`deterministic_site_id`) recorded on the admin-owned `peer/<n>.site_id`, with a
+  shared `siteid/` collision table + self-claim offline fallback. Every member is
+  assigned one at admission so any node can become an overlap gateway with no admin
+  round-trip. MagicDNS resolves `<a>-<b>-<c>-<d>-via-<site>.hop` → the via6 IPv6
+  (`AAAA`); the embedded IPv4 is never returned as an `A` record (that would hand
+  the client the colliding address).
+- **SIIT split** (the key design choice): hop does only the *stateless* IP/ICMP
+  translation (RFC 6145 — `vpn::siit`), and the **host kernel does the v4 LAN NAT**
+  (the shipped Tier-1 `ip_forward` + nftables masquerade). The translated source is
+  a per-client address from the reserved SIIT pool `100.127.0.0/16` (the top /16 of
+  the warren /10, excluded from vIP allocation), so it falls inside the range the
+  gateway already masquerades and a reply routed back to it is recognized for the
+  reverse translation. The coarse `client_v6 ↔ pooled_v4` map (`vpn::SiitState`) is
+  the only per-client state hop holds; the kernel's conntrack handles per-flow NAT.
+- **Data path**: client `via6(siteB,D)` → TUN (via6 `/64` route) → outbound loop
+  decodes `siteB` → gateway B → QUIC datagram (carrying the v6 packet) → B's ingress
+  reach-authorizes (the client's embedded vIP must reach `D` via an advertised
+  route) → SIIT v6→v4 (dst `D`, src pooled) → TUN → kernel forwards + masquerades →
+  `D`. The reply reverses: kernel reverse-masquerade → pooled → TUN → outbound loop
+  recognizes the pool address → SIIT v4→v6 (src `via6(siteB,D)`, dst client_v6) →
+  datagram → client.
+- **Opt-in + inert by default**: a client enables via6 routing with `HOP_VIA6`
+  (assigns its TUN v6 address + routes the via6 `/64`, delegated to the privsep
+  monitor via `ConfigureTunV6`). Nothing forwards v6 until a gateway owns the site.
+- **Scope**: Linux gateway first; full TCP/UDP/ICMP + path-MTU. macOS utun-v6 + pf
+  NAT46 is a second-platform follow-up. Validated by `tests/e2e/via6-overlap-e2e.sh`
+  (two sites both `192.168.1.0/24` + a client with a local `192.168.1.50` collision
+  reaching the *remote* `192.168.1.50` via its via6 address).
+
 ### Network Monitoring
 
 `crates/hop-core/src/net/netmon.rs` implements a lightweight interface poller that detects IP address changes and kicks iroh's re-discovery.

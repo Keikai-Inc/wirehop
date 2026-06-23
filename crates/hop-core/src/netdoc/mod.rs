@@ -2250,6 +2250,7 @@ impl NetDoc {
             && let Ok(mut s) = self.vpn_siit.write()
         {
             s.my_site = Some(site);
+            tracing::info!("via6: this node's site id = {site}");
         }
 
         // 4via6 client routing (Tier 3a), opt-in via `HOP_VIA6`. Assign this node's
