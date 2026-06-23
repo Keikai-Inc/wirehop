@@ -47,6 +47,7 @@ pub mod discovery;
 pub mod dns;
 pub mod gateway;
 pub mod resolver;
+pub mod siit;
 pub mod tailscale_import;
 
 /// Parse the destination transport port (TCP/UDP) from a raw L3 packet, if the
