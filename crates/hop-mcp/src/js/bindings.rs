@@ -1188,8 +1188,38 @@ fn refresh_anthropic_token(ds: &Datastore, username: &str) -> Option<String> {
 
 /// Resolve the claude CLI binary path by checking known locations directly.
 /// Avoids shell invocation (which can hang in daemon contexts).
+/// A **writable** home directory for the claude CLI's binary and its `~/.claude`
+/// scratch (config/cache). The hop daemon runs as a system service whose `HOME`
+/// is frequently unset or `/`, so `~/.claude` resolves to `/.claude` on the
+/// read-only root filesystem (`mkdir: /.claude: Read-only file system`). Prefer a
+/// real user HOME; otherwise fall back to a writable temp-based hop dir. The
+/// Anthropic token is supplied to claude via `CLAUDE_CODE_OAUTH_TOKEN`, so nothing
+/// credential-bearing needs to persist here — a re-created scratch dir is fine.
+fn claude_home_dir() -> std::path::PathBuf {
+    match claude_usable_home(std::env::var("HOME").ok().as_deref()) {
+        Some(h) => h,
+        None => {
+            let dir = std::env::temp_dir().join("hop-claude");
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        }
+    }
+}
+
+/// Whether `home` (the `HOME` env value) is a usable home directory: present,
+/// non-blank, and not the filesystem root `/` (a daemon with `HOME` unset or `/`
+/// would mkdir `~/.claude` as `/.claude` on the read-only root). `None` means
+/// "fall back to a writable scratch dir".
+fn claude_usable_home(home: Option<&str>) -> Option<std::path::PathBuf> {
+    let t = home?.trim();
+    if t.is_empty() || t == "/" {
+        return None;
+    }
+    Some(std::path::PathBuf::from(t))
+}
+
 fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let home = claude_home_dir().to_string_lossy().into_owned();
     #[cfg(target_os = "macos")]
     let user_home = username
         .map(|u| format!("/Users/{u}"))
@@ -1249,6 +1279,9 @@ fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
                 hop_bin_dir.display()
             ),
         ])
+        // The installer (and claude itself) touch `~/.claude`; point HOME at a
+        // writable dir so it never tries to mkdir under a read-only root.
+        .env("HOME", &user_home)
         .stdin(std::process::Stdio::null())
         .output();
 
@@ -1283,6 +1316,11 @@ fn claude_invoke(
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
+
+    // Default to a writable HOME so claude's `~/.claude` scratch never lands on a
+    // read-only root (the daemon's own HOME is often unset or `/`). Overridden
+    // below when we drop to a specific user (claude then uses that user's home).
+    cmd.env("HOME", claude_home_dir());
 
     // Drop privileges if running as root with a target user
     #[cfg(unix)]
@@ -1877,6 +1915,26 @@ fn remove_dangerous_globals(ctx: &Ctx<'_>) -> Result<()> {
         let _ = globals.remove::<String>(name.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod claude_home_tests {
+    use super::claude_usable_home;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rejects_unset_root_and_blank_home() {
+        // The daemon failure mode: HOME unset, "/", "", or whitespace → fall back.
+        for bad in [None, Some("/"), Some(""), Some("   "), Some(" / ")] {
+            assert_eq!(claude_usable_home(bad), None, "{bad:?} should be unusable");
+        }
+    }
+
+    #[test]
+    fn accepts_real_home_trimmed() {
+        assert_eq!(claude_usable_home(Some("/Users/jason")), Some(PathBuf::from("/Users/jason")));
+        assert_eq!(claude_usable_home(Some("/home/hop\n")), Some(PathBuf::from("/home/hop")));
+    }
 }
 
 #[cfg(test)]
