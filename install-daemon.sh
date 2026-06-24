@@ -50,8 +50,10 @@ apply_daemon_primers() {
   [[ -n "${TAGS}" ]]            && sudo "${HOP_BIN}" config set tags "${TAGS}" --config "${cfg_dir}" >/dev/null && applied=true && info "Host tags: ${TAGS}"
   [[ -n "${DEFAULT_ROLE}" ]]    && sudo "${HOP_BIN}" config set default_role "${DEFAULT_ROLE}" --config "${cfg_dir}" >/dev/null && applied=true && info "Default invite role: ${DEFAULT_ROLE}"
   # Unified invite: redeems for membership + writes the namespace join ticket.
+  # `connect --warren` is the headless warren join (no shell); `--yes` consents to
+  # the node setup non-interactively.
   if [[ -n "${INVITE}" ]]; then
-    sudo "${HOP_BIN}" warren join "${INVITE}" --config "${cfg_dir}" && applied=true && info "Joined warren via invite"
+    sudo "${HOP_BIN}" connect "${INVITE}" --warren --yes --config "${cfg_dir}" && applied=true && info "Joined warren via invite"
   fi
   if [[ -n "${JOIN_TICKET}" ]]; then
     printf '%s' "${JOIN_TICKET}" | sudo tee "${cfg_dir}/netdoc-join.ticket" >/dev/null && applied=true && info "Warren join ticket saved (federates on next daemon start)"
@@ -169,7 +171,7 @@ if [[ "${OS}" == "Darwin" ]]; then
     printf "\n${BOLD}=== CREATOR INVITE (expires in 1 hour) ===${RESET}\n\n"
     TOKEN=$(cat "$CREATOR_INVITE")
     printf "  hop connect %s\n\n" "$TOKEN"
-    printf "This grants full admin access. Re-read with: ${BOLD}hop creator-invite${RESET}\n"
+    printf "This grants full admin access. Re-read with: ${BOLD}hop invite --creator${RESET}\n"
   else
     printf "Create an invite with: ${BOLD}hop invite${RESET}\n"
   fi
@@ -298,7 +300,7 @@ if [ -f "$CREATOR_INVITE" ]; then
     printf "\n${BOLD}=== CREATOR INVITE (expires in 1 hour) ===${RESET}\n\n"
     TOKEN=$(cat "$CREATOR_INVITE")
     printf "  hop connect %s\n\n" "$TOKEN"
-    printf "This grants full admin access. Re-read with: ${BOLD}hop creator-invite${RESET}\n"
+    printf "This grants full admin access. Re-read with: ${BOLD}hop invite --creator${RESET}\n"
 else
     printf "Create an invite with: ${BOLD}hop invite${RESET}\n"
 fi

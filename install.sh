@@ -275,12 +275,12 @@ if [[ "${NO_VPN}" == "true" || -n "${TAGS}" || -n "${DEFAULT_ROLE}" || -n "${JOI
 fi
 
 # Client + invite: redeem it now so the host is saved and (if the invite carries
-# a warren) the ticket is stored for a later `hop warren join`. Non-fatal.
+# a warren) the ticket is stored for a later `hop connect --warren`. Non-fatal.
 if [[ -n "${INVITE}" ]]; then
   info "Redeeming invite..."
   if "${HOP_BIN}" exec "${INVITE}" -- true >/dev/null 2>&1; then
     info "Connected. You can reach the host with: hop <name>"
-    info "To put THIS machine on the warren VPN later: hop warren join"
+    info "To put THIS machine on the warren VPN later: hop connect --warren"
   else
     warn "Could not auto-redeem the invite; connect manually with: hop connect ${INVITE}"
   fi

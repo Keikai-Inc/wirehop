@@ -102,8 +102,13 @@ async fn main() -> Result<()> {
             cmd_host(secret_key, &config_dir, quiet, reload_handle).await
         }
         Command::Recover { quiet } => cmd_recover(quiet),
-        Command::Invite { user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Invite { creator, user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            // `--creator`: print this host's standing creator invite (the former
+            // `hop creator-invite`) instead of minting a new one.
+            if creator {
+                return cmd_creator_invite(&config_dir);
+            }
             std::fs::create_dir_all(&config_dir)
                 .with_context(|| format!("Failed to create config dir: {}", config_dir.display()))?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
@@ -122,11 +127,18 @@ async fn main() -> Result<()> {
             };
             cmd_invite(&config_dir, params)
         }
-        Command::Connect { target, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Connect {
+            target, name, read_only, no_network, scopes, allow_commands, preset,
+            yes, on_warren_conflict, warren,
+        } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
-            cmd_connect(secret_key, &target, &config_dir, name.as_deref(), sandbox).await
+            cmd_connect(
+                secret_key, target.as_deref(), &config_dir, name.as_deref(), sandbox,
+                ConnectWarrenOpts { yes, on_warren_conflict, warren },
+            )
+            .await
         }
         Command::Exec { target, read_only, no_network, scopes, allow_commands, preset, command } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
@@ -189,20 +201,10 @@ async fn main() -> Result<()> {
             let user_config_dir = config::default_config_dir()?;
             cmd_peers(action, &host_config_dir, &user_config_dir)
         }
-        Command::On { target, name, read_only, no_network, scopes, allow_commands, preset } => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
-            let sandbox = build_sandbox_policy(preset.as_deref(), read_only, no_network, &scopes, &allow_commands)?;
-            cmd_connect(secret_key, &target, &config_dir, name.as_deref(), sandbox).await
-        }
         Command::Admin { target, action } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_admin(secret_key, &target, &config_dir, action).await
-        }
-        Command::CreatorInvite => {
-            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            cmd_creator_invite(&config_dir)
         }
         Command::Fleet { action } => {
             // The daemon writes the warren snapshot to ITS config dir: honor an
@@ -339,7 +341,13 @@ async fn main() -> Result<()> {
             if let Some(command) = ext.exec_command {
                 cmd_exec(secret_key, &ext.target, &config_dir, &command, sandbox).await
             } else {
-                cmd_connect(secret_key, &ext.target, &config_dir, ext.name.as_deref(), sandbox).await
+                // The catch-all `hop <target>` is connect; a warren-carrying invite
+                // still auto-joins, with default (prompted) consent.
+                cmd_connect(
+                    secret_key, Some(&ext.target), &config_dir, ext.name.as_deref(), sandbox,
+                    ConnectWarrenOpts { yes: false, on_warren_conflict: None, warren: false },
+                )
+                .await
             }
         }
     }
@@ -437,6 +445,35 @@ fn restart_host_daemon() -> DaemonRestart {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn restart_host_daemon() -> DaemonRestart {
     DaemonRestart::NotInstalled
+}
+
+/// Restart the installed system daemon from an UNPRIVILEGED context (the
+/// self-upgrade path runs as the user, not root), escalating via `sudo`. Used so
+/// consuming a warren invite actually brings the warren up on a machine that
+/// already runs the daemon — the restart re-imports the new join ticket. Returns
+/// whether the restart command succeeded. If already root, runs the privileged
+/// restart directly (no sudo).
+fn restart_system_daemon_privileged() -> bool {
+    #[cfg(target_os = "macos")]
+    let argv: &[&str] = &["launchctl", "kickstart", "-k", "system/com.hop.daemon"];
+    #[cfg(target_os = "linux")]
+    let argv: &[&str] = &["systemctl", "restart", "hop"];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let argv: &[&str] = &[];
+
+    if argv.is_empty() {
+        return false;
+    }
+    let mut cmd = if hop_core::unix_user::is_running_as_root() {
+        let mut c = std::process::Command::new(argv[0]);
+        c.args(&argv[1..]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.args(argv);
+        c
+    };
+    matches!(cmd.status(), Ok(s) if s.success())
 }
 
 async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
@@ -624,7 +661,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     {
                         tracing::warn!(
                             "netdoc: a pending join ticket is for warren {} but this node is on \
-                             warren {} (kept). To switch: `hop warren join --on-warren-conflict switch`",
+                             warren {} (kept). To switch: `hop connect <invite> --on-warren-conflict replace`",
                             &pending_ns[..8.min(pending_ns.len())],
                             &net.namespace().to_string()[..8]
                         );
@@ -879,7 +916,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                             println!("  hop connect {token}");
                             println!();
                             println!("This grants full admin access. Use it to set up the first administrator.");
-                            println!("Re-read with: hop creator-invite");
+                            println!("Re-read with: hop invite --creator");
                             println!();
                         }
                         tracing::info!("Creator invite generated and saved to {}", creator_invite_path.display());
@@ -2456,13 +2493,44 @@ fn rebuild_session_request(
     }
 }
 
+/// Warren-related options for `hop connect` (consolidates the old `hop warren
+/// join` flags onto `connect`).
+struct ConnectWarrenOpts {
+    /// Consent to the privileged node setup without prompting.
+    yes: bool,
+    /// How to resolve a conflict with a different, populated warren.
+    on_warren_conflict: Option<cli::OnWarrenConflict>,
+    /// Resume warren membership from the stored ticket (no target / invite).
+    warren: bool,
+}
+
 async fn cmd_connect(
     _secret_key: iroh::SecretKey,
-    target: &str,
+    target: Option<&str>,
     config_dir: &std::path::Path,
     cli_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
+    warren_opts: ConnectWarrenOpts,
 ) -> Result<()> {
+    // `--warren` means "join the warren (no shell session)": from the invite given
+    // as the target, else from the ticket stored by a prior connection. This is
+    // the explicit, headless join that replaces `hop warren join [<invite>]`.
+    if warren_opts.warren {
+        return do_warren_join(
+            config_dir,
+            target.map(String::from),
+            warren_opts.yes,
+            warren_opts.on_warren_conflict,
+        )
+        .await;
+    }
+    let Some(target) = target else {
+        anyhow::bail!(
+            "specify a target (host / invite / alias), or `--warren` to join the warren \
+             from an invite or a stored ticket"
+        );
+    };
+
     // Choose the protocol variant based on whether sandbox is restricted
     let session_msg: ClientMessage = if sandbox.is_restricted() {
         ClientMessage::RequestShellV3 { session_id: None, sandbox }
@@ -2478,11 +2546,13 @@ async fn cmd_connect(
         ).await?;
 
     // Convention: consuming a warren-carrying invite puts this machine on the
-    // warren (self-upgrade to a daemon) — no separate `hop warren join`, no
-    // `--host`. The connection above authorized us, which is the membership
-    // redeem. A client-tier invite is a no-op. Best-effort: a failure here must
-    // not block the shell session the user asked for.
-    if let Err(e) = maybe_upgrade_warren_on_connect(config_dir, target) {
+    // warren (self-upgrade to a daemon) — no separate command, no `--host`. The
+    // connection above authorized us, which is the membership redeem. A
+    // client-tier invite is a no-op. Best-effort: a failure here must not block
+    // the shell session the user asked for.
+    if let Err(e) = maybe_upgrade_warren_on_connect(
+        config_dir, target, warren_opts.yes, warren_opts.on_warren_conflict,
+    ) {
         eprintln!("warren upgrade skipped: {e:#}");
     }
 
@@ -5301,11 +5371,21 @@ fn self_upgrade_to_node(
     println!();
 
     if system_daemon_installed() {
-        println!("Joined. A system daemon is already installed — restart it to pick up the warren:");
-        #[cfg(target_os = "macos")]
-        println!("      sudo launchctl kickstart -k system/com.hop.daemon");
-        #[cfg(not(target_os = "macos"))]
-        println!("      sudo systemctl restart hop");
+        // A daemon is already installed: the join ticket we just wrote only takes
+        // effect when the daemon restarts and re-imports the namespace. RESTART it
+        // (privileged, via sudo) so the machine actually lands on the warren —
+        // previously this only printed a hint and returned, which is why a
+        // `hop connect <invite>` join silently never completed on an existing node.
+        println!("A system daemon is already installed — restarting it to bring up the warren...");
+        if restart_system_daemon_privileged() {
+            println!("Restarted the daemon — this machine is now on the warren.");
+        } else {
+            println!("Could not restart the daemon automatically. Finish the join with:");
+            #[cfg(target_os = "macos")]
+            println!("      sudo launchctl kickstart -k system/com.hop.daemon");
+            #[cfg(not(target_os = "macos"))]
+            println!("      sudo systemctl restart hop");
+        }
         return Ok(());
     }
 
@@ -5515,7 +5595,7 @@ fn leave_warren(config_dir: &std::path::Path, yes: bool, no_backup: bool) -> Res
 
 /// Resolve a multi-warren conflict (if any) and write the warren join primers
 /// into `config_dir`. Returns `false` if the user aborted (caller should stop).
-/// Shared by `hop warren join` and the `hop connect <invite>` auto-upgrade.
+/// Shared by `hop connect <invite>` (auto-upgrade) and `hop connect --warren`.
 fn prepare_warren_join(
     config_dir: &std::path::Path,
     ticket: &str,
@@ -5573,11 +5653,81 @@ fn prepare_warren_join(
     Ok(true)
 }
 
+/// Put this machine on the warren from an invite token (which carries the warren
+/// ticket) or, with `invite = None`, from the ticket stored by a prior connection.
+/// This is the canonical join used by `hop connect --warren` (no target) — the
+/// former `hop warren join`. Writes the join primers, redeems membership when an
+/// invite is supplied, then escalates to a system daemon (the H10-safe
+/// self-upgrade).
+async fn do_warren_join(
+    config_dir: &std::path::Path,
+    invite: Option<String>,
+    yes: bool,
+    on_warren_conflict: Option<cli::OnWarrenConflict>,
+) -> Result<()> {
+    let (ticket, founder_author, founder_node, redeem, tier) = match invite {
+        Some(tok) => {
+            let decoded = hop_core::invite::decode_invite(&tok).context("invalid invite token")?;
+            let t = decoded.warren_ticket.clone().context(
+                "this invite does not carry a warren — the host has no VPN/warren enabled",
+            )?;
+            let tier = decoded.effective_tier();
+            (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok), tier)
+        }
+        None => {
+            let stored = std::fs::read_to_string(config_dir.join("warren-ticket")).context(
+                "no stored warren ticket — connect with a warren invite first (`hop connect <invite>`)",
+            )?;
+            let t = stored.trim().to_string();
+            anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
+            (t, None, None, None, hop_core::invite::InviteTier::Node)
+        }
+    };
+
+    // Multi-warren resolution (KISS default = replace) + write the join primers.
+    // Runs in the unprivileged user context, before the daemon.
+    if !prepare_warren_join(
+        config_dir,
+        &ticket,
+        founder_author.as_deref(),
+        founder_node.as_deref(),
+        on_warren_conflict,
+    )? {
+        return Ok(());
+    }
+
+    // Redeem for membership (auth handshake → the inviting host records us).
+    if let Some(tok) = redeem {
+        println!("Joining warren — redeeming invite for membership...");
+        let secret_key = config::load_or_generate_identity(config_dir)?;
+        if let Err(e) = cmd_exec(
+            secret_key, &tok, config_dir, &["true".to_string()],
+            hop_core::sandbox::SandboxPolicy::default(),
+        )
+        .await
+        {
+            tracing::warn!("membership redeem failed (namespace still joined): {e:#}");
+        }
+        // The redeem started a mux agent (it holds this config dir's datastore
+        // lock). Stop it so the node daemon we're about to bring up can acquire
+        // the datastore — otherwise `hop host` refuses to start (lock contention).
+        let _ = agent::stop_agent(config_dir);
+    }
+
+    // Consent + escalate to a system daemon (the H10-safe self-upgrade).
+    self_upgrade_to_node(config_dir, tier, yes)
+}
+
 /// When `hop connect <target>` consumes an invite that carries a warren, put
 /// this machine on the warren (the "consume → on the warren, no --host"
 /// convention). A client-tier invite (no warren ticket) is a no-op. Runs after
 /// the connection authorized us (that handshake is the membership redeem).
-fn maybe_upgrade_warren_on_connect(config_dir: &std::path::Path, target: &str) -> Result<()> {
+fn maybe_upgrade_warren_on_connect(
+    config_dir: &std::path::Path,
+    target: &str,
+    yes: bool,
+    on_warren_conflict: Option<cli::OnWarrenConflict>,
+) -> Result<()> {
     if !hop_core::invite::is_invite_token(target) {
         return Ok(());
     }
@@ -5594,11 +5744,11 @@ fn maybe_upgrade_warren_on_connect(config_dir: &std::path::Path, target: &str) -
         ticket,
         decoded.founder_author.as_deref(),
         Some(&decoded.node_id),
-        None,
+        on_warren_conflict,
     )? {
         return Ok(());
     }
-    self_upgrade_to_node(config_dir, decoded.effective_tier(), false)
+    self_upgrade_to_node(config_dir, decoded.effective_tier(), yes)
 }
 
 async fn cmd_warren(
@@ -5607,57 +5757,6 @@ async fn cmd_warren(
 ) -> Result<()> {
     use cli::WarrenAction;
     match action {
-        WarrenAction::Join { invite, yes, on_warren_conflict } => {
-            // Resolve the warren ticket + tier from the invite (which carries
-            // them), or the ticket stored from a prior client connection.
-            let (ticket, founder_author, founder_node, redeem, tier) = match invite {
-                Some(tok) => {
-                    let decoded = hop_core::invite::decode_invite(&tok)
-                        .context("invalid invite token")?;
-                    let t = decoded.warren_ticket.clone().context(
-                        "this invite does not carry a warren — the host has no VPN/warren enabled",
-                    )?;
-                    let tier = decoded.effective_tier();
-                    (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok), tier)
-                }
-                None => {
-                    let stored = std::fs::read_to_string(config_dir.join("warren-ticket"))
-                        .context("no invite given and no stored warren ticket — run `hop warren join <invite>` first")?;
-                    let t = stored.trim().to_string();
-                    anyhow::ensure!(!t.is_empty(), "stored warren ticket is empty");
-                    (t, None, None, None, hop_core::invite::InviteTier::Node)
-                }
-            };
-
-            // Multi-warren resolution (KISS default = replace) + write the join
-            // primers. Runs in the unprivileged user context, before the daemon.
-            if !prepare_warren_join(
-                config_dir,
-                &ticket,
-                founder_author.as_deref(),
-                founder_node.as_deref(),
-                on_warren_conflict,
-            )? {
-                return Ok(());
-            }
-
-            // Redeem for membership (auth handshake → the inviting host records
-            // us). Identity loaded lazily — only redeeming needs the key.
-            if let Some(tok) = redeem {
-                println!("Joining warren — redeeming invite for membership...");
-                let secret_key = config::load_or_generate_identity(config_dir)?;
-                if let Err(e) =
-                    cmd_exec(secret_key, &tok, config_dir, &["true".to_string()],
-                        hop_core::sandbox::SandboxPolicy::default()).await
-                {
-                    tracing::warn!("membership redeem failed (namespace still joined): {e:#}");
-                }
-            }
-
-            // Consent + escalate to a system daemon (the H10-safe self-upgrade).
-            self_upgrade_to_node(config_dir, tier, yes)?;
-            Ok(())
-        }
         WarrenAction::Leave { yes, no_backup } => leave_warren(config_dir, yes, no_backup),
         WarrenAction::Status => {
             // Membership / namespace. netdoc.json stores the namespace as a
@@ -5680,7 +5779,7 @@ async fn cmd_warren(
             if ns.is_none() && has_join {
                 println!();
                 println!("A warren ticket is stored. Put this machine on the VPN with:");
-                println!("  hop warren join          # uses the stored ticket");
+                println!("  hop connect --warren     # uses the stored ticket");
                 println!("  curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host");
             }
             Ok(())

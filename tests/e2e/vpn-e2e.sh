@@ -106,10 +106,10 @@ docker run -d --name hop-vpn-b "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
   while [ ! -f /shared/invite-a ]; do sleep 1; done
   INVITE="$(cat /shared/invite-a)"
-  # Unified token: the single invite carries host-a s warren. `hop warren join`
+  # Unified token: the single invite carries host-a s warren. `hop connect --warren`
   # redeems it for membership AND writes the namespace join ticket — no separate
   # netdoc ticket, no separate redeem step.
-  hop --config /cfg warren join "$INVITE" >/cfg/join.log 2>&1 || true
+  hop --config /cfg connect "$INVITE" --warren >/cfg/join.log 2>&1 || true
   # Bring up the host; it imports the namespace from /cfg/netdoc-join.ticket and
   # the VPN comes up default-on.
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
@@ -386,7 +386,7 @@ if [ "$RC" = "0" ]; then
     if [ "$RC" = "0" ]; then
         docker run -d --name hop-vpn-c "${COMMON[@]}" -e INVITE_C="$INVITE_C" "$IMG" bash -c '
           set -e; mkdir -p /cfg
-          hop --config /cfg warren join "$INVITE_C" >/cfg/join.log 2>&1 || true
+          hop --config /cfg connect "$INVITE_C" --warren >/cfg/join.log 2>&1 || true
           hop --config /cfg host --quiet >/cfg/log 2>&1 &
           while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
           # Grab the vIP from the enable line itself: "vpn: enabled, virtual IP X, ..."

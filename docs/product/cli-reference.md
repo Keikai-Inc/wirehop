@@ -51,7 +51,9 @@ exactly as before.
 
 ### `hop connect <target>`
 
-Connect to a host by NodeId, invite token, or known host alias.
+Connect to a host by NodeId, invite token, or known host alias. **`hop connect`
+is also how you join a warren** — there is no separate `hop warren join` (removed;
+folded into `connect`).
 
 | Flag | Description |
 |---|---|
@@ -61,34 +63,36 @@ Connect to a host by NodeId, invite token, or known host alias.
 | `--scope <PATH>` | Restrict filesystem to these paths (repeatable) |
 | `--allow-command <CMD>` | Only allow these commands (repeatable) |
 | `--preset <PRESET>` | Sandbox preset: `monitor`, `audit`, `deploy` |
+| `-y, --yes` | Consent to the privileged node setup without prompting (headless) |
+| `--on-warren-conflict <ACTION>` | Resolve a conflict with a different, populated warren: `replace` (switch), `abort` (keep) |
+| `--warren` | Join the warren from the **stored** ticket (no target/invite) |
 
 ```bash
-hop connect <invite-token>
+hop connect <invite-token>          # connect + (if the invite carries a warren) join it
+hop connect <invite-token> --yes    # headless: also do the node setup without prompting
+hop connect --warren                # put this machine on the warren from a stored ticket
 hop connect myhost
 hop connect myhost --read-only --scope /var/log
 ```
 
-**Consuming a warren invite also puts this machine on the warren.** If the invite
-carries a warren (any `node`/`admin`/`warren-only` invite — i.e. not a plain
-`client` invite), `hop connect <invite>` joins the warren as a side effect of the
-connection and self-upgrades this machine to a **node** (brings up the daemon +
-TUN; needs privilege). No separate `hop warren join` is required. A plain
-`client` invite is reach-only and never joins. The join follows the same
-conflict rules as `hop warren join` (see [`hop warren`](#hop-warren-joinstatus)
-below) — adopt when you're on no warren or a solo one, never switch a populated
-warren silently. Because `hop
-connect` takes no `--on-warren-conflict` flag, a conflict with a *populated*
-warren prompts interactively (Keep/Switch) or, non-interactively, is **skipped**
-with a message (the shell session still proceeds — the warren upgrade is
-best-effort and never blocks the connection).
+**Joining a warren.** If the invite carries a warren (any `node`/`admin`/
+`warren-only` invite — not a plain `client` invite), `hop connect <invite>` puts
+this machine on the warren and brings up the **node** (a daemon running as root,
+for the TUN). Concretely it writes the join ticket, then:
 
-### `hop on <target>`
+- if a daemon is **already installed**, it **restarts it** (via sudo) so the new
+  warren is imported — you're on the warren;
+- if there's **no daemon yet**, it offers to set one up with sudo (interactive),
+  or pass `--yes` to do it non-interactively;
+- a plain `client` invite is reach-only and never joins.
 
-Shorthand for `hop connect`.
-
-```bash
-hop on myhost
-```
+Bringing up a node needs privilege (sudo / a TTY). With neither — a headless run
+without `--yes`, or a declined/failed sudo — the join ticket is saved and the
+shell still opens, but the machine isn't on the warren yet; finish with
+`hop connect --warren --yes` or `install.sh --host`. If you're already on a
+*different* warren, the invite's warren is adopted only when the current one is
+solo (no other members); a populated warren is never switched without
+`--on-warren-conflict replace` (or an interactive choice).
 
 ### `hop <target>` (catch-all)
 
@@ -137,13 +141,9 @@ The invited peer joins with the given role; the role's host tags decide what it
 can reach over the warren VPN (default-deny). Elevate later with `hop admin
 <host> grant` (below) — no re-invite needed.
 
-### `hop creator-invite`
-
-Print the creator invite for this host. Useful for headless/Docker setups.
-
-```bash
-hop creator-invite
-```
+> **`hop invite --creator`** prints this host's standing creator invite (admin
+> tier) instead of minting a new one — useful for headless/Docker bootstrap.
+> (This replaces the former `hop creator-invite` command.)
 
 ---
 
@@ -237,36 +237,35 @@ hop config path                     # print the host config directory
 
 Changes take effect on the next `hop host` / daemon restart.
 
-### `hop warren [join|status]`
+### `hop warren [status|leave]`
 
-Manage this machine's membership of the warren (private network).
+Inspect or tear down this machine's warren membership. **Joining is done with
+[`hop connect`](#hop-connect-target)** (there is no `hop warren join`).
 
 | Subcommand | Description |
 |---|---|
-| `join [<invite>]` | Put this machine on the warren VPN. With an invite (which carries the warren), it redeems for membership and joins the namespace; with no argument it uses the ticket stored from a prior client connection. |
 | `status` | Show this machine's warren namespace membership and VPN state. |
+| `leave` | Tear down this machine's warren state (namespace, tickets, store, vIP) after a backup. Does not uninstall the daemon. |
 
 ```bash
-hop warren join <invite>   # join the warren VPN from an invite
-hop warren join            # upgrade a client using its stored ticket
+hop connect <invite>       # join a warren (the invite carries it)
+hop connect --warren       # join from a stored ticket (no new invite)
 hop warren status
+hop warren leave
 ```
 
-> A **client** install reaches hosts it's invited to with no VPN. `hop warren
-> join` upgrades it to a **node** on the warren (needs sudo to bring up the TUN;
-> on a fresh machine, `install.sh --host` does the privileged setup).
-
-This same membership-from-an-invite path runs whether you redeem with `hop warren
-join <invite>` **or** `hop connect <invite>` — both consume the invite's warren
-ticket. (`hop connect` can't pass `--on-warren-conflict`, so a populated-warren
-conflict there prompts interactively or is skipped; see [`hop connect`](#hop-connect-target).)
+> A **client** install reaches hosts it's invited to with no VPN. Consuming a
+> warren invite with `hop connect` upgrades it to a **node** on the warren (needs
+> sudo to bring up the TUN; on a fresh machine, `install.sh --host` does the
+> privileged setup). See [`hop connect`](#hop-connect-target) for the full join
+> behavior and flags.
 
 **Already on a warren?** Consuming an invite for a *different* warren resolves as:
 > - **Not on a warren, or the current one is solo** (no other members) → the
 >   invite's warren is **adopted automatically** — no prompt.
 > - **Has other members** → it is **never switched silently**. Interactively you
 >   choose **Keep** (default) or **Switch**; non-interactively you must pass
->   `--on-warren-conflict switch` (alias `replace`) or `abort`. `Switch` leaves the
+>   `--on-warren-conflict replace` (switch) or `abort`. Switching leaves the
 >   current warren (backed up to `.warren-backup-*`) and joins the new one.
 >   Running both at once (multi-home) is planned.
 

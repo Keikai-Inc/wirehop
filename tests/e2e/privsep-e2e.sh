@@ -87,7 +87,7 @@ echo "=== starting host-b (joins the warren, privsep) ==="
 docker run -d --name hop-ps-b "${COMMON[@]}" "$IMG" bash -c '
   set -e; mkdir -p /cfg
   while [ ! -f /shared/invite-a ]; do sleep 1; done
-  hop --config /cfg warren join "$(cat /shared/invite-a)" >/cfg/join.log 2>&1 || true
+  hop --config /cfg connect "$(cat /shared/invite-a)" --warren >/cfg/join.log 2>&1 || true
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
   touch /shared/ready-b

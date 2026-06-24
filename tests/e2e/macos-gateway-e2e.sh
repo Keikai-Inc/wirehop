@@ -147,7 +147,7 @@ scp "${SSHOPTS[@]}" /tmp/hop-invite.txt "admin@$CL_IP:/tmp/invite.txt" >/dev/nul
 vssh "$CL_IP" "
   sudo pkill -f 'hop .*host' 2>/dev/null; sleep 2
   sudo rm -rf /Users/admin/hopcfg; sudo mkdir -p /Users/admin/hopcfg
-  sudo /usr/local/bin/hop --config /Users/admin/hopcfg warren join \"\$(cat /tmp/invite.txt)\" 2>&1 | grep -iE 'authorized|reject' | head -1
+  sudo /usr/local/bin/hop --config /Users/admin/hopcfg connect \"\$(cat /tmp/invite.txt)\" --warren --yes 2>&1 | grep -iE 'authorized|reject' | head -1
   sudo bash -c 'HOP_ACCEPT_ROUTES=1 ${HOPENV} nohup /usr/local/bin/hop --config /Users/admin/hopcfg host --quiet >/tmp/hop.log 2>&1 &'
 "
 # --- gate on warren convergence -------------------------------------------

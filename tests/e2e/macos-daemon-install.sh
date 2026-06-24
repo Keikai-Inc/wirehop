@@ -100,7 +100,7 @@ echo "founder namespace: $FOUNDER_NS"
 # ---- stage the join ticket into a user-owned stage dir ----------------------
 # `warren join --config <stage>` writes netdoc-join.ticket + netdoc-founder.*
 echo "=== staging join ticket ==="
-"$HOP" --config "$STAGE" warren join "$INVITE" >"$WORK/join.log" 2>&1 || true
+"$HOP" --config "$STAGE" connect "$INVITE" --warren >"$WORK/join.log" 2>&1 || true
 [[ -s "$STAGE/netdoc-join.ticket" ]] || { cat "$WORK/join.log"; fail "no netdoc-join.ticket staged"; }
 
 # ---- run the native installer under sudo ------------------------------------

@@ -57,7 +57,7 @@ grep -q "creator invite augmented" /tmp/founder.log || { tail -30 /tmp/founder.l
 INVITE=$(cat /tmp/founder/creator_invite)
 FOUNDER_NS=$(/tmp/hop-client --config /tmp/founder warren status 2>/dev/null | awk "/warren namespace/{print \$3}")
 echo "founder namespace: $FOUNDER_NS"
-/tmp/hop-client --config /tmp/stage warren join "$INVITE" >/tmp/join.log 2>&1 || true
+/tmp/hop-client --config /tmp/stage connect "$INVITE" --warren >/tmp/join.log 2>&1 || true
 test -s /tmp/stage/netdoc-join.ticket || { cat /tmp/join.log; fail "no staged join ticket"; }
 
 echo "--- run native installer (promote + stage primers + write unit, no start) ---"

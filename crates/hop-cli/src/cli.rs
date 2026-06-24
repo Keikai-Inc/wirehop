@@ -31,6 +31,11 @@ pub enum Command {
 
     /// Generate a one-time invite token/URL
     Invite {
+        /// Print this host's standing **creator** invite (admin tier) instead of
+        /// minting a new one — useful for headless/Docker bootstrap. Ignores the
+        /// other invite-shaping flags.
+        #[arg(long)]
+        creator: bool,
         /// Unix username the invited peer will log in as
         #[arg(long)]
         user: Option<String>,
@@ -73,8 +78,9 @@ pub enum Command {
 
     /// Connect to a host (NodeId, invite token, or known host alias)
     Connect {
-        /// Host NodeId, invite token, or known host alias
-        target: String,
+        /// Host NodeId, invite token, or known host alias. Optional only with
+        /// `--warren` (resume warren membership from the stored ticket).
+        target: Option<String>,
         /// Override the name saved for this host in known_hosts
         #[arg(long)]
         name: Option<String>,
@@ -93,6 +99,19 @@ pub enum Command {
         /// Use a sandbox preset (monitor, audit, deploy)
         #[arg(long)]
         preset: Option<String>,
+        /// Consent to the privileged node setup without prompting (when the invite
+        /// carries a warren, this installs/restarts the hop daemon via sudo).
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// How to resolve consuming a warren invite while already on a *different*
+        /// warren: `replace` (switch), `abort` (keep), `merge`/`multi-home`.
+        #[arg(long = "on-warren-conflict", value_enum)]
+        on_warren_conflict: Option<OnWarrenConflict>,
+        /// Join the warren without opening a shell: from the invite given as the
+        /// target, or — with no target — from the ticket stored by a prior
+        /// connection. The headless join that replaces `hop warren join`.
+        #[arg(long)]
+        warren: bool,
     },
 
     /// View or update host configuration
@@ -211,30 +230,6 @@ pub enum Command {
         command: Vec<String>,
     },
 
-    /// Connect to a host (shorthand: "hop on <target>")
-    On {
-        /// Host NodeId, invite token, or known host alias
-        target: String,
-        /// Override the name saved for this host in known_hosts
-        #[arg(long)]
-        name: Option<String>,
-        /// Request read-only filesystem access
-        #[arg(long)]
-        read_only: bool,
-        /// Request blocking outbound network access
-        #[arg(long)]
-        no_network: bool,
-        /// Restrict filesystem access to these paths (can be repeated)
-        #[arg(long = "scope", value_name = "PATH")]
-        scopes: Vec<std::path::PathBuf>,
-        /// Only allow these commands (can be repeated)
-        #[arg(long = "allow-command", value_name = "CMD")]
-        allow_commands: Vec<String>,
-        /// Use a sandbox preset (monitor, audit, deploy)
-        #[arg(long)]
-        preset: Option<String>,
-    },
-
     /// Remote administration (requires creator role)
     Admin {
         /// Target host (alias, NodeId, or invite token)
@@ -242,9 +237,6 @@ pub enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
-
-    /// Print the creator invite for this host (useful for headless/Docker)
-    CreatorInvite,
 
     /// Fleet management (host-side)
     Fleet {
@@ -434,21 +426,6 @@ pub enum AclAction {
 
 #[derive(Subcommand)]
 pub enum WarrenAction {
-    /// Put this machine on the warren VPN — redeem an invite (which carries the
-    /// warren), or use the ticket stored from a previous client connection.
-    Join {
-        /// Invite token. Omit to use the ticket stored from a prior connection.
-        invite: Option<String>,
-        /// Assume "yes" to all prompts (headless: run the daemon upgrade and any
-        /// warren switch without asking).
-        #[arg(long)]
-        yes: bool,
-        /// How to resolve consuming a *different* warren's invite while already
-        /// on one. Interactive default is `replace`; non-interactive defaults to
-        /// `abort` unless this is set.
-        #[arg(long = "on-warren-conflict", value_enum)]
-        on_warren_conflict: Option<OnWarrenConflict>,
-    },
     /// Leave the warren: tear down this machine's warren state (namespace,
     /// tickets, store, vIP) after a backup. Does not uninstall the daemon.
     Leave {

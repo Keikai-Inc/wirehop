@@ -134,7 +134,7 @@ measure_ttr() {
 }
 
 say "COLD convergence: member join + start"
-docker exec "$MEMBER" sh -c "hop --config /cfg warren join '$INVITE' >/cfg/join.log 2>&1" || true
+docker exec "$MEMBER" sh -c "hop --config /cfg connect '$INVITE' --warren >/cfg/join.log 2>&1" || true
 start_daemon "$MEMBER"
 COLD_TTR=$(measure_ttr "$BACKSTOP_MS")
 echo "cold convergence TTR = ${COLD_TTR}ms (budget ${COLD_BUDGET_MS}ms)"

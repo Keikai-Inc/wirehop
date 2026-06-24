@@ -124,7 +124,7 @@ docker run -d --name via6-client "${COMMON[@]}" -e HOP_VIA6=1 "$IMG" bash -c '
   ip addr add 192.168.1.50/24 dev collision0 2>/dev/null || true
   ip link set collision0 up 2>/dev/null || true
   while [ ! -f /shared/invite-gw ]; do sleep 1; done
-  hop --config /cfg warren join "$(cat /shared/invite-gw)" >/cfg/join.log 2>&1 || true
+  hop --config /cfg connect "$(cat /shared/invite-gw)" --warren >/cfg/join.log 2>&1 || true
   hop --config /cfg host --quiet >/cfg/log 2>&1 &
   while ! grep -q "vpn: enabled" /cfg/log; do sleep 1; done
   while ! grep -q "via6: client routing enabled" /cfg/log; do sleep 1; done

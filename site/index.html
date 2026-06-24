@@ -540,7 +540,7 @@
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's your private group of machines. Add a machine to your warren and it's reachable by its hostname (a box named <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver</code> answers at <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach &mdash; from anywhere, with no port-forwarding, no VPN appliance, and no coordination server in someone else's cloud.</p>
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Then the tools you already use just work &mdash; SSH, scp, VNC, anything &mdash; with the same ease, simplicity, and reliability as hop.</p>
           <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Joining takes one command</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">A warren travels in an <strong>invite</strong>. Generate one on any machine that's already on the warren, hand it to the new machine, and run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop warren join &lt;invite&gt;</code>. That's it &mdash; the machine picks up its private IP and <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address and is instantly reachable by every other member.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">A warren travels in an <strong>invite</strong>. Generate one on any machine that's already on the warren, hand it to the new machine, and run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code>. That's it &mdash; the machine picks up its private IP and <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address and is instantly reachable by every other member.</p>
           <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">The invite is single-use and time-limited, and its role decides exactly what the new member can reach. No accounts, no central server &mdash; the warren itself is the source of truth, shared peer-to-peer.</p>
         </div>
 
@@ -553,7 +553,7 @@
           </div>
           <div class="code-body">
 <span class="comment"># Join the warren with an invite</span>
-<span class="prompt">$</span> <span class="cmd">hop warren join</span> <span class="flag">eyJ0eX...</span>
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
 
 <span class="comment"># Your machines, reachable by hostname from anywhere</span>
@@ -678,7 +678,7 @@
           </div>
 
           <p id="builder-hint" style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-top: 0.75rem;">
-            <strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">hop warren join</code>.
+            <strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);">hop connect &lt;invite&gt;</code>.
           </p>
         </div>
 
@@ -952,7 +952,7 @@
       if (hint) {
         hint.innerHTML = isNode
           ? "<strong>On the warren:</strong> sudo daemon, a virtual IP + <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">name.hop</code>, role-based reach. The VPN is opt-in (this is the opt-in) and fail-safe. Default-deny until you hand out invites."
-          : "<strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">hop warren join</code>.";
+          : "<strong>Client:</strong> reach hosts you're invited to — no sudo, no daemon, no VPN. Upgrade to the warren VPN anytime with <code style=\"font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-secondary);\">hop connect &lt;invite&gt;</code>.";
       }
     }
 
