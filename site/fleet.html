@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hop — Fleet Management</title>
-  <meta name="description" content="A fleet in hop is your warren, managed at scale: role-based access, host tags, and one-command invites — replicated to every machine, no master server. From a 5-person team to thousands of hosts.">
+  <title>hop, Fleet Management</title>
+  <meta name="description" content="A fleet in hop is your warren, managed at scale: role-based access, host tags, and one-command invites, replicated to every machine, no master server. From a 5-person team to thousands of hosts.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -118,7 +118,7 @@
       .steps-2 { grid-template-columns: 1fr; }
       .concept-grid { grid-template-columns: 1fr; }
 
-      /* Roles table — stacked card layout */
+      /* Roles table, stacked card layout */
       .roles-row.roles-header-row { display: none; }
       .roles-row {
         grid-template-columns: 1fr;
@@ -150,7 +150,7 @@
   <div class="hero">
     <div class="badge"><span class="dot"></span> Fleet Management</div>
     <h1>One tool,<br><span class="gradient">every machine</span></h1>
-    <p>A fleet in hop is just your private network of machines (a <strong>warren</strong>), managed at scale &mdash; roles and tags across every machine, replicated to all of them, with no master server. Same hop simplicity, from 5 machines to 5,000.</p>
+    <p>A fleet in hop is just your private network of machines (a <strong>warren</strong>), managed at scale: roles and tags across every machine, replicated to all of them, with no master server. Same hop simplicity, from 5 machines to 5,000.</p>
     <div class="hero-actions">
       <a href="#how-fleet-works" class="btn btn-primary">How It Works</a>
       <a href="index.html" class="btn btn-ghost">&larr; Back to hop</a>
@@ -171,7 +171,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
           </div>
           <h3>Your warren</h3>
-          <p>Your machines, as one shared list. Every node sees the same membership &mdash; there's no master server to run or lose. Add a machine and it's in the warren; its roles and tags travel with it.</p>
+          <p>Your machines, as one shared list. Every node sees the same membership; there's no master server to run or lose. Add a machine and it's in the warren; its roles and tags travel with it.</p>
         </div>
 
         <div class="card card-teal">
@@ -187,7 +187,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           </div>
           <h3>Roles</h3>
-          <p>Define what people can reach. A role maps to host tags &mdash; "developers reach developer + staging machines" &mdash; and gates warren VPN reach too. Each person gets their own account.</p>
+          <p>Define what people can reach. A role maps to host tags ("developers reach developer + staging machines") and gates warren VPN reach too. Each person gets their own account.</p>
         </div>
       </div>
     </div>
@@ -204,19 +204,19 @@
       <div class="steps steps-2">
         <div class="step">
           <h3>Start your warren</h3>
-          <p>Install hop on any machine. It starts your warren and prints a <strong>creator invite</strong>. Redeem it from your laptop with <code>hop connect</code> &mdash; it's saved as a known host (here, <code>rex</code>).</p>
+          <p>Install hop on any machine. It starts your warren and prints a <strong>creator invite</strong>. Redeem it from your laptop with <code>hop connect</code> and it's saved as a known host (here, <code>myserver</code>).</p>
         </div>
         <div class="step">
           <h3>Define roles</h3>
-          <p>Roles map host tags to access &mdash; and to warren VPN reach. Manage any host remotely with <code>hop admin &lt;host&gt;</code>, e.g. <code>hop admin rex role create developer</code>.</p>
+          <p>Roles map host tags to access, and to warren VPN reach. Manage any host remotely with <code>hop admin &lt;host&gt;</code>, e.g. <code>hop admin rex role create developer</code>.</p>
         </div>
         <div class="step">
           <h3>Add machines</h3>
-          <p>One invite registers any number of machines into the warren, with their tags. Membership replicates to every node &mdash; no master list to keep in sync.</p>
+          <p>One invite registers any number of machines into the warren, with their tags. Membership replicates to every node, no master list to keep in sync.</p>
         </div>
         <div class="step">
           <h3>Invite your team</h3>
-          <p>Invite people by role. They reach every matching machine &mdash; by name, over the warren &mdash; each with their own account.</p>
+          <p>Invite people by role. They reach every matching machine (by name, over the warren) each with their own account.</p>
         </div>
       </div>
 
@@ -226,18 +226,18 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — Setting up your warren</span>
+            <span class="code-title">Terminal, Setting up your warren</span>
           </div>
           <div class="code-body">
-<span class="comment"># 1. Install hop on a host — it starts your warren</span>
+<span class="comment"># 1. Install hop on a host, it starts your warren</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span>
 <span class="output">Creator invite: eyJ0eX...   (valid for 1 hour)</span>
 
-<span class="comment"># 2. Redeem it from your laptop — saved as a known host, "rex"</span>
+<span class="comment"># 2. Redeem it from your laptop, saved as a known host, "rex"</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Saved as known host: rex</span>
 
-<span class="comment"># 3. Define roles — they map tags to access AND warren reach</span>
+<span class="comment"># 3. Define roles, they map tags to access AND warren reach</span>
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">developer</span> --tags developer,staging
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">ops</span> --tags '*' --sudo
 
@@ -245,7 +245,7 @@
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> fleet-invite --tags developer,web
 <span class="output">Warren invite: abCdEf...   (100 uses, 24h expiry)</span>
 
-<span class="comment"># 5. On each machine — joins the warren with its tags</span>
+<span class="comment"># 5. On each machine, joins the warren with its tags</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span> -s -- --register <span class="flag">abCdEf...</span>
 
 <span class="comment"># 6. Invite a teammate by role</span>
@@ -268,13 +268,13 @@
       <div class="concept-grid">
         <div class="concept-info">
           <h3>Sensible defaults, full control</h3>
-          <p>Roles default to individual accounts with no sudo. Override as needed &mdash; give ops sudo, create shared service accounts for CI, or add users to specific Unix groups.</p>
+          <p>Roles default to individual accounts with no sudo. Override as needed, give ops sudo, create shared service accounts for CI, or add users to specific Unix groups.</p>
           <ul class="concept-list">
-            <li><strong>Individual accounts</strong> &mdash; each person gets their own Unix user</li>
-            <li><strong>No sudo by default</strong> &mdash; principle of least privilege</li>
-            <li><strong>No passwords</strong> &mdash; access only via hop's key-based auth</li>
-            <li><strong>Auto-created</strong> &mdash; user accounts created on first connection</li>
-            <li><strong>Git-committable</strong> &mdash; roles live in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code>, version-control your access policy</li>
+            <li><strong>Individual accounts</strong>: each person gets their own Unix user</li>
+            <li><strong>No sudo by default</strong>: principle of least privilege</li>
+            <li><strong>No passwords</strong>: access only via hop's key-based auth</li>
+            <li><strong>Auto-created</strong>: user accounts created on first connection</li>
+            <li><strong>Git-committable</strong>: roles live in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code>, version-control your access policy</li>
           </ul>
         </div>
 
@@ -292,14 +292,14 @@
               <div class="roles-cell role-detail" data-label="Host Tags">developer, staging</div>
               <div class="roles-cell role-detail" data-label="Sudo">No</div>
               <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
-              <div class="roles-cell role-detail" data-label="Sandbox">&mdash;</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">, </div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">ops</div>
               <div class="roles-cell role-detail" data-label="Host Tags">* (all hosts)</div>
               <div class="roles-cell role-detail" data-label="Sudo">Yes</div>
               <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
-              <div class="roles-cell role-detail" data-label="Sandbox">&mdash;</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">, </div>
             </div>
             <div class="roles-row">
               <div class="roles-cell role-name" data-label="Role">security</div>
@@ -367,11 +367,11 @@
           <h3>Three layers of enforcement</h3>
           <p>Sandbox policies flow through three layers: role definition (the role sets the baseline), invite creation (the host can further restrict), and client connection (the client can self-restrict). The result is always the strictest combination.</p>
           <ul class="concept-list">
-            <li><strong>Presets</strong> &mdash; <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code> (read-only, no network, scoped paths), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code> (read-only, no network), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code> (scoped write, dangerous commands blocked)</li>
-            <li><strong>Custom policies</strong> &mdash; combine <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--read-only</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-network</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--scope</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--allow-command</code></li>
-            <li><strong>Role-based</strong> &mdash; assign sandbox policies per role in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code></li>
-            <li><strong>Client self-restriction</strong> &mdash; peers can request stricter sandbox at connect time</li>
-            <li><strong>Merge logic</strong> &mdash; restrictions only tighten, never loosen</li>
+            <li><strong>Presets</strong>: <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code> (read-only, no network, scoped paths), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code> (read-only, no network), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code> (scoped write, dangerous commands blocked)</li>
+            <li><strong>Custom policies</strong>: combine <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--read-only</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-network</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--scope</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--allow-command</code></li>
+            <li><strong>Role-based</strong>: assign sandbox policies per role in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code></li>
+            <li><strong>Client self-restriction</strong>: peers can request stricter sandbox at connect time</li>
+            <li><strong>Merge logic</strong>: restrictions only tighten, never loosen</li>
           </ul>
         </div>
 
@@ -381,7 +381,7 @@
               <span class="code-dot"></span>
               <span class="code-dot"></span>
               <span class="code-dot"></span>
-              <span class="code-title">Terminal — Sandbox examples</span>
+              <span class="code-title">Terminal, Sandbox examples</span>
             </div>
             <div class="code-body">
 <span class="comment"># Create a monitor-only invite</span>
@@ -416,7 +416,7 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — Connecting</span>
+            <span class="code-title">Terminal, Connecting</span>
           </div>
           <div class="code-body">
 <span class="comment"># Alice redeems her invite</span>
@@ -444,7 +444,7 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — Fleet operations</span>
+            <span class="code-title">Terminal, Fleet operations</span>
           </div>
           <div class="code-body">
 <span class="comment"># Run a command across all developer hosts</span>
@@ -482,7 +482,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
           </div>
           <h3>Small Team (5-50)</h3>
-          <p>Your warren plus JSON config &mdash; zero infrastructure beyond hop itself. Set up in minutes.</p>
+          <p>Your warren plus JSON config, zero infrastructure beyond hop itself. Set up in minutes.</p>
         </div>
 
         <div class="card card-teal">
@@ -490,7 +490,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           </div>
           <h3>Growing (50-500)</h3>
-          <p>Same warren. Roles keep access organized, and membership replicates to every node automatically &mdash; nothing to keep in sync by hand.</p>
+          <p>Same warren. Roles keep access organized, and membership replicates to every node automatically, nothing to keep in sync by hand.</p>
         </div>
 
         <div class="card card-amber">
@@ -498,7 +498,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="9" height="9" rx="1"/><rect x="13" y="2" width="9" height="9" rx="1"/><rect x="2" y="13" width="9" height="9" rx="1"/><rect x="13" y="13" width="9" height="9" rx="1"/></svg>
           </div>
           <h3>Large (500+)</h3>
-          <p>No central server to bottleneck or shard &mdash; the warren replicates peer-to-peer, and data flows directly between machines.</p>
+          <p>No central server to bottleneck or shard: the warren replicates peer-to-peer, and data flows directly between machines.</p>
         </div>
       </div>
     </div>
@@ -509,7 +509,7 @@
     <div class="container">
       <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
         <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to get started?</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop &mdash; it's just your warren at scale. Install the daemon, redeem the creator invite, and you're managing every machine.</p>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop: it's just your warren at scale. Install the daemon, redeem the creator invite, and you're managing every machine.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="index.html#install" class="btn btn-primary">Install hop</a>
         </div>
