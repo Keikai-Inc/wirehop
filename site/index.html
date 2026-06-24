@@ -539,9 +539,11 @@
           <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">What's a warren?</h3>
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's your private group of machines. Add a machine to your warren and it's reachable by its hostname (a box named <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver</code> answers at <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach, from anywhere, with no port-forwarding, no VPN appliance, and no coordination server in someone else's cloud.</p>
           <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Then the tools you already use just work (SSH, scp, VNC, anything) with the same ease, simplicity, and reliability as hop.</p>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Joining takes one command</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">A warren travels in an <strong>invite</strong>. Generate one on any machine that's already on the warren, hand it to the new machine, and run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code>. That's it, the machine picks up its private IP and <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address and is instantly reachable by every other member.</p>
-          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">The invite is single-use and time-limited, and its role decides exactly what the new member can reach. No accounts, no central server: the warren itself is the source of truth, shared peer-to-peer.</p>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Start one, then invite</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Set up an always-on machine as a host (see below) and it creates your warren, with you as the owner. After that, <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop invite</code> on any machine that's on the warren makes an <strong>invite</strong> that carries it. Hand it over, the new machine runs <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code>, and it picks up a private IP and a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address, reachable by every member. Each invite is single-use, time-limited, and its role sets exactly what the new member can reach.</p>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Already on a warren?</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Consuming an invite for a different warren switches you only if your current one is just you. If it has other members, hop keeps you where you are unless you explicitly ask to switch, and your old warren is backed up first.</p>
+          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">No accounts, no central server: the warren itself is the source of truth, shared peer-to-peer.</p>
         </div>
 
         <div class="code-block">
@@ -552,17 +554,17 @@
             <span class="code-title">Terminal</span>
           </div>
           <div class="code-body">
-<span class="comment"># Join the warren with an invite</span>
+<span class="comment"># On a machine that's on your warren: make an invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span>
+<span class="output">Invite: eyJ0eX...</span>
+
+<span class="comment"># On the new machine: join with it</span>
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
 
-<span class="comment"># Your machines, reachable by hostname from anywhere</span>
+<span class="comment"># Now your machines answer by hostname, from anywhere</span>
 <span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">myserver.hop</span>
-
-<span class="comment"># Copy a file with the tools you already know</span>
 <span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">myserver.hop</span>:~
-
-<span class="comment"># Even a desktop, VNC over the private network</span>
 <span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span>
           </div>
         </div>
