@@ -534,16 +534,102 @@
         <p>Hop also gives you a peer-to-peer private network. Setting up a VPN should be as easy as SSH or scp, so it is.</p>
       </div>
 
+      <div style="max-width: 760px; margin: 0 auto 3.5rem;">
+        <svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" style="width: 100%; height: auto; display: block;" font-family="Inter, system-ui, sans-serif">
+          <title>A hop warren: your machines connected peer-to-peer</title>
+          <desc>Three machines (a laptop, a server, and a Raspberry Pi) reach each other by name over direct encrypted peer-to-peer links with no central server. The Pi bridges a home LAN (printer and NAS) that cannot run hop.</desc>
+
+          <!-- card -->
+          <rect x="1" y="1" width="758" height="468" rx="18" fill="#18181b" stroke="rgba(255,255,255,0.08)"/>
+
+          <!-- header -->
+          <text x="32" y="46" fill="#f4f4f5" font-size="22" font-weight="800" font-family="Manrope, Inter, sans-serif">Your warren</text>
+          <text x="32" y="70" fill="#9a9aa3" font-size="13.5">Your machines, reachable by name from anywhere. Peer-to-peer, no central server.</text>
+
+          <!-- mesh links (drawn first, behind nodes) -->
+          <g stroke="#2ec4b6" stroke-width="2" fill="none" opacity="0.85">
+            <line x1="190" y1="155" x2="570" y2="155"/>
+            <line x1="150" y1="192" x2="215" y2="318"/>
+            <line x1="595" y1="192" x2="280" y2="330"/>
+          </g>
+          <!-- lock badge on the top link -->
+          <g font-size="11" text-anchor="middle">
+            <rect x="362" y="145" width="44" height="20" rx="10" fill="#0c2e2a" stroke="#2ec4b6"/><text x="384" y="159" fill="#2ec4b6">🔒 E2E</text>
+          </g>
+
+          <!-- Node: laptop (owner) -->
+          <g>
+            <rect x="40" y="123" width="150" height="74" rx="12" fill="#1e1e23" stroke="#2ec4b6" stroke-width="1.5"/>
+            <rect x="58" y="141" width="34" height="24" rx="2" fill="none" stroke="#2ec4b6" stroke-width="2"/>
+            <line x1="54" y1="171" x2="96" y2="171" stroke="#2ec4b6" stroke-width="2"/>
+            <text x="104" y="151" fill="#f4f4f5" font-size="13.5" font-weight="700">laptop</text>
+            <text x="104" y="169" fill="#2ec4b6" font-size="12" font-family="ui-monospace, monospace">laptop.hop</text>
+            <text x="58" y="189" fill="#9a9aa3" font-size="10.5">you · owner</text>
+          </g>
+
+          <!-- Node: server -->
+          <g>
+            <rect x="570" y="123" width="150" height="74" rx="12" fill="#1e1e23" stroke="#2ec4b6" stroke-width="1.5"/>
+            <rect x="588" y="141" width="34" height="14" rx="2" fill="none" stroke="#2ec4b6" stroke-width="2"/>
+            <rect x="588" y="159" width="34" height="14" rx="2" fill="none" stroke="#2ec4b6" stroke-width="2"/>
+            <circle cx="594" cy="148" r="1.6" fill="#10b981"/>
+            <circle cx="594" cy="166" r="1.6" fill="#10b981"/>
+            <text x="634" y="151" fill="#f4f4f5" font-size="13.5" font-weight="700">myserver</text>
+            <text x="634" y="169" fill="#2ec4b6" font-size="12" font-family="ui-monospace, monospace">myserver.hop</text>
+            <text x="588" y="189" fill="#9a9aa3" font-size="10.5">always-on host</text>
+          </g>
+
+          <!-- Node: pi (the bridge) -->
+          <g>
+            <rect x="155" y="318" width="150" height="74" rx="12" fill="#1e1e23" stroke="#f59e0b" stroke-width="1.5"/>
+            <rect x="173" y="336" width="30" height="22" rx="3" fill="none" stroke="#f59e0b" stroke-width="2"/>
+            <text x="215" y="346" fill="#f4f4f5" font-size="13.5" font-weight="700">pi</text>
+            <text x="215" y="364" fill="#2ec4b6" font-size="12" font-family="ui-monospace, monospace">pi.hop</text>
+            <text x="173" y="384" fill="#f59e0b" font-size="10.5">bridges the LAN ↓</text>
+          </g>
+
+          <!-- bridge link from pi to LAN -->
+          <line x1="230" y1="392" x2="230" y2="420" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4 4"/>
+
+          <!-- LAN cluster (can't run hop) -->
+          <g>
+            <rect x="360" y="356" width="368" height="92" rx="12" fill="#161616" stroke="rgba(245,158,11,0.35)" stroke-dasharray="6 5"/>
+            <text x="376" y="380" fill="#f59e0b" font-size="11.5" font-weight="700">Home LAN · 192.168.1.0/24</text>
+            <text x="376" y="396" fill="#9a9aa3" font-size="10.5">devices that can't run hop, reached through pi</text>
+
+            <!-- printer -->
+            <g transform="translate(376,408)">
+              <rect x="0" y="6" width="40" height="28" rx="4" fill="#1e1e23" stroke="#9a9aa3" stroke-width="1.5"/>
+              <rect x="8" y="0" width="24" height="10" rx="1" fill="none" stroke="#9a9aa3" stroke-width="1.5"/>
+              <text x="48" y="20" fill="#c4c4cc" font-size="11">printer</text>
+              <text x="48" y="33" fill="#9a9aa3" font-size="10" font-family="ui-monospace, monospace">.1.50</text>
+            </g>
+            <!-- NAS -->
+            <g transform="translate(560,408)">
+              <rect x="0" y="2" width="40" height="32" rx="4" fill="#1e1e23" stroke="#9a9aa3" stroke-width="1.5"/>
+              <line x1="6" y1="12" x2="34" y2="12" stroke="#9a9aa3" stroke-width="1.5"/>
+              <line x1="6" y1="22" x2="34" y2="22" stroke="#9a9aa3" stroke-width="1.5"/>
+              <text x="48" y="20" fill="#c4c4cc" font-size="11">NAS</text>
+              <text x="48" y="33" fill="#9a9aa3" font-size="10" font-family="ui-monospace, monospace">.1.60</text>
+            </g>
+          </g>
+
+          <!-- legend (bottom-left, clear of header and LAN box) -->
+          <g font-size="11" fill="#9a9aa3">
+            <line x1="40" y1="432" x2="64" y2="432" stroke="#2ec4b6" stroke-width="2"/>
+            <text x="70" y="436">encrypted P2P link</text>
+            <line x1="200" y1="432" x2="224" y2="432" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4 4"/>
+            <text x="230" y="436">LAN bridge</text>
+          </g>
+        </svg>
+      </div>
+
       <div class="grid grid-2" style="align-items: center; gap: 3rem;">
         <div>
           <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">What's a warren?</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">It's your private group of machines. Add a machine to your warren and it's reachable by its hostname (a box named <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver</code> answers at <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach, from anywhere, with no port-forwarding, no VPN appliance, and no coordination server in someone else's cloud.</p>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Then the tools you already use just work (SSH, scp, VNC, anything) with the same ease, simplicity, and reliability as hop.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Your private group of machines. Add one and it answers by name (<code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver</code> at <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach, from anywhere. No port-forwarding, no VPN appliance, no coordination server in someone else's cloud. The tools you already use (SSH, scp, VNC) just work.</p>
           <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Start one, then invite</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Set up an always-on machine as a host (see below) and it creates your warren, with you as the owner. After that, <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop invite</code> on any machine that's on the warren makes an <strong>invite</strong> that carries it. Hand it over, the new machine runs <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code>, and it picks up a private IP and a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address, reachable by every member. Each invite is single-use, time-limited, and its role sets exactly what the new member can reach.</p>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Already on a warren?</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Consuming an invite for a different warren switches you only if your current one is just you. If it has other members, hop keeps you where you are unless you explicitly ask to switch, and your old warren is backed up first.</p>
-          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">No accounts, no central server: the warren itself is the source of truth, shared peer-to-peer.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">An always-on host (below) creates your warren, with you as owner. Run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop invite</code> on any member, hand over the token, and the new machine runs <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code> to pick up a private IP and a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address, reachable by everyone. Each invite is single-use, time-limited, and its role sets what the new member can reach.</p>
         </div>
 
         <div class="code-block">
@@ -583,12 +669,10 @@
       <div class="grid grid-2" style="align-items: center; gap: 3rem;">
         <div>
           <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One machine bridges the rest</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Plenty of devices will never run a VPN. So pick one machine that <em>is</em> on your warren (a home server, a Raspberry Pi, your always-on box) and let it carry the others. Tell it which network to share, and every member of your warren can reach everything on that LAN, by its real address, from anywhere.</p>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">One machine routes for the whole subnet. Set up the hop way: <strong>one command</strong>, no config files, no appliance.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Plenty of devices will never run a VPN. Pick one machine that's on your warren (a home server, a Raspberry Pi) and tell it which network to share. Every member then reaches that whole LAN by its real address, from anywhere. <strong>One command</strong>, no config files, no appliance.</p>
 
           <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Even when the addresses collide</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Home and cabin both on <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">192.168.1.x</code>? That normally breaks a VPN: two devices, same address. hop keeps them straight and routes to the right one, so an overlapping network is just another network.</p>
-          <p style="color: var(--color-text-tertiary); font-size: 0.9rem;">Access is still gated by role, a bridged device is only reachable by members you've allowed.</p>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Home and cabin both on <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">192.168.1.x</code>? That normally breaks a VPN: two devices, same address. hop keeps them straight and routes to the right one. Access stays gated by role: a bridged device is only reachable by members you've allowed.</p>
         </div>
 
         <div class="code-block">
