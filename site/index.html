@@ -394,7 +394,7 @@
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Private network</div>
-          <div class="comparison-cell hop-col">Built-in P2P mesh (the warren)</div>
+          <div class="comparison-cell hop-col">Built in &mdash; peer-to-peer</div>
           <div class="comparison-cell comparison-other">Tailscale (separate WireGuard mesh)</div>
         </div>
         <div class="comparison-row">
@@ -444,7 +444,7 @@
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Remote management</div>
-          <div class="comparison-cell hop-col">hop myhost secrets/cap</div>
+          <div class="comparison-cell hop-col">Built-in secrets &amp; tasks</div>
           <div class="comparison-cell comparison-other">SSH + separate tools</div>
         </div>
         <div class="comparison-row">
@@ -713,18 +713,18 @@
   <section id="daemon" style="padding-bottom: 8rem;">
     <div class="container">
       <div class="section-header">
-        <h2>Always-On Host on Your Warren</h2>
-        <p>One command turns a machine into a persistent node on your private network &mdash; macOS or Linux.</p>
+        <h2>Always-on machines</h2>
+        <p>One command turns a machine into a <strong>node</strong> &mdash; a machine that stays on your private network and reachable by name, even across reboots. macOS or Linux.</p>
       </div>
 
       <div class="daemon-grid">
         <div class="daemon-info">
-          <h3>A node, always reachable</h3>
-          <p>The daemon installer detects your platform and sets up hop as a native system service that starts at boot and stays on the warren &mdash; with a stable virtual IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
+          <h3>Always reachable</h3>
+          <p>The installer detects your platform and sets up hop as a native system service that starts at boot and stays on your private network &mdash; with a stable private IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
           <ul class="daemon-features">
             <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
             <li>Registers a native service (LaunchDaemon on macOS, systemd on Linux)</li>
-            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot, on the warren with a virtual IP + MagicDNS</li>
+            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot, on your private network with a private IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address</li>
             <li>Built-in P2P VPN is opt-in &mdash; and fail-safe: shell/exec/transfer keep working whether or not it's enabled</li>
             <li>Automatic restarts on crash</li>
             <li>Works on macOS (Apple Silicon &amp; Intel) and Linux (x86_64, ARM64, ARMv7)</li>
