@@ -416,6 +416,27 @@ impl PacketNumberSpace {
         Some(packet)
     }
 
+    /// Span of retained sent packets (`largest_sent - oldest_unacked`). (hop fork.)
+    ///
+    /// `sent_packets` is a sparse buffer whose backing storage is sized to this
+    /// span, not to the number of live entries — a single never-ACKed oldest
+    /// packet pins the lower bound open while newer packets keep extending the
+    /// upper bound. Used to bound per-path retention; see `PathData::sent`.
+    pub(super) fn sent_packets_span(&self) -> u64 {
+        let mut keys = self.sent_packets.keys();
+        match (keys.next(), keys.next_back()) {
+            (Some(lo), Some(hi)) => hi - lo,
+            _ => 0,
+        }
+    }
+
+    /// Evict and return the oldest retained sent packet, advancing the buffer's
+    /// lower bound past the whole trailing run of already-removed slots. (hop fork.)
+    pub(super) fn forget_oldest_sent_packet(&mut self) -> Option<SentPacket> {
+        let oldest = self.sent_packets.keys().next()?;
+        self.take(oldest)
+    }
+
     /// May return a packet that should be forgotten
     pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<SentPacket> {
         // Retain state for at most this many non-ACK-eliciting packets sent after the most recently
@@ -1433,5 +1454,63 @@ mod test {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
         assert!(std::mem::size_of::<SentPacket>() <= 128);
+    }
+
+    fn mk_ack_eliciting(now: std::time::Instant) -> SentPacket {
+        SentPacket {
+            path_generation: 0,
+            time_sent: now,
+            size: 1200,
+            ack_eliciting: true,
+            largest_acked: Default::default(),
+            retransmits: Default::default(),
+            stream_frames: Default::default(),
+        }
+    }
+
+    // hop fork: `forget_oldest_sent_packet` must advance the buffer's pinned lower
+    // bound (the root of the multipath black-hole leak), not just drop a slot.
+    #[test]
+    fn forget_oldest_sent_packet_advances_lower_bound() {
+        let now = std::time::Instant::now();
+        let mut space = PacketNumberSpace::new_deterministic(now, SpaceId::Data);
+        for pn in 0..5u64 {
+            space.sent(pn, mk_ack_eliciting(now));
+        }
+        assert_eq!(space.sent_packets_span(), 4); // span over [0, 4]
+
+        // ACK-draining a middle packet leaves the lower bound pinned at 0, so the
+        // span — and thus the backing buffer — does not shrink. This is the leak.
+        space.take(2);
+        assert_eq!(space.sent_packets_span(), 4);
+
+        // Forgetting the oldest advances the lower bound to 1 and shrinks the span.
+        assert!(space.forget_oldest_sent_packet().unwrap().ack_eliciting);
+        assert_eq!(space.sent_packets_span(), 3); // span over [1, 4]
+
+        for pn in 1..5u64 {
+            let _ = space.take(pn);
+        }
+        assert_eq!(space.sent_packets_span(), 0);
+        assert!(space.forget_oldest_sent_packet().is_none());
+    }
+
+    // hop fork: a path that never ACKs (the black-hole case) must not grow
+    // `sent_packets` without bound. Emulates `PathData::sent`'s cap enforcement.
+    #[test]
+    fn sent_packets_span_is_bounded_by_eviction() {
+        let now = std::time::Instant::now();
+        let mut space = PacketNumberSpace::new_deterministic(now, SpaceId::Data);
+        const CAP: u64 = 16;
+        for pn in 0..10_000u64 {
+            space.sent(pn, mk_ack_eliciting(now)); // never ACKed
+            while space.sent_packets_span() > CAP {
+                assert!(space.forget_oldest_sent_packet().is_some());
+            }
+            assert!(
+                space.sent_packets_span() <= CAP,
+                "sent_packets span grew unbounded at pn {pn}"
+            );
+        }
     }
 }

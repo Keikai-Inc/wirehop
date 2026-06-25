@@ -240,6 +240,13 @@ pub(super) struct PathData {
     generation: u64,
 }
 
+/// Hard upper bound on the span of a single path's retained `sent_packets`
+/// buffer (in packet numbers). Far above any legitimate in-flight window
+/// (bandwidth-delay product plus reordering/loss-recovery history), so a healthy
+/// path never reaches it; it exists only to cap the multipath black-hole leak
+/// described in `PathData::sent`. (hop fork.)
+const MAX_SENT_PACKETS_SPAN: u64 = 1 << 16;
+
 impl PathData {
     pub(super) fn new(
         network_path: FourTuple,
@@ -369,6 +376,28 @@ impl PathData {
         }
         if let Some(forgotten) = space.sent(pn, packet) {
             self.remove_in_flight(&forgotten);
+        }
+        // Bound per-path sent-packet retention. (hop fork.)
+        //
+        // `sent_packets` spans [oldest_unacked, largest_sent] and its backing
+        // buffer is sized to that span. A path that is validated but has silently
+        // stopped ACKing (the multipath "black-hole" case: keepalives keep it from
+        // being abandoned, yet data ACKs never arrive, so neither ACK-drain nor
+        // loss detection — which requires an ACK — ever advances the lower bound)
+        // grows the buffer without limit as new packets extend the upper bound:
+        // a multi-GB heap leak under sustained traffic. DATAGRAM frames are
+        // ack-eliciting yet never retransmitted, so a VPN data plane feeds this
+        // directly. The cap is far above any legitimate in-flight window, so a
+        // healthy path never trips it; when it does, dropping the oldest packet
+        // lets the buffer compact past the whole run of already-ACKed slots.
+        // Congestion counters stay correct via `remove_in_flight`.
+        while space.sent_packets_span() > MAX_SENT_PACKETS_SPAN {
+            match space.forget_oldest_sent_packet() {
+                Some(forgotten) => {
+                    self.remove_in_flight(&forgotten);
+                }
+                None => break,
+            }
         }
     }
 
