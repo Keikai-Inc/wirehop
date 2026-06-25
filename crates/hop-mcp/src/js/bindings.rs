@@ -1196,20 +1196,23 @@ fn refresh_anthropic_token(ds: &Datastore, username: &str) -> Option<String> {
 /// Anthropic token is supplied to claude via `CLAUDE_CODE_OAUTH_TOKEN`, so nothing
 /// credential-bearing needs to persist here — a re-created scratch dir is fine.
 fn claude_home_dir() -> std::path::PathBuf {
-    match claude_usable_home(std::env::var("HOME").ok().as_deref()) {
-        Some(h) => h,
-        None => {
-            let dir = std::env::temp_dir().join("hop-claude");
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        }
+    // A real $HOME, but only if THIS process can actually write to it. The daemon
+    // worker is privsep-dropped to a service user, so a bound peer's home (e.g.
+    // `/Users/jason`) exists but isn't writable by us (`Permission denied`), and a
+    // daemon with HOME unset/`/` hits the read-only root (`/.claude`).
+    if let Some(h) = claude_usable_home(std::env::var("HOME").ok().as_deref())
+        && claude_dir_writable(&h)
+    {
+        return h;
     }
+    let dir = std::env::temp_dir().join("hop-claude");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
-/// Whether `home` (the `HOME` env value) is a usable home directory: present,
-/// non-blank, and not the filesystem root `/` (a daemon with `HOME` unset or `/`
-/// would mkdir `~/.claude` as `/.claude` on the read-only root). `None` means
-/// "fall back to a writable scratch dir".
+/// Whether `home` (the `HOME` env value) is a plausible home directory: present,
+/// non-blank, and not the filesystem root `/`. `None` means "fall back to a
+/// writable scratch dir". (Writability is checked separately by `claude_dir_writable`.)
 fn claude_usable_home(home: Option<&str>) -> Option<std::path::PathBuf> {
     let t = home?.trim();
     if t.is_empty() || t == "/" {
@@ -1218,27 +1221,69 @@ fn claude_usable_home(home: Option<&str>) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(t))
 }
 
-fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
-    let home = claude_home_dir().to_string_lossy().into_owned();
-    #[cfg(target_os = "macos")]
-    let user_home = username
-        .map(|u| format!("/Users/{u}"))
-        .unwrap_or_else(|| home.clone());
-    #[cfg(not(target_os = "macos"))]
-    let user_home = username
-        .map(|u| format!("/home/{u}"))
-        .unwrap_or_else(|| home.clone());
+/// Whether THIS process can create files under `dir` (it exists or can be made,
+/// and a probe write succeeds). Catches a read-only root AND another user's home
+/// we lack permission to write.
+fn claude_dir_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".hop-claude-write-probe");
+    let ok = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
 
-    // Check known installation locations
-    let search_dirs = [&user_home, &home];
-    let known_paths = [
-        ".local/bin/claude",
-        ".hop/bin/claude",
-        ".nvm/versions/node/*/bin/claude", // nvm-installed (glob not supported, check below)
-    ];
+fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
+    // Where to install + use as HOME. Mirror claude_invoke's privilege decision:
+    // if claude will be invoked AS a specific user (we're root and have their
+    // name), install into their home so they can run it. Otherwise (the dropped
+    // privsep worker, or no user) install where THIS process can write — never a
+    // foreign home, which is the `/Users/<peer>/.claude: Permission denied` case.
+    let writable_home: std::path::PathBuf = {
+        #[cfg(unix)]
+        {
+            if let Some(u) = username
+                && hop_core::unix_user::is_running_as_root()
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    std::path::PathBuf::from(format!("/Users/{u}"))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    std::path::PathBuf::from(format!("/home/{u}"))
+                }
+            } else {
+                claude_home_dir()
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            claude_home_dir()
+        }
+    };
+
+    // SEARCH for an existing claude in plausible locations first (read-only and
+    // harmless even where we couldn't write): our writable home, the bound user's
+    // home, and $HOME.
+    let mut search_dirs: Vec<String> = vec![writable_home.to_string_lossy().into_owned()];
+    if let Some(u) = username {
+        #[cfg(target_os = "macos")]
+        search_dirs.push(format!("/Users/{u}"));
+        #[cfg(not(target_os = "macos"))]
+        search_dirs.push(format!("/home/{u}"));
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        let t = h.trim();
+        if !t.is_empty() && t != "/" && !search_dirs.iter().any(|d| d == t) {
+            search_dirs.push(t.to_string());
+        }
+    }
+    let known_paths = [".local/bin/claude", ".hop/bin/claude"];
 
     for dir in &search_dirs {
-        for rel in &known_paths[..2] {
+        for rel in &known_paths {
             let candidate = std::path::PathBuf::from(dir).join(rel);
             if candidate.exists() {
                 return Ok(candidate);
@@ -1262,13 +1307,15 @@ fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
         return Ok(usr_local);
     }
 
-    // 3. Auto-download
-    tracing::info!("hop.claude: claude CLI not found, downloading...");
-    let hop_bin_dir = std::path::PathBuf::from(&user_home).join(".hop/bin");
+    // 3. Auto-download into the PROCESS-WRITABLE home (never another user's home,
+    // which the dropped worker can't write — the `/Users/<peer>/.claude:
+    // Permission denied` failure).
+    let hop_bin_dir = writable_home.join(".hop/bin");
     let dest = hop_bin_dir.join("claude");
     if dest.exists() {
         return Ok(dest);
     }
+    tracing::info!("hop.claude: claude CLI not found, downloading to {}...", hop_bin_dir.display());
 
     let _ = std::fs::create_dir_all(&hop_bin_dir);
     let install_result = std::process::Command::new("bash")
@@ -1279,9 +1326,9 @@ fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
                 hop_bin_dir.display()
             ),
         ])
-        // The installer (and claude itself) touch `~/.claude`; point HOME at a
-        // writable dir so it never tries to mkdir under a read-only root.
-        .env("HOME", &user_home)
+        // The installer (and claude itself) touch `~/.claude`; point HOME at our
+        // writable dir so it never mkdirs under a read-only root or a foreign home.
+        .env("HOME", &writable_home)
         .stdin(std::process::Stdio::null())
         .output();
 
@@ -1934,6 +1981,21 @@ mod claude_home_tests {
     fn accepts_real_home_trimmed() {
         assert_eq!(claude_usable_home(Some("/Users/jason")), Some(PathBuf::from("/Users/jason")));
         assert_eq!(claude_usable_home(Some("/home/hop\n")), Some(PathBuf::from("/home/hop")));
+    }
+
+    #[test]
+    fn dir_writable_detects_a_writable_dir() {
+        // A fresh temp subdir is writable; a path we can neither find nor create
+        // (a file used as a directory parent) is not.
+        let ok = std::env::temp_dir().join(format!("hop-claude-test-{}", std::process::id()));
+        assert!(super::claude_dir_writable(&ok));
+        let _ = std::fs::remove_dir_all(&ok);
+
+        let file = ok.with_extension("file");
+        std::fs::write(&file, b"x").unwrap();
+        // create_dir_all under an existing *file* fails → not writable.
+        assert!(!super::claude_dir_writable(&file.join("sub")));
+        let _ = std::fs::remove_file(&file);
     }
 }
 
