@@ -2101,6 +2101,7 @@ dependencies = [
  "cron",
  "hop-core",
  "iroh",
+ "nix 0.29.0",
  "reqwest 0.12.28",
  "rquickjs",
  "serde",
