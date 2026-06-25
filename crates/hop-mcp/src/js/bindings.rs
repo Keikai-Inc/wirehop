@@ -1205,9 +1205,55 @@ fn claude_home_dir() -> std::path::PathBuf {
     {
         return h;
     }
-    let dir = std::env::temp_dir().join("hop-claude");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    claude_scratch_dir()
+}
+
+/// A private, process-owned scratch dir (mode 0700) for the claude binary and its
+/// `~/.claude`, used when no usable HOME exists (the privsep worker).
+///
+/// SECURITY: the daemon *executes* the claude binary found under this dir, so it
+/// must be writable ONLY by us — otherwise a local user could pre-plant a
+/// malicious `claude` in a world-writable temp path (e.g. `/tmp`) for the daemon
+/// to run. We use a stable per-uid path so the download is cached across calls,
+/// but trust it only when it is a real directory we own with no group/other
+/// access; if it has been squatted (wrong owner/perms, or a symlink), we fall back
+/// to a fresh, unpredictable `mkdtemp` dir rather than risk running a planted
+/// binary or denying service.
+fn claude_scratch_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let uid = nix::unistd::geteuid().as_raw();
+        let stable = std::env::temp_dir().join(format!("hop-claude-{uid}"));
+        let trusted = match std::fs::symlink_metadata(&stable) {
+            // Existing: must be a real dir, owned by us, no group/other bits.
+            Ok(md) => md.file_type().is_dir() && md.uid() == uid && md.mode() & 0o077 == 0,
+            // Missing: create it 0700 (atomically owned by us).
+            Err(_) => std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&stable)
+                .is_ok(),
+        };
+        if trusted {
+            return stable;
+        }
+        tracing::warn!(
+            "hop.claude: {} is not exclusively owned by this process; using a fresh \
+             private scratch dir so a planted binary can't be executed",
+            stable.display()
+        );
+        match tempfile::Builder::new().prefix("hop-claude-").tempdir() {
+            Ok(td) => td.keep(), // mkdtemp: unpredictable name, mode 0700, owned by us
+            Err(_) => stable,    // last resort; install will fail safely if unwritable
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let dir = std::env::temp_dir().join("hop-claude");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
 }
 
 /// Whether `home` (the `HOME` env value) is a plausible home directory: present,
@@ -1996,6 +2042,19 @@ mod claude_home_tests {
         // create_dir_all under an existing *file* fails → not writable.
         assert!(!super::claude_dir_writable(&file.join("sub")));
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn scratch_dir_is_private_and_owned() {
+        // SECURITY: the daemon executes claude from here, so the dir must be a real
+        // directory owned by us with no group/other access (else a local user could
+        // plant a binary). True whether we get the stable dir or the mkdtemp fallback.
+        use std::os::unix::fs::MetadataExt;
+        let d = super::claude_scratch_dir();
+        let md = std::fs::metadata(&d).unwrap();
+        assert!(md.is_dir());
+        assert_eq!(md.uid(), nix::unistd::geteuid().as_raw(), "must be owned by us");
+        assert_eq!(md.mode() & 0o077, 0, "no group/other access");
     }
 }
 
