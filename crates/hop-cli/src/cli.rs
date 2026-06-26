@@ -300,6 +300,12 @@ pub enum Command {
         config: Option<PathBuf>,
     },
 
+    /// Debugging tools for the host daemon (memory/CPU profiling)
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+
     /// Internal: apply sandbox and exec a shell (used by Linux PTY sandboxing)
     #[command(name = "__sandbox-shell", hide = true)]
     SandboxShell {
@@ -396,6 +402,55 @@ pub enum AgentAction {
     Stop,
     /// Check agent status
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum DebugAction {
+    /// Memory-profile the host daemon. Restarts it in profiling mode (full speed,
+    /// serves traffic), snapshots its live heap, and restores the normal daemon.
+    /// Native profiler per platform: MallocStackLogging/malloc_history on macOS,
+    /// jemalloc on Linux.
+    #[command(name = "mem-profile")]
+    MemProfile {
+        #[command(subcommand)]
+        action: MemProfileAction,
+    },
+
+    /// CPU-profile the running host daemon (no restart): samples its call stacks
+    /// for a few seconds and reports the hottest functions. `sample` on macOS,
+    /// `perf` on Linux. Auto-targets the busiest `hop host` process.
+    #[command(name = "cpu-profile")]
+    CpuProfile {
+        /// Seconds to sample (default: 10)
+        #[arg(long, default_value = "10")]
+        secs: u64,
+        /// Profile this pid instead of auto-detecting the busiest `hop host`
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Write the report here (default: /tmp/hop-cpu-<pid>-<ts>.txt)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemProfileAction {
+    /// Restart the host daemon in memory-profiling mode (run with sudo)
+    On,
+    /// Write a sorted, symbolized heap report from the running profiling daemon
+    Snapshot {
+        /// Write the report here (default: /tmp/hop-heap-<pid>-<ts>.txt)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore the normal (privsep) daemon (run with sudo)
+    Off,
+    /// Internal: detached watchdog that restores the normal daemon after a deadline
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog {
+        #[arg(long)]
+        deadline: u64,
+    },
 }
 
 #[derive(Subcommand)]

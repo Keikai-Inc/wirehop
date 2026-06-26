@@ -36,6 +36,21 @@ sha2.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 base64.workspace = true
 dhat = { version = "0.3", optional = true }
+# Function-level flame graphs for `hop debug cpu-profile`: pure-Rust FlameGraph.
+# Folds the native sampler output (macOS `sample`, Linux `perf script`) and
+# renders an interactive SVG — no external perl scripts. Cross-platform.
+inferno = { version = "0.12", default-features = false }
+
+# Linux heap profiling for `hop debug mem-profile`: jemalloc compiled WITH prof
+# support but inactive by default (negligible overhead) — `mem-profile on`
+# re-execs with MALLOC_CONF=prof:true and `snapshot`/SIGUSR2 triggers prof.dump,
+# analyzed with jeprof. macOS uses the native MallocStackLogging + malloc_history
+# path instead, so jemalloc is Linux-only. The `#[global_allocator]` in main.rs
+# is additionally gated `not(feature = "dhat-heap")` so the two profilers never
+# collide (cargo target keys can't express the feature gate, so it lives in code).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["profiling"] }
 
 [features]
 # Heap-profile the daemon: build with `--features dhat-heap`, run the daemon,

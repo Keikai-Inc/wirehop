@@ -1,6 +1,8 @@
 mod agent;
 mod cli;
+mod cpuprofile;
 mod itemize;
+mod memprofile;
 mod oauth;
 mod mux;
 mod progress_ui;
@@ -12,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronAction, FleetAction, KvAction, PeersAction, RoleAction, SecretsAction, TsAction};
+use cli::{AdminAction, AgentAction, CapAction, Cli, Command, ConfigAction, CronAction, DebugAction, FleetAction, KvAction, MemProfileAction, PeersAction, RoleAction, SecretsAction, TsAction};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
@@ -37,6 +39,14 @@ use hop_core::transfer::{self, PathSpec};
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+// On Linux, use jemalloc (compiled with prof support, inactive by default) so
+// `hop debug mem-profile` can turn on heap profiling without a special build.
+// Negligible overhead until activated via MALLOC_CONF=prof:true. macOS uses the
+// system allocator + native MallocStackLogging instead. Skipped under dhat-heap.
+#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
+#[global_allocator]
+static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -277,6 +287,21 @@ async fn main() -> Result<()> {
                 None => agent::run_foreground(&config_dir, reload_handle).await,
             }
         }
+        Command::Debug { action } => match action {
+            DebugAction::MemProfile { action } => {
+                let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+                let act = match action {
+                    MemProfileAction::On => memprofile::Action::On,
+                    MemProfileAction::Off => memprofile::Action::Off,
+                    MemProfileAction::Snapshot { out } => memprofile::Action::Snapshot { out },
+                    MemProfileAction::Watchdog { deadline } => {
+                        memprofile::Action::Watchdog { deadline_secs: deadline }
+                    }
+                };
+                memprofile::run(act, &config_dir)
+            }
+            DebugAction::CpuProfile { secs, pid, out } => cpuprofile::run(secs, pid, out),
+        },
         Command::SandboxShell { policy, shell_args } => {
             cmd_sandbox_shell(&policy, &shell_args)
         }
@@ -1033,6 +1058,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         .context("failed to register SIGINT handler")?;
     let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .context("failed to register SIGUSR1 handler")?;
+    // SIGUSR2: write a heap snapshot (paired with `hop debug mem-profile`).
+    let mut sigusr2 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        .context("failed to register SIGUSR2 handler")?;
     let mut debug_enabled = false;
 
     loop {
@@ -1084,6 +1112,22 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 };
                 if let Err(e) = reload_handle.reload(new_filter) {
                     tracing::error!("Failed to reload log filter: {e}");
+                }
+            }
+            _ = sigusr2.recv() => {
+                // Heap snapshot on demand. Runs the platform profiler
+                // (malloc_history on macOS, jemalloc prof.dump on Linux) off the
+                // reactor so it can't stall connection handling.
+                if memprofile::in_profiling_mode() {
+                    tokio::task::spawn_blocking(|| match memprofile::self_snapshot() {
+                        Ok(path) => tracing::info!("heap snapshot written to {}", path.display()),
+                        Err(e) => tracing::warn!("heap snapshot failed: {e:#}"),
+                    });
+                } else {
+                    tracing::warn!(
+                        "SIGUSR2 heap snapshot ignored: daemon not in profiling mode \
+                         (start it with `hop debug mem-profile on`)"
+                    );
                 }
             }
             _ = sigterm.recv() => {
