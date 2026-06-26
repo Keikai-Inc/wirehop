@@ -614,6 +614,57 @@ hop agent stop
 
 ---
 
+## Debugging
+
+Profiling tools for the host daemon. They use each platform's **native** profiler,
+so they work on the normal release binary and (for CPU) on the running daemon
+without a restart. Run with `sudo` (they inspect the system daemon).
+
+### `hop debug cpu-profile [--secs N] [--pid P] [--out F]`
+
+Sample the running host daemon's CPU and render a **function-level flame graph
+SVG** plus a hottest-functions text report. No restart needed — run it *while* the
+daemon is busy. Auto-targets the busiest `hop host` process (the privsep worker).
+
+| Flag | Description |
+|---|---|
+| `--secs <N>` | Seconds to sample (default: 10) |
+| `--pid <P>` | Profile this PID instead of auto-detecting |
+| `--out <F>` | Report path (default: `/tmp/hop-cpu-<pid>-<ts>.txt`; SVG alongside) |
+
+Sampler: `sample(1)` on macOS, `perf record`/`perf script` on Linux; folded to SVG
+in-process via [inferno](https://github.com/jonhoo/inferno).
+
+```bash
+sudo hop debug cpu-profile --secs 15   # writes /tmp/hop-cpu-<pid>-<ts>.{txt,svg}
+```
+
+### `hop debug mem-profile <on | snapshot | off>`
+
+Heap-profile the daemon to find a leak. `on` restarts it in profiling mode (the
+native allocator profiler armed: `MallocStackLogging` on macOS, jemalloc `prof` on
+Linux), as a single root process at full speed that serves traffic normally; a
+self-restoring watchdog brings the normal daemon back after a deadline regardless.
+
+| Subcommand | Description |
+|---|---|
+| `on` | Restart the daemon in memory-profiling mode |
+| `snapshot [--out F]` | Sorted, symbolized heap report from the **live** daemon (repeatable) |
+| `off` | Restore the normal privsep daemon |
+
+`snapshot` runs `malloc_history -allBySize` + `leaks` (macOS) or `prof.dump` +
+`jeprof` (Linux). It tracks only `malloc`, so mmap'd redb/blob memory is excluded.
+`SIGUSR2` on the daemon also writes a snapshot (`kill -USR2 <pid>`).
+
+```bash
+sudo hop debug mem-profile on        # restart in profiling mode (serves traffic)
+# ... reproduce the leak (e.g. a VNC session) ...
+sudo hop debug mem-profile snapshot  # repeat as RSS grows
+sudo hop debug mem-profile off       # restore the normal daemon
+```
+
+---
+
 ## Internal Commands
 
 These commands are hidden from `--help` and used internally by hop.
