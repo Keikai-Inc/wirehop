@@ -401,6 +401,43 @@ mod tests {
         unsafe { libc::getuid() }
     }
 
+    /// Write a fake extension's bootstrap file atomically: a temp sibling with
+    /// mode 0o600, then `rename` into place. Rename is atomic, so a concurrent
+    /// reader (the dispatcher) sees either no file or the complete,
+    /// correctly-permissioned bootstrap — never an empty/partial write nor a
+    /// world-readable 0644 file. Both flakes were observed under parallel load.
+    fn write_bootstrap_atomic(path: &std::path::Path, bs: &super::super::Bootstrap) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .unwrap();
+            f.write_all(toml::to_string(bs).unwrap().as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    /// Wait for a spawned fake extension's bootstrap file to appear (it's
+    /// written atomically, so existence implies it's complete). Replaces a
+    /// fixed sleep that flaked when the writer thread was scheduled late under
+    /// heavy parallel test load.
+    async fn wait_for_bootstrap(path: &std::path::Path) {
+        for _ in 0..300 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("bootstrap never appeared: {}", path.display());
+    }
+
     /// Spawn a fake extension that handles `StreamOpen` by emitting
     /// a fixed sequence: `StreamOpened` → two `StreamFrame`s carrying
     /// `chunk-1`/`chunk-2` → `StreamClosed("done")`. Used to test
@@ -418,22 +455,7 @@ mod tests {
                 pid: std::process::id(),
                 version: version.clone(),
             };
-            // Create the bootstrap file 0o600 atomically. Writing then chmod'ing
-            // leaves a window where it sits at the ambient umask (0644 on macOS),
-            // and the dispatcher's trust check rejects a world-readable bootstrap
-            // — a flake the reader can hit in that window under parallel test load.
-            {
-                use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt as _;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&bootstrap_path)
-                    .unwrap();
-                f.write_all(toml::to_string(&bs).unwrap().as_bytes()).unwrap();
-            }
+            write_bootstrap_atomic(&bootstrap_path, &bs);
 
             let (rx, hello) = server.accept().expect("accept");
             let reverse_name = match hello {
@@ -485,22 +507,7 @@ mod tests {
                 pid: std::process::id(),
                 version: version.clone(),
             };
-            // Create the bootstrap file 0o600 atomically. Writing then chmod'ing
-            // leaves a window where it sits at the ambient umask (0644 on macOS),
-            // and the dispatcher's trust check rejects a world-readable bootstrap
-            // — a flake the reader can hit in that window under parallel test load.
-            {
-                use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt as _;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&bootstrap_path)
-                    .unwrap();
-                f.write_all(toml::to_string(&bs).unwrap().as_bytes()).unwrap();
-            }
+            write_bootstrap_atomic(&bootstrap_path, &bs);
 
             let (rx, hello) = server.accept().expect("accept");
             let reverse_name = match hello {
@@ -557,7 +564,7 @@ mod tests {
         // Spawn the echo extension. It writes the bootstrap then waits
         // for hop to drive the rest.
         let _ext_handle = spawn_echo_extension(bootstrap_path.clone(), "0.1.0");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_bootstrap(&bootstrap_path).await;
 
         let registry = ExtensionRegistry::discover(dir.path().to_path_buf())
             .await
@@ -633,7 +640,7 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let _ext = spawn_streaming_extension(bootstrap_path.clone(), "0.1.0");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_bootstrap(&bootstrap_path).await;
 
         let registry = ExtensionRegistry::discover(dir.path().to_path_buf())
             .await
