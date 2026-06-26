@@ -83,8 +83,7 @@ impl Datastore {
     }
 
     fn open_inner(path: &Path, secrets_key: Option<[u8; 32]>) -> Result<Self> {
-        let db = redb::Database::create(path)
-            .with_context(|| format!("Failed to open datastore at {}", path.display()))?;
+        let db = Self::create_db_with_retry(path)?;
 
         // Tighten the on-disk permissions of the (encrypted) datastore. By
         // default `redb::Database::create` honors the umask, often leaving the
@@ -115,6 +114,46 @@ impl Datastore {
         Ok(Self {
             inner: Arc::new(DatastoreInner::Local { db, secrets_key }),
         })
+    }
+
+    /// Open (create) the redb database, riding out a brief lock hand-off.
+    ///
+    /// redb takes an exclusive file lock. A fast daemon restart (launchd
+    /// `kickstart -k`, a systemd restart) can relaunch us *before* the previous
+    /// process has released that lock + the TUN, so `Database::create` fails
+    /// instantly with `DatabaseAlreadyOpen`. Under privsep that instant failure
+    /// is fatal: three such fast worker failures trip the crash-loop fallback to
+    /// a non-privsep daemon, which in turn drops the client mux socket — so every
+    /// local `hop` client spawns a second iroh endpoint under the daemon's
+    /// node-id and the relay prunes the two against each other (the identity
+    /// collision that shows up as a session reconnect loop). Waiting out the
+    /// hand-off (the old process exits within ~1s) keeps privsep + the mux intact
+    /// across restarts. Bounded so a *genuinely* stuck holder still surfaces.
+    fn create_db_with_retry(path: &Path) -> Result<redb::Database> {
+        use std::time::{Duration, Instant};
+        const MAX_WAIT: Duration = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            match redb::Database::create(path) {
+                Ok(db) => return Ok(db),
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if start.elapsed() < MAX_WAIT => {
+                    tracing::warn!(
+                        "datastore {} is locked by a still-exiting process; \
+                         retrying for up to {}s",
+                        path.display(),
+                        MAX_WAIT.as_secs()
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to open datastore at {}", path.display())
+                    });
+                }
+            }
+        }
     }
 
     /// Connect to the daemon's Unix socket (Remote mode).
