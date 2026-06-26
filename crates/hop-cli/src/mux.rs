@@ -125,21 +125,31 @@ pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
         return Ok(stream);
     }
 
-    // Start agent in background, with stderr → agent.log for diagnostics
-    let exe = std::env::current_exe().context("could not determine hop executable path")?;
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(agent_log_path(config_dir))
-        .context("failed to open agent log file")?;
-    std::process::Command::new(exe)
-        .args(["agent", "--daemon", "--config"])
-        .arg(config_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log_file))
-        .spawn()
-        .context("failed to spawn agent process")?;
+    // Start the user agent — unless one is already coming up. A live agent.pid
+    // means another `hop connect` just spawned it and it's still binding its
+    // socket; spawning a SECOND would create competing agents (each dialing the
+    // same host), the exact pile-up behind the post-restart storm. In that case
+    // skip the spawn and fall through to wait for the existing agent's socket.
+    #[cfg(unix)]
+    let already_starting = user_agent_alive(config_dir);
+    #[cfg(not(unix))]
+    let already_starting = false;
+    if !already_starting {
+        let exe = std::env::current_exe().context("could not determine hop executable path")?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(agent_log_path(config_dir))
+            .context("failed to open agent log file")?;
+        std::process::Command::new(exe)
+            .args(["agent", "--daemon", "--config"])
+            .arg(config_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .context("failed to spawn agent process")?;
+    }
 
     // Wait for agent to be ready (retry with backoff)
     for i in 0..20 {
@@ -151,17 +161,133 @@ pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
     anyhow::bail!("Agent failed to start within timeout")
 }
 
+/// How long the client waits for the agent to report the connection ready
+/// before giving up on a single attempt. The agent's dial to the host can hang
+/// (dead path, relay flap) far longer than a user will tolerate; without this
+/// the client blocks indefinitely with no feedback. On timeout we drop the IPC
+/// stream, which the agent observes (it watches for IPC close) and aborts its
+/// dial — so a wedged attempt can't leak. The responsive connect/reconnect loops
+/// use a shorter per-attempt deadline on top of this; this is the backstop for
+/// any caller.
+const AGENT_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Resolved target info retained for reconnection.
+#[derive(Clone)]
 pub struct ResolvedHost {
     pub host_id: iroh::PublicKey,
     pub relay_url: Option<iroh::RelayUrl>,
 }
 
-/// Connect to a host through the agent. Handles target resolution (alias, invite,
-/// direct NodeId), agent IPC handshake, and the hop auth/session protocol.
-///
-/// Returns the resolved host info plus the IPC socket split into read/write halves,
-/// ready for the session protocol.
+/// One-shot authentication to perform after the dial succeeds, before the
+/// session request. Resolved up front from the target so the responsive connect
+/// loop only has to drive the (retriable) dial.
+pub enum AuthStep {
+    /// Known alias or raw NodeId — no pre-session auth.
+    None,
+    /// Invite token — send the secret, expect an AuthResult, then save the host.
+    Invite {
+        secret: Vec<u8>,
+        desired_name: String,
+        warren_ticket: Option<String>,
+    },
+}
+
+/// A resolved connect target plus its one-shot auth step. Produced by
+/// [`resolve_target`] (fast, local, prints in cooked mode); consumed by the
+/// responsive connect loop. Splitting resolution from the dial is what lets the
+/// initial connect enable raw mode + start polling stdin BEFORE the (slow,
+/// hangable) dial — so `q`/Ctrl-C and the spinner stay live the whole time.
+pub struct ConnectPlan {
+    pub host_id: iroh::PublicKey,
+    pub relay_url: Option<iroh::RelayUrl>,
+    pub auth: AuthStep,
+}
+
+impl ConnectPlan {
+    pub fn resolved(&self) -> ResolvedHost {
+        ResolvedHost {
+            host_id: self.host_id,
+            relay_url: self.relay_url.clone(),
+        }
+    }
+
+    fn relay_str(&self) -> Option<String> {
+        self.relay_url.as_ref().map(|u| u.to_string())
+    }
+}
+
+/// Resolve a connect target (alias / invite token / raw NodeId) into a
+/// [`ConnectPlan`] without dialing. Local and fast; prints the "Resolved …" /
+/// "Connecting to …" banner in cooked mode before the caller switches to raw
+/// mode for the responsive dial.
+pub fn resolve_target(
+    config_dir: &Path,
+    target: &str,
+    cli_name: Option<&str>,
+) -> Result<ConnectPlan> {
+    // 1. Known-hosts alias.
+    let hosts = KnownHostsStore::load(config_dir)?;
+    if let Some(node_id_str) = hosts.resolve_alias(target) {
+        let host_id: iroh::PublicKey = node_id_str
+            .parse()
+            .context("Invalid NodeId in known_hosts")?;
+        let relay_url: Option<iroh::RelayUrl> = hosts
+            .hosts
+            .iter()
+            .find(|h| h.node_id == node_id_str)
+            .and_then(|h| h.relay_url.as_deref())
+            .map(|u| u.parse())
+            .transpose()
+            .ok()
+            .flatten();
+        println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
+        return Ok(ConnectPlan { host_id, relay_url, auth: AuthStep::None });
+    }
+
+    // 2. Invite token.
+    if invite::is_invite_token(target) {
+        let token = invite::decode_invite(target)?;
+        let host_id: iroh::PublicKey = token
+            .node_id
+            .parse()
+            .context("Invalid NodeId in invite token")?;
+        let relay_url: Option<iroh::RelayUrl> = token
+            .relay_url
+            .as_deref()
+            .map(|u| u.parse())
+            .transpose()
+            .context("Invalid relay URL in invite token")?;
+        let desired_name = cli_name
+            .map(String::from)
+            .or(token.host_name)
+            .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
+        println!("Connecting to host {}...", host_id.fmt_short());
+        return Ok(ConnectPlan {
+            host_id,
+            relay_url,
+            auth: AuthStep::Invite {
+                secret: token.secret.as_bytes().to_vec(),
+                desired_name,
+                warren_ticket: token.warren_ticket,
+            },
+        });
+    }
+
+    // 3. Raw NodeId (64-char hex). Always carry the default relay as a hint so
+    // iroh can reach the host without relying on DNS/pkarr discovery (which can
+    // fail on musl or restricted networks).
+    let host_id: iroh::PublicKey = target
+        .parse()
+        .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
+    let relay_url: Option<iroh::RelayUrl> = hop_core::net::HOP_RELAY_URL.parse().ok();
+    println!("Connecting to {}...", host_id.fmt_short());
+    Ok(ConnectPlan { host_id, relay_url, auth: AuthStep::None })
+}
+
+/// One-shot blocking connect: resolve the target, dial, run any auth, and send
+/// the session request. Used by the NON-interactive commands (exec, cp, sync,
+/// mcp, …) that don't want the interactive spinner/retry UI — `cmd_connect`
+/// drives the responsive [`crate::reconnect::run_initial_connect`] loop instead.
 pub async fn connect_to_host(
     config_dir: &Path,
     target: &str,
@@ -172,137 +298,108 @@ pub async fn connect_to_host(
     tokio::net::unix::OwnedWriteHalf,
     tokio::net::unix::OwnedReadHalf,
 )> {
-    // --- Target resolution ---
+    let plan = resolve_target(config_dir, target, cli_name)?;
+    let (mut write, mut read) = dial_initial(config_dir, &plan).await?;
+    finish_auth_and_request(config_dir, &plan, session_request, &mut write, &mut read).await?;
+    Ok((plan.resolved(), write, read))
+}
 
-    // 1. Check known_hosts for alias match
-    let hosts = KnownHostsStore::load(config_dir)?;
-    if let Some(node_id_str) = hosts.resolve_alias(target) {
-        let host_id: iroh::PublicKey = node_id_str
-            .parse()
-            .context("Invalid NodeId in known_hosts")?;
+/// Dial the host through the agent for an initial connect (no eviction). The
+/// retriable unit the responsive loop drives; on its own it is bounded by
+/// [`AGENT_DIAL_TIMEOUT`].
+pub async fn dial_initial(
+    config_dir: &Path,
+    plan: &ConnectPlan,
+) -> Result<(
+    tokio::net::unix::OwnedWriteHalf,
+    tokio::net::unix::OwnedReadHalf,
+)> {
+    open_agent_stream(config_dir, &plan.host_id, plan.relay_str(), false).await
+}
 
-        let relay_url: Option<iroh::RelayUrl> = hosts
-            .hosts
-            .iter()
-            .find(|h| h.node_id == node_id_str)
-            .and_then(|h| h.relay_url.as_deref())
-            .map(|u| u.parse())
-            .transpose()
-            .ok()
-            .flatten();
-
-        println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
-        println!("Connecting...");
-
-        let (mut ipc_write, ipc_read) =
-            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()), false)
-                .await?;
-
-        // Send session request through the transparent pipe
-        proto::write_message(&mut ipc_write, session_request).await?;
-
-        return Ok((ResolvedHost { host_id, relay_url }, ipc_write, ipc_read));
-    }
-
-    // 2. Check if invite token
-    if invite::is_invite_token(target) {
-        let token = invite::decode_invite(target)?;
-        let host_id: iroh::PublicKey = token
-            .node_id
-            .parse()
-            .context("Invalid NodeId in invite token")?;
-
-        let relay_url: Option<iroh::RelayUrl> = token
-            .relay_url
-            .as_deref()
-            .map(|u| u.parse())
-            .transpose()
-            .context("Invalid relay URL in invite token")?;
-
-        println!("Connecting to host {}...", host_id.fmt_short());
-
-        let (mut ipc_write, mut ipc_read) =
-            open_agent_stream(config_dir, &host_id, relay_url.as_ref().map(|u| u.to_string()), false)
-                .await?;
-
-        // Send invite auth through the transparent pipe
-        proto::write_message(
-            &mut ipc_write,
-            &ClientMessage::AuthResponse {
-                secret: token.secret.as_bytes().to_vec(),
-            },
-        )
-        .await?;
-
-        let result: HostMessage = proto::read_message(&mut ipc_read).await?;
-        match result {
-            HostMessage::AuthResult { authorized: true } => {
-                println!("Authorized!");
-
-                let desired_name = cli_name
-                    .map(String::from)
-                    .or(token.host_name)
-                    .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
-
-                let mut hosts = KnownHostsStore::load(config_dir)?;
-                let actual_name = hosts.add_host_dedup(
-                    &host_id,
-                    desired_name,
-                    relay_url.as_ref().map(|u| u.to_string()),
-                );
-                hosts.save(config_dir)?;
-                println!("Saved as known host: {actual_name}");
-
-                // Unified invite: if it carries the warren's namespace ticket,
-                // persist it as a fallback (the connect-time auto-upgrade in
-                // cmd_connect handles putting this machine on the warren).
-                if let Some(ticket) = token.warren_ticket.as_deref() {
-                    let path = config_dir.join("warren-ticket");
-                    if let Err(e) = std::fs::write(&path, ticket) {
-                        tracing::debug!("could not persist warren ticket: {e}");
+/// After the dial is up, run any one-shot auth and send the session request.
+/// Prints are raw-mode-safe (`\r\n`) because the caller holds raw mode by the
+/// time this runs. Invite auth is intentionally NOT retried by the loop — an
+/// invite is single-use, so a failure here is terminal.
+pub async fn finish_auth_and_request(
+    config_dir: &Path,
+    plan: &ConnectPlan,
+    session_request: &ClientMessage,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    read: &mut tokio::net::unix::OwnedReadHalf,
+) -> Result<()> {
+    use std::io::Write as _;
+    match &plan.auth {
+        AuthStep::None => {
+            proto::write_message(write, session_request).await?;
+        }
+        AuthStep::Invite { secret, desired_name, warren_ticket } => {
+            proto::write_message(
+                write,
+                &ClientMessage::AuthResponse { secret: secret.clone() },
+            )
+            .await?;
+            let result: HostMessage =
+                tokio::time::timeout(AGENT_DIAL_TIMEOUT, proto::read_message(read))
+                    .await
+                    .context("timed out waiting for the host's auth result")??;
+            match result {
+                HostMessage::AuthResult { authorized: true } => {
+                    print!("Authorized!\r\n");
+                    let mut hosts = KnownHostsStore::load(config_dir)?;
+                    let actual_name = hosts.add_host_dedup(
+                        &plan.host_id,
+                        desired_name.clone(),
+                        plan.relay_str(),
+                    );
+                    hosts.save(config_dir)?;
+                    print!("Saved as known host: {actual_name}\r\n");
+                    let _ = std::io::stdout().flush();
+                    if let Some(ticket) = warren_ticket.as_deref() {
+                        let path = config_dir.join("warren-ticket");
+                        if let Err(e) = std::fs::write(&path, ticket) {
+                            tracing::debug!("could not persist warren ticket: {e}");
+                        }
                     }
+                    proto::write_message(write, session_request).await?;
                 }
-
-                // Send session request on the same stream
-                proto::write_message(&mut ipc_write, session_request).await?;
-
-                return Ok((ResolvedHost { host_id, relay_url }, ipc_write, ipc_read));
-            }
-            HostMessage::AuthResult { authorized: false } => {
-                anyhow::bail!("Invite rejected by host (expired or already used)");
-            }
-            other => {
-                anyhow::bail!("Unexpected response from host: {other:?}");
+                HostMessage::AuthResult { authorized: false } => {
+                    anyhow::bail!("Invite rejected by host (expired or already used)");
+                }
+                other => anyhow::bail!("Unexpected response from host: {other:?}"),
             }
         }
     }
+    Ok(())
+}
 
-    // 3. Parse as NodeId (64-char hex)
-    let host_id: iroh::PublicKey = target
-        .parse()
-        .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
+/// Kill a wedged USER agent (the one this client spawned) so the next dial
+/// starts a fresh one — the automated form of the `killall hop` users have had
+/// to run by hand when the agent gets stuck storm-redialing. Only ever touches
+/// the per-user `agent.pid`/socket in `config_dir`; never the system daemon's
+/// mux (a host machine has no user `agent.pid`, so this is a safe no-op there).
+pub fn restart_user_agent(config_dir: &Path) {
+    let pid_path = agent_pid_path(config_dir);
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = pid_str.trim().parse::<i32>()
+    {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(agent_sock_path(config_dir));
+}
 
-    println!("Connecting to {}...", host_id.fmt_short());
-
-    // Always pass the default relay URL as a hint so iroh can reach the
-    // host without relying on DNS/pkarr discovery (which can fail on musl
-    // or in restricted network environments).
-    let default_relay = hop_core::net::HOP_RELAY_URL.to_string();
-    let (mut ipc_write, ipc_read) =
-        open_agent_stream(config_dir, &host_id, Some(default_relay.clone()), false).await?;
-
-    let relay_url: Option<iroh::RelayUrl> = default_relay.parse().ok();
-
-    proto::write_message(&mut ipc_write, session_request).await?;
-
-    Ok((
-        ResolvedHost {
-            host_id,
-            relay_url,
-        },
-        ipc_write,
-        ipc_read,
-    ))
+/// True if a user agent we spawned is recorded and its process is alive.
+#[cfg(unix)]
+fn user_agent_alive(config_dir: &Path) -> bool {
+    std::fs::read_to_string(agent_pid_path(config_dir))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|pid| unsafe { libc::kill(pid, 0) == 0 })
+        .unwrap_or(false)
 }
 
 /// Open a bi-stream to a host through the agent (public for reconnection).
@@ -343,7 +440,13 @@ async fn open_agent_stream(
     };
     write_ipc_message(&mut ipc, &req).await?;
 
-    let result: MuxResult = read_ipc_message(&mut ipc).await?;
+    // Bound the wait for the agent to report ready. A hung dial (dead path,
+    // relay flap) would otherwise block here for the full QUIC idle timeout with
+    // no feedback. On timeout we return an error and drop `ipc`, which the agent
+    // sees (it watches for IPC close) and uses to abort its dial.
+    let result: MuxResult = tokio::time::timeout(AGENT_DIAL_TIMEOUT, read_ipc_message(&mut ipc))
+        .await
+        .context("agent timed out establishing the connection")??;
     match result {
         MuxResult::Ready => {}
         MuxResult::Error(msg) => anyhow::bail!("Agent connection failed: {msg}"),
@@ -357,6 +460,23 @@ async fn open_agent_stream(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn resolve_target_raw_nodeid_is_noauth_with_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let plan = resolve_target(dir.path(), &pk.to_string(), None).unwrap();
+        assert_eq!(plan.host_id, pk);
+        assert!(matches!(plan.auth, AuthStep::None));
+        // A raw NodeId carries the default relay as a discovery hint.
+        assert!(plan.relay_url.is_some());
+    }
+
+    #[test]
+    fn resolve_target_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_target(dir.path(), "not-a-host", None).is_err());
+    }
 
     #[tokio::test]
     async fn ipc_roundtrip_mux_connect() {

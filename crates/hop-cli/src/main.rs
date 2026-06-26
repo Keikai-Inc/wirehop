@@ -2589,12 +2589,32 @@ async fn cmd_connect(
         ClientMessage::RequestShellV2 { session_id: None }
     };
 
-    // Connect through the agent (avoids relay conflicts, enables multiplexing)
-    let (resolved, first_send, first_recv) =
-        mux::connect_to_host(
-            config_dir, target, cli_name,
-            &session_msg,
-        ).await?;
+    // Resolve the target first — fast and local. Prints the "Resolved … /
+    // Connecting to …" banner in cooked mode before we switch to raw mode.
+    let plan = mux::resolve_target(config_dir, target, cli_name)?;
+
+    // Own raw mode and start the stdin reader BEFORE the dial — held for the
+    // WHOLE interactive lifecycle (initial connect + sessions + reconnect
+    // dialogs). The initial connect used to set these up only AFTER a blocking
+    // dial returned, so nothing read the keyboard while connecting: `q`/Enter
+    // did nothing and a hung dial trapped the user. Now the connect is polled
+    // alongside stdin from the first moment, exactly like reconnect. The guard's
+    // Drop restores the terminal on `?`/panic; the `process::exit` paths below
+    // disable it explicitly first, since exit() skips Drop.
+    let mut stdin_rx = spawn_stdin_reader();
+    let _raw = shell::RawModeGuard::enable()?;
+
+    // Responsive initial connect: live spinner, instant q/Ctrl+C, bounded
+    // per-attempt deadline, backoff, and wedged-agent self-heal.
+    let (first_send, first_recv) =
+        match reconnect::run_initial_connect(config_dir, &plan, &session_msg, &mut stdin_rx).await? {
+            reconnect::InitialConnectOutcome::Connected { send, recv } => (send, recv),
+            reconnect::InitialConnectOutcome::Quit => {
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Ok(());
+            }
+        };
+    let resolved = plan.resolved();
 
     // Convention: consuming a warren-carrying invite puts this machine on the
     // warren (self-upgrade to a daemon) — no separate command, no `--host`. The
@@ -2604,19 +2624,8 @@ async fn cmd_connect(
     if let Err(e) = maybe_upgrade_warren_on_connect(
         config_dir, target, warren_opts.yes, warren_opts.on_warren_conflict,
     ) {
-        eprintln!("warren upgrade skipped: {e:#}");
+        eprint!("warren upgrade skipped: {e:#}\r\n");
     }
-
-    // Spawn stdin reader once — shared across reconnections
-    let mut stdin_rx = spawn_stdin_reader();
-
-    // Own raw mode for the WHOLE interactive lifecycle (sessions + reconnect
-    // dialogs), held continuously so the background stdin reader never drops to
-    // cooked/line-buffered mode between phases — that gap was why `q` didn't
-    // register on the reconnect screen until you pressed Enter. The guard's Drop
-    // restores the terminal on `?`/panic; the `process::exit` paths below disable
-    // it explicitly first, since exit() skips Drop.
-    let _raw = shell::RawModeGuard::enable()?;
 
     // Bracketed-paste / lost-chunk state, shared across reconnections so a
     // paste interrupted by a reconnect is completed rather than stranded.

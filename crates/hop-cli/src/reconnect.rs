@@ -187,6 +187,146 @@ pub async fn try_quick_reconnect(
     None
 }
 
+/// Outcome of the responsive initial connect.
+pub enum InitialConnectOutcome {
+    Connected {
+        send: OwnedWriteHalf,
+        recv: OwnedReadHalf,
+    },
+    /// User pressed q / Ctrl+C while connecting.
+    Quit,
+}
+
+/// Drive the INITIAL connect responsively — the same live spinner, instant
+/// q/Ctrl+C, bounded per-attempt deadline, and backoff the reconnect path
+/// already has. The old initial connect was a bare blocking await with raw mode
+/// and the stdin reader set up only AFTER it returned, so during a slow/hung
+/// dial nothing read the keyboard: `q`/Enter did nothing and the only way out
+/// was to kill the process. Raw mode MUST already be enabled by the caller
+/// (cmd_connect owns it for the whole interactive lifecycle).
+///
+/// After a few consecutive dial failures it restarts a wedged user-spawned agent
+/// (Fix C self-heal — a no-op on a host that routes through the daemon mux), so
+/// a stuck agent recovers automatically instead of needing a manual `killall`.
+pub async fn run_initial_connect(
+    config_dir: &Path,
+    plan: &mux::ConnectPlan,
+    session_request: &ClientMessage,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<InitialConnectOutcome> {
+    use std::io::Write;
+    let mut stdout = io::stdout();
+    let mut pending = Vec::new();
+    let start = Instant::now();
+    let mut net_watcher = NetWatcher::new();
+    let mut attempt: u32 = 0;
+    let mut consecutive_fail: u32 = 0;
+
+    loop {
+        attempt += 1;
+
+        // Backoff between attempts, fully responsive (Enter = retry now, q = quit).
+        let backoff = backoff_secs(attempt);
+        if backoff > 0 {
+            let cd_start = Instant::now();
+            let cd = tokio::time::sleep(Duration::from_secs(backoff));
+            tokio::pin!(cd);
+            let mut tick = tokio::time::interval(Duration::from_millis(150));
+            loop {
+                let remaining =
+                    (backoff as f64 - cd_start.elapsed().as_secs_f64()).max(0.0).ceil() as u64;
+                let _ = write!(
+                    stdout,
+                    "\r\x1b[K\x1b[33m[hop]\x1b[0m Connection failed — retrying in {remaining}s  (Enter: now · q: quit)"
+                );
+                let _ = stdout.flush();
+                tokio::select! {
+                    _ = &mut cd => break,
+                    _ = tick.tick() => { if net_watcher.changed() { attempt = 0; break; } }
+                    chunk = stdin_rx.recv() => {
+                        if let Some(data) = chunk {
+                            match classify_chunk(&data, &mut pending) {
+                                PollAction::Quit => {
+                                    let _ = write!(stdout, "\r\x1b[K");
+                                    let _ = stdout.flush();
+                                    return Ok(InitialConnectOutcome::Quit);
+                                }
+                                PollAction::RetryNow => { attempt = 0; break; }
+                                PollAction::None => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Connecting phase: the dial runs as a future polled alongside the
+        // spinner, a 12s deadline, and stdin — so q/Ctrl+C cancel instantly.
+        let dial_fut = mux::dial_initial(config_dir, plan);
+        tokio::pin!(dial_fut);
+        let deadline = tokio::time::sleep(Duration::from_secs(12));
+        tokio::pin!(deadline);
+        let mut spinner = tokio::time::interval(Duration::from_millis(120));
+        let mut spin: u64 = 0;
+        let mut user_retry = false;
+
+        let dial = loop {
+            tokio::select! {
+                r = &mut dial_fut => break Some(r),
+                _ = &mut deadline => break None,
+                _ = spinner.tick() => {
+                    spin += 1;
+                    let _ = write!(
+                        stdout,
+                        "\r\x1b[K\x1b[33m[hop]\x1b[0m {} Connecting… (attempt {attempt}, {}s)   q: cancel",
+                        spinning_char(spin), start.elapsed().as_secs()
+                    );
+                    let _ = stdout.flush();
+                }
+                chunk = stdin_rx.recv() => {
+                    if let Some(data) = chunk {
+                        match classify_chunk(&data, &mut pending) {
+                            PollAction::Quit => {
+                                let _ = write!(stdout, "\r\x1b[K");
+                                let _ = stdout.flush();
+                                return Ok(InitialConnectOutcome::Quit);
+                            }
+                            PollAction::RetryNow => { attempt = 0; user_retry = true; break None; }
+                            PollAction::None => {}
+                        }
+                    }
+                }
+            }
+        };
+
+        match dial {
+            Some(Ok((mut send, mut recv))) => {
+                let _ = write!(stdout, "\r\x1b[K");
+                let _ = stdout.flush();
+                // One-shot auth + session request. A failure here (e.g. an
+                // invite already used) is terminal — don't loop on it.
+                mux::finish_auth_and_request(config_dir, plan, session_request, &mut send, &mut recv)
+                    .await?;
+                return Ok(InitialConnectOutcome::Connected { send, recv });
+            }
+            _ => {
+                // Dial failed or timed out (not a user-requested retry). After a
+                // few in a row, restart a wedged user agent so it self-heals.
+                if !user_retry {
+                    consecutive_fail += 1;
+                    if consecutive_fail >= 3 {
+                        mux::restart_user_agent(config_dir);
+                        consecutive_fail = 0;
+                    }
+                }
+            }
+        }
+        if net_watcher.changed() {
+            attempt = 0;
+        }
+    }
+}
+
 /// Show a reconnection TUI that reconnects through the agent process.
 ///
 /// On success returns `ReconnectedViaAgent` with the IPC stream halves and
