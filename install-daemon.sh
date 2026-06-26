@@ -131,7 +131,9 @@ info "Installing hop v${VERSION} daemon"
 # --- macOS path --------------------------------------------------------------
 
 if [[ "${OS}" == "Darwin" ]]; then
-  PKG_NAME="hop-${VERSION}.pkg"
+  # Per-arch .pkg (the universal one was retired to halve the download). ARCH is
+  # arm64 or x86_64 here, matching the published hop-<ver>-<arch>.pkg artifacts.
+  PKG_NAME="hop-${VERSION}-${ARCH}.pkg"
   PKG_URL="${BASE_URL}/v${VERSION}/${PKG_NAME}"
 
   info "Downloading ${PKG_NAME}..."

@@ -273,6 +273,35 @@ fi
 
 rm -rf "${BUILD_LOG_DIR}"
 
+# --- Compress Linux binaries with UPX ----------------------------------------
+# UPX shrinks the static-musl Linux binaries ~72-76% (e.g. ~30MB -> ~8MB) for a
+# much smaller download. The daemon decompresses once at launch (negligible); a
+# CLI invocation pays a small one-time decompress. Run BEFORE checksums/signing
+# so the .sha256/.sig cover the PACKED file install.sh actually downloads.
+#
+# Done inside Docker (alpine + upx) rather than depending on a host upx — UPX
+# rewrites the ELF based on its own arch header, so an arm64 container packs the
+# x86_64/armv7 binaries fine. Linux only: macOS Mach-O + UPX trips Gatekeeper/
+# AMFI, and macOS download size is handled by per-arch (non-universal) .pkgs.
+# `upx -t` self-tests each packed binary and FAILS the release if a pack is
+# broken. NOTE: armv7 can't be exec-tested in CI (no 32-bit-ARM emulation) — it's
+# non-PIE static like arm64 (validated); the -t gate catches structural breakage,
+# but smoke-test it on real hardware.
+echo "==> Compressing Linux binaries with UPX (via Docker)"
+docker run --rm -v "${DIST_DIR}:/dist" alpine:latest sh -c '
+  set -e
+  apk add --no-cache upx >/dev/null 2>&1
+  for b in hop-linux-arm64 hop-linux-x86_64 hop-linux-armv7; do
+    f="/dist/${b}"
+    [ -f "${f}" ] || { echo "Error: ${f} missing before UPX"; exit 1; }
+    before=$(wc -c < "${f}")
+    upx --best --lzma "${f}" >/dev/null 2>&1 || { echo "Error: upx failed to pack ${b}"; exit 1; }
+    upx -t "${f}" >/dev/null 2>&1 || { echo "Error: upx -t failed for ${b} (broken pack)"; exit 1; }
+    after=$(wc -c < "${f}")
+    echo "  ${b}: $((before / 1024 / 1024))MB -> $((after / 1024 / 1024))MB"
+  done
+' || { echo "Error: UPX compression step failed"; exit 1; }
+
 # --- Checksums ---------------------------------------------------------------
 
 echo "==> Generating checksums"
@@ -308,24 +337,29 @@ else
   echo "==> HOP_SIGNING_KEY unset — unsigned release (install.sh verifies checksum only)"
 fi
 
-# --- macOS .pkg installer ----------------------------------------------------
-
-echo "==> Building macOS universal .pkg"
-"${PROJECT_ROOT}/pkg/build-pkg.sh" --arch universal --binary-dir "${DIST_DIR}"
-PKG_PATH="${PROJECT_ROOT}/target/pkg-staging/output/hop-${VERSION}.pkg"
-if [[ ! -f "${PKG_PATH}" ]]; then
-  echo "Error: .pkg not found at ${PKG_PATH}"
-  exit 1
-fi
+# --- macOS per-arch .pkg installers ------------------------------------------
+# Per-arch, not universal: a universal .pkg fuses both Mac slices (~2x size,
+# half of it dead weight on any given machine). Each per-arch .pkg ships only the
+# slice that Mac runs (~half the download — e.g. 21MB universal -> 10MB arm64).
+# build-pkg.sh wipes its staging dir on each call, so build + upload each one in
+# the same iteration before the next build clobbers it.
+for pkgarch in arm64 x86_64; do
+  echo "==> Building macOS .pkg (${pkgarch})"
+  "${PROJECT_ROOT}/pkg/build-pkg.sh" --arch "${pkgarch}" --binary-dir "${DIST_DIR}"
+  PKG_SRC="${PROJECT_ROOT}/target/pkg-staging/output/hop-${VERSION}-${pkgarch}.pkg"
+  if [[ ! -f "${PKG_SRC}" ]]; then
+    echo "Error: .pkg not found at ${PKG_SRC}"
+    exit 1
+  fi
+  echo "==> Uploading hop-${VERSION}-${pkgarch}.pkg to s3://${BUCKET}/v${VERSION}/"
+  aws s3 cp "${PKG_SRC}" "s3://${BUCKET}/v${VERSION}/hop-${VERSION}-${pkgarch}.pkg"
+done
 
 # --- Upload to S3 ------------------------------------------------------------
 
 echo "==> Uploading binaries to s3://${BUCKET}/v${VERSION}/"
 aws s3 cp "${DIST_DIR}/" "s3://${BUCKET}/v${VERSION}/" \
   --recursive --exclude '*' --include 'hop-*'
-
-echo "==> Uploading .pkg to s3://${BUCKET}/v${VERSION}/"
-aws s3 cp "${PKG_PATH}" "s3://${BUCKET}/v${VERSION}/hop-${VERSION}.pkg"
 
 echo "==> Uploading latest version marker"
 echo -n "${VERSION}" > "${DIST_DIR}/latest"

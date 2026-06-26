@@ -72,6 +72,10 @@ build_for_target() {
     echo "$bin"
 }
 
+# Arch suffix for the output .pkg filename (empty for native/universal so the
+# canonical `hop-<version>.pkg` name is preserved; per-arch builds get a suffix).
+PKG_SUFFIX=""
+
 case "$ARCH" in
     native)
         echo "Building for native architecture..."
@@ -80,10 +84,24 @@ case "$ARCH" in
         strip "$BINARY"
         ;;
     arm64)
-        BINARY=$(build_for_target "aarch64-apple-darwin")
+        # Prefer the release-built, already-stripped binary when the pipeline
+        # passes --binary-dir; otherwise build from source. Per-arch .pkgs are
+        # ~half the size of the universal (one slice, not two) — that's the
+        # whole point: ship the slice the user's Mac actually runs.
+        if [[ -n "${BINARY_DIR}" && -f "${BINARY_DIR}/hop-darwin-arm64" ]]; then
+            BINARY="${BINARY_DIR}/hop-darwin-arm64"
+        else
+            BINARY=$(build_for_target "aarch64-apple-darwin")
+        fi
+        PKG_SUFFIX="-arm64"
         ;;
     x86_64)
-        BINARY=$(build_for_target "x86_64-apple-darwin")
+        if [[ -n "${BINARY_DIR}" && -f "${BINARY_DIR}/hop-darwin-x86_64" ]]; then
+            BINARY="${BINARY_DIR}/hop-darwin-x86_64"
+        else
+            BINARY=$(build_for_target "x86_64-apple-darwin")
+        fi
+        PKG_SUFFIX="-x86_64"
         ;;
     universal)
         if [[ -n "${BINARY_DIR}" ]]; then
@@ -166,17 +184,17 @@ productbuild \
     --distribution "$STAGING/distribution.xml" \
     --resources "$RESOURCES" \
     --package-path "$STAGING" \
-    "$OUTPUT/hop-${VERSION}.pkg"
+    "$OUTPUT/hop-${VERSION}${PKG_SUFFIX}.pkg"
 
 # Clean up intermediate files
 rm -f "$STAGING/hop-component.pkg"
 
 echo ""
 echo "Success! Installer package built:"
-echo "  $OUTPUT/hop-${VERSION}.pkg"
+echo "  $OUTPUT/hop-${VERSION}${PKG_SUFFIX}.pkg"
 echo ""
 echo "Install with:"
-echo "  sudo installer -pkg $OUTPUT/hop-${VERSION}.pkg -target /"
+echo "  sudo installer -pkg $OUTPUT/hop-${VERSION}${PKG_SUFFIX}.pkg -target /"
 echo ""
 echo "Uninstall with:"
 echo "  sudo bash pkg/uninstall.sh"
