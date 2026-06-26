@@ -46,11 +46,17 @@ fn find_host_worker() -> Option<u32> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut best: Option<(f64, u32)> = None;
     for line in text.lines() {
+        // `ps` right-aligns the pid/%cpu columns with variable padding, so split
+        // off the first two tokens with split_once (collapses runs of spaces) and
+        // keep the remainder — which itself contains spaces — as the command.
         let line = line.trim_start();
-        let mut it = line.splitn(3, char::is_whitespace);
-        let (Some(pid_s), Some(cpu_s), Some(cmd)) = (it.next(), it.next(), it.next()) else {
+        let Some((pid_s, rest)) = line.split_once(char::is_whitespace) else {
             continue;
         };
+        let Some((cpu_s, cmd)) = rest.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let cmd = cmd.trim_start();
         if !cmd.contains("hop host") || cmd.contains("debug cpu-profile") {
             continue;
         }
@@ -204,17 +210,23 @@ mod tests {
 
     #[test]
     fn parses_busiest_hop_host_from_ps_lines() {
-        // Mirror the parsing in find_host_worker against a synthetic ps dump.
-        let text = "  100  0.0 /usr/local/bin/hop host --quiet --config x\n  \
-                      101 88.5 /usr/local/bin/hop host --config x --quiet\n  \
-                      102  3.1 /bin/zsh -c hop debug cpu-profile\n";
+        // Realistic `ps -axo pid=,pcpu=,command=` output: right-aligned columns
+        // with VARIABLE padding (multiple spaces) — the case the old splitn parser
+        // got wrong. Monitor (low cpu) + worker (busy) + the profiler itself.
+        let text = "  100   0.0 /usr/local/bin/hop host --quiet --config /Library/x\n\
+                    99101  88.5 /usr/local/bin/hop host --config /Library/x --quiet\n\
+                     1023   3.1 /bin/zsh -c sudo hop debug cpu-profile --secs 15\n\
+                      777  12.0 /usr/sbin/cupsd -l\n";
         let mut best: Option<(f64, u32)> = None;
         for line in text.lines() {
             let line = line.trim_start();
-            let mut it = line.splitn(3, char::is_whitespace);
-            let (Some(pid_s), Some(cpu_s), Some(cmd)) = (it.next(), it.next(), it.next()) else {
+            let Some((pid_s, rest)) = line.split_once(char::is_whitespace) else {
                 continue;
             };
+            let Some((cpu_s, cmd)) = rest.trim_start().split_once(char::is_whitespace) else {
+                continue;
+            };
+            let cmd = cmd.trim_start();
             if !cmd.contains("hop host") || cmd.contains("debug cpu-profile") {
                 continue;
             }
@@ -225,6 +237,7 @@ mod tests {
                 best = Some((cpu, pid));
             }
         }
-        assert_eq!(best.map(|(_, p)| p), Some(101)); // the busy worker, not the monitor or the profiler
+        // The busy worker (99101) — not the monitor, the profiler, or cupsd.
+        assert_eq!(best.map(|(_, p)| p), Some(99101));
     }
 }
