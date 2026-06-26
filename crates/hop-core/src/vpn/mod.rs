@@ -610,9 +610,13 @@ pub async fn pump_vpn_datagrams(
     gateway_cidrs: &std::sync::RwLock<Vec<GatewayRouteEntry>>,
     siit: &SiitSlot,
 ) {
+    use crate::netstats::NET_STATS;
+    use std::sync::atomic::Ordering::Relaxed;
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
     while let Ok(dg) = conn.read_datagram().await {
+        // Per-datagram handling timer (recorded on the path that reaches the TUN).
+        let t0 = std::time::Instant::now();
         // Liveness signal: a datagram arrived from this peer, so the path is
         // alive right now. The outbound forwarder uses this to tell a working
         // pooled connection from a silently-dead one and recover from the latter.
@@ -622,8 +626,12 @@ pub async fn pump_vpn_datagrams(
         // packet — skip cleanly so it never triggers a spurious refresh or TUN
         // write.
         if dg.as_ref() == VPN_KEEPALIVE {
+            NET_STATS.in_keepalive.fetch_add(1, Relaxed);
             continue;
         }
+        // Real user datagram (past the keepalive fast-path).
+        NET_STATS.in_dg.fetch_add(1, Relaxed);
+        NET_STATS.in_bytes.fetch_add(dg.len() as u64, Relaxed);
         // 4via6 (Tier 3a): an IPv6 datagram is either a via6 request to translate
         // (we're the destination gateway) or a translated reply to deliver (we're
         // the client). Handled before the v4 anti-spoof path (which would drop it).
@@ -642,6 +650,7 @@ pub async fn pump_vpn_datagrams(
                     // sending client (its vIP is embedded in client_v6) must be
                     // permitted to reach `real_v4` via an advertised route.
                     if !is_client_v6(src_v6) {
+                        NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
                         continue;
                     }
                     let client_vip = Ipv4Addr::new(
@@ -651,17 +660,30 @@ pub async fn pump_vpn_datagrams(
                         .read()
                         .is_ok_and(|rs| gateway_forwards(&rs, client_vip, real_v4));
                     if !authorized {
+                        NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
                         tracing::debug!("via6 ingress: DROP — {client_vip} not authorized for {real_v4}");
                         continue;
                     }
                     let pooled = match siit.write().ok().and_then(|mut s| s.map_client(src_v6)) {
                         Some(p) => p,
-                        None => continue, // pool exhausted
+                        None => {
+                            NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
+                            continue; // pool exhausted
+                        }
                     };
                     if let Some(v4pkt) = siit::translate_v6_to_v4(&dg, pooled, real_v4)
                         && let Some(tun) = tun.read().await.clone()
                     {
-                        let _ = tun.send(&v4pkt).await;
+                        match tun.send(&v4pkt).await {
+                            Ok(_) => {
+                                NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                                NET_STATS.in_tun_bytes.fetch_add(v4pkt.len() as u64, Relaxed);
+                                NET_STATS.record_ingress_latency(t0.elapsed());
+                            }
+                            Err(_) => {
+                                NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -672,7 +694,16 @@ pub async fn pump_vpn_datagrams(
             if my_client_v6 == Some(dst_v6)
                 && let Some(tun) = tun.read().await.clone()
             {
-                let _ = tun.send(&dg).await;
+                match tun.send(&dg).await {
+                    Ok(_) => {
+                        NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                        NET_STATS.in_tun_bytes.fetch_add(dg.len() as u64, Relaxed);
+                        NET_STATS.record_ingress_latency(t0.elapsed());
+                    }
+                    Err(_) => {
+                        NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                    }
+                }
             }
             continue;
         }
@@ -681,6 +712,7 @@ pub async fn pump_vpn_datagrams(
         // re-registers — takes effect without dropping the connection.
         let expected_src = peer_ips.read().await.get(&remote).copied();
         let Some(expected) = expected_src else {
+            NET_STATS.in_drop_unknown_peer.fetch_add(1, Relaxed);
             // Unknown peer: ask the NetDoc to refresh from the document. The
             // notify coalesces and the consumer is rate-limited, so a packet
             // flood can't amplify into excessive doc reads.
@@ -706,6 +738,7 @@ pub async fn pump_vpn_datagrams(
             // route we accepted", alongside per-role route gating.)
             Some(src) if !is_virtual_addr(src) => {}
             _ => {
+                NET_STATS.in_drop_spoof.fetch_add(1, Relaxed);
                 refresh.notify_one();
                 continue;
             }
@@ -728,6 +761,7 @@ pub async fn pump_vpn_datagrams(
             let for_gateway = dst
                 .is_some_and(|d| gateway_cidrs.read().is_ok_and(|rs| gateway_forwards(&rs, expected, d)));
             if !for_us && !for_gateway {
+                NET_STATS.in_drop_dest.fetch_add(1, Relaxed);
                 continue;
             }
             if for_gateway && !for_us {
@@ -738,7 +772,16 @@ pub async fn pump_vpn_datagrams(
             }
         }
         if let Some(tun) = tun.read().await.clone() {
-            let _ = tun.send(&dg).await;
+            match tun.send(&dg).await {
+                Ok(_) => {
+                    NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                    NET_STATS.in_tun_bytes.fetch_add(dg.len() as u64, Relaxed);
+                    NET_STATS.record_ingress_latency(t0.elapsed());
+                }
+                Err(_) => {
+                    NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                }
+            }
         }
     }
 }

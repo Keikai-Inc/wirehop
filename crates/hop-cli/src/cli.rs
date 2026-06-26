@@ -431,6 +431,22 @@ pub enum DebugAction {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+
+    /// Show VPN data-plane counters from the running daemon: per-packet drops,
+    /// send-queue backpressure, and forwarding-latency histograms. Answers "are
+    /// packets being dropped / queues backing up / how long do we hold a packet".
+    #[command(name = "net-stats")]
+    NetStats {
+        /// Refresh continuously, showing per-second rates (Ctrl-C to stop)
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between refreshes in --watch mode (default: 2)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+        /// Emit the raw snapshot as JSON instead of the formatted report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

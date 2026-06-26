@@ -663,6 +663,36 @@ sudo hop debug mem-profile snapshot  # repeat as RSS grows
 sudo hop debug mem-profile off       # restore the normal daemon
 ```
 
+### `hop debug net-stats [--watch] [--interval N] [--json]`
+
+Show the **VPN data-plane counters** from the running daemon — the live forwarding
+pipeline, with no restart. Answers three operational questions:
+
+- **Are packets being dropped?** — a counter at every drop site (reach-denied, no
+  route/endpoint, send conn-closed, unknown peer, source-spoofed, wrong
+  destination, TUN-write error), as totals and (with `--watch`) per-second rates.
+- **Are queues filling / backing up?** — egress send-backpressure counters: how
+  often and how long the forwarder waited for QUIC datagram send-buffer space.
+  Zero = the pipe keeps up.
+- **How long do we hold a packet?** — a log2 histogram of per-packet handling
+  latency (TUN→send on egress, recv→TUN on ingress) with p50/p99.
+
+The counters are always-on, lock-free atomics in the worker (no measurable cost),
+served over the daemon socket. An operator-group user can read them **without
+sudo** (the socket is group-restricted, like other operator-admin ops).
+
+| Flag | Description |
+|---|---|
+| `--watch` | Refresh continuously, showing per-second rates (Ctrl-C to stop) |
+| `--interval <N>` | Seconds between refreshes in `--watch` mode (default: 2) |
+| `--json` | Emit the raw snapshot as JSON instead of the formatted report |
+
+```bash
+hop debug net-stats              # one-shot totals + latency histograms
+hop debug net-stats --watch      # live drop/throughput rates, refreshed every 2s
+hop debug net-stats --json       # machine-readable snapshot
+```
+
 ---
 
 ## Internal Commands

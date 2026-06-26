@@ -206,8 +206,6 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn parses_busiest_hop_host_from_ps_lines() {
         // Realistic `ps -axo pid=,pcpu=,command=` output: right-aligned columns

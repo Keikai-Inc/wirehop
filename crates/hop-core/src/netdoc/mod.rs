@@ -2518,7 +2518,9 @@ impl NetDoc {
     /// a `hop/vpn/1` QUIC-datagram connection (re-using/reconnecting as needed).
     #[cfg(unix)]
     async fn vpn_outbound_loop(&self, tun: std::sync::Arc<tun::AsyncDevice>) {
+        use crate::netstats::NET_STATS;
         use std::collections::HashMap;
+        use std::sync::atomic::Ordering::Relaxed;
         // Cached dials: connection + when we dialed it (for the post-dial grace).
         let mut conns: HashMap<iroh::PublicKey, (iroh::endpoint::Connection, std::time::Instant)> =
             HashMap::new();
@@ -2547,6 +2549,16 @@ impl NetDoc {
         // multipath — a failover lands on an already-warm path). Both ends run
         // this, so the liveness signal stays bidirectional.
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        // Egress send backpressure (see the send site below). Wait up to
+        // SEND_TIMEOUT for QUIC datagram send-buffer space before giving up on a
+        // packet, rather than letting the buffer silently drop the OLDEST queued
+        // datagram. Bounds head-of-line blocking on this single serial forwarder
+        // if one peer's path wedges. 100ms absorbs a transient congestion spike
+        // on a fast path while keeping a wedged peer from stalling others long.
+        const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+        // A send that completes faster than this didn't really wait — it's
+        // scheduling jitter, not send-buffer backpressure. Don't count it.
+        const BACKPRESSURE_MIN: std::time::Duration = std::time::Duration::from_micros(200);
         // VPN re-dial timeout — short so a dial to a peer whose address is briefly
         // stale (just after it restarted/roamed, before discovery catches up) fails
         // fast and retries on the next packet, instead of blocking one 30s dial
@@ -2654,6 +2666,12 @@ impl NetDoc {
                 },
             };
             let pkt = &buf[..n];
+            // Start the per-packet handling timer the instant we have a packet;
+            // recorded only on the path that actually forwards it (drops below
+            // bump their own counters instead).
+            let t0 = std::time::Instant::now();
+            NET_STATS.eg_tun_pkts.fetch_add(1, Relaxed);
+            NET_STATS.eg_tun_bytes.fetch_add(n as u64, Relaxed);
             let version = pkt.first().map(|b| b >> 4).unwrap_or(0);
             // Resolve the destination peer + the (possibly translated) payload.
             // 4via6 (Tier 3a) adds two arms: an IPv6 packet to a via6 destination
@@ -2670,6 +2688,7 @@ impl NetDoc {
                 match self.resolve_site_endpoint(site).await {
                     Some((pk, r)) => (pk, r, std::borrow::Cow::Borrowed(pkt)),
                     None => {
+                        NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
                         tracing::debug!("via6 egress: site {site} UNRESOLVED — packet dropped");
                         continue;
                     }
@@ -2699,6 +2718,7 @@ impl NetDoc {
                 match self.lookup_vpn_endpoint(client_vip).await {
                     Ok(Some((pk, r))) => (pk, r, std::borrow::Cow::Owned(v6pkt)),
                     _ => {
+                        NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
                         tracing::debug!("via6 reply: client {client_vip} UNRESOLVED — dropped");
                         continue;
                     }
@@ -2721,6 +2741,7 @@ impl NetDoc {
                             // Observability: the reach ACL silently dropping
                             // packets is the hard-to-debug case (a missing/empty
                             // role → reach nothing). Say so (debug; per-packet).
+                            NET_STATS.eg_drop_reach.fetch_add(1, Relaxed);
                             tracing::debug!(
                                 "vpn egress: reach DENIED {src} -> {dst} (role policy) — dropped"
                             );
@@ -2732,6 +2753,7 @@ impl NetDoc {
                 match self.lookup_vpn_endpoint(dst).await {
                     Ok(Some((pk, r))) => (pk, r, std::borrow::Cow::Borrowed(pkt)),
                     _ => {
+                        NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
                         tracing::debug!(
                             "vpn egress: {dst} UNRESOLVED (no endpoint) — packet dropped"
                         );
@@ -2763,6 +2785,7 @@ impl NetDoc {
                     }
                 }
                 if candidates.is_empty() {
+                    NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
                     continue;
                 }
                 // Failover: pick a live gateway (fresh inbound datagram) if any;
@@ -2887,6 +2910,7 @@ impl NetDoc {
                                 c
                             }
                             Err(e) => {
+                                NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
                                 tracing::debug!("vpn: dial {pubkey} failed: {e}");
                                 continue;
                             }
@@ -2894,7 +2918,33 @@ impl NetDoc {
                     }
                 },
             };
-            if let Err(e) = conn.send_datagram(bytes::Bytes::copy_from_slice(&out_pkt)) {
+            // Backpressure instead of oldest-drop. `send_datagram_wait` awaits
+            // QUIC datagram send-buffer space; the plain `send_datagram` instead
+            // silently drops the OLDEST queued datagram when the buffer is full,
+            // which for a tunneled TCP flow (VNC) manufactures a sequence gap →
+            // dup-ACK → fast-retransmit → cwnd collapse → the stall. Waiting lets
+            // the buffer drain and backpressures the TUN reader, so the tunneled
+            // TCP paces itself. A SEND_TIMEOUT cap bounds head-of-line blocking on
+            // this single serial forwarder if one peer's path wedges: that packet
+            // is dropped (a truly-dead path is caught by the rx-staleness gate +
+            // keepalive) rather than stalling every other peer behind it.
+            let payload = bytes::Bytes::copy_from_slice(&out_pkt);
+            let send_started = std::time::Instant::now();
+            match tokio::time::timeout(SEND_TIMEOUT, conn.send_datagram_wait(payload)).await {
+                Ok(Ok(())) => {
+                    NET_STATS.eg_sent_ok.fetch_add(1, Relaxed);
+                    // If the send had to wait for buffer space, the send buffer is
+                    // backing up — record it and how long (the "queue full"
+                    // signal). A sub-jitter wait is just the scheduler.
+                    let waited = send_started.elapsed();
+                    if waited >= BACKPRESSURE_MIN {
+                        NET_STATS.eg_backpressure_waits.fetch_add(1, Relaxed);
+                        NET_STATS
+                            .eg_backpressure_nanos
+                            .fetch_add(waited.as_nanos() as u64, Relaxed);
+                    }
+                    NET_STATS.record_egress_latency(t0.elapsed());
+                }
                 // Only abandon the connection if it's genuinely CLOSED. A
                 // transient send failure — no validated path yet on a
                 // freshly-dialed multipath connection, or an over-MTU packet —
@@ -2903,15 +2953,33 @@ impl NetDoc {
                 // never let any connection finish establishing (the no-admin
                 // reconnect failure). A live connection recovers on its own; a
                 // truly-dead one is caught by the rx-staleness gate + keepalive.
-                if conn.close_reason().is_some() {
+                Ok(Err(e)) if conn.close_reason().is_some() => {
+                    NET_STATS.eg_drop_send_closed.fetch_add(1, Relaxed);
                     tracing::debug!("vpn: connection to {pubkey} closed ({e}); dropping from cache");
                     conns.remove(&pubkey);
                     let mut shared = self.vpn_conns.write().await;
                     if shared.get(&pubkey.to_string()).map(|c| c.stable_id()) == Some(conn.stable_id()) {
                         shared.remove(&pubkey.to_string());
                     }
-                } else {
+                }
+                Ok(Err(e)) => {
+                    NET_STATS.eg_send_transient.fetch_add(1, Relaxed);
                     tracing::trace!("vpn: transient send failure to {pubkey} ({e}); keeping connection");
+                }
+                Err(_timeout) => {
+                    // The send buffer stayed full for SEND_TIMEOUT: the path can't
+                    // drain. Drop this packet to free the serial forwarder; keep
+                    // the connection (a congestion spike recovers; a dead path is
+                    // caught by the rx-staleness gate + keepalive). Counts as both
+                    // a backpressure wait (it did block) and a drop.
+                    NET_STATS.eg_backpressure_waits.fetch_add(1, Relaxed);
+                    NET_STATS
+                        .eg_backpressure_nanos
+                        .fetch_add(SEND_TIMEOUT.as_nanos() as u64, Relaxed);
+                    NET_STATS.eg_drop_send_timeout.fetch_add(1, Relaxed);
+                    tracing::trace!(
+                        "vpn: send to {pubkey} blocked past {SEND_TIMEOUT:?} (buffer full); packet dropped"
+                    );
                 }
             }
         }
@@ -3637,7 +3705,7 @@ mod tests {
         assert_eq!(net.list_peers().await.unwrap().len(), 2);
 
         // Reconcile to {alice} → bob revoked and dropped.
-        net.reconcile(&[alice.clone()], &[]).await.unwrap();
+        net.reconcile(std::slice::from_ref(&alice), &[]).await.unwrap();
         let peers = net.list_peers().await.unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].node_id, "a1");

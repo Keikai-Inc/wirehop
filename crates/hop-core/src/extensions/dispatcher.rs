@@ -418,12 +418,22 @@ mod tests {
                 pid: std::process::id(),
                 version: version.clone(),
             };
-            std::fs::write(&bootstrap_path, toml::to_string(&bs).unwrap()).unwrap();
-            std::fs::set_permissions(
-                &bootstrap_path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            // Create the bootstrap file 0o600 atomically. Writing then chmod'ing
+            // leaves a window where it sits at the ambient umask (0644 on macOS),
+            // and the dispatcher's trust check rejects a world-readable bootstrap
+            // — a flake the reader can hit in that window under parallel test load.
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&bootstrap_path)
+                    .unwrap();
+                f.write_all(toml::to_string(&bs).unwrap().as_bytes()).unwrap();
+            }
 
             let (rx, hello) = server.accept().expect("accept");
             let reverse_name = match hello {
@@ -475,12 +485,22 @@ mod tests {
                 pid: std::process::id(),
                 version: version.clone(),
             };
-            std::fs::write(&bootstrap_path, toml::to_string(&bs).unwrap()).unwrap();
-            std::fs::set_permissions(
-                &bootstrap_path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            // Create the bootstrap file 0o600 atomically. Writing then chmod'ing
+            // leaves a window where it sits at the ambient umask (0644 on macOS),
+            // and the dispatcher's trust check rejects a world-readable bootstrap
+            // — a flake the reader can hit in that window under parallel test load.
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&bootstrap_path)
+                    .unwrap();
+                f.write_all(toml::to_string(&bs).unwrap().as_bytes()).unwrap();
+            }
 
             let (rx, hello) = server.accept().expect("accept");
             let reverse_name = match hello {

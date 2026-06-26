@@ -294,6 +294,9 @@ fn dispatch_request(
         DsRequest::SecretsList { username } => {
             DsResponse::SecretNames(ds.secrets_list(&username)?)
         }
+        DsRequest::NetStats => {
+            DsResponse::NetStats(Box::new(crate::netstats::NET_STATS.snapshot()))
+        }
     })
 }
 
@@ -357,6 +360,33 @@ mod tests {
             key: "k1".into(),
         }).unwrap();
         assert!(matches!(resp, DsResponse::Bool(true)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_roundtrip_netstats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Bump a couple of global counters so the snapshot is non-trivial.
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::netstats::NET_STATS.eg_sent_ok.fetch_add(2, Relaxed);
+        crate::netstats::NET_STATS.in_drop_spoof.fetch_add(1, Relaxed);
+
+        let conn = DaemonConnection::connect(dir.path()).unwrap();
+        let resp = conn.request(&DsRequest::NetStats).unwrap();
+        match resp {
+            DsResponse::NetStats(s) => {
+                assert!(s.eg_sent_ok >= 2);
+                assert!(s.in_drop_spoof >= 1);
+                assert_eq!(s.eg_lat.len(), crate::netstats::LAT_BUCKETS);
+                assert_eq!(s.in_lat.len(), crate::netstats::LAT_BUCKETS);
+            }
+            other => panic!("expected NetStats, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

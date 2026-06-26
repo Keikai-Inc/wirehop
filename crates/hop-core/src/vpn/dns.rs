@@ -214,7 +214,6 @@ mod tests {
 
     #[test]
     fn answers_via_name_with_aaaa_record() {
-        use std::net::Ipv6Addr;
         let via6 = crate::vpn::via6_encode(7, Ipv4Addr::new(192, 168, 1, 50));
         let p = query_packet_typed(0x55, "192-168-1-50-via-7.acme.hop", TYPE_AAAA);
         let resp = answer(&p, "acme.hop", |h| {
@@ -225,7 +224,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1); // ANCOUNT 1
         // Last 16 bytes are the AAAA record (the via6 address).
         let n = resp.len();
-        assert_eq!(&resp[n - 16..], &Ipv6Addr::from(via6).octets());
+        assert_eq!(&resp[n - 16..], &via6.octets());
     }
 
     #[test]

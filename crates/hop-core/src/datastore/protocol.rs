@@ -35,6 +35,10 @@ pub enum DsRequest {
     /// invites / report identity instead of reading `_hop`-owned config + needing
     /// root. The socket is group-restricted to the operator group.
     Admin(Box<crate::proto::AdminRequest>),
+    /// Read the data-plane (VPN forwarding) counters. Non-mutating; lets
+    /// `hop debug net-stats` poll drop/queue/latency metrics from the worker.
+    /// Appended last to keep existing variant discriminants stable.
+    NetStats,
 }
 
 /// Response from the daemon's datastore to a client.
@@ -53,4 +57,5 @@ pub enum DsResponse {
     SecretNames(Vec<String>),
     StringList(Vec<String>),
     Admin(Box<crate::proto::AdminResponse>),
+    NetStats(Box<crate::netstats::NetStatsSnapshot>),
 }

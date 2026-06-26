@@ -8,6 +8,7 @@ pub mod fleet;
 pub mod invite;
 pub mod net;
 pub mod netdoc;
+pub mod netstats;
 #[cfg(unix)]
 pub mod privsep;
 pub mod proto;

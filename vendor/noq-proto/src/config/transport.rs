@@ -563,8 +563,20 @@ impl Default for TransportConfig {
             keep_alive_interval: None,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
-            datagram_receive_buffer_size: Some(STREAM_RWND as usize),
-            datagram_send_buffer_size: 1024 * 1024,
+            // hop: the VPN data plane tunnels TCP (e.g. VNC) over QUIC DATAGRAMs.
+            // The stock ~1 MB datagram buffers fill during a screen-update burst;
+            // a full SEND buffer then drops the OLDEST queued datagram, which
+            // manufactures a TCP sequence gap → dup-ACK → fast-retransmit → cwnd
+            // collapse → stall. hop now BACKPRESSURES on a full send buffer
+            // (send_datagram_wait) instead of oldest-dropping, and these larger
+            // ceilings give a burst room to drain before backpressure engages.
+            // 4 MB (≈4×) is a deliberate middle ground: enough to absorb VNC/bulk
+            // bursts, small enough to bound standing-queue latency (~0.3 s even at
+            // 100 Mbps) so interactive traffic doesn't bufferbloat. iroh's
+            // transport-config builder doesn't expose these, so we set the
+            // default here (it flows through TransportConfig::default()).
+            datagram_receive_buffer_size: Some(4 * 1024 * 1024),
+            datagram_send_buffer_size: 4 * 1024 * 1024,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 

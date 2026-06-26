@@ -3,6 +3,7 @@ mod cli;
 mod cpuprofile;
 mod itemize;
 mod memprofile;
+mod netstats;
 mod oauth;
 mod mux;
 mod progress_ui;
@@ -303,6 +304,10 @@ async fn main() -> Result<()> {
                 memprofile::run(act, &config_dir)
             }
             DebugAction::CpuProfile { secs, pid, out } => cpuprofile::run(secs, pid, out),
+            DebugAction::NetStats { watch, interval, json } => {
+                let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+                netstats::run(&config_dir, watch, interval, json)
+            }
         },
         Command::SandboxShell { policy, shell_args } => {
             cmd_sandbox_shell(&policy, &shell_args)
