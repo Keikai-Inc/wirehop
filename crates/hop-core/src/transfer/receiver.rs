@@ -80,22 +80,33 @@ pub async fn receive_files(
                 send_ack(send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
-                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir, &path)?;
-                if let Some(parent) = link_path.parent() {
-                    fs::create_dir_all(parent)?;
+                // A symlink whose target escapes the destination root is a
+                // traversal risk — but rejecting one must NOT kill the whole
+                // transfer (that turned a single bad link into a "broken pipe"
+                // for the sender). Skip it with a NACK, like a failed file, and
+                // keep going. Safe in-tree relative links (npm `.bin/` etc.) pass.
+                if let Err(e) = validate_symlink_within(&path, &target) {
+                    let err_msg = format!("{e:#}");
+                    tracing::warn!("skipping unsafe symlink {path} -> {target}: {err_msg}");
+                    progress.file_error(&path, &err_msg);
+                    send_ack(send, &path, false, Some(err_msg)).await?;
+                } else {
+                    if let Some(parent) = link_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    // Remove existing symlink/file if present
+                    let _ = fs::remove_file(&link_path);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&target, &link_path)
+                        .with_context(|| format!("symlink: {}", link_path.display()))?;
+                    #[cfg(not(unix))]
+                    {
+                        // On non-Unix, just skip symlinks
+                        tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
+                    }
+                    send_ack(send, &path, true, None).await?;
                 }
-                // Remove existing symlink/file if present
-                let _ = fs::remove_file(&link_path);
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &link_path)
-                    .with_context(|| format!("symlink: {}", link_path.display()))?;
-                #[cfg(not(unix))]
-                {
-                    // On non-Unix, just skip symlinks
-                    tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
-                }
-                send_ack(send, &path, true, None).await?;
             }
             TransferMsg::DeletePath(path) => {
                 let target = safe_join(&dest_dir, &path)?;
@@ -381,20 +392,28 @@ pub async fn receive_parallel(
                 send_ack(control_send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
-                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir_canon, &path)?;
-                if let Some(parent) = link_path.parent() {
-                    fs::create_dir_all(parent)?;
+                // Skip (don't abort) a symlink whose target escapes the root;
+                // safe in-tree relative links (npm `.bin/` etc.) pass.
+                if let Err(e) = validate_symlink_within(&path, &target) {
+                    let err_msg = format!("{e:#}");
+                    tracing::warn!("skipping unsafe symlink {path} -> {target}: {err_msg}");
+                    progress.file_error(&path, &err_msg);
+                    send_ack(control_send, &path, false, Some(err_msg)).await?;
+                } else {
+                    if let Some(parent) = link_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let _ = fs::remove_file(&link_path);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&target, &link_path)
+                        .with_context(|| format!("symlink: {}", link_path.display()))?;
+                    #[cfg(not(unix))]
+                    {
+                        tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
+                    }
+                    send_ack(control_send, &path, true, None).await?;
                 }
-                let _ = fs::remove_file(&link_path);
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &link_path)
-                    .with_context(|| format!("symlink: {}", link_path.display()))?;
-                #[cfg(not(unix))]
-                {
-                    tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
-                }
-                send_ack(control_send, &path, true, None).await?;
             }
             TransferMsg::Done => break,
             TransferMsg::Error(e) => bail!("remote error: {e}"),
@@ -598,20 +617,28 @@ pub async fn receive_files_with_delta(
                 send_ack(send, &dir.path, true, None).await?;
             }
             TransferMsg::CreateSymlink { path, target } => {
-                validate_symlink_target(&target)?;
                 let link_path = safe_join(&dest_dir, &path)?;
-                if let Some(parent) = link_path.parent() {
-                    fs::create_dir_all(parent)?;
+                // Skip (don't abort) a symlink whose target escapes the root;
+                // safe in-tree relative links (npm `.bin/` etc.) pass.
+                if let Err(e) = validate_symlink_within(&path, &target) {
+                    let err_msg = format!("{e:#}");
+                    tracing::warn!("skipping unsafe symlink {path} -> {target}: {err_msg}");
+                    progress.file_error(&path, &err_msg);
+                    send_ack(send, &path, false, Some(err_msg)).await?;
+                } else {
+                    if let Some(parent) = link_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let _ = fs::remove_file(&link_path);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&target, &link_path)
+                        .with_context(|| format!("symlink: {}", link_path.display()))?;
+                    #[cfg(not(unix))]
+                    {
+                        tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
+                    }
+                    send_ack(send, &path, true, None).await?;
                 }
-                let _ = fs::remove_file(&link_path);
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &link_path)
-                    .with_context(|| format!("symlink: {}", link_path.display()))?;
-                #[cfg(not(unix))]
-                {
-                    tracing::warn!("Symlinks not supported on this platform, skipping: {path}");
-                }
-                send_ack(send, &path, true, None).await?;
             }
             TransferMsg::DeletePath(path) => {
                 let target = safe_join(&dest_dir, &path)?;
@@ -659,15 +686,52 @@ fn has_parent_dir_component(path: &Path) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-/// Validate a symlink target is safe: no absolute paths, no `..` traversal.
-/// Only relative targets that stay within the destination are allowed.
-fn validate_symlink_target(target: &str) -> Result<()> {
+/// Validate that a symlink at `rel_link_path` (the link's path relative to the
+/// destination root) points to a target that stays within that root.
+///
+/// The target is resolved against the link's own directory and normalized
+/// **lexically** — collapsing `.`/`..` without touching the filesystem, since
+/// the tree is still being written and the target may not exist yet. An
+/// absolute target, or one that climbs above the root, is rejected; everything
+/// else is allowed, including the ubiquitous in-tree relative links such as
+/// npm's `.bin/foo -> ../foo/bin/foo`. The old check banned *every* `..`, which
+/// rejected those safe links and aborted any transfer containing `node_modules`.
+fn validate_symlink_within(rel_link_path: &str, target: &str) -> Result<()> {
+    use std::ffi::OsString;
+    use std::path::Component;
+
     let target_path = Path::new(target);
     if target_path.is_absolute() {
         bail!("symlink with absolute target rejected: {target}");
     }
-    if has_parent_dir_component(target_path) {
-        bail!("symlink with traversal target rejected: {target}");
+
+    // Depth stack of path components relative to the root. Seed it with the
+    // link's own parent directory (already confined to the root by safe_join),
+    // then walk the target. Popping past the root means the link escapes it.
+    let mut stack: Vec<OsString> = Vec::new();
+    let parent = Path::new(rel_link_path).parent().unwrap_or(Path::new(""));
+    for comp in parent.components() {
+        match comp {
+            Component::Normal(c) => stack.push(c.to_os_string()),
+            Component::ParentDir => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    for comp in target_path.components() {
+        match comp {
+            Component::Normal(c) => stack.push(c.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    bail!("symlink target escapes destination root: {target}");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("symlink with absolute target rejected: {target}");
+            }
+        }
     }
     Ok(())
 }
@@ -766,17 +830,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_symlink_target_accepts_dots_in_names() {
-        validate_symlink_target("foo..bar").unwrap();
-        validate_symlink_target("dir/file...ext").unwrap();
+    fn validate_symlink_within_allows_in_tree_relative() {
+        // The npm `.bin` pattern that the old check wrongly rejected.
+        validate_symlink_within("node_modules/.bin/acorn", "../acorn/bin/acorn").unwrap();
+        // Other safe relative links that stay within the destination tree.
+        validate_symlink_within("a/b/link", "../c/file").unwrap();
+        validate_symlink_within("link", "target").unwrap();
+        validate_symlink_within("dir/link", "./sub/file").unwrap();
+        validate_symlink_within("a/../b/link", "../c").unwrap();
+        // Dots inside names are fine (not parent-dir components).
+        validate_symlink_within("link", "foo..bar").unwrap();
+        validate_symlink_within("link", "dir/file...ext").unwrap();
     }
 
     #[test]
-    fn validate_symlink_target_rejects_traversal() {
-        assert!(validate_symlink_target("..").is_err());
-        assert!(validate_symlink_target("../escape").is_err());
-        assert!(validate_symlink_target("a/../b").is_err());
-        assert!(validate_symlink_target("/absolute").is_err());
+    fn validate_symlink_within_rejects_escape_and_absolute() {
+        // Climbing above the destination root.
+        assert!(validate_symlink_within("link", "..").is_err());
+        assert!(validate_symlink_within("link", "../escape").is_err());
+        assert!(validate_symlink_within("a/b/link", "../../../etc/passwd").is_err());
+        // a/b/link -> ../../.. pops a, b, then escapes the root.
+        assert!(validate_symlink_within("a/b/link", "../../../x").is_err());
+        // Absolute targets are always rejected.
+        assert!(validate_symlink_within("link", "/absolute").is_err());
+        assert!(validate_symlink_within("link", "/etc/passwd").is_err());
     }
 
     /// Reproduce the sender/receiver zstd roundtrip to verify data integrity.
