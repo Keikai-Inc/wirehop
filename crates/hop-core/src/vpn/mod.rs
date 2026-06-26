@@ -434,6 +434,27 @@ pub type VpnLastRx =
 pub type VpnConns =
     std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>>;
 
+/// Egress forwarding cache: member vIP → resolved `(endpoint pubkey, relay url)`.
+/// Built by `NetDoc::refresh_vpn_peer_ips` on the 5s tick (and on the refresh
+/// notify), so `vpn_outbound_loop` resolves a destination with one map lookup
+/// instead of `lookup_vpn_endpoint`'s iroh-docs scans per packet. Those per-packet
+/// scans pinned redb's MVCC read version, blocking page reclamation while
+/// background sync writes churned — the data-plane memory leak. Mirrors the
+/// ingress `VpnPeerIps` cache; the doc path stays as the cold/miss fallback.
+#[cfg(unix)]
+pub type VpnFwd = std::sync::Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<Ipv4Addr, (iroh::PublicKey, Option<iroh::RelayUrl>)>,
+    >,
+>;
+
+/// Egress reach cache: member vIP → owning node-id. Built on the same refresh
+/// tick so the per-packet reach ACL (`vpn_reach_allowed`) does a map lookup
+/// instead of `list_virtual_ips()` (a full `ip/` doc scan + blob reads) per packet.
+#[cfg(unix)]
+pub type VpnVipOwner =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<Ipv4Addr, String>>>;
+
 /// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
 /// packets) to the TUN device — **after authenticating ingress** (security-audit
 /// C2). A datagram is delivered only if (a) the connecting node is a registered

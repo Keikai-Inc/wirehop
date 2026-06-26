@@ -260,6 +260,15 @@ pub struct NetDoc {
     /// shared with the `VpnInbound` handler; refreshed from the `vpn/` table.
     #[cfg(unix)]
     vpn_peer_ips: crate::vpn::VpnPeerIps,
+    /// Egress forwarding cache: vIP → `(endpoint pubkey, relay)`, built on the
+    /// refresh tick. The per-packet forwarder reads this instead of scanning
+    /// iroh-docs (the read-side of the data-plane leak). Doc path is the fallback.
+    #[cfg(unix)]
+    vpn_fwd: crate::vpn::VpnFwd,
+    /// Egress reach cache: vIP → owner node-id, built on the same tick so the
+    /// per-packet reach ACL is a map lookup, not a `list_virtual_ips()` doc scan.
+    #[cfg(unix)]
+    vpn_vip_owner: crate::vpn::VpnVipOwner,
     /// This host's own vIP (the only legitimate ingress destination).
     #[cfg(unix)]
     vpn_local_ip: crate::vpn::VpnLocalIp,
@@ -403,6 +412,12 @@ impl NetDoc {
         let vpn_peer_ips: crate::vpn::VpnPeerIps =
             std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         #[cfg(unix)]
+        let vpn_fwd: crate::vpn::VpnFwd =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        #[cfg(unix)]
+        let vpn_vip_owner: crate::vpn::VpnVipOwner =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        #[cfg(unix)]
         let vpn_local_ip: crate::vpn::VpnLocalIp = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         #[cfg(unix)]
         let vpn_refresh: crate::vpn::VpnRefresh = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -461,6 +476,10 @@ impl NetDoc {
             vpn_tun,
             #[cfg(unix)]
             vpn_peer_ips,
+            #[cfg(unix)]
+            vpn_fwd,
+            #[cfg(unix)]
+            vpn_vip_owner,
             #[cfg(unix)]
             vpn_local_ip,
             #[cfg(unix)]
@@ -1243,12 +1262,36 @@ impl NetDoc {
         &self,
         addr: std::net::Ipv4Addr,
     ) -> Result<Option<(iroh::PublicKey, Option<iroh::RelayUrl>)>> {
-        let key = format!("{KEY_VPN_PREFIX}{addr}");
-        let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
+        // Fast path: the egress forwarding cache, rebuilt on the 5s refresh tick
+        // (and on the refresh notify). The per-packet forwarder hits this instead
+        // of scanning iroh-docs below — those per-packet scans pinned redb's MVCC
+        // read version and blocked page reclamation (the data-plane leak). A miss
+        // (a brand-new peer in the ~1s before the next refresh) falls through to
+        // the doc resolution and kicks a refresh so the cache converges.
+        #[cfg(unix)]
+        if let Some(ep) = self.vpn_fwd.read().await.get(&addr).cloned() {
+            return Ok(Some(ep));
+        }
+        #[cfg(unix)]
+        self.vpn_refresh.notify_one();
 
         // Who owns this vIP? Validated (admin-allocated peer.vip / vouched ip/).
-        // Computed once, reused by the self-doc lookup and the node-id fallback.
         let owner = self.vip_owner(addr).await;
+        Ok(self.resolve_endpoint_for(addr, owner).await)
+    }
+
+    /// Resolve a vIP's endpoint given its already-known `owner`, by reading
+    /// iroh-docs: roster `vpn_endpoint` → owner self-doc → shared `vpn/` → owner
+    /// node-id. This is the doc-reading body shared by `lookup_vpn_endpoint` (the
+    /// per-packet cache-miss fallback) and `refresh_vpn_peer_ips` (which calls it
+    /// per member off the data path to build the `vpn_fwd` cache).
+    async fn resolve_endpoint_for(
+        &self,
+        addr: std::net::Ipv4Addr,
+        owner: Option<String>,
+    ) -> Option<(iroh::PublicKey, Option<iroh::RelayUrl>)> {
+        let key = format!("{KEY_VPN_PREFIX}{addr}");
+        let mk_query = || Query::single_latest_per_key().key_exact(key.as_bytes()).build();
 
         // Preferred: the owner's endpoint recorded in the admin doc roster
         // (`peer/N.vpn_endpoint`). Admin-vouched (the peer entry is admin-authored,
@@ -1262,7 +1305,7 @@ impl NetDoc {
             && let Some(v) = parse_vpn_endpoint_value(val.as_bytes())
         {
             tracing::debug!("netdoc egress: {addr} resolved via roster vpn_endpoint");
-            return Ok(Some(v));
+            return Some(v);
         }
 
         // Fallback: the addr owner's self-doc (the isolated endpoint source) — for
@@ -1275,7 +1318,7 @@ impl NetDoc {
             && let Some(v) = parse_vpn_endpoint_value(&bytes)
         {
             tracing::debug!("netdoc egress: {addr} resolved via owner self-doc");
-            return Ok(Some(v));
+            return Some(v);
         }
 
         // Fallback 1: the shared `vpn/` table (legacy / self-doc not yet imported).
@@ -1288,7 +1331,7 @@ impl NetDoc {
             && let Some(v) = parse_vpn_endpoint_value(&bytes)
         {
             tracing::debug!("netdoc egress: {addr} resolved via shared fallback");
-            return Ok(Some(v));
+            return Some(v);
         }
 
         // Fallback 2: the vIP OWNER's node-id alone. We already know who owns this
@@ -1303,11 +1346,11 @@ impl NetDoc {
         {
             let relay = crate::net::HOP_RELAY_URL.parse().ok();
             tracing::debug!("netdoc egress: {addr} resolved via owner node-id fallback");
-            return Ok(Some((pubkey, relay)));
+            return Some((pubkey, relay));
         }
 
         tracing::debug!("netdoc egress: {addr} UNRESOLVED (no self-doc, no shared entry, no owner)");
-        Ok(None)
+        None
     }
 
     /// Resolve a **gateway node's** VPN endpoint by node-id, for routing to a
@@ -1629,6 +1672,25 @@ impl NetDoc {
         }
         *self.vpn_peer_ips.write().await = map;
 
+        // Egress caches: the per-packet forwarder reads these instead of scanning
+        // iroh-docs (the reach `ip/` scan + the endpoint `peer/`/`vpn/` scans that
+        // pinned redb's read version and leaked). Build them here, off the data
+        // path, from the same validated `ip_owner`: vIP→owner for the reach ACL,
+        // and vIP→(pubkey, relay) by resolving each owner's endpoint once. Skip on
+        // an empty `ip_owner` (transient sync gap) to keep last-known-good, like
+        // the `vpn_peer_ips` guard above.
+        if !ip_owner.is_empty() {
+            let mut fwd: HashMap<std::net::Ipv4Addr, (iroh::PublicKey, Option<iroh::RelayUrl>)> =
+                HashMap::with_capacity(ip_owner.len());
+            for (addr, owner) in ip_owner.iter() {
+                if let Some(ep) = self.resolve_endpoint_for(*addr, Some(owner.clone())).await {
+                    fwd.insert(*addr, ep);
+                }
+            }
+            *self.vpn_fwd.write().await = fwd;
+            *self.vpn_vip_owner.write().await = ip_owner;
+        }
+
         // Tier 1 LAN bridging: recompute per-route reach gates on the same tick.
         self.refresh_gateway_acl().await;
     }
@@ -1896,38 +1958,25 @@ impl NetDoc {
         // Each deny path logs WHY (debug) — the reach decision was previously a
         // silent drop, which made "I'm a member but can't reach anything"
         // impossible to diagnose without a code change.
-        let ips = match self.list_virtual_ips().await {
-            Ok(v) => v,
-            Err(e) => {
-                // Fail OPEN on a roster READ error (a doc-level failure — missing
-                // blobs are skipped per-entry, not errors). Hard-denying all egress
-                // over a transient read is the "dead until restart" footgun. Safe:
-                // delivery is still gated by lookup_vpn_endpoint (an unknown vIP has
-                // no endpoint → dropped there), so fail-open can't reach a
-                // non-member. Kick a refresh and allow.
-                tracing::warn!(
-                    "reach ALLOW(read-error) {src_ip}->{dst_ip}: list_virtual_ips failed ({e:#}) — \
-                     refreshing rather than blackholing"
-                );
-                self.vpn_refresh.notify_one();
-                return true;
-            }
+        // Read the vIP→owner mapping from the cache (rebuilt on the 5s refresh tick),
+        // NOT a per-packet `list_virtual_ips()` doc scan. Clone the two owners and
+        // drop the lock before the (async) reach-engine check.
+        let (src_node, dst_node) = {
+            let owners = self.vpn_vip_owner.read().await;
+            (owners.get(&src_ip).cloned(), owners.get(&dst_ip).cloned())
         };
-        let owner = |ip: std::net::Ipv4Addr| ips.iter().find(|(a, _)| *a == ip).map(|(_, n)| n.clone());
-        let (Some(src_node), Some(dst_node)) = (owner(src_ip), owner(dst_ip)) else {
-            // The ip/ ownership table lags peer/role sync (5s refresh tick). Hard-
-            // denying here drops a legitimate member's packets during the
-            // convergence window — the "member but can't reach" footgun, just
-            // relocated to the resolution layer. Fail OPEN and kick a refresh
-            // instead of blackholing: the endpoint-resolution step
-            // (lookup_vpn_endpoint) still gates actual delivery, so an unknown
+        let (src_known, dst_known) = (src_node.is_some(), dst_node.is_some());
+        let (Some(src_node), Some(dst_node)) = (src_node, dst_node) else {
+            // The vIP→owner cache lags peer/role sync (5s refresh tick + notify).
+            // Hard-denying here drops a legitimate member's packets during the
+            // convergence window — the "member but can't reach" footgun. Fail OPEN
+            // and kick a refresh instead of blackholing: the endpoint-resolution
+            // step (lookup_vpn_endpoint) still gates actual delivery, so an unknown
             // vIP has no endpoint and is dropped there — fail-open here can't
             // forward to a non-member, it only avoids dropping during sync lag.
             tracing::debug!(
-                "reach ALLOW(sync) {src_ip}->{dst_ip}: vIP owner not resolved yet (src_known={}, \
-                 dst_known={}) — refreshing rather than blackholing",
-                owner(src_ip).is_some(),
-                owner(dst_ip).is_some()
+                "reach ALLOW(sync) {src_ip}->{dst_ip}: vIP owner not in cache yet \
+                 (src_known={src_known}, dst_known={dst_known}) — refreshing rather than blackholing"
             );
             self.vpn_refresh.notify_one();
             return true;
@@ -3628,17 +3677,23 @@ mod tests {
         net.put_peer(&dev).await.unwrap();
         net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
 
-        // Developer reaches the staging host.
+        // Developer reaches the staging host. `vpn_reach_allowed` reads the
+        // vIP→owner cache that the refresh tick builds, so refresh first (in prod
+        // the 5s tick / refresh notify does this).
+        net.refresh_vpn_peer_ips().await;
         assert!(net.vpn_reach_allowed(src_ip, dst_ip, None).await);
 
-        // Re-tag the host production-only → developer is denied.
+        // Re-tag the host production-only → developer is denied. (vIP→owner is
+        // unchanged; the reach engine picks up the new tag.)
         net.register_host_tags("staginghost", &["production".into()]).await.unwrap();
+        net.refresh_vpn_peer_ips().await;
         assert!(!net.vpn_reach_allowed(src_ip, dst_ip, None).await);
 
         // A peer with NO role_name reaches nothing.
         let m_ip = net.claim_virtual_ip("memberpeer").await.unwrap();
         net.put_peer(&sample_peer("memberpeer", "m")).await.unwrap();
         net.register_host_tags("staginghost", &["staging".into()]).await.unwrap();
+        net.refresh_vpn_peer_ips().await;
         assert!(!net.vpn_reach_allowed(m_ip, dst_ip, None).await);
 
         // But a peer WITH a role name that isn't defined/synced still reaches the
@@ -3648,6 +3703,7 @@ mod tests {
         let mut u = sample_peer("unsyncedpeer", "u");
         u.role_name = Some("member".into()); // no "member" role defined in this doc
         net.put_peer(&u).await.unwrap();
+        net.refresh_vpn_peer_ips().await;
         assert!(net.vpn_reach_allowed(u_ip, dst_ip, None).await);
 
         // A leaf member owns a vIP but holds NO peer roster — its own node is not
@@ -3658,6 +3714,7 @@ mod tests {
         // above.) This is THE bug behind the two-Mac warren's 100% packet loss.
         let leaf_ip = net.claim_virtual_ip("leafnode").await.unwrap();
         // deliberately no put_peer("leafnode") → not a known principal locally
+        net.refresh_vpn_peer_ips().await;
         assert!(net.vpn_reach_allowed(leaf_ip, dst_ip, None).await);
     }
 
