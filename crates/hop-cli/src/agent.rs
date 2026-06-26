@@ -116,8 +116,17 @@ enum AgentCommand {
         host_id: PublicKey,
         result: Result<Connection>,
     },
-    /// Evict a stale connection after an open_bi failure.
+    /// Evict a stale connection after an open_bi failure or reconnect.
+    /// Skipped if the host still has live sessions (the conn is in use).
     RemoveConnection {
+        host_id: PublicKey,
+    },
+    /// A multiplexed proxy session for `host_id` started.
+    SessionStarted {
+        host_id: PublicKey,
+    },
+    /// A multiplexed proxy session for `host_id` ended.
+    SessionEnded {
         host_id: PublicKey,
     },
     /// Flush all pooled connections (sleep/wake recovery).
@@ -163,6 +172,19 @@ impl AgentHandle {
             .await;
     }
 
+    /// Register a started proxy session for `host_id` (fire-and-forget).
+    async fn session_started(&self, host_id: PublicKey) {
+        let _ = self
+            .tx
+            .send(AgentCommand::SessionStarted { host_id })
+            .await;
+    }
+
+    /// Register an ended proxy session for `host_id` (fire-and-forget).
+    async fn session_ended(&self, host_id: PublicKey) {
+        let _ = self.tx.send(AgentCommand::SessionEnded { host_id }).await;
+    }
+
     /// Flush all pooled connections (fire-and-forget).
     async fn flush_all(&self) {
         let _ = self.tx.send(AgentCommand::FlushAll).await;
@@ -189,11 +211,38 @@ struct AgentState {
     endpoint: Endpoint,
     connections: HashMap<PublicKey, Connection>,
     semaphores: HashMap<PublicKey, Arc<tokio::sync::Semaphore>>,
+    /// Live multiplexed sessions per host. The pooled connection is shared across
+    /// all sessions to a host, so eviction must never close a connection that
+    /// still has a live session on it (see `RemoveConnection`).
+    active: HashMap<PublicKey, usize>,
     /// In-flight connect waiters: queued reply channels for hosts being connected.
     pending: HashMap<PublicKey, Vec<ConnectReply>>,
     /// Self-sender for spawned connect tasks to send ConnectDone back.
     tx: mpsc::Sender<AgentCommand>,
     last_activity: Instant,
+}
+
+/// Whether a host's pooled connection may be evicted. Eviction closes the
+/// shared per-host connection's streams, so it is only safe when no live session
+/// is using it — otherwise a concurrent session's reconnect would tear down the
+/// streams in use (the mutual-eviction loop). See `AgentCommand::RemoveConnection`.
+fn may_evict(active: &HashMap<PublicKey, usize>, host_id: &PublicKey) -> bool {
+    active.get(host_id).copied().unwrap_or(0) == 0
+}
+
+/// Record that a proxy session for `host_id` started.
+fn session_inc(active: &mut HashMap<PublicKey, usize>, host_id: PublicKey) {
+    *active.entry(host_id).or_insert(0) += 1;
+}
+
+/// Record that a proxy session for `host_id` ended (drops the entry at zero).
+fn session_dec(active: &mut HashMap<PublicKey, usize>, host_id: &PublicKey) {
+    if let Some(n) = active.get_mut(host_id) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            active.remove(host_id);
+        }
+    }
 }
 
 /// Spawn the agent actor and return a handle.
@@ -203,6 +252,7 @@ fn spawn_agent_actor(endpoint: Endpoint) -> AgentHandle {
         endpoint,
         connections: HashMap::new(),
         semaphores: HashMap::new(),
+        active: HashMap::new(),
         pending: HashMap::new(),
         tx: tx.clone(),
         last_activity: Instant::now(),
@@ -292,10 +342,31 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
             }
 
             AgentCommand::RemoveConnection { host_id } => {
-                tracing::debug!("actor: evicting connection for {} (open_bi failed, pool size: {})", host_id.fmt_short(), state.connections.len().saturating_sub(1));
-                if let Some(conn) = state.connections.remove(&host_id) {
-                    conn.close(0u32.into(), b"open-bi-failed");
+                // Never close a connection that still has live multiplexed
+                // sessions. The pooled connection is shared per-host, so evicting
+                // it — e.g. a concurrent session's reconnect dialing with
+                // evict_first — would tear down the streams the other sessions are
+                // actively using. That is a mutual-eviction reconnect loop between
+                // two `hop connect` sessions to the same host: each one's reconnect
+                // kills the other's connection, forever. A connection with a live
+                // session is provably not half-open, so keep it; only evict an
+                // idle (genuinely stale) pooled connection.
+                if may_evict(&state.active, &host_id) {
+                    if let Some(conn) = state.connections.remove(&host_id) {
+                        tracing::debug!("actor: evicting idle connection for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
+                        conn.close(0u32.into(), b"evicted-idle");
+                    }
+                } else {
+                    tracing::debug!("actor: skip evicting connection for {} — {} active session(s) still using it", host_id.fmt_short(), state.active.get(&host_id).copied().unwrap_or(0));
                 }
+            }
+
+            AgentCommand::SessionStarted { host_id } => {
+                session_inc(&mut state.active, host_id);
+            }
+
+            AgentCommand::SessionEnded { host_id } => {
+                session_dec(&mut state.active, &host_id);
             }
 
             AgentCommand::FlushAll => {
@@ -449,9 +520,12 @@ async fn handle_client(
     // 7. Drop semaphore permit — unblocks next waiter, doesn't block proxy
     drop(permit);
 
-    // 8. Track active session
+    // 8. Track active session. The per-host count guards the shared pooled
+    // connection from being evicted out from under this session (see
+    // RemoveConnection); the global counter drives idle shutdown.
     let session_start = Instant::now();
     active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    handle.session_started(host_id).await;
     handle.touch_activity().await;
     tracing::debug!("handle_client: session started for {}", host_id.fmt_short());
 
@@ -460,6 +534,7 @@ async fn handle_client(
 
     // 10. Session done
     active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    handle.session_ended(host_id).await;
     handle.touch_activity().await;
     tracing::debug!("handle_client: session ended for {} (duration: {:?})", host_id.fmt_short(), session_start.elapsed());
 
@@ -961,6 +1036,45 @@ mod tests {
         }
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // Regression: two concurrent `hop connect` sessions to one host share a single
+    // pooled connection. A reconnect's evict_first must NOT close that connection
+    // while another session is live, or the two sessions mutually evict each other
+    // in an endless reconnect loop. Eviction is allowed only once the host is idle.
+    #[test]
+    fn eviction_gated_by_live_sessions() {
+        let host = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let other = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut active = HashMap::new();
+
+        // No sessions yet: an idle/stale pooled connection may be evicted.
+        assert!(may_evict(&active, &host));
+
+        // Two sessions to `host` come up (they multiplex over one connection).
+        session_inc(&mut active, host);
+        session_inc(&mut active, host);
+        assert_eq!(active.get(&host).copied(), Some(2));
+        // A reconnect on either session must not evict the in-use connection.
+        assert!(!may_evict(&active, &host));
+
+        // A different host is unaffected — its idle connection can still be evicted.
+        assert!(may_evict(&active, &other));
+
+        // One session ends; the other is still live, so eviction stays blocked.
+        session_dec(&mut active, &host);
+        assert_eq!(active.get(&host).copied(), Some(1));
+        assert!(!may_evict(&active, &host));
+
+        // Last session ends: the host is idle and the entry is cleared, so a
+        // genuinely stale pooled connection may now be evicted on reconnect.
+        session_dec(&mut active, &host);
+        assert!(!active.contains_key(&host));
+        assert!(may_evict(&active, &host));
+
+        // Decrementing an already-absent host is a no-op (no underflow panic).
+        session_dec(&mut active, &host);
+        assert!(may_evict(&active, &host));
     }
 
     #[tokio::test]
