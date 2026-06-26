@@ -40,11 +40,13 @@ use hop_core::transfer::{self, PathSpec};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// On Linux, use jemalloc (compiled with prof support, inactive by default) so
-// `hop debug mem-profile` can turn on heap profiling without a special build.
+// On 64-bit Linux, use jemalloc (compiled with prof support, inactive by default)
+// so `hop debug mem-profile` can turn on heap profiling without a special build.
 // Negligible overhead until activated via MALLOC_CONF=prof:true. macOS uses the
-// system allocator + native MallocStackLogging instead. Skipped under dhat-heap.
-#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
+// system allocator + native MallocStackLogging instead; 32-bit Linux (armv7)
+// keeps the system allocator (jemalloc's __ffsdi2 doesn't link there). Skipped
+// under dhat-heap.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(feature = "dhat-heap")))]
 #[global_allocator]
 static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

@@ -45,10 +45,12 @@ inferno = { version = "0.12", default-features = false }
 # support but inactive by default (negligible overhead) — `mem-profile on`
 # re-execs with MALLOC_CONF=prof:true and `snapshot`/SIGUSR2 triggers prof.dump,
 # analyzed with jeprof. macOS uses the native MallocStackLogging + malloc_history
-# path instead, so jemalloc is Linux-only. The `#[global_allocator]` in main.rs
-# is additionally gated `not(feature = "dhat-heap")` so the two profilers never
-# collide (cargo target keys can't express the feature gate, so it lives in code).
-[target.'cfg(target_os = "linux")'.dependencies]
+# path instead, so jemalloc is Linux-only. Restricted to 64-bit: jemalloc's
+# pow2_ceil_u64 pulls in __ffsdi2, which doesn't resolve in the 32-bit armv7
+# static-musl link (armv7 keeps the system allocator; heap profiling there is a
+# non-need). The `#[global_allocator]` in main.rs is additionally gated
+# `not(feature = "dhat-heap")` so the two profilers never collide.
+[target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["profiling"] }
 

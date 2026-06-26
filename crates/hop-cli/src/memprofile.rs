@@ -480,12 +480,13 @@ mod platform {
     }
 
     pub fn profiler_available() -> bool {
-        // jemalloc is compiled in; jeprof is only needed to symbolize and we degrade
-        // gracefully without it, so profiling is always "available" on Linux.
-        true
+        // jemalloc (the heap profiler) is only linked on 64-bit Linux; jeprof is
+        // only needed to symbolize and we degrade gracefully without it.
+        cfg!(target_pointer_width = "64")
     }
     pub fn unavailable_msg() -> String {
-        String::new()
+        "heap profiling needs jemalloc, which is only built on 64-bit Linux (this is a 32-bit build)."
+            .into()
     }
 
     pub fn snapshot(pid: u32, out: &Path) -> Result<()> {
@@ -529,6 +530,7 @@ mod platform {
         Ok(())
     }
 
+    #[cfg(target_pointer_width = "64")]
     pub fn self_snapshot(_pid: u32) -> Result<PathBuf> {
         // Trigger jemalloc's dump to the deterministic LINUX_HEAP path. mallctl
         // `prof.dump` reads `newp` as a `const char *` filename, so we pass the
@@ -543,6 +545,11 @@ mod platform {
             })?;
         }
         Ok(PathBuf::from(LINUX_HEAP))
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    pub fn self_snapshot(_pid: u32) -> Result<PathBuf> {
+        bail!("heap profiling unavailable on 32-bit Linux (jemalloc is 64-bit only)")
     }
 }
 
