@@ -31,6 +31,24 @@ CYCLES="${SOAK_CYCLES:-10}"
 WARM_BUDGET_MS=60000
 COLD_BUDGET_MS=60000
 BACKSTOP_MS=120000
+# Per-perturbation warm-recovery budgets (ms). founder_restart is the hardest
+# case — its TTR spans the founder daemon's boot + rejoin PLUS the member's
+# recovery of a silently-dead path after an abrupt (SIGKILL) reboot. Two fixes
+# (netdoc/mod.rs + vpn/mod.rs) closed the tail: seeding last_rx at inbound accept
+# (the member latches onto the founder's fresh redial instead of tearing it down
+# — was a >120s livelock) and cutting DIAL_GRACE 30s→12s (a dead-but-Ok dial was
+# reused for the full grace before re-dialing — was the fixed ~27s tail). Under
+# the SIGKILL soak, founder_restart now runs ~1.3-6.6s; 18s banks that with
+# headroom over the ~15s DIAL_GRACE-bounded worst case while still failing a
+# release if the ~27s tail ever returns. The rest recover near-instantly in this
+# topology (direct path, no founder boot). Releases are GATED via release.sh.
+FOUNDER_BUDGET_MS="${FOUNDER_BUDGET_MS:-18000}"
+budget_for() {
+  case "$1" in
+    founder_restart) echo "$FOUNDER_BUDGET_MS" ;;
+    *) echo "$WARM_BUDGET_MS" ;;
+  esac
+}
 RELAY_HOST="relay.keik.ai"
 # CROSS_SITE=1: founder + member on SEPARATE docker networks (no shared L2 → mDNS
 # cannot bridge them — the genuine cross-site case), connected only through a LOCAL
@@ -48,6 +66,11 @@ say() { echo "=== $* ==="; }
 trap 'cleanup' EXIT
 cleanup() {
   say "cleanup"
+  if [ -n "${HOP_DUMP_LOGS:-}" ]; then
+    docker exec "$MEMBER" cat /cfg/log >"${HOP_DUMP_LOGS}/member.log" 2>/dev/null || true
+    docker exec "$FOUNDER" cat /cfg/log >"${HOP_DUMP_LOGS}/founder.log" 2>/dev/null || true
+    echo "dumped logs to ${HOP_DUMP_LOGS}/{member,founder}.log"
+  fi
   docker rm -f "$FOUNDER" "$MEMBER" >/dev/null 2>&1 || true
   docker network rm "$NET" "$NET_A" "$NET_B" >/dev/null 2>&1 || true
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null
@@ -79,7 +102,13 @@ COMMON_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun
 # start hop host inside a container (detached), config persisted at /cfg so a
 # restart is a WARM restart (roster already on disk).
 start_daemon() { docker exec -d "$1" bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'; }
-stop_daemon()  { docker exec "$1" pkill -f 'hop .*host' >/dev/null 2>&1 || true; }
+# SIGKILL (-9), not SIGTERM: a host restart/reboot is ABRUPT — the daemon never
+# gets to send a QUIC close-notify, so the peer must detect the silently-dead path
+# (rx-staleness) and recover, which is the realistic + hardest case. SIGTERM let
+# the daemon shut down gracefully (a clean close → the peer redials instantly),
+# which under-tested recovery and read as NO-IMPACT when the graceful close
+# outlasted the impact window. Kill ALL hop processes (privsep monitor + worker).
+stop_daemon()  { docker exec "$1" pkill -9 -f 'hop' >/dev/null 2>&1 || true; }
 
 # --- bring up the warren --------------------------------------------------
 say "starting containers (long-lived; hop driven via exec)"
@@ -236,17 +265,18 @@ print(pct(ok,50), pct(ok,95), (max(ok) if ok else -1), fails, noimpact)
 PY
 )
 EOF
+  bud=$(budget_for "$name")
   if [ -z "$p50" ] || { [ "$p50" = "-1" ] && [ "$noimpact" -gt 0 ]; }; then
     # only no-impact samples (no real outage in this topology)
     printf "  %-16s no-impact (topology)\n" "$name"
-    echo "| ${name} | n/a | n/a | n/a | ${WARM_BUDGET_MS}ms | no-impact |" >>"$ART"
+    echo "| ${name} | n/a | n/a | n/a | ${bud}ms | no-impact |" >>"$ART"
     continue
   fi
   status="PASS"
   [ "$fails" -gt 0 ] && { status="FAIL(${fails} timeout)"; RC=1; }
-  [ "$mx" -gt "$WARM_BUDGET_MS" ] 2>/dev/null && { status="FAIL(over budget)"; RC=1; }
-  printf "  %-16s p50=%sms p95=%sms max=%sms  %s\n" "$name" "$p50" "$p95" "$mx" "$status"
-  echo "| ${name} | ${p50}ms | ${p95}ms | ${mx}ms | ${WARM_BUDGET_MS}ms | ${status} |" >>"$ART"
+  [ "$mx" -gt "$bud" ] 2>/dev/null && { status="FAIL(over budget)"; RC=1; }
+  printf "  %-16s p50=%sms p95=%sms max=%sms  (budget %sms)  %s\n" "$name" "$p50" "$p95" "$mx" "$bud" "$status"
+  echo "| ${name} | ${p50}ms | ${p95}ms | ${mx}ms | ${bud}ms | ${status} |" >>"$ART"
 done
 rm -rf "$RDIR"
 {

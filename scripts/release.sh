@@ -193,6 +193,29 @@ fi
 echo "==> Running tests"
 cargo test --quiet
 
+# --- Resilience soak gate (WS5) ----------------------------------------------
+# A release must not ship a warren that regresses recovery. Run the chaos soak
+# (tests/e2e/soak-resilience.sh) and ABORT the release if any perturbation
+# exceeds its per-scenario SLA budget (founder_restart ≤ FOUNDER_BUDGET_MS, the
+# rest ≤ WARM_BUDGET_MS). A green soak is the contract for the "it just works
+# and is reliable" free tier. Set SKIP_SOAK=1 to bypass (e.g. Docker
+# unavailable) — only deliberately.
+if [[ "${SKIP_SOAK:-0}" != "1" ]]; then
+  echo "==> Running resilience soak gate (SOAK_CYCLES=${SOAK_CYCLES:-20})"
+  if ! command -v docker &>/dev/null; then
+    echo "Error: docker not found — the soak gate needs Docker (Colima on macOS)."
+    echo "       Start Docker, or set SKIP_SOAK=1 to bypass (not recommended)."
+    exit 1
+  fi
+  if ! SOAK_CYCLES="${SOAK_CYCLES:-20}" "${PROJECT_ROOT}/tests/e2e/soak-resilience.sh"; then
+    echo "Error: resilience soak FAILED — recovery exceeded SLA budget. Release aborted."
+    echo "       See tests/e2e/sla-results.md for the per-scenario breakdown."
+    exit 1
+  fi
+else
+  echo "==> SKIP_SOAK=1 — skipping resilience soak gate (NOT recommended)"
+fi
+
 # --- Build (parallel) --------------------------------------------------------
 
 rm -rf "${DIST_DIR}"
