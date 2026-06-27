@@ -28,8 +28,8 @@ use hop_core::config::{self, HostConfig, KnownHostsStore, PeerRole, PeersStore};
 use hop_core::invite;
 use hop_core::net;
 use hop_core::proto::{
-    self, AdminRequest, AdminResponse, ClientMessage, RoleDefinition, RoleUpdates, UserMode,
-    TransferDirection, TransferMode, TransferMsg, TransferRequest,
+    self, AdminRequest, AdminResponse, ClientMessage, HostMessage, RoleDefinition, RoleUpdates,
+    UserMode, TransferDirection, TransferMode, TransferMsg, TransferRequest,
 };
 use hop_core::shell::{self, SessionOutcome};
 use hop_core::shell::session_registry::{self as session_registry, RegistryHandle};
@@ -2753,6 +2753,37 @@ async fn cmd_connect(
     }
 }
 
+/// Run `command` on `target` **through the daemon mux** and CAPTURE its combined
+/// output + exit code (instead of streaming to the terminal like `cmd_exec`).
+///
+/// Routing via `mux::connect_to_host` reuses the machine's single endpoint — on a
+/// host machine that's the daemon's endpoint, on a pure client it's the agent's —
+/// so a fleet one-shot like `cap deploy` no longer mints a SECOND canonical iroh
+/// endpoint that briefly collides with the host endpoint at the relay
+/// (endpoint-unification follow-up).
+async fn exec_capture_via_mux(
+    config_dir: &std::path::Path,
+    target: &str,
+    command: &str,
+) -> Result<(i32, String)> {
+    let exec_msg = ClientMessage::RequestExec { command: command.to_string() };
+    // `_send` is kept alive (not `_`) so the IPC connection stays open while we
+    // read; the command we run is non-interactive, so we never write stdin.
+    let (_resolved, _send, mut recv) =
+        mux::connect_to_host(config_dir, target, None, &exec_msg).await?;
+    let mut out = Vec::new();
+    loop {
+        match proto::read_message::<HostMessage>(&mut recv).await {
+            Ok(HostMessage::Output(data)) => out.extend_from_slice(&data),
+            Ok(HostMessage::Exit(code)) => {
+                return Ok((code, String::from_utf8_lossy(&out).into_owned()));
+            }
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("exec stream error: {e}"),
+        }
+    }
+}
+
 async fn cmd_exec(
     _secret_key: iroh::SecretKey,
     target: &str,
@@ -4108,37 +4139,45 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
             println!("Triggered capability '{}' locally (job {}, will run on next scheduler tick ~15s)", id, job_id);
         }
         CapAction::Deploy { id, targets } => {
-            use hop_mcp::backend::OrchestratorBackend;
-
             let _cap = CapabilityDefinition::find(&id)
                 .ok_or_else(|| anyhow::anyhow!("Unknown capability: '{id}'"))?;
 
-            // Deploy uses fleet exec to run `hop cap enable <id>` on each node
-            let config_dir2 = config_dir.to_path_buf();
-            let secret_key = config::load_or_generate_identity(&config_dir2)?;
-            let endpoint = net::create_client_endpoint(secret_key).await?;
-
-            let backend = hop_mcp::backend::direct::DirectBackend::new(
-                std::sync::Arc::new(endpoint),
-                config_dir2,
-            );
-
-            let cmd = format!("hop cap enable {}", id);
-            println!("Deploying capability '{}' to targets '{}'...", id, targets);
-
-            match backend.fleet_exec(&targets, &cmd).await {
-                Ok(results) => {
-                    for r in &results {
-                        if r.exit_code == 0 {
-                            println!("  {}: ok", r.host);
-                        } else {
-                            eprintln!("  {}: failed (exit {}): {}", r.host, r.exit_code, r.stderr.trim());
-                        }
-                    }
-                    println!("Deployed to {} hosts", results.len());
-                }
-                Err(e) => anyhow::bail!("Fleet exec failed: {e}"),
+            // Resolve the fleet group locally (same FleetStore the backend reads),
+            // then run `hop cap enable <id>` on each target THROUGH THE DAEMON MUX
+            // (exec_capture_via_mux). This reuses the machine's single endpoint
+            // instead of minting a second canonical client endpoint that briefly
+            // collides with the host endpoint at the relay (endpoint-unification).
+            let fleet = hop_core::fleet::FleetStore::load(config_dir)?;
+            let hosts: Vec<&hop_core::fleet::FleetMember> = fleet
+                .members
+                .iter()
+                .filter(|m| targets == "*" || m.tags.iter().any(|t| t == &targets))
+                .collect();
+            if hosts.is_empty() {
+                anyhow::bail!("No fleet hosts match targets '{targets}'");
             }
+
+            let cmd = format!("hop cap enable {id}");
+            println!(
+                "Deploying capability '{}' to '{}' ({} hosts)...",
+                id,
+                targets,
+                hosts.len()
+            );
+            let mut ok = 0usize;
+            for m in &hosts {
+                match exec_capture_via_mux(config_dir, &m.node_id, &cmd).await {
+                    Ok((0, _)) => {
+                        println!("  {}: ok", m.hostname);
+                        ok += 1;
+                    }
+                    Ok((code, out)) => {
+                        eprintln!("  {}: failed (exit {}): {}", m.hostname, code, out.trim());
+                    }
+                    Err(e) => eprintln!("  {}: connection error: {e}", m.hostname),
+                }
+            }
+            println!("Deployed to {}/{} hosts", ok, hosts.len());
         }
         CapAction::Setup { id, schedule } => {
             return cmd_cap_setup(&id, schedule.as_deref(), None, config_dir).await;
