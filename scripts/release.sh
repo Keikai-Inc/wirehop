@@ -436,8 +436,10 @@ echo ""
 echo "Binaries:"
 ls -lh "${DIST_DIR}"/hop-*
 echo ""
-echo "Package:"
-ls -lh "${PKG_PATH}"
+echo "Packages (per-arch):"
+for pkgarch in arm64 x86_64; do
+  echo "  s3://${BUCKET}/v${VERSION}/hop-${VERSION}-${pkgarch}.pkg"
+done
 echo ""
 echo "CDN: https://hop.keikai.ai"
 echo "Install: curl -fsSL https://hop.keikai.ai/install.sh | bash"
