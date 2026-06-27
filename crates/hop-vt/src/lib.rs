@@ -270,9 +270,69 @@ impl VtScreen {
                     out.extend_from_slice(b"\x1b[r");
                 }
                 out.extend_from_slice(b"\x1b[2J\x1b[H");
+                // Re-assert the captured app's input/keyboard private modes so
+                // the reattaching client's terminal matches the remote app's
+                // expectations. Without this the key ENCODING desyncs after every
+                // reconnect and tmux/vim/Claude key bindings silently stop
+                // matching (e.g. Ctrl-L passes through instead of switching panes).
+                self.emit_private_modes(out);
             }
         }
     }
+
+    /// Re-assert the captured app's terminal *input* private modes from
+    /// `TermMode`, each emitted as set-or-reset so the client ends up in exactly
+    /// the captured state (idempotent). The screen repaint restores cells +
+    /// alt-screen, but a reattaching client also needs app-cursor-keys,
+    /// app-keypad, bracketed paste, mouse, focus reporting, and the kitty
+    /// keyboard protocol — otherwise the client and the remote app disagree on
+    /// how keys are encoded, and key bindings (tmux/vim nav) stop matching.
+    fn emit_private_modes(&self, out: &mut Vec<u8>) {
+        let m = self.term.mode();
+        dec_mode(out, m.contains(TermMode::SHOW_CURSOR), b"25");
+        dec_mode(out, m.contains(TermMode::APP_CURSOR), b"1");
+        dec_mode(out, m.contains(TermMode::BRACKETED_PASTE), b"2004");
+        dec_mode(out, m.contains(TermMode::FOCUS_IN_OUT), b"1004");
+        dec_mode(out, m.contains(TermMode::MOUSE_REPORT_CLICK), b"1000");
+        dec_mode(out, m.contains(TermMode::MOUSE_DRAG), b"1002");
+        dec_mode(out, m.contains(TermMode::MOUSE_MOTION), b"1003");
+        dec_mode(out, m.contains(TermMode::SGR_MOUSE), b"1006");
+        // Application keypad: ESC= (DECKPAM) / ESC> (DECKPNM) — not a `?` mode.
+        out.extend_from_slice(if m.contains(TermMode::APP_KEYPAD) {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        });
+        // Kitty keyboard protocol: set the active flags to EXACTLY the captured
+        // bitset via `CSI = flags ; 1 u` (mode 1 = set the given bits, reset the
+        // rest). This adjusts the current flags WITHOUT a stack push/pop, so the
+        // app's own kitty flag-stack bookkeeping stays intact. Bit values per the
+        // kitty keyboard protocol spec.
+        let mut kitty = 0u32;
+        if m.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+            kitty |= 0b0_0001;
+        }
+        if m.contains(TermMode::REPORT_EVENT_TYPES) {
+            kitty |= 0b0_0010;
+        }
+        if m.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+            kitty |= 0b0_0100;
+        }
+        if m.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            kitty |= 0b0_1000;
+        }
+        if m.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+            kitty |= 0b1_0000;
+        }
+        let _ = write!(out, "\x1b[={kitty};1u");
+    }
+}
+
+/// DECSET (`h`) or DECRST (`l`) the private mode `?<code>` based on `on`.
+fn dec_mode(out: &mut Vec<u8>, on: bool, code: &[u8]) {
+    out.extend_from_slice(b"\x1b[?");
+    out.extend_from_slice(code);
+    out.push(if on { b'h' } else { b'l' });
 }
 
 /// Custom [`Dimensions`] impl with `scrolling_history = 0`: `total_lines`
@@ -667,5 +727,39 @@ mod tests {
         let direct = screen.render(4, 10, Prelude::Initial);
         let shim = screen.render_full_repaint();
         assert_eq!(direct, shim, "render_full_repaint must match render(native, Initial)");
+    }
+
+    #[test]
+    fn repaint_reasserts_input_private_modes() {
+        let mut screen = VtScreen::new(24, 80);
+        // Remote app enables: app-cursor (?1), bracketed paste (?2004), focus
+        // reporting (?1004), X10 + SGR mouse (?1000 ?1006), application keypad
+        // (ESC=). On reattach the repaint must re-assert all of these, or the
+        // client's key ENCODING desyncs and tmux/vim/Claude bindings break.
+        screen.advance(b"\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1006h\x1b=");
+        let out = screen.render(24, 80, Prelude::Initial);
+        let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        for seq in [
+            &b"\x1b[?1h"[..],
+            b"\x1b[?2004h",
+            b"\x1b[?1004h",
+            b"\x1b[?1000h",
+            b"\x1b[?1006h",
+            b"\x1b=",
+        ] {
+            assert!(
+                has(seq),
+                "repaint missing enabled mode {:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
+        // A mode the app did NOT enable is explicitly reset, so a stale client
+        // (mode left on from before the reconnect) is brought back in sync.
+        assert!(has(b"\x1b[?1002l"), "repaint should reset un-enabled mouse-drag");
+        // The kitty keyboard flags are always re-asserted via `CSI = N ; 1 u`.
+        assert!(
+            has(b"\x1b[=") && has(b";1u"),
+            "repaint missing kitty keyboard set sequence"
+        );
     }
 }
