@@ -449,8 +449,7 @@ pub async fn host_shell_session(
                 let writer = pty_writer.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Ok(mut w) = writer.lock() {
-                        let _ = w.write_all(&data);
-                        let _ = w.flush();
+                        pty_write_all_blocking(&mut **w, &data);
                     }
                 });
             }
@@ -653,6 +652,38 @@ async fn read_setup_messages(
 /// of the child: the registry fires `cancel` on removal, so the daemon releases
 /// its master fd even if a backgrounded/`nohup`'d survivor still holds the slave
 /// open and EOF never comes.
+///
+/// Write every byte of `data` to a PTY master, retrying on `WouldBlock`.
+///
+/// The master fd is non-blocking: `spawn_cancellable_pty_reader` `dup()`s it for
+/// the async reader and sets `O_NONBLOCK`, and `O_NONBLOCK` lives on the shared
+/// open file description (dup'd fds share it), so the writer's fd is non-blocking
+/// too. A plain `write_all` would then return `WouldBlock` the moment the PTY
+/// input buffer fills mid-paste and SILENTLY DROP the unwritten tail — losing a
+/// bracketed paste's closing `ESC[201~`, which leaves the remote terminal stuck
+/// in paste mode (typed control keys become literal paste content, so e.g. tmux
+/// stops catching Ctrl-L). Retrying until every byte lands is the backpressure the
+/// input-writer design already assumes (bytes queue in the unbounded channel
+/// while this blocks).
+fn pty_write_all_blocking<W: std::io::Write + ?Sized>(w: &mut W, data: &[u8]) {
+    let mut off = 0;
+    while off < data.len() {
+        match w.write(&data[off..]) {
+            Ok(0) => return, // slave closed — nothing more we can do
+            Ok(n) => off += n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                // Buffer full (or signal): wait briefly for the app to drain it.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => return, // real error (e.g. SIGHUP'd slave)
+        }
+    }
+    let _ = w.flush();
+}
+
 #[cfg(unix)]
 fn spawn_cancellable_pty_reader(
     master_fd: std::os::unix::io::RawFd,
@@ -862,8 +893,7 @@ fn spawn_persistent_pty(
     tokio::task::spawn_blocking(move || {
         while let Some(data) = input_rx.blocking_recv() {
             if let Ok(mut w) = writer_clone.lock() {
-                let _ = w.write_all(&data);
-                let _ = w.flush();
+                pty_write_all_blocking(&mut **w, &data);
             }
         }
     });
@@ -1998,6 +2028,45 @@ mod reader_tests {
             libc::close(read_fd);
             libc::close(write_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod pty_write_tests {
+    use super::*;
+    use std::io::{self, Write};
+
+    /// A writer that returns WouldBlock on every other call and accepts at most
+    /// 3 bytes per successful write — modelling a full PTY input buffer that
+    /// drains slowly mid-paste. The old `let _ = w.write_all()` would drop the
+    /// tail (the closing ESC[201~) the first time it hit WouldBlock.
+    struct FlakyWriter {
+        out: Vec<u8>,
+        call: usize,
+    }
+    impl Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.call += 1;
+            if self.call % 2 == 1 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer full"));
+            }
+            let n = buf.len().min(3);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pty_write_all_blocking_loses_nothing_under_wouldblock() {
+        let data = b"\x1b[200~hello world this is a pasted block\x1b[201~";
+        let mut w = FlakyWriter { out: Vec::new(), call: 0 };
+        pty_write_all_blocking(&mut w, data);
+        // Every byte lands in order — crucially the closing ESC[201~, whose loss
+        // is what left the remote terminal stuck in bracketed-paste mode.
+        assert_eq!(w.out, data);
     }
 }
 
