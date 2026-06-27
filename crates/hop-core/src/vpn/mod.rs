@@ -798,6 +798,21 @@ impl iroh::protocol::ProtocolHandler for VpnInbound {
         // connection, not a silently-dead cached dial.
         let my_id = conn.stable_id();
         self.conns.write().await.insert(remote.clone(), conn.clone());
+        // Seed last_rx NOW, at accept time — not on the first datagram. A peer
+        // establishing a connection TO us is the freshest possible liveness signal:
+        // it just completed a QUIC handshake from its CURRENT address. Without this
+        // seed there's a race on peer reboot — the rebooted founder redials us and
+        // this fresh conn is registered, but until its first datagram lands the
+        // outbound forwarder still sees the peer as rx-stale, so it tears THIS
+        // connection down (close + reset_node) and redials, thrashing the founder's
+        // recovery handshake (the ~31s tail, and a >120s livelock under a short
+        // reset cooldown). Seeding makes the forwarder latch onto the inbound
+        // immediately; it ages out normally after STALE_AFTER if no real datagrams
+        // follow.
+        self.last_rx
+            .write()
+            .await
+            .insert(remote.clone(), std::time::Instant::now());
         pump_vpn_datagrams(
             &conn,
             &self.tun,

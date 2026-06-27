@@ -2541,7 +2541,21 @@ impl NetDoc {
         // arrives. Keep using it until then instead of redialing; redialing
         // mid-establishment was the reconnect storm that prevented any connection
         // from ever stabilizing.
-        const DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        //
+        // 12s, NOT 30s: a QUIC datagram send returns Ok on a silently-dead path, so
+        // a dial that hands back a connection to a peer's OLD (pre-reboot) address
+        // looks "successful" and gets reused for the WHOLE grace before we redial +
+        // reset_node to re-discover the peer's new address. At 30s that was the
+        // dominant founder-restart tail: recovery only happened on the next redial,
+        // so a first dial that lost the race against the founder's re-registration
+        // cost a fixed ~29s (measured: redials were exactly DIAL_GRACE apart). A
+        // working dial produces its first reply in ~2-3s, so 12s still leaves >4x
+        // margin for a slow relay/holepunch to validate (no mid-establishment
+        // storm), while bounding the tail to ~grace + one redial (~15s). Matches
+        // STALE_AFTER: a connection — fresh OR established — is abandoned if no rx
+        // within 12s. Only successful dials cache here, so this never changes how
+        // often an unreachable peer (failed dial) is retried.
+        const DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
         // App-level keepalive: every KEEPALIVE_INTERVAL send a heartbeat datagram
         // to each peer connection. Keeps the QUIC path validated/warm and the
         // remote's `last_rx` fresh, so a live-but-idle connection is never
@@ -2572,14 +2586,28 @@ impl NetDoc {
         // ages out (~60-80s). `endpoint.reset_node()` (fork API) clears that
         // selection so iroh re-resolves + re-holepunches now. Rate-limited (the
         // re-dial arm fires per packet during a stall); fire-and-forget.
-        // Long cooldown: a reset must get an UNINTERRUPTED convergence window. Firing
-        // it repeatedly (every few seconds) during a stall re-clears the selection
-        // right as holepunch is about to settle → livelock (observed: a stuck >280s
-        // recovery under rapid restarts). One reset per stall, then leave it alone.
-        const PATH_RESET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
-        let mut last_path_reset = std::time::Instant::now()
-            .checked_sub(PATH_RESET_COOLDOWN)
-            .unwrap_or_else(std::time::Instant::now);
+        //
+        // The cooldown is PER-PEER, not global, so an unrelated peer's reset can't
+        // block this one's convergence window (a global timer made each peer wait
+        // out any other peer's recent reset).
+        //
+        // 12s: a reset must still get an UNINTERRUPTED convergence window — firing
+        // it every few seconds during a stall re-clears the selection mid-holepunch
+        // → livelock. 12s is comfortably above the 8s VPN_DIAL_TIMEOUT, so each
+        // reset's dial fully completes (or fails) before the next reset is allowed.
+        // It can be this short ONLY because VpnInbound::accept now seeds last_rx:
+        // that stops the redial arm from tearing down a rebooted peer's fresh
+        // INBOUND handshake, which was the real livelock source (an earlier 12s
+        // WITHOUT the seed produced a >120s founder-restart stall — the seed makes
+        // the inbound the fast path and confines this reset to the no-inbound
+        // backup, where there's no peer-side holepunch to thrash). Bounding the
+        // re-reset to 12s (was 30s) is what closes the founder-restart tail: when
+        // the member's first reset fires before the founder has re-registered, the
+        // next reset catches it ~12s later instead of ~30s.
+        const PATH_RESET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(12);
+        // Per-peer last reset_node time. Bounded by warren size (one entry/peer).
+        let mut path_resets: std::collections::HashMap<iroh::PublicKey, std::time::Instant> =
+            std::collections::HashMap::new();
         let mut buf = vec![0u8; 65535];
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2870,10 +2898,14 @@ impl NetDoc {
                         }
                         // Make iroh forget this peer's stale (dead) path so the dial
                         // below re-resolves its CURRENT address instead of pinning
-                        // the port it left behind when it restarted. Rate-limited;
-                        // fire-and-forget (see PATH_RESET_COOLDOWN).
-                        if last_path_reset.elapsed() >= PATH_RESET_COOLDOWN {
-                            last_path_reset = std::time::Instant::now();
+                        // the port it left behind when it restarted. Rate-limited
+                        // PER-PEER; fire-and-forget (see PATH_RESET_COOLDOWN).
+                        let due = path_resets
+                            .get(&pubkey)
+                            .map(|t| t.elapsed() >= PATH_RESET_COOLDOWN)
+                            .unwrap_or(true);
+                        if due {
+                            path_resets.insert(pubkey, std::time::Instant::now());
                             let ep = self.endpoint.clone();
                             tokio::spawn(async move { ep.reset_node(pubkey).await });
                         }
