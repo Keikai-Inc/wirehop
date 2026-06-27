@@ -20,24 +20,29 @@ hop-vt = { path = "crates/hop-vt" }
 # `address-lookup-mdns`: local-network (mDNS) peer discovery so same-LAN warren
 # members find each other's CURRENT address directly — fast recovery after a peer
 # restarts/roams without waiting on n0 DNS propagation or a relay hairpin.
-iroh = { version = "0.97", features = ["address-lookup-mdns"] }
+# default-features off drops iroh's `metrics` + `portmapper` (UPnP — pulls
+# igd-next/xml-rs) defaults hop never uses; keep mDNS discovery + the macOS fast
+# datapath. The iroh-* siblings likewise drop `rpc` (irpc) + `metrics`, keeping
+# only the local fs store / gossip net hop actually uses.
+iroh = { version = "0.97", default-features = false, features = ["address-lookup-mdns", "fast-apple-datapath"] }
 # iroh-docs CRDT + its mandatory companions (content-addressed values via blobs,
 # live replication via gossip). Stable lockstep matched to iroh 0.97.
-iroh-docs = "0.97"
-iroh-gossip = "0.97"
-iroh-blobs = "0.99"
+iroh-docs = { version = "0.97", default-features = false, features = ["fs-store"] }
+iroh-gossip = { version = "0.97", default-features = false, features = ["net"] }
+iroh-blobs = { version = "0.99", default-features = false, features = ["fs-store"] }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "signal"] }
 futures-lite = "2"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
+# CLI — default-features off drops `color` (anstream) + `suggestions` (strsim);
+# keep the help/usage/error machinery.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bincode = { version = "2", features = ["serde"] }
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 toml = "0.8"
 
 # Extension IPC (typed channels with serde, fd transfer, cross-platform)
@@ -62,7 +67,10 @@ directories = "5"
 # Error handling & logging
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# No `env-filter`: it pulls the regex stack (regex-automata/aho-corasick, ~500KB).
+# hop only uses target=level filtering, served by the lightweight `Targets` filter
+# (still parses RUST_LOG). Defaults (fmt/ansi/std/tracing-log) are kept.
+tracing-subscriber = "0.3"
 
 # System
 libc = "0.2"
@@ -72,8 +80,10 @@ hostname = "0.4"
 filetime = "0.2"
 landlock = "0.4"
 
-# Compression & Hashing
-zstd = "0.13"
+# Compression & Hashing — hop only does bulk compress/decompress at a fixed
+# level; drop `zdict_builder` (dictionary training, unused). Keep `legacy` (decode
+# old peers' streams) + `arrays` (SIMD).
+zstd = { version = "0.13", default-features = false, features = ["legacy", "arrays"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Datastore
@@ -106,6 +116,12 @@ iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-rela
 noq-proto = { path = "vendor/noq-proto" }
 
 [profile.release]
+# opt-level "s" optimizes for size (still keeps most speed opts, unlike "z").
+# Chosen because the daemon is CPU-idle under the heaviest workload (VNC-over-VPN
+# sampled <0.1% CPU) and the hot crypto/compression is C/asm (ring, zstd-sys),
+# unaffected by Rust opt-level. Validate throughput on real hardware before fully
+# relying on it (iperf over the tunnel).
+opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true

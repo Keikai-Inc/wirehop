@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Targets;
 
 use hop_core::config;
 use hop_core::net;
@@ -27,7 +27,7 @@ use hop_core::net;
 use crate::mux::{self, MuxConnect, MuxResult};
 
 /// Type alias for the reload handle used by the SIGUSR1 debug toggle.
-type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+type ReloadHandle = tracing_subscriber::reload::Handle<Targets, tracing_subscriber::Registry>;
 
 /// Idle timeout: shut down the agent after 10 minutes with no active sessions.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -824,10 +824,11 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
                 debug_enabled = !debug_enabled;
                 let new_filter = if debug_enabled {
                     tracing::info!("Agent debug logging ENABLED (send SIGUSR1 again to disable)");
-                    EnvFilter::new("hop=debug,hop_core=debug,iroh=debug,iroh_relay=debug")
+                    "hop=debug,hop_core=debug,iroh=debug,iroh_relay=debug"
+                        .parse::<Targets>().expect("valid directives")
                 } else {
                     tracing::info!("Agent debug logging DISABLED (back to info level)");
-                    EnvFilter::new("hop=info,hop_core=info")
+                    "hop=info,hop_core=info".parse::<Targets>().expect("valid directives")
                 };
                 if let Err(e) = reload_handle.reload(new_filter) {
                     tracing::error!("Failed to reload log filter: {e}");

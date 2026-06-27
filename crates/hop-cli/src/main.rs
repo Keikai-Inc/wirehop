@@ -20,7 +20,7 @@ use iroh::endpoint::{RecvStream, SendStream};
 use iroh::Watcher;
 use tokio::sync::mpsc;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::reload;
 
 use hop_core::auth::{self, AuthOutcome};
@@ -78,15 +78,18 @@ async fn main() -> Result<()> {
 
     // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag.
     // Uses a reload layer so the host daemon can toggle debug logging at runtime via SIGUSR1.
-    let initial_filter = if std::env::var("RUST_LOG").is_ok() {
-        EnvFilter::from_default_env()
-    } else {
-        EnvFilter::new(match cli.verbose {
-            0 => "hop=info,hop_core=info,hop_mcp=info",
-            1 => "hop=debug,hop_core=debug,hop_mcp=debug",
-            _ => "hop=trace,hop_core=trace,hop_mcp=trace",
-        })
+    let default_directives = match cli.verbose {
+        0 => "hop=info,hop_core=info,hop_mcp=info",
+        1 => "hop=debug,hop_core=debug,hop_mcp=debug",
+        _ => "hop=trace,hop_core=trace,hop_mcp=trace",
     };
+    // `Targets` parses the same `target=level` syntax as RUST_LOG, without the
+    // regex engine `EnvFilter` pulls in. A RUST_LOG that uses EnvFilter-only span
+    // or field directives won't parse here → fall back to the verbosity default.
+    let initial_filter: Targets = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| default_directives.parse().expect("valid default directives"));
     let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
     tracing_subscriber::registry()
         .with(filter_layer)
@@ -386,7 +389,7 @@ async fn main() -> Result<()> {
 }
 
 /// Type alias for the reload handle used by the SIGUSR1 debug toggle.
-type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+type ReloadHandle = reload::Handle<Targets, tracing_subscriber::Registry>;
 
 /// Outcome of the host-daemon restart attempted by `hop recover`.
 enum DaemonRestart {
@@ -1112,10 +1115,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 debug_enabled = !debug_enabled;
                 let new_filter = if debug_enabled {
                     tracing::info!("Debug logging ENABLED (send SIGUSR1 again to disable)");
-                    EnvFilter::new("hop=debug,hop_core=debug,hop_mcp=debug,iroh=debug,iroh_relay=debug")
+                    "hop=debug,hop_core=debug,hop_mcp=debug,iroh=debug,iroh_relay=debug"
+                        .parse::<Targets>().expect("valid directives")
                 } else {
                     tracing::info!("Debug logging DISABLED (back to info level)");
-                    EnvFilter::new("hop=info,hop_core=info,hop_mcp=info")
+                    "hop=info,hop_core=info,hop_mcp=info".parse::<Targets>().expect("valid directives")
                 };
                 if let Err(e) = reload_handle.reload(new_filter) {
                     tracing::error!("Failed to reload log filter: {e}");

@@ -41,10 +41,10 @@ cron = { workspace = true }
 # musl's DNS resolver is minimal and fails on TXT lookups / certain AAAA+A combos.
 # Feature unification merges this with iroh's reqwest 0.12 dependency.
 reqwest = { version = "0.12", default-features = false, features = ["hickory-dns", "rustls-tls"] }
-# Same fix for reqwest 0.13 (used by pkarr for HTTP relay lookups).
-reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["hickory-dns"] }
 bytes = "1.11.1"
-cedar-policy = "4.11.0"
+# default-features off drops the `ipaddr` extension (hop's reach policies use no
+# IP attributes); keep `decimal` + `datetime` as a hedge for future tag policies.
+cedar-policy = { version = "4.11.0", default-features = false, features = ["decimal", "datetime"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

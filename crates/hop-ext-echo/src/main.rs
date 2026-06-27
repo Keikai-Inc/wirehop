@@ -36,7 +36,8 @@ use clap::Parser;
 use hop_core::extensions::{Bootstrap, ExtMessage};
 use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Hop echo extension daemon")]
@@ -54,8 +55,15 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+    // Targets filter (no regex/env-filter feature): honors RUST_LOG's
+    // target=level syntax, defaults to info.
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse::<Targets>().ok())
+        .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     let args = Args::parse();
