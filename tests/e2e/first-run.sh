@@ -25,6 +25,7 @@ BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/hop"
 # ceilings (cold Docker, relay handshake). A regression past budget fails the gate.
 A1_BUDGET="${A1_BUDGET:-40}"
 A2_BUDGET="${A2_BUDGET:-60}"
+A3_BUDGET="${A3_BUDGET:-40}"
 GUARD_BUDGET="${GUARD_BUDGET:-40}"
 
 PASS=0; FAIL=0; REPORT=""
@@ -59,7 +60,7 @@ say "building image"
 docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates jq iputils-ping iproute2 dnsutils && rm -rf /var/lib/apt/lists/* \
+        ca-certificates jq iputils-ping iproute2 dnsutils netcat-openbsd && rm -rf /var/lib/apt/lists/* \
     && useradd -m -s /bin/bash hop
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
@@ -158,6 +159,32 @@ else
   A2_SECS=$A2_BUDGET
 fi
 record "A2 private-network" "$A2_OK" "${A2_SECS:-$A2_BUDGET}" "$A2_BUDGET" "$A2_DETAIL"
+
+#############################################################################
+say "A3 — expose a local device (hop tunnel: forward a remote port to localhost)"
+#############################################################################
+# Reuse the A2 founder + member. A trivial marker service on the founder's
+# localhost:9000; the member runs `hop tunnel <founder> 9000` and reaches the
+# service at its OWN localhost:9000 over the encrypted link.
+A3_OK=0; A3_DETAIL="needs A2 founder+member"
+if [ "$A2_OK" = 1 ]; then
+  F_ID=$(docker exec fr-founder hop --config /cfg id 2>/dev/null)
+  docker exec -d fr-founder bash -lc 'while true; do printf "TUNNEL_OK\n" | nc -l 9000 >/dev/null 2>&1; done'
+  sleep 1
+  t0=$(nsec)
+  docker exec -d fr-member bash -lc "hop --config /cfg tunnel '$F_ID' 9000 >/cfg/tunnel.log 2>&1"
+  A3_DETAIL="tunnel never delivered the marker"
+  for _ in $(seq 1 30); do
+    if docker exec fr-member bash -lc "nc -w2 127.0.0.1 9000 </dev/null 2>/dev/null" | grep -q TUNNEL_OK; then
+      A3_OK=1; A3_DETAIL="localhost:9000 -> founder:9000 (TUNNEL_OK)"; break
+    fi
+    sleep 1
+  done
+  A3_SECS=$(( $(nsec) - t0 ))
+else
+  A3_SECS=$A3_BUDGET
+fi
+record "A3 expose-tunnel" "$A3_OK" "${A3_SECS:-$A3_BUDGET}" "$A3_BUDGET" "$A3_DETAIL"
 
 #############################################################################
 say "GUARD — default client install (no daemon, no VPN) still reaches + transfers"

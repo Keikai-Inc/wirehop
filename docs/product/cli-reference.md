@@ -214,6 +214,32 @@ hop sync --stats ./src myhost:~/src     # detailed stats
 
 ---
 
+## Port forwarding
+
+### `hop tunnel <target> <spec>`
+
+Forward a local TCP port to a port on a remote host, like `ssh -L`, over the
+encrypted P2P link (works through NAT with no router config). Binds
+`localhost:<localport>` and bridges each connection to the host's
+`127.0.0.1:<remoteport>`; runs until Ctrl-C. One QUIC stream per TCP connection.
+
+| Spec | Effect |
+|---|---|
+| `<port>` | `localhost:<port>` → host's `127.0.0.1:<port>` |
+| `<localport>:<remoteport>` | `localhost:<localport>` → host's `127.0.0.1:<remoteport>` |
+
+```bash
+hop tunnel myserver 3000           # reach the host's :3000 at localhost:3000
+hop tunnel myserver 8080:3000      # reach the host's :3000 at localhost:8080
+```
+
+Authorization is the same as `hop exec`: the peer must be authorized, and a tunnel
+is **denied if the peer's session sandbox blocks network** (`--no-network`). The
+target is the host's own loopback (`127.0.0.1`); reverse forwards, third-party
+targets, and `--reverse` are planned.
+
+---
+
 ## Administration
 
 ### `hop config [set <key> <value>] | path`

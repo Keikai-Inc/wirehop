@@ -230,6 +230,16 @@ pub enum Command {
         command: Vec<String>,
     },
 
+    /// Forward a local TCP port to a port on a remote host (like `ssh -L`).
+    /// Opens `localhost:<localport>` and bridges each connection to the host's
+    /// `127.0.0.1:<remoteport>` over the encrypted P2P link.
+    Tunnel {
+        /// Host NodeId, invite token, or known host alias
+        target: String,
+        /// Port forward: `<port>` (same local+remote) or `<localport>:<remoteport>`
+        spec: String,
+    },
+
     /// Remote administration (requires creator role)
     Admin {
         /// Target host (alias, NodeId, or invite token)

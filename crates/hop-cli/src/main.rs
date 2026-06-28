@@ -167,6 +167,10 @@ async fn main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_cp(secret_key, &config_dir, recursive, &paths).await
         }
+        Command::Tunnel { target, spec } => {
+            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            cmd_tunnel(&config_dir, &target, &spec).await
+        }
         Command::Sync {
             delete,
             dry_run,
@@ -1463,6 +1467,7 @@ async fn dispatch_session(
                 | ClientMessage::RequestTransfer(_)
                 | ClientMessage::RequestExec { .. }
                 | ClientMessage::RequestExecV2 { .. }
+                | ClientMessage::RequestTunnel { .. }
         )
     );
     if is_session_req && peer_is_network_only(config_dir, peer_id) {
@@ -1508,6 +1513,21 @@ async fn dispatch_session(
             let merged = sandbox.merge_stricter(&client_sandbox);
             tracing::info!("Starting exec session with client sandbox: {command}");
             shell::host_exec_session(send, recv, &command, username, &merged, protocol_version).await?;
+        }
+        Some(ClientMessage::RequestTunnel { port }) => {
+            // A tunnel is network access on the host's behalf — honor the session's
+            // network policy (don't let a no-network peer bypass it). Same root
+            // guard as exec/transfer otherwise.
+            if sandbox.no_network {
+                tracing::warn!("Tunnel denied: session sandbox blocks network");
+                return Ok(());
+            }
+            if let Err(e) = shell::check_shell_security(username) {
+                tracing::warn!("Tunnel denied: {e:#}");
+                return Err(e);
+            }
+            tracing::info!("Starting tunnel session -> 127.0.0.1:{port}");
+            shell::host_tunnel_session(send, recv, port, protocol_version).await?;
         }
         Some(ClientMessage::RequestPeerOp(request)) => {
             tracing::info!("Peer op from {}: {:?}", peer_id, request);
@@ -2816,6 +2836,54 @@ async fn cmd_exec(
             eprintln!("Connection lost");
             std::process::exit(1);
         }
+    }
+}
+
+/// Parse a `hop tunnel` port spec: `<port>` (local==remote) or `<localport>:<remoteport>`.
+fn parse_tunnel_spec(spec: &str) -> Result<(u16, u16)> {
+    if let Some((l, r)) = spec.split_once(':') {
+        let lport = l.parse().with_context(|| format!("invalid local port '{l}'"))?;
+        let rport = r.parse().with_context(|| format!("invalid remote port '{r}'"))?;
+        Ok((lport, rport))
+    } else {
+        let p = spec.parse().with_context(|| format!("invalid port '{spec}'"))?;
+        Ok((p, p))
+    }
+}
+
+/// `hop tunnel` (local forward, like `ssh -L`): bind `localhost:<localport>` and
+/// forward each TCP connection to the host's `127.0.0.1:<remoteport>` over the
+/// encrypted P2P link. One QUIC stream per TCP connection (QUIC-native multiplex).
+async fn cmd_tunnel(config_dir: &std::path::Path, target: &str, spec: &str) -> Result<()> {
+    let (lport, rport) = parse_tunnel_spec(spec)?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", lport))
+        .await
+        .with_context(|| format!("cannot bind localhost:{lport}"))?;
+    println!("Tunnel: localhost:{lport} -> {target}:{rport}  (Ctrl-C to stop)");
+    loop {
+        let (mut tcp, _peer) = listener.accept().await.context("accept failed")?;
+        let config_dir = config_dir.to_path_buf();
+        let target = target.to_string();
+        tokio::spawn(async move {
+            match mux::connect_to_host(
+                &config_dir,
+                &target,
+                None,
+                &ClientMessage::RequestTunnel { port: rport },
+            )
+            .await
+            {
+                Ok((_resolved, write, read)) => {
+                    // The stream is now a transparent pipe to the host's TCP dial;
+                    // bridge the local TCP connection across it.
+                    let mut peer = tokio::io::join(read, write);
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut peer).await {
+                        tracing::debug!("tunnel connection closed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("hop tunnel: failed to reach {target}: {e:#}"),
+            }
+        });
     }
 }
 

@@ -1764,6 +1764,32 @@ impl ExecExit {
 }
 
 /// Host side: execute a command via pipes (no PTY) and stream output over the wire.
+/// Host side of `hop tunnel` (local forward, like `ssh -L`): the stream is now a
+/// transparent byte pipe, so dial `127.0.0.1:<port>` and bridge it bidirectionally.
+/// One stream per forwarded TCP connection. The caller has already gated
+/// authorization (authenticated peer; the session's `no_network` sandbox).
+pub async fn host_tunnel_session(
+    mut send: SendStream,
+    recv: RecvStream,
+    port: u16,
+    _protocol_version: u8,
+) -> Result<()> {
+    let target = format!("127.0.0.1:{port}");
+    match tokio::net::TcpStream::connect(&target).await {
+        Ok(mut tcp) => {
+            tracing::info!("tunnel: bridging peer <-> {target}");
+            // recv = peer->host bytes (read); send = host->peer bytes (write).
+            let mut peer = tokio::io::join(recv, send);
+            let _ = tokio::io::copy_bidirectional(&mut peer, &mut tcp).await;
+        }
+        Err(e) => {
+            tracing::warn!("tunnel: cannot reach {target}: {e}");
+            let _ = send.finish(); // EOF the peer's forwarded connection
+        }
+    }
+    Ok(())
+}
+
 pub async fn host_exec_session(
     mut send: SendStream,
     mut recv: RecvStream,

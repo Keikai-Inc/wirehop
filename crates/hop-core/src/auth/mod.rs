@@ -182,6 +182,7 @@ pub async fn authenticate_client(
         | ClientMessage::RequestTransfer(_)
         | ClientMessage::RequestExec { .. }
         | ClientMessage::RequestExecV2 { .. }
+        | ClientMessage::RequestTunnel { .. }
         | ClientMessage::AnnounceNetdocAuthor { .. }
         | ClientMessage::RequestAdmin(_) => {
             // Authorization order:

@@ -89,6 +89,12 @@ pub enum ClientMessage {
         command: String,
         sandbox: SandboxPolicy,
     },
+    /// Request a TCP local port-forward (`hop tunnel`, like `ssh -L`): after this
+    /// message the stream becomes a transparent byte pipe, and the host dials
+    /// `127.0.0.1:<port>` and bridges it. One stream per forwarded TCP connection.
+    /// Gated like exec: an authenticated peer, denied if the session sandbox
+    /// blocks network (`no_network`).
+    RequestTunnel { port: u16 },
     /// Client environment variables (TERM, LANG, LC_*, COLORTERM).
     SetEnv { vars: HashMap<String, String> },
     /// Admin request (hop/2+). Requires creator role.
