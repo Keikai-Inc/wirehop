@@ -551,16 +551,24 @@ pub struct HostConfig {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Whether the warren VPN data plane is enabled. Default: `false`
-    /// (**off by default**, opt-in). A bare `hop host` does not bring up the TUN;
-    /// the VPN is enabled deliberately — by `--host` install (which sets this),
-    /// `hop config set vpn on`, or `HOP_VPN=1`. This off-by-default posture is the
-    /// interim mitigation for the warren write-capability trust gap (see
-    /// `docs/technical/security-audit.md`, C1) until per-author write
-    /// authorization lands. When enabled, bringup is best-effort (skips on a
-    /// `100.64.0.0/10` conflict or TUN failure; core access is unaffected).
-    /// `HOP_VPN=1` forces on (past the conflict guard); `HOP_VPN=0` forces off.
-    #[serde(default = "default_vpn_enabled")]
+    /// Whether the warren VPN data plane is enabled. **On by default for a NEW
+    /// host** (`HostConfig::default()`) — a fresh `hop host` / `--host` install
+    /// brings up the warren VPN so a member can reach peers by name without an
+    /// extra step. Opt out with `--host --no-vpn` or `hop config set vpn off`.
+    ///
+    /// Backward-compat: a config FILE that predates this field deserializes to
+    /// `false` (`vpn_default_for_existing_config`), so upgrading an existing host
+    /// never silently brings up the VPN — only brand-new configs default on.
+    ///
+    /// Safe to default on because the C1 warren write-capability trust gap is now
+    /// closed by anchor-conditional author-validation enforce (a founder-anchored
+    /// warren rejects forged `vpn/ip/name` bindings; see `netdoc::ValidationMode`),
+    /// which is what the old off-by-default posture was the interim mitigation for
+    /// (`docs/technical/security-audit.md`, C1). When enabled, bringup is
+    /// best-effort (skips on a `100.64.0.0/10` conflict or TUN failure; core access
+    /// is unaffected). `HOP_VPN=1` forces on (past the conflict guard); `HOP_VPN=0`
+    /// forces off.
+    #[serde(default = "vpn_default_for_existing_config")]
     pub vpn_enabled: bool,
 }
 
@@ -568,7 +576,14 @@ fn default_role_name() -> String {
     "member".to_string()
 }
 
+/// New-host default (used by `HostConfig::default()`): VPN on.
 fn default_vpn_enabled() -> bool {
+    true
+}
+
+/// Serde default for a config file MISSING `vpn_enabled` (predates the field):
+/// off, so upgrading an existing host never silently enables the VPN.
+fn vpn_default_for_existing_config() -> bool {
     false
 }
 
@@ -687,19 +702,21 @@ mod tests {
     }
 
     #[test]
-    fn host_config_vpn_default_off() {
-        // Off by default (security: opt-in until the warren write-capability
-        // trust gap is closed). A fresh config does NOT enable the VPN.
-        assert!(!HostConfig::default().vpn_enabled);
+    fn host_config_vpn_default_on() {
+        // On by default for a NEW host: a fresh config brings up the warren VPN so
+        // a member reaches peers by name without an extra step. (Safe now that C1
+        // author-validation enforce closes the write-trust gap; see netdoc.)
+        assert!(HostConfig::default().vpn_enabled);
     }
 
     #[test]
-    fn host_config_backward_compat_vpn_default_off() {
-        // Configs predating `vpn_enabled` deserialize to off (opt-in), so an
-        // upgrade never silently brings up the VPN on a bare host.
+    fn host_config_backward_compat_vpn_off_for_existing_config() {
+        // A config FILE predating `vpn_enabled` deserializes to OFF, so upgrading an
+        // existing host never silently brings up the VPN — only brand-new configs
+        // (HostConfig::default) default on.
         let json = r#"{ "session_timeout_secs": 3600, "max_sessions": 5 }"#;
         let cfg: HostConfig = serde_json::from_str(json).unwrap();
-        assert!(!cfg.vpn_enabled);
+        assert!(!cfg.vpn_enabled, "missing field on an existing config must stay off");
         assert_eq!(cfg.default_role, "member");
     }
 

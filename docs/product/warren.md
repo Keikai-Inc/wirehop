@@ -98,10 +98,11 @@ from the first daemon and grows through invites.
 
 > **(Mostly shipped.)** The commands below are the *target* experience. Today
 > `hop invite --role <named>` and the **warren VPN** are shipped; the VPN is
-> **off by default** as of v0.6.37 (opt in with `--host` / `HOP_VPN=1` /
-> `hop config set vpn on`) while the warren write model is hardened. Federation
-> still joins via a namespace ticket (`HOP_VPN_JOIN_TICKET`) rather than a
-> `--join` installer flag. See **Status**
+> **on by default** for a new host (opt out with `--host --no-vpn` /
+> `hop config set vpn off`; a config predating the field stays off on upgrade) now
+> that the warren write model is hardened by anchor-conditional author-validation
+> enforce. Federation still joins via a namespace ticket (`HOP_VPN_JOIN_TICKET`)
+> rather than a `--join` installer flag. See **Status**
 > and **Roadmap** for what's shipped vs planned.
 
 ```
@@ -375,7 +376,7 @@ holds the registry* is replaced by the replicated document.
 
 A fleet in hop is just your **[warren](warren.md)**, managed at scale. Any `hop host` can issue invites and define roles, but there is **no orchestrator and no master member list**: membership, roles, tags, and ACLs live in a **replicated network document** (iroh-docs) that every node holds its own copy of. Fleet features are integrated into `hop host` — there is no separate fleet server.
 
-The warren federates across hosts via a join ticket (carried by `node`/`admin` invites; `--join` / `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke another's entries. Roles drive both host access (RBAC) **and** warren VPN reach. Writes are gated by an admin/owner author binding (C1; see [Security Internals](../technical/security.md) and [Warren Internals](../technical/warren-internals.md)) — author validation ships in **observe** mode by default, with **enforce** opt-in (`HOP_NETDOC_VALIDATION`) pending a multi-node federated rollout.
+The warren federates across hosts via a join ticket (carried by `node`/`admin` invites; `--join` / `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke another's entries. Roles drive both host access (RBAC) **and** warren VPN reach. Writes are gated by an admin/owner author binding (C1; see [Security Internals](../technical/security.md) and [Warren Internals](../technical/warren-internals.md)): author validation defaults to **enforce** once a founder trust anchor is known (new/founder-anchored warrens reject forged admin and `vpn/ip/name` entries), and stays in **observe** for legacy joins with no anchor so they can't be partitioned. `HOP_NETDOC_VALIDATION` (`off`/`observe`/`enforce`) overrides.
 
 ### Architecture
 

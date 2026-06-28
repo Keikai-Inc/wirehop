@@ -308,6 +308,12 @@ pub struct NetDoc {
     /// Set via `HOP_NETDOC_VALIDATION`; interior-mutable so tests can override
     /// per instance without global env races.
     validation_mode: std::sync::Mutex<ValidationMode>,
+    /// True when `validation_mode` was pinned by an explicit `HOP_NETDOC_VALIDATION`
+    /// operator override. When false, the mode starts at `Observe` and is upgraded
+    /// to `Enforce` by `record_founder_anchor` once a trust anchor is known — so a
+    /// founder-anchored warren enforces by default while a legacy join (no anchor)
+    /// stays in `Observe`.
+    validation_env_pinned: bool,
     /// First-seen iroh-docs author per doc key, used to detect an entry whose
     /// author changed — the signature of a member forging/hijacking another
     /// node's `vpn`/`name`/`ip` registration (C1). Log-only in `Observe` mode.
@@ -335,17 +341,26 @@ pub enum ValidationMode {
     /// partition a warren, only surface forgery attempts.
     #[default]
     Observe,
-    /// Reject entries that fail author validation. **Not yet wired** — needs the
-    /// founder-author trust anchor; see install-and-invite-tiers.md §9.
+    /// Reject entries that fail author validation (forged admin keys; self-owned
+    /// `vpn/ip/name` bindings whose author ≠ the owner's admin-vouched author).
+    /// Wired (`validate_entry` / `self_entry_author_ok`); the DEFAULT once
+    /// `record_founder_anchor` establishes a trust anchor (new/founder-anchored
+    /// warrens), with a migration grace for unbound owners so joins still converge.
     Enforce,
 }
 
 impl ValidationMode {
-    fn from_env() -> Self {
+    /// An explicit operator override from `HOP_NETDOC_VALIDATION`, if set to a
+    /// recognized value. `None` = unset → the mode is chosen by trust-anchor
+    /// presence: `Observe` until `record_founder_anchor` establishes a founder
+    /// anchor, then `Enforce` (new/founder-anchored warrens enforce by default;
+    /// legacy joins with no anchor stay in `Observe` so they can't be partitioned).
+    fn from_env_opt() -> Option<Self> {
         match std::env::var("HOP_NETDOC_VALIDATION").as_deref() {
-            Ok("off") => ValidationMode::Off,
-            Ok("enforce") => ValidationMode::Enforce,
-            _ => ValidationMode::Observe,
+            Ok("off") => Some(ValidationMode::Off),
+            Ok("observe") => Some(ValidationMode::Observe),
+            Ok("enforce") => Some(ValidationMode::Enforce),
+            _ => None,
         }
     }
 }
@@ -459,6 +474,11 @@ impl NetDoc {
         }
         let router = builder.spawn();
 
+        // C1 validation: an explicit env override pins the mode; otherwise start in
+        // Observe and let record_founder_anchor upgrade to Enforce once a trust
+        // anchor is known (anchor-conditional default — see ValidationMode).
+        let env_validation = ValidationMode::from_env_opt();
+
         Ok(Self {
             _router: router,
             fs_store,
@@ -493,7 +513,10 @@ impl NetDoc {
             #[cfg(unix)]
             vpn_siit,
             reach_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            validation_mode: std::sync::Mutex::new(ValidationMode::from_env()),
+            validation_mode: std::sync::Mutex::new(
+                env_validation.unwrap_or(ValidationMode::Observe),
+            ),
+            validation_env_pinned: env_validation.is_some(),
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
             founder_author: std::sync::Mutex::new(None),
             admin_authors: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -529,11 +552,25 @@ impl NetDoc {
             // The founder is always an admin author; co-admins are added by
             // refresh_admin_authors once their vouched bindings replicate.
             self.admin_authors.lock().unwrap().insert(a);
-            tracing::info!("netdoc C1: trusted admin author = {a}");
+            // A trust anchor is now known, so forged admin/self entries CAN be
+            // validated — default to Enforce (closing the C1 write-trust gap that
+            // gated VPN-on), unless an operator pinned the mode via env. A legacy
+            // join with no anchor never reaches this branch and stays in Observe,
+            // so it can't be partitioned.
+            if !self.validation_env_pinned {
+                let mut mode = self.validation_mode.lock().unwrap();
+                if *mode == ValidationMode::Observe {
+                    *mode = ValidationMode::Enforce;
+                }
+            }
+            tracing::info!(
+                "netdoc C1: trusted admin author = {a}; validation = {:?}",
+                self.validation_mode()
+            );
         } else if self.federated {
             tracing::warn!(
-                "netdoc C1: no founder author available (legacy join) — enforce mode \
-                 would reject admin entries; staying in observe is recommended"
+                "netdoc C1: no founder author available (legacy join) — staying in \
+                 observe (enforce would reject admin entries without an anchor)"
             );
         }
     }
@@ -4058,6 +4095,10 @@ mod tests {
             .await
             .expect("spawn A");
         a.record_founder_anchor(None); // founder = A
+        // The anchor now defaults A to Enforce; the setup below needs the permissive
+        // Observe so B's (not-yet-vouched) peer/C can first replicate to A. The real
+        // enforce assertion flips it back on at the relevant step.
+        a.set_validation_mode(ValidationMode::Observe);
 
         // Co-admin B imports the warren and invites C — i.e. B authors peer/C.
         let ticket = a.write_ticket().await.unwrap();
@@ -4068,7 +4109,7 @@ mod tests {
         let b_id = b.endpoint.id().to_string();
         b.put_peer(&sample_peer("nodeCCCCCCCC", "C")).await.unwrap();
 
-        // Wait until B's peer/C replicates to A (Observe default — honored).
+        // Wait until B's peer/C replicates to A (Observe, set above — honored).
         let mut replicated = false;
         for _ in 0..150 {
             if a.get_peer("nodeCCCCCCCC").await.unwrap().is_some() {
