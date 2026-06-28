@@ -9,6 +9,7 @@ separate files have been consolidated here.
 
 | Document | Description |
 |----------|-------------|
+| [quickstart.md](product/quickstart.md) | Copy-pasteable recipes for the three core jobs (reach a machine · private network · expose a device) — the same commands the first-run acceptance suite gates on |
 | [overview.md](product/overview.md) | Vision, why hop exists, core user flows, architecture diagram |
 | [cli-reference.md](product/cli-reference.md) | Every CLI command with flags and examples |
 | [warren.md](product/warren.md) | The warren — hop's zero-config private network: client vs node, role-is-the-access model, onboarding, plus **fleet/RBAC at scale** and the living gap analysis |
