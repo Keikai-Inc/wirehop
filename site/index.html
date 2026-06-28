@@ -383,9 +383,9 @@
           <div class="comparison-cell comparison-header">SSH / Tailscale / ngrok</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Port forwarding</div>
-          <div class="comparison-cell hop-col">Not needed</div>
-          <div class="comparison-cell comparison-other">SSH requires it</div>
+          <div class="comparison-cell comparison-label">Router / NAT config</div>
+          <div class="comparison-cell hop-col">Never</div>
+          <div class="comparison-cell comparison-other">SSH / ngrok often need it</div>
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Account required</div>
@@ -702,6 +702,42 @@
     </div>
   </section>
 
+  <!-- Port forwarding -->
+  <section id="port-forward" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Reach a remote port as if it were local</h2>
+        <p>A database, a dashboard, a dev server on a machine you can reach: forward its port to your laptop with one command, through NAT, with no router setup and nothing exposed to the internet.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One command, encrypted end to end</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Pick a machine you can already reach and the port you want. hop opens that port on your laptop and pipes it straight to the service on the other side, encrypted. Access stays gated by role, so only the people you've allowed can connect.</p>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Reach myserver's :3000 at localhost:3000</span>
+<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 3000
+
+<span class="comment"># Or land it on a different local port</span>
+<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 8080:3000
+
+<span class="comment"># Now use it like it's running here</span>
+<span class="prompt">$</span> <span class="cmd">open</span> http://localhost:8080
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Install -->
   <section id="install">
     <div class="container">
@@ -942,7 +978,7 @@
   <script>
     var cmds = {
       'install-latest':  'curl -fsSL https://hop.keikai.ai/install.sh | bash',
-      'install-version': 'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.4.4',
+      'install-version': 'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.9.17',
       'install-dir':     'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin',
       'daemon-install':  'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host',
       'install-builder': 'curl -fsSL https://hop.keikai.ai/install.sh | bash',

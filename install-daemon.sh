@@ -40,8 +40,8 @@ done
 # ownership/perms on Linux so the daemon (root) and the hop group can read.
 apply_daemon_primers() {
   local cfg_dir="$1" applied=true
-  # A node install opts INTO the warren VPN (off by default for a bare host);
-  # --no-vpn keeps the host without the VPN data plane.
+  # A node brings up the warren VPN by default; --no-vpn keeps the host without
+  # the VPN data plane (core access/shell/exec/transfer work either way).
   if [[ "${NO_VPN}" == "true" ]]; then
     sudo "${HOP_BIN}" config set vpn off --config "${cfg_dir}" >/dev/null && info "Warren VPN disabled"
   else
