@@ -267,6 +267,40 @@ hop config path                     # print the host config directory
 
 Changes take effect on the next `hop host` / daemon restart.
 
+### `hop acl policy [set|show|test]`
+
+Author the warren's **Cedar reach policy** — the rules that decide who reaches what,
+including **device-posture gates**. The default is open (members reach the warren);
+authored rules *tighten* it (progressive hardening). `set` saves the policy locally
+to `acl_policy.cedar`; the daemon publishes it to the replicated `acl/cedar` on
+(re)start, where C1 author-validation restricts the write to an **admin** author.
+
+| Subcommand | Effect |
+|---|---|
+| `set [<file>]` | Validate + save the authored Cedar policy (from a file, or stdin). Restart the host/daemon to publish + apply. |
+| `show` | Print the locally-saved authored policy. |
+| `test --role <r> --tag <t>... --posture k=v...` | **Offline dry-run:** evaluate a principal (role + posture) reaching a tagged host, print `ALLOW`/`DENY`. No daemon needed. |
+
+**Device posture.** Each host publishes a signed "health card" — `os`, `os_version`,
+`disk_encrypted`, `firewall`, `screen_lock` (booleans are `true`/`false`/`unknown`),
+collected best-effort on macOS + Linux and author-validated (tamper-evident). A
+policy gates reach on these as principal attributes:
+
+```bash
+# Reach production only from an encrypted, current box.
+hop acl policy set <<'EOF'
+permit ( principal, action == Action::"connect", resource )
+when { resource.tags.contains("production") && principal.disk_encrypted == "true" };
+EOF
+
+# Dry-run before rolling it out:
+hop acl policy test --role ops --tag production --posture disk_encrypted=true   # ALLOW
+hop acl policy test --role ops --tag production --posture disk_encrypted=false  # DENY
+```
+
+(`hop acl` also has `import` / `check` / `show` / `caps` for role↔tag reach; see
+`hop acl --help`.) See the [device-posture how-to](posture.md).
+
 ### `hop warren [status|leave]`
 
 Inspect or tear down this machine's warren membership. **Joining is done with

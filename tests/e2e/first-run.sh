@@ -217,6 +217,31 @@ else
 fi
 record "GUARD client-no-vpn" "$GUARD_OK" "${GUARD_SECS:-$GUARD_BUDGET}" "$GUARD_BUDGET" "$GUARD_DETAIL"
 
+#############################################################################
+say "POSTURE — a Cedar policy gates reach on device posture (allow vs deny)"
+#############################################################################
+# Device posture (Path D): an admin authors a posture-gated policy and a node is
+# allowed/denied by its health card. `hop acl policy test` evaluates the real
+# Cedar engine offline, so this is deterministic: in-policy ALLOW, out DENY.
+run_client fr-posture posture
+P_OK=0; P_DETAIL="acl policy test failed"
+# `docker exec -i` so the heredoc reaches the container's stdin.
+docker exec -i fr-posture sh -c 'cat > /cfg/roles.json' <<'JSON'
+{"roles":[{"name":"locked","host_tags":[],"admin":false,"sudo":false,"network_only":false,"groups":[],"capabilities":{}}]}
+JSON
+docker exec -i fr-posture sh -c 'cat > /cfg/p.cedar' <<'CEDAR'
+permit ( principal, action == Action::"connect", resource ) when { resource.tags.contains("production") && principal.disk_encrypted == "true" };
+CEDAR
+docker exec fr-posture hop --config /cfg acl policy set /cfg/p.cedar >/dev/null 2>&1
+t0=$(nsec)
+ALLOW=$(docker exec fr-posture hop --config /cfg acl policy test --role locked --tag production --posture disk_encrypted=true 2>/dev/null)
+DENY=$(docker exec fr-posture hop --config /cfg acl policy test --role locked --tag production --posture disk_encrypted=false 2>/dev/null)
+P_SECS=$(( $(nsec) - t0 ))
+if printf '%s' "$ALLOW" | grep -q '^ALLOW' && printf '%s' "$DENY" | grep -q '^DENY'; then
+  P_OK=1; P_DETAIL="in-policy ALLOW, out-of-policy DENY"
+fi
+record "POSTURE acl-gate" "$P_OK" "${P_SECS:-20}" "20" "$P_DETAIL"
+
 # --- report ---------------------------------------------------------------
 ART="${HOP_FIRSTRUN_ARTIFACT:-$SCRIPT_DIR/first-run-results.md}"
 STAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

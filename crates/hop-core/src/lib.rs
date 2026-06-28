@@ -9,6 +9,7 @@ pub mod invite;
 pub mod net;
 pub mod netdoc;
 pub mod netstats;
+pub mod posture;
 #[cfg(unix)]
 pub mod privsep;
 pub mod proto;

@@ -812,7 +812,15 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                             );
                         } else {
                             let host_tags = host_cfg.tags.clone();
-                            match net.enable_vpn(&host_node_id, &host_tags).await {
+                            // Authored Cedar reach policy, if an admin saved one
+                            // locally with `hop acl policy set` (published to the
+                            // warren by enable_vpn; admin-gated under C1 enforce).
+                            let authored_policy =
+                                std::fs::read_to_string(cfg.join("acl_policy.cedar")).ok();
+                            match net
+                                .enable_vpn(&host_node_id, &host_tags, authored_policy.as_deref())
+                                .await
+                            {
                                 Ok(ip) => tracing::info!(
                                     "vpn: enabled, virtual IP {ip}, tags {host_tags:?}"
                                 ),
@@ -5522,6 +5530,108 @@ fn cmd_acl(action: cli::AclAction, config_dir: &std::path::Path) -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        AclAction::Policy { action } => cmd_acl_policy(action, config_dir),
+    }
+}
+
+/// `hop acl policy set|show|test` — author the warren's Cedar reach policy. The
+/// authored policy is saved locally to `acl_policy.cedar` (mirroring the roles.json
+/// pattern); the daemon publishes it to the replicated `acl/cedar` on (re)start,
+/// where C1 enforce restricts the write to an admin author. `test` is fully offline.
+fn cmd_acl_policy(action: cli::AclPolicyAction, config_dir: &std::path::Path) -> Result<()> {
+    use cli::AclPolicyAction;
+    use hop_core::fleet::RolesStore;
+    let policy_path = config_dir.join("acl_policy.cedar");
+    match action {
+        AclPolicyAction::Set { file } => {
+            let text = match file {
+                Some(f) => std::fs::read_to_string(&f)
+                    .with_context(|| format!("reading {}", f.display()))?,
+                None => {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading policy from stdin")?;
+                    s
+                }
+            };
+            hop_core::vpn::cedar::validate_policy(&text).context("invalid Cedar policy")?;
+            std::fs::write(&policy_path, text.as_bytes())
+                .with_context(|| format!("writing {}", policy_path.display()))?;
+            println!("Saved authored policy to {}", policy_path.display());
+            println!(
+                "The daemon publishes it to the warren on (re)start (admin only). \
+                 Restart the host/daemon to apply."
+            );
+            Ok(())
+        }
+        AclPolicyAction::Show => match std::fs::read_to_string(&policy_path) {
+            Ok(t) => {
+                print!("{t}");
+                Ok(())
+            }
+            Err(_) => {
+                println!("(no authored policy saved; the default reach policy applies)");
+                Ok(())
+            }
+        },
+        AclPolicyAction::Test { role, tags, posture, policy } => {
+            use hop_core::config::{Peer, PeerRole};
+            // Resolve the authored policy: explicit --policy, else the saved one.
+            let authored: Option<String> = match policy {
+                Some(f) => Some(
+                    std::fs::read_to_string(&f)
+                        .with_context(|| format!("reading {}", f.display()))?,
+                ),
+                None => std::fs::read_to_string(&policy_path).ok(),
+            };
+            // Parse posture k=v pairs.
+            let mut posture_attrs = std::collections::BTreeMap::new();
+            for kv in &posture {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--posture must be K=V, got '{kv}'"))?;
+                posture_attrs.insert(k.to_string(), v.to_string());
+            }
+            // Synthetic principal (the role under test) + a synthetic tagged host.
+            let principal = Peer {
+                node_id: "test-principal".into(),
+                name: "test-principal".into(),
+                authorized_at: "1970-01-01T00:00:00Z".into(),
+                last_seen: None,
+                username: None,
+                role: PeerRole::Peer,
+                role_name: Some(role.clone()),
+                netdoc_author: None,
+                self_doc: None,
+                vip: None,
+                vpn_endpoint: None,
+                site_id: None,
+                sandbox: Default::default(),
+            };
+            let roles = RolesStore::load(config_dir)?.roles;
+            let mut host_tags = std::collections::HashMap::new();
+            host_tags.insert("test-host".to_string(), tags.clone());
+            let mut posture_map = std::collections::HashMap::new();
+            posture_map.insert("test-principal".to_string(), posture_attrs);
+            let engine = hop_core::vpn::cedar::AclEngine::build(
+                std::slice::from_ref(&principal),
+                &roles,
+                &host_tags,
+                &posture_map,
+                authored.as_deref(),
+            )
+            .context("building reach engine")?;
+            let allowed = engine.is_reach_allowed("test-principal", "test-host", None);
+            let post = if posture.is_empty() { "(none)".to_string() } else { posture.join(", ") };
+            println!(
+                "{} role={role} posture=[{post}] -> host[tags: {}]",
+                if allowed { "ALLOW" } else { "DENY " },
+                if tags.is_empty() { "(none)".into() } else { tags.join(", ") }
+            );
             Ok(())
         }
     }

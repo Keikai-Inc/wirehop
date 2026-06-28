@@ -17,6 +17,7 @@ separate files have been consolidated here.
 | [remote-access.md](product/remote-access.md) | Interactive shell sessions (persistence, reconnection, connection agent) and file transfer (`hop cp`, `hop sync`, delta + compression) |
 | [ai-and-scripting.md](product/ai-and-scripting.md) | MCP server, tools, skills library, AI-agent integration, and the complete `hop.*` JS runtime API |
 | [security.md](product/security.md) | Sandbox system, auth, invites, privilege separation (user-facing) |
+| [posture.md](product/posture.md) | Device posture: the signed health card (disk-encryption, OS version, firewall) and gating reach on it with `hop acl policy` |
 | [tap.md](product/tap.md) | hop-tap — eBPF terminal session audit (visibility, auditability, control) |
 
 ## Technical Documentation (`docs/technical/`)

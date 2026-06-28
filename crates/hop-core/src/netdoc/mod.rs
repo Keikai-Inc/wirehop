@@ -2155,6 +2155,7 @@ impl NetDoc {
         self: &std::sync::Arc<Self>,
         host_node_id: &str,
         host_tags: &[String],
+        authored_policy: Option<&str>,
     ) -> Result<std::net::Ipv4Addr> {
         // vIP acquisition (#3b): a federated member's vIP is allocated by the
         // admin at admission (`peer/N.vip`, with a matching `ip/` claim) — wait
@@ -2243,14 +2244,25 @@ impl NetDoc {
         if let Err(e) = self.register_host_tags(host_node_id, host_tags).await {
             tracing::warn!("vpn: host-tag registration failed: {e:#}");
         }
-        // Self-attest device posture (Phase 6): OS + hop version, for posture-
-        // gated reach policies.
-        let posture = std::collections::BTreeMap::from([
-            ("os".to_string(), std::env::consts::OS.to_string()),
-            ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
-        ]);
+        // Self-attest device posture for posture-gated reach policies. The
+        // collector gathers real device facts (os/os_version/disk_encrypted/
+        // firewall/screen_lock) best-effort; published over the self-doc posture
+        // path (author-validated by C1 enforce). Probes run concurrently and a
+        // missing tool fails fast, so this doesn't delay bringup.
+        let posture = crate::posture::collect().await;
         if let Err(e) = self.register_posture(host_node_id, &posture).await {
             tracing::warn!("vpn: posture registration failed: {e:#}");
+        }
+        // Publish the locally-authored Cedar reach policy (from `acl_policy.cedar`,
+        // written by `hop acl policy set`) to the warren's `acl/cedar` key. Under C1
+        // enforce this write only "takes" if this host is an admin author; a
+        // non-admin's write is rejected (no effect, no harm).
+        if let Some(policy) = authored_policy {
+            if let Err(e) = self.set_authored_policy(policy).await {
+                tracing::warn!("vpn: authored-policy publish failed: {e:#}");
+            } else {
+                tracing::info!("vpn: published authored reach policy to the warren");
+            }
         }
         // M4a: a host that OWNS this warren (created the namespace, not federated)
         // self-registers as an `admin` member so it can originate and return VPN

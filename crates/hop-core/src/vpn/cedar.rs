@@ -29,6 +29,19 @@ permit ( principal, action == Action::"connect", resource )
 when { principal.wildcard || principal.reach_tags.containsAny(resource.tags) };
 "#;
 
+/// Validate that `authored` parses as a Cedar policy set, combined with the default
+/// reach policy exactly as `AclEngine::build` does. Used by `hop acl policy set` to
+/// reject a malformed policy before it's saved/published.
+pub fn validate_policy(authored: &str) -> Result<()> {
+    let mut text = DEFAULT_REACH_POLICY.to_string();
+    text.push('\n');
+    text.push_str(authored);
+    let _: PolicySet = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing Cedar policy: {e}"))?;
+    Ok(())
+}
+
 /// A compiled reach decision engine over a snapshot of warren membership.
 pub struct AclEngine {
     policies: PolicySet,
@@ -349,5 +362,53 @@ mod tests {
         let e = AclEngine::build(&peers, &roles, &tags, &posture, Some(authored)).unwrap();
         assert!(e.is_reach_allowed("linuxAdmin", "prod", None), "linux admin permitted by posture policy");
         assert!(!e.is_reach_allowed("macAdmin", "prod", None), "mac admin denied by posture policy");
+    }
+
+    #[test]
+    fn posture_disk_encryption_gate() {
+        // The device-posture acceptance: a posture-gated policy ALLOWS an encrypted
+        // node and DENIES an unencrypted one. Uses a no-reach role so reach to prod
+        // comes ONLY from the disk_encrypted gate (matches the collector's
+        // "true"/"false" values).
+        let roles = vec![RoleDefinition {
+            name: "locked".into(),
+            host_tags: vec![], // no default reach; the gate is the only path
+            user_mode: Default::default(),
+            sudo: false,
+            admin: false,
+            network_only: false,
+            groups: vec![],
+            shell: None,
+            sandbox: SandboxPolicy::default(),
+            capabilities: Default::default(),
+        }];
+        let peers = vec![peer("encrypted", "locked"), peer("plaintext", "locked")];
+        let mut tags = HashMap::new();
+        tags.insert("prodhost".to_string(), vec!["production".to_string()]);
+        let mut posture = HashMap::new();
+        posture.insert(
+            "encrypted".to_string(),
+            std::collections::BTreeMap::from([("disk_encrypted".to_string(), "true".to_string())]),
+        );
+        posture.insert(
+            "plaintext".to_string(),
+            std::collections::BTreeMap::from([("disk_encrypted".to_string(), "false".to_string())]),
+        );
+        let authored = r#"
+            permit ( principal, action == Action::"connect", resource )
+            when { resource.tags.contains("production") && principal.disk_encrypted == "true" };
+        "#;
+        let e = AclEngine::build(&peers, &roles, &tags, &posture, Some(authored)).unwrap();
+        assert!(e.is_reach_allowed("encrypted", "prodhost", None), "encrypted node permitted");
+        assert!(!e.is_reach_allowed("plaintext", "prodhost", None), "unencrypted node denied");
+    }
+
+    #[test]
+    fn validate_policy_accepts_good_rejects_bad() {
+        assert!(validate_policy(
+            r#"permit ( principal, action == Action::"connect", resource ) when { principal.disk_encrypted == "true" };"#
+        )
+        .is_ok());
+        assert!(validate_policy("this is not cedar {{{").is_err());
     }
 }

@@ -503,6 +503,41 @@ pub enum AclAction {
         /// Role name (from roles.json)
         role: String,
     },
+    /// Author the warren's Cedar reach policy (posture/role/tag-gated rules)
+    Policy {
+        #[command(subcommand)]
+        action: AclPolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AclPolicyAction {
+    /// Save the authored Cedar policy (from a file, or stdin if omitted). The
+    /// daemon publishes it to the warren on (re)start; only an admin's write
+    /// takes effect (`acl/cedar` is admin-owned under C1 enforce).
+    Set {
+        /// Path to a `.cedar` policy file (reads stdin if omitted)
+        file: Option<std::path::PathBuf>,
+    },
+    /// Print the locally-saved authored policy.
+    Show,
+    /// Dry-run (offline): evaluate a principal (role + posture) reaching a tagged
+    /// host against a policy, and print ALLOW / DENY. Useful before rolling a
+    /// policy out.
+    Test {
+        /// Role name for the test principal (from roles.json)
+        #[arg(long)]
+        role: String,
+        /// Destination host tag(s) (the resource). Repeat for multiple.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Principal posture attributes, e.g. `--posture disk_encrypted=true --posture os=linux`
+        #[arg(long = "posture", value_name = "K=V")]
+        posture: Vec<String>,
+        /// Policy file to test against (default: the locally-saved authored policy)
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
