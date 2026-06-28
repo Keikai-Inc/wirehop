@@ -6173,6 +6173,18 @@ mod tests {
     use hop_core::sandbox::SandboxPolicy;
 
     #[test]
+    fn tunnel_spec_parses_both_forms() {
+        // `<port>` → same local + remote
+        assert_eq!(parse_tunnel_spec("3000").unwrap(), (3000, 3000));
+        // `<localport>:<remoteport>`
+        assert_eq!(parse_tunnel_spec("8080:3000").unwrap(), (8080, 3000));
+        // junk is rejected (not silently mis-forwarded)
+        assert!(parse_tunnel_spec("nope").is_err());
+        assert!(parse_tunnel_spec("8080:nope").is_err());
+        assert!(parse_tunnel_spec("99999").is_err()); // > u16
+    }
+
+    #[test]
     fn embedded_daemon_templates_present() {
         // The embedded launchd/systemd templates must exist and target the
         // root-owned binary path; this guards `__install-daemon` against an
