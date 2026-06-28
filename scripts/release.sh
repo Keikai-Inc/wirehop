@@ -216,6 +216,28 @@ else
   echo "==> SKIP_SOAK=1 — skipping resilience soak gate (NOT recommended)"
 fi
 
+# --- First-run acceptance gate -----------------------------------------------
+# The free tier's promise is "each core job in ~60s, no docs." Run the first-run
+# acceptance suite (tests/e2e/first-run.sh: reach-a-machine, private-network,
+# expose, + the VPN-free client guard) and ABORT the release if any core job
+# breaks or exceeds its step/time budget. The tutorials ARE the tests. Set
+# SKIP_FIRSTRUN=1 to bypass (e.g. Docker unavailable) — only deliberately.
+if [[ "${SKIP_FIRSTRUN:-0}" != "1" ]]; then
+  echo "==> Running first-run acceptance gate"
+  if ! command -v docker &>/dev/null; then
+    echo "Error: docker not found — the first-run gate needs Docker (Colima on macOS)."
+    echo "       Start Docker, or set SKIP_FIRSTRUN=1 to bypass (not recommended)."
+    exit 1
+  fi
+  if ! "${PROJECT_ROOT}/tests/e2e/first-run.sh"; then
+    echo "Error: first-run acceptance FAILED — a core job broke or exceeded budget. Release aborted."
+    echo "       See tests/e2e/first-run-results.md for the per-job breakdown."
+    exit 1
+  fi
+else
+  echo "==> SKIP_FIRSTRUN=1 — skipping first-run acceptance gate (NOT recommended)"
+fi
+
 # --- Build (parallel) --------------------------------------------------------
 
 rm -rf "${DIST_DIR}"
