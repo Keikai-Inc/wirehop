@@ -1885,6 +1885,34 @@ fn install_datastore_raw(ctx: &Ctx<'_>, ds: &Datastore, run_as_user: Option<&str
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    // __hop_audit_query(optsJson) → JSON array of AuditEvent (most-recent-first).
+    // opts = { category?, since?, until?, actor?, limit? } (since/until = unix ms).
+    // Exposes the per-node audit & flow log (G4) to automation — the event source
+    // the webhook cap polls.
+    {
+        let ds = ds.clone();
+        globals.set("__hop_audit_query",
+            Function::new(ctx.clone(), move |_ctx: Ctx<'_>, opts_json: String| -> rquickjs::Result<String> {
+                let v: serde_json::Value =
+                    serde_json::from_str(&opts_json).unwrap_or(serde_json::Value::Null);
+                let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+                let query = hop_core::audit::AuditQuery {
+                    category: get_str("category")
+                        .as_deref()
+                        .and_then(hop_core::audit::AuditCategory::parse),
+                    since_ms: v.get("since").and_then(|x| x.as_u64()),
+                    until_ms: v.get("until").and_then(|x| x.as_u64()),
+                    actor: get_str("actor"),
+                    limit: v.get("limit").and_then(|x| x.as_u64()).map(|n| n as usize),
+                };
+                match ds.audit_query(&query) {
+                    Ok(events) => Ok(serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string())),
+                    Err(e) => Err(js_err(format!("hop.audit.query failed: {e}"))),
+                }
+            }).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     Ok(())
 }
 
@@ -1954,6 +1982,11 @@ fn install_datastore_js_wrappers(ctx: &Ctx<'_>) -> Result<()> {
                 return JSON.parse(__hop_secrets_list());
             }
         };
+        hop.audit = {
+            query: function(options) {
+                return JSON.parse(__hop_audit_query(JSON.stringify(options || {})));
+            }
+        };
     "#;
 
     ctx.eval::<(), _>(js_code)
@@ -1984,6 +2017,9 @@ fn install_datastore_stubs(ctx: &Ctx<'_>) -> Result<()> {
             set: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); },
             delete: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); },
             list: function() { throw new Error("hop.secrets.* requires a datastore (run in host mode)"); }
+        };
+        hop.audit = {
+            query: function() { throw new Error("hop.audit.* requires a datastore (run in host mode)"); }
         };
     "#;
 

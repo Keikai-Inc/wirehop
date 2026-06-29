@@ -2259,6 +2259,21 @@ impl NetDoc {
         // path (author-validated by C1 enforce). Probes run concurrently and a
         // missing tool fails fast, so this doesn't delay bringup.
         let posture = crate::posture::collect().await;
+        // Record a local audit event when this node boots non-compliant (disk
+        // encryption / firewall / screen-lock reported off), so the webhook cap
+        // (G5) can relay it. Each node attests its OWN posture (federated).
+        let failures = crate::posture::posture_failures(&posture);
+        if !failures.is_empty() {
+            crate::audit::record(
+                crate::audit::AuditEvent::new(
+                    crate::audit::AuditCategory::Config,
+                    "posture.fail",
+                    crate::audit::AuditOutcome::Failure,
+                )
+                .actor(host_node_id.to_string())
+                .detail(format!("failing: {}", failures.join(", "))),
+            );
+        }
         if let Err(e) = self.register_posture(host_node_id, &posture).await {
             tracing::warn!("vpn: posture registration failed: {e:#}");
         }

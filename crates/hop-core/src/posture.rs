@@ -39,6 +39,18 @@ pub async fn collect() -> BTreeMap<String, String> {
     m
 }
 
+/// Security-relevant posture facts that are explicitly **failing** — reported
+/// `"false"` (not `"unknown"`, which is treated as "couldn't determine, don't
+/// alarm"). Drives the `posture.fail` audit event (G4) that the webhook cap (G5)
+/// relays. Order is stable for deterministic output.
+pub fn posture_failures(posture: &BTreeMap<String, String>) -> Vec<String> {
+    ["disk_encrypted", "firewall", "screen_lock"]
+        .into_iter()
+        .filter(|k| posture.get(*k).map(|v| v == "false").unwrap_or(false))
+        .map(|k| k.to_string())
+        .collect()
+}
+
 /// Run `cmd args...` with a timeout; trimmed stdout on success, else `None`.
 async fn probe(cmd: &str, args: &[&str]) -> Option<String> {
     let fut = tokio::process::Command::new(cmd).args(args).output();
@@ -171,5 +183,27 @@ mod tests {
                 "{k} = {v:?} not in true/false/unknown"
             );
         }
+    }
+
+    #[test]
+    fn posture_failures_flags_only_explicit_false() {
+        let mk = |de: &str, fw: &str, sl: &str| {
+            BTreeMap::from([
+                ("disk_encrypted".to_string(), de.to_string()),
+                ("firewall".to_string(), fw.to_string()),
+                ("screen_lock".to_string(), sl.to_string()),
+            ])
+        };
+        // All good → no failures.
+        assert!(posture_failures(&mk("true", "true", "true")).is_empty());
+        // `unknown` is NOT a failure (couldn't determine — don't alarm).
+        assert!(posture_failures(&mk("unknown", "unknown", "unknown")).is_empty());
+        // Explicit false flags, in stable order.
+        assert_eq!(
+            posture_failures(&mk("false", "true", "false")),
+            vec!["disk_encrypted".to_string(), "screen_lock".to_string()]
+        );
+        // Missing key → not a failure.
+        assert!(posture_failures(&BTreeMap::new()).is_empty());
     }
 }

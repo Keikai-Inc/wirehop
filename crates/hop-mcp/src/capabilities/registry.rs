@@ -66,5 +66,29 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
                 AuthRequirement { provider: "anthropic", description: "Anthropic" },
             ],
         },
+        CapabilityDefinition {
+            id: "event-webhook",
+            name: "Event Webhook",
+            description: "Fires a local HTTP POST to a secret-stored URL on warren \
+                events: a new member joins, this node's device posture fails (disk \
+                encryption / firewall off), or rejected-connection/reach-denial \
+                activity crosses a threshold. Polls THIS node's audit log (no central \
+                collector); each node reports its own events. Set the target with \
+                `hop secrets set webhook_url <https-url>`.",
+            tier: PermissionTier::Connect,
+            trigger: TriggerMode::Both { default_schedule: "0 */5 * * * *" },
+            data_pattern: DataPattern::Push,
+            script: include_str!("scripts/event_webhook.js"),
+            category: "automation",
+            params: &[
+                ParamDef {
+                    name: "deny_threshold",
+                    description: "Fire a summary alert when this many rejected/denied events accumulate since the last run (default 5)",
+                    required: false,
+                    default: Some("5"),
+                },
+            ],
+            auth_requirements: &[],
+        },
     ]
 }

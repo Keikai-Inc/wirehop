@@ -568,6 +568,37 @@ if (latest) hop.log("Current load: " + latest.value);
 
 ---
 
+### Datastore: Audit Log
+
+#### `hop.audit.query(options?)`
+
+Query this node's per-node audit & flow log (see
+[data-and-automation.md](data-and-automation.md#per-node-audit--flow-log) and
+[`hop audit`](cli-reference.md#hop-audit)) — the event source the `event-webhook`
+cap polls. Returns the OTel-aligned `AuditEvent` records, **most-recent-first**.
+
+| Option | Type | Description |
+|---|---|---|
+| `category` | string | One of `connection`, `session`, `exec`, `transfer`, `reach`, `flow`, `membership`, `config` |
+| `since` / `until` | number | Unix-ms time bounds (inclusive) |
+| `actor` | string | Substring match on the node-id or username |
+| `limit` | number | Max rows (most recent first) |
+
+**Returns:** array of `{ ts_ms, category, action, outcome, actor, actor_user, target, peer, bytes_tx, bytes_rx, path, detail }`
+
+**Requires:** datastore
+
+```javascript
+// New members admitted in the last hour
+var joins = hop.audit.query({ category: "membership", since: Date.now() - 3600000 });
+// Count rejected connections since a stored watermark
+var denials = hop.audit.query({ since: lastTs }).filter(function (e) {
+    return e.outcome === "deny";
+});
+```
+
+---
+
 ### Datastore: Cron
 
 #### `hop.cron.list()`

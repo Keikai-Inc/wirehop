@@ -396,4 +396,74 @@ mod tests {
             .unwrap();
         assert_eq!(result, "42.5");
     }
+
+    #[tokio::test]
+    async fn execute_audit_query_binding() {
+        use hop_core::audit::{AuditCategory, AuditEvent, AuditOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        // Seed the audit log: one membership join + two denials.
+        ds.audit_append(
+            &AuditEvent::new(AuditCategory::Membership, "member.join", AuditOutcome::Success)
+                .actor("nodeA"),
+        )
+        .unwrap();
+        ds.audit_append(&AuditEvent::new(
+            AuditCategory::Connection,
+            "connection.rejected",
+            AuditOutcome::Deny,
+        ))
+        .unwrap();
+        ds.audit_append(&AuditEvent::new(
+            AuditCategory::Connection,
+            "connection.rejected",
+            AuditOutcome::Deny,
+        ))
+        .unwrap();
+
+        let mut runtime = JsRuntime::new();
+        runtime.set_datastore(ds);
+        let backend = test_backend();
+
+        // The webhook cap's exact access pattern: query all, then filter by category.
+        let code = r#"
+            var all = hop.audit.query({});
+            var members = hop.audit.query({ category: "membership" });
+            var denials = all.filter(function(e){ return e.outcome === "deny"; });
+            return all.length + "|" + members.length + "|" + denials.length + "|" + members[0].action;
+        "#;
+        let result = runtime
+            .execute(code, &backend, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(result, "3|1|2|member.join");
+    }
+
+    #[tokio::test]
+    async fn event_webhook_cap_script_runs_and_guards_no_url() {
+        use hop_core::audit::{AuditCategory, AuditEvent, AuditOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("t.redb")).unwrap();
+        ds.audit_append(&AuditEvent::new(
+            AuditCategory::Membership,
+            "member.join",
+            AuditOutcome::Success,
+        ))
+        .unwrap();
+        let mut runtime = JsRuntime::new();
+        runtime.set_datastore(ds);
+        let backend = test_backend();
+
+        // Run the ACTUAL embedded cap script: with no webhook_url secret it must
+        // exit gracefully (proves the script parses + the no-URL guard fires + the
+        // hop.audit/hop.kv access paths work) without attempting any network call.
+        let script = crate::capabilities::CapabilityDefinition::find("event-webhook")
+            .expect("event-webhook cap is registered")
+            .script;
+        let result = runtime
+            .execute(script, &backend, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(result.contains("no webhook_url"), "expected no-URL no-op, got: {result}");
+    }
 }

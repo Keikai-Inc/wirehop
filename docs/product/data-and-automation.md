@@ -315,12 +315,14 @@ hop cap deploy <id> --targets prod  # deploy to remote nodes
 | `log-search` | Log Search | Searches system logs across fleet nodes. Each node greps locally, returns matching lines. | Observe | OnDemand | -- | operations | FanOut |
 | `security-baseline` | Security Baseline | Audits SUID binaries, open ports, failed auth, SSH keys, world-writable files. Dual-mode with push. | Audit | Both | `0 0 3 * * *` (daily 3 AM) | security | Push |
 | `email-monitor` | Email Monitor | Daily Gmail triage and morning briefing. Classifies emails as URGENT/ACTION/FYI using Claude, sends briefing, marks FYI as read. | Connect | Both | `0 0 7 * * *` (daily 7 AM) | automation | Push |
+| `event-webhook` | Event Webhook | Fires a local HTTP POST to a secret-stored URL on warren events: a new member joins, this node's device posture fails, or rejected/denied activity crosses a threshold. Polls this node's audit log; no central collector. | Connect | Both | `0 */5 * * * *` (every 5 min) | automation | Push |
 
 #### Parameters
 
 | Capability | Parameter | Required | Default | Description |
 |---|---|---|---|---|
 | `log-search` | `query` | Yes | -- | Search term to grep for in system logs |
+| `event-webhook` | `deny_threshold` | No | `5` | Fire a summary alert when this many rejected/denied events accumulate since the last run |
 
 ### Permission Tiers
 
@@ -406,6 +408,37 @@ Daily Gmail monitoring with AI-powered triage:
 7. Archives briefing to KV (`briefings:<date>`)
 
 **Setup required:** See [Email Monitor Setup](#email-monitor-setup) below.
+
+#### event_webhook.js
+
+A local, no-central-collector notifier. Each run polls **this node's** per-node
+audit log (G4) and POSTs a JSON payload to a secret-stored URL for three event
+types:
+
+| Trigger | Detected from the audit log | Payload `hop_event` |
+|---|---|---|
+| **New member joins** | category `membership` (e.g. `member.join`) | `membership` |
+| **Posture fails** | action `posture.fail` (this node booted with disk encryption / firewall / screen-lock reported **off**) | `posture_fail` |
+| **Denial spike** | `>= deny_threshold` events with outcome `deny`/`failure` (rejected connections, reach denials) since the last run | `denial_threshold` |
+
+Each node reports **its own** events (federated; the membership events come from the
+admitting node, the posture event from the node itself). State is a watermark in KV
+(`event-webhook`/`last_ts`) so each run only acts on newer events. Delivery is
+best-effort (failures are logged; the watermark still advances).
+
+**Setup:**
+
+```bash
+hop secrets set webhook_url "https://hooks.example.com/your-endpoint"
+hop cap enable event-webhook                       # every 5 min (default)
+hop cap enable event-webhook --schedule "0 * * * * *"   # every minute
+hop cap enable event-webhook --param deny_threshold=10
+hop cap run event-webhook                          # run once now
+```
+
+The URL **must be public** (`https`): the cap runs under the restricted `connect`
+sandbox, whose SSRF guard blocks loopback / private / CGNAT targets. (Slack,
+PagerDuty, Discord, or your own internet-facing endpoint all work.)
 
 ### Email Monitor Setup
 
