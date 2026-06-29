@@ -8,6 +8,15 @@ pub const KV_TABLE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new(
 /// Time-series: (metric_name, unix_timestamp_ms) → bincode-encoded MetricPoint.
 pub const TS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("ts");
 
+/// Per-node audit & flow log: (series, packed_id) → bincode-encoded AuditEvent.
+/// `series` is a single constant ([`AUDIT_SERIES`]) so all events live in one
+/// time-ordered range; `packed_id = (ts_ms << 20) | seq` keeps same-millisecond
+/// events distinct while preserving time order (see `crate::audit::pack_id`).
+pub const AUDIT_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("audit");
+
+/// The single logical series all audit events are stored under.
+pub const AUDIT_SERIES: &str = "ev";
+
 /// Cron jobs: job_id → bincode-encoded CronJob.
 pub const CRON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cron");
 

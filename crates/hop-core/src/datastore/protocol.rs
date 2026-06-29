@@ -39,6 +39,11 @@ pub enum DsRequest {
     /// `hop debug net-stats` poll drop/queue/latency metrics from the worker.
     /// Appended last to keep existing variant discriminants stable.
     NetStats,
+    /// Append a per-node audit/flow event. Appended last to keep existing
+    /// variant discriminants stable.
+    AuditAppend { event: Box<crate::audit::AuditEvent> },
+    /// Query the per-node audit/flow log (most recent first).
+    AuditQuery { query: crate::audit::AuditQuery },
 }
 
 /// Response from the daemon's datastore to a client.
@@ -58,4 +63,5 @@ pub enum DsResponse {
     StringList(Vec<String>),
     Admin(Box<crate::proto::AdminResponse>),
     NetStats(Box<crate::netstats::NetStatsSnapshot>),
+    AuditEvents(Vec<crate::audit::AuditEvent>),
 }

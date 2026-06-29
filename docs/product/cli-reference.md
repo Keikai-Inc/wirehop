@@ -619,6 +619,43 @@ hop ts query health.disk_pct --last 7d
 
 **`ts query` flag:** `--last <DURATION>` (e.g., `1h`, `30m`, `7d`; default: `1h`)
 
+### `hop audit`
+
+Query this node's **per-node audit & flow log** — its own append-only logbook of
+who connected, what ran, what flowed, and what membership/config changed. The log
+lives in this machine's datastore (read over the daemon socket); there is **no
+central collector**. Out-of-the-box export to external log/metric/SIEM systems
+(Datadog, Splunk, Grafana/OTLP) is a planned layer on top (roadmap G22) — `--json`
+already emits the OTel-aligned schema it will ship.
+
+| Flag | Description |
+|---|---|
+| `--since <DURATION>` | How far back (e.g. `1h`, `30m`, `7d`). Default: `24h` |
+| `--category <CAT>` | One of `connection`, `session`, `exec`, `transfer`, `reach`, `flow`, `membership`, `config` |
+| `--actor <STR>` | Filter by acting node-id or username (substring) |
+| `--limit <N>` | Max rows, most recent first. Default: `100` |
+| `--json` | One JSON object per line (the OTel-aligned export schema) |
+
+```bash
+hop audit                                  # last 24h, all categories
+hop audit --since 7d --category exec       # commands run in the last week
+hop audit --actor alice --json             # alice's events, machine-readable
+```
+
+**Verbosity (config-gated).** What gets recorded is set by `audit_level` in the
+host config (or `HOP_AUDIT_LEVEL`), default `connections`:
+
+| Level | Records |
+|---|---|
+| `off` | nothing |
+| `security` | auth rejections, reach denials, membership + config changes |
+| `connections` *(default)* | the above **plus** accepted connections, sessions, exec, transfers |
+| `flows` | the above **plus** periodic per-node flow summaries (bytes over the VPN) and reach *allows* |
+
+Retention: events older than `HOP_AUDIT_RETENTION_DAYS` (default `30`) are purged
+hourly. (Per-packet reach decisions are **not** recorded — that's the VPN hot path;
+denials surface in aggregate via the flow summary's drop counts.)
+
 ### `hop cron <action>`
 
 Manage cron jobs on the daemon.

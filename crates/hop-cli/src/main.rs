@@ -1,4 +1,5 @@
 mod agent;
+mod audit;
 mod cli;
 mod cpuprofile;
 mod itemize;
@@ -272,6 +273,17 @@ async fn main() -> Result<()> {
                 }
             };
             hop_mcp::run_stdio_server_with_datastore(&config_dir, datastore).await
+        }
+        Command::Audit { since, category, actor, limit, json } => {
+            let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            audit::run(
+                &config_dir,
+                since.as_deref(),
+                category.as_deref(),
+                actor.as_deref(),
+                limit,
+                json,
+            )
         }
         Command::Id => {
             // Print the *host* node id. Ask the running daemon first (privsep §6:
@@ -582,6 +594,86 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 ds_path.display()
             )
         })?;
+
+    // Per-node audit & flow log (G4): install the global audit sink so the deep
+    // hook points (auth, shell, transfer, reach) can record with one non-blocking
+    // call. The drain thread writes to THIS daemon's datastore — no central
+    // collector. Level: HOP_AUDIT_LEVEL overrides the host config (default
+    // `connections`). A periodic retention purge + an opt-in flow summary ride on
+    // top. `init` is a no-op when level is `off`, leaving recording inert.
+    {
+        use hop_core::audit::AuditLevel;
+        let host_cfg = hop_core::config::HostConfig::load(config_dir).unwrap_or_default();
+        let level = std::env::var("HOP_AUDIT_LEVEL")
+            .ok()
+            .and_then(|s| AuditLevel::parse(&s))
+            .unwrap_or(host_cfg.audit_level);
+        if level != AuditLevel::Off {
+            let ds_drain = datastore.clone();
+            hop_core::audit::init(level, move |ev| {
+                if let Err(e) = ds_drain.audit_append(&ev) {
+                    tracing::debug!("audit: append failed: {e:#}");
+                }
+            });
+            tracing::info!("audit: per-node log enabled (level {})", level.as_str());
+
+            // Retention: purge audit events older than HOP_AUDIT_RETENTION_DAYS
+            // (default 30) hourly. Best-effort, off the hot path.
+            let retain_days: u64 = std::env::var("HOP_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30)
+                .max(1);
+            let ds_ret = datastore.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    tick.tick().await;
+                    let cutoff = hop_core::audit::now_ms()
+                        .saturating_sub(retain_days * 24 * 3600 * 1000);
+                    let ds = ds_ret.clone();
+                    let _ = tokio::task::spawn_blocking(move || ds.audit_purge_before(cutoff))
+                        .await;
+                }
+            });
+
+            // Flow summary (only materializes at the `flows` level): persist the
+            // net-stats data-plane counters into the flow log every 60s, so the
+            // ephemeral `hop debug net-stats` counters become a queryable history.
+            if level >= AuditLevel::Flows {
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    let (mut last_tx, mut last_rx) = (0u64, 0u64);
+                    loop {
+                        tick.tick().await;
+                        let s = hop_core::netstats::NET_STATS.snapshot();
+                        let (tx, rx) = (s.eg_tun_bytes, s.in_bytes);
+                        // Record the per-interval delta (a flow, not a gauge).
+                        let (dtx, drx) = (tx.saturating_sub(last_tx), rx.saturating_sub(last_rx));
+                        last_tx = tx;
+                        last_rx = rx;
+                        if dtx == 0 && drx == 0 {
+                            continue; // idle interval — don't spam the log
+                        }
+                        let drops = s.eg_drop_reach
+                            + s.eg_drop_noroute
+                            + s.eg_drop_send_closed
+                            + s.in_drop_unknown_peer
+                            + s.in_drop_spoof;
+                        hop_core::audit::record(
+                            hop_core::audit::AuditEvent::new(
+                                hop_core::audit::AuditCategory::Flow,
+                                "flow.summary",
+                                hop_core::audit::AuditOutcome::Info,
+                            )
+                            .bytes(dtx, drx)
+                            .detail(format!("60s: drops={drops}")),
+                        );
+                    }
+                });
+            }
+        }
+    }
 
     // Derive the netdoc endpoint key before the host secret is moved into the
     // host endpoint. The netdoc stack runs on its own isolated endpoint.
@@ -5311,7 +5403,7 @@ fn cmd_ts(config_dir: &std::path::Path, action: TsAction) -> Result<()> {
 }
 
 /// Parse a human-readable duration like "1h", "30m", "7d" into milliseconds.
-fn parse_duration_ms(s: &str) -> Result<u64> {
+pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix('d') {
         Ok(n.parse::<u64>().context("invalid number")? * 86_400_000)

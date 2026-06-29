@@ -245,6 +245,44 @@ datastore.ts_purge_before("cpu", cutoff)?;
 
 KV and secrets entries do not have automatic expiry; delete them explicitly when no longer needed.
 
+### Per-node Audit & Flow Log
+
+Each machine keeps its own append-only logbook of security- and connection-relevant
+events — who connected, what they ran, what flowed, and membership/config changes.
+It is **datastore-backed and local**: no central collector. Query it with
+[`hop audit`](cli-reference.md#hop-audit); export to external SIEM/metrics systems
+is a planned layer (roadmap G22).
+
+**Schema (OpenTelemetry-aligned).** Each event (`crate::audit::AuditEvent`) has a
+fixed field set that maps 1:1 onto OTel log attributes, so external export is a
+lossless field rename rather than a reshape:
+
+| Field | OTel attribute | Notes |
+|---|---|---|
+| `ts_ms` | `Timestamp` | unix ms |
+| `category` | `event.domain` | `connection` / `session` / `exec` / `transfer` / `reach` / `flow` / `membership` / `config` |
+| `action` | `event.name` | e.g. `connection.authorized`, `member.join`, `exec` |
+| `outcome` | `event.outcome` | `success` / `failure` / `allow` / `deny` / `info` |
+| `actor` / `actor_user` | `source.node_id` / `enduser.id` | acting node-id / unix user |
+| `target` / `peer` | `destination.address` / `network.peer.node_id` | |
+| `bytes_tx` / `bytes_rx` | `network.io.bytes` | flow summaries |
+| `path` | `network.type` | `direct` / `relay` / `mixed` |
+| `detail` | `event.description` | short free text |
+
+**Storage.** Events live in the `audit` redb table under a single time-ordered series,
+keyed `(ts_ms << 20) | seq` so same-millisecond events never collide. Values are
+stored as **JSON** (not bincode) so the schema can gain fields across upgrades without
+breaking old records (`#[serde(default)]` fills the gaps). API:
+`audit_append(&event)`, `audit_query(&AuditQuery)` (most-recent-first; category/time/
+actor/limit filters), and `audit_purge_before(before_ms)`.
+
+**Verbosity + retention.** Recording is gated by `audit_level` in the host config
+(`off` / `security` / `connections` *(default)* / `flows`), overridable with
+`HOP_AUDIT_LEVEL`. A drain thread keeps recording off the hot path. Events older than
+`HOP_AUDIT_RETENTION_DAYS` (default 30) are purged hourly. Per-packet reach decisions
+are deliberately **not** recorded (that's the VPN forwarding hot path); denials show
+up in aggregate in the periodic flow summary's drop counts.
+
 *Last updated: v0.6.33*
 
 

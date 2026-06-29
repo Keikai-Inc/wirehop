@@ -90,6 +90,20 @@ pub async fn host_transfer_session(
     // Resolve the remote path to an absolute path on the host filesystem.
     let base_path = resolve_host_path(&request.remote_path, username)?;
 
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditCategory::Transfer,
+            "transfer",
+            crate::audit::AuditOutcome::Info,
+        )
+        .user_opt(username)
+        .target(request.remote_path.clone())
+        .detail(match request.direction {
+            TransferDirection::Push => "push",
+            TransferDirection::Pull => "pull",
+        }),
+    );
+
     // Enforce the peer's sandbox policy on the data plane (security-audit C3).
     // Transfer previously ran with full host privileges regardless of the
     // policy attached to the invite, nullifying read-only and path scope for

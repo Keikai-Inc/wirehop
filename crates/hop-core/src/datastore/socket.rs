@@ -297,6 +297,13 @@ fn dispatch_request(
         DsRequest::NetStats => {
             DsResponse::NetStats(Box::new(crate::netstats::NET_STATS.snapshot()))
         }
+        DsRequest::AuditAppend { event } => {
+            ds.audit_append(&event)?;
+            DsResponse::Ok
+        }
+        DsRequest::AuditQuery { query } => {
+            DsResponse::AuditEvents(ds.audit_query(&query)?)
+        }
     })
 }
 

@@ -1129,6 +1129,15 @@ pub async fn host_shell_session_persistent(
         let _ = proto::write_message(&mut send, &HostMessage::SessionError(format!("{e:#}"))).await;
         return Err(e);
     }
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditCategory::Session,
+            "session.start",
+            crate::audit::AuditOutcome::Info,
+        )
+        .actor(peer_id.to_string())
+        .user_opt(username),
+    );
 
     let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut recv).await;
 
@@ -1798,6 +1807,15 @@ pub async fn host_exec_session(
     sandbox: &crate::sandbox::SandboxPolicy,
     protocol_version: u8,
 ) -> Result<()> {
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditCategory::Exec,
+            "exec",
+            crate::audit::AuditOutcome::Info,
+        )
+        .user_opt(username)
+        .detail(command.chars().take(200).collect::<String>()),
+    );
     // --- Pre-spawn security checks (same as shell) ---
     #[cfg(unix)]
     {

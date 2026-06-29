@@ -4,6 +4,7 @@
 //! - **Local**: direct access to a redb database file (used by the daemon).
 //! - **Remote**: connects to the daemon's Unix socket (used by `hop mcp`).
 
+pub mod audit;
 pub mod cron;
 pub mod kv;
 pub mod protocol;

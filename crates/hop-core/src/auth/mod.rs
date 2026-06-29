@@ -95,6 +95,19 @@ pub fn generate_peer_display_name(
     format!("peer-{short_id}")
 }
 
+/// Record a rejected (unauthorized) connection attempt in the audit log.
+fn record_unauthorized(remote_id: &PublicKey) {
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditCategory::Connection,
+            "connection.rejected",
+            crate::audit::AuditOutcome::Deny,
+        )
+        .actor(remote_id.to_string())
+        .detail("unauthorized"),
+    );
+}
+
 /// Host-side: authenticate an incoming connection.
 ///
 /// Reads the first message from the client. If it's an `AuthResponse` (invite flow),
@@ -168,11 +181,30 @@ pub async fn authenticate_client(
                 proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
 
                 tracing::info!("Invite accepted for peer {} (role: {:?})", remote_id.fmt_short(), consumed.role);
+                crate::audit::record(
+                    crate::audit::AuditEvent::new(
+                        crate::audit::AuditCategory::Membership,
+                        "member.join",
+                        crate::audit::AuditOutcome::Success,
+                    )
+                    .actor(remote_id.to_string())
+                    .user_opt(consumed.username.as_deref())
+                    .detail(format!("role={:?}", consumed.role)),
+                );
                 Ok((AuthOutcome::InviteAccepted { username: consumed.username, role: consumed.role, sandbox: consumed.sandbox }, None))
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;
                 tracing::warn!("Invalid invite from peer {}", remote_id.fmt_short());
+                crate::audit::record(
+                    crate::audit::AuditEvent::new(
+                        crate::audit::AuditCategory::Connection,
+                        "connection.rejected",
+                        crate::audit::AuditOutcome::Deny,
+                    )
+                    .actor(remote_id.to_string())
+                    .detail("invalid invite"),
+                );
                 Ok((AuthOutcome::Rejected, None))
             }
         }
@@ -203,6 +235,15 @@ pub async fn authenticate_client(
                     "Peer {} rejected: revoked in network document (overrides local entry)",
                     remote_id.fmt_short()
                 );
+                crate::audit::record(
+                    crate::audit::AuditEvent::new(
+                        crate::audit::AuditCategory::Connection,
+                        "connection.rejected",
+                        crate::audit::AuditOutcome::Deny,
+                    )
+                    .actor(remote_id.to_string())
+                    .detail("revoked in network document"),
+                );
                 return Ok((AuthOutcome::Rejected, None));
             }
             if peers.is_authorized(remote_id) {
@@ -212,6 +253,15 @@ pub async fn authenticate_client(
                 let mut peers = peers;
                 peers.update_last_seen(remote_id);
                 peers.save(config_dir)?;
+                crate::audit::record(
+                    crate::audit::AuditEvent::new(
+                        crate::audit::AuditCategory::Connection,
+                        "connection.authorized",
+                        crate::audit::AuditOutcome::Allow,
+                    )
+                    .actor(remote_id.to_string())
+                    .user_opt(username.as_deref()),
+                );
                 Ok((AuthOutcome::Authorized { username, role, sandbox }, Some(msg)))
             } else if let Some(nd) = netdoc {
                 let remote_hex = remote_id.to_string();
@@ -221,6 +271,16 @@ pub async fn authenticate_client(
                     Ok((AuthOutcome::Rejected, None))
                 } else if let Some(dp) = nd.get_peer(&remote_hex).await.ok().flatten() {
                     tracing::info!("Authorized peer {} via netdoc replica", remote_id.fmt_short());
+                    crate::audit::record(
+                        crate::audit::AuditEvent::new(
+                            crate::audit::AuditCategory::Connection,
+                            "connection.authorized",
+                            crate::audit::AuditOutcome::Allow,
+                        )
+                        .actor(remote_id.to_string())
+                        .user_opt(dp.username.as_deref())
+                        .detail("via netdoc replica"),
+                    );
                     Ok((
                         AuthOutcome::Authorized {
                             username: dp.username,
@@ -232,12 +292,14 @@ pub async fn authenticate_client(
                 } else {
                     proto::write_message(send, &HostMessage::AuthResult { authorized: false }).await?;
                     tracing::warn!("Unauthorized peer {} rejected", remote_id.fmt_short());
+                    record_unauthorized(remote_id);
                     Ok((AuthOutcome::Rejected, None))
                 }
             } else {
                 proto::write_message(send, &HostMessage::AuthResult { authorized: false })
                     .await?;
                 tracing::warn!("Unauthorized peer {} rejected", remote_id.fmt_short());
+                record_unauthorized(remote_id);
                 Ok((AuthOutcome::Rejected, None))
             }
         }

@@ -33,7 +33,7 @@ On macOS/Linux, if the parent directory has the setgid bit (0o2000), the databas
 
 ## redb Tables
 
-Five tables are defined in `crates/hop-core/src/datastore/tables.rs`:
+The tables are defined in `crates/hop-core/src/datastore/tables.rs` (plus a user-scoped `secrets_v2`):
 
 ```rust
 // KV store: composite key (namespace, key) -> bincode-encoded KvEntry
@@ -50,9 +50,13 @@ const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 // Encrypted secrets: secret_name -> bincode-encoded SealedSecret
 const SECRETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
+
+// Per-node audit & flow log: (series, packed_id) -> JSON-encoded AuditEvent.
+// packed_id = (ts_ms << 20) | seq keeps same-ms events distinct + time-ordered.
+const AUDIT_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("audit");
 ```
 
-All values are stored as `&[u8]` (bincode-encoded). Tables are created lazily on first write. Reads on non-existent tables return empty results via `TableDoesNotExist` error handling.
+Most values are stored as `&[u8]` (bincode-encoded). Tables are created lazily on first write. Reads on non-existent tables return empty results via `TableDoesNotExist` error handling. **Exception:** `AUDIT_TABLE` values are **JSON**-encoded (not bincode) so the audit-event schema can gain fields across upgrades without breaking old records — bincode is non-self-describing and would fail to decode an older record once a field is added. See `crate::audit` (the OTel-aligned schema) and `datastore::audit` (`audit_append` / `audit_query` / `audit_purge_before`).
 
 ## Data Types
 

@@ -570,6 +570,18 @@ pub struct HostConfig {
     /// forces off.
     #[serde(default = "vpn_default_for_existing_config")]
     pub vpn_enabled: bool,
+
+    /// Verbosity of the per-node audit & flow log (`hop audit`). Default
+    /// `connections` — records auth/membership/config/reach-denials **and**
+    /// accepted connections, sessions, exec, and transfers, but not per-node flow
+    /// summaries (raise to `flows` for those, or `security` for denials only, or
+    /// `off`). `HOP_AUDIT_LEVEL` overrides at runtime.
+    #[serde(default = "default_audit_level")]
+    pub audit_level: crate::audit::AuditLevel,
+}
+
+fn default_audit_level() -> crate::audit::AuditLevel {
+    crate::audit::AuditLevel::Connections
 }
 
 fn default_role_name() -> String {
@@ -603,6 +615,7 @@ impl Default for HostConfig {
             default_role: default_role_name(),
             tags: Vec::new(),
             vpn_enabled: default_vpn_enabled(),
+            audit_level: default_audit_level(),
         }
     }
 }

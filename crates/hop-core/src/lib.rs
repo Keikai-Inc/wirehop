@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod peer_ops;
 pub mod config;

@@ -301,6 +301,26 @@ pub enum Command {
     /// Start MCP server (Model Context Protocol) for AI agent integration
     Mcp,
 
+    /// Query this node's per-node audit & flow log (who connected, what ran, what flowed)
+    Audit {
+        /// How far back to look (e.g. "1h", "30m", "7d"). Default: 24h.
+        #[arg(long)]
+        since: Option<String>,
+        /// Restrict to one category: connection, session, exec, transfer, reach,
+        /// flow, membership, config.
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter by actor — matches a node-id or username substring.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Maximum rows (most recent first). Default: 100.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit one JSON object per line (the OTel-aligned export schema).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print this node's identity (NodeId)
     Id,
 

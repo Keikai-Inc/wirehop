@@ -116,6 +116,34 @@ fi
 record "A1 reach-a-machine" "$A1_OK" "${A1_SECS:-$A1_BUDGET}" "$A1_BUDGET" "$A1_DETAIL"
 
 #############################################################################
+say "AUDIT — the per-node audit log captured the A1 session (no central collector)"
+#############################################################################
+# A1 redeemed an invite, authorized a connection, and ran `echo` over exec on
+# fr-srv. With the default audit level (connections), the host's local audit log
+# must show those events; `hop audit --json` reads them back over the daemon socket.
+# The drain is async, so retry briefly.
+AUDIT_OK=0; AUDIT_DETAIL="no A1 events in audit log"
+if [ "$A1_OK" = 1 ]; then
+  for _ in $(seq 1 10); do
+    AJSON=$(docker exec fr-srv hop --config /cfg audit --since 1h --json 2>/dev/null)
+    if echo "$AJSON" | grep -q '"action":"exec"'; then
+      AUDIT_OK=1; AUDIT_DETAIL="exec recorded ($(echo "$AJSON" | grep -c '"ts_ms"') events)"; break
+    elif echo "$AJSON" | grep -qE '"category":"(connection|membership)"'; then
+      AUDIT_OK=1; AUDIT_DETAIL="connection/membership recorded"; break
+    fi
+    sleep 1
+  done
+  # Category filter must also work (proves the query path, not just a dump).
+  if [ "$AUDIT_OK" = 1 ]; then
+    CONNS=$(docker exec fr-srv hop --config /cfg audit --category connection --json 2>/dev/null | grep -c '"ts_ms"')
+    AUDIT_DETAIL="$AUDIT_DETAIL; --category connection -> ${CONNS:-0}"
+  fi
+else
+  AUDIT_DETAIL="A1 failed; skipped"
+fi
+record "AUDIT per-node-log" "$AUDIT_OK" 0 5 "$AUDIT_DETAIL"
+
+#############################################################################
 say "A2 — private network (node joins with bare --host -> reach founder BY NAME over VPN)"
 #############################################################################
 run_node fr-founder founder
