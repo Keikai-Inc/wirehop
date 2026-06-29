@@ -248,6 +248,8 @@ mod tests {
             shell: None,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         }
     }
 
@@ -342,6 +344,8 @@ mod tests {
             shell: None,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         }];
         let peers = vec![peer("linuxAdmin", "admin"), peer("macAdmin", "admin")];
         let mut tags = HashMap::new();
@@ -381,6 +385,8 @@ mod tests {
             shell: None,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         }];
         let peers = vec![peer("encrypted", "locked"), peer("plaintext", "locked")];
         let mut tags = HashMap::new();

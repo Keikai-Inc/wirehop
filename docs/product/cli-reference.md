@@ -273,6 +273,7 @@ config directory.
 | `vpn` | `on` / `off` | Warren VPN data plane (default `on`) |
 | `tags` | comma-separated | Host tags (drive role→tag reach + MagicDNS); empty clears |
 | `default_role` | role name | Role for invites that don't specify one (default `member`) |
+| `require_explicit_access` | `true` / `false` | "Lock" this host (G23): only roles **explicitly** granted its tags may open exec/shell/transfer/search sessions; admins exempt. Default `false` (open within the warren) |
 
 ```bash
 hop config                          # show current config
@@ -281,6 +282,7 @@ hop config set max_sessions 10
 hop config set vpn off              # disable the warren VPN
 hop config set tags production,web  # tag this host
 hop config set default_role developer
+hop config set require_explicit_access true   # lock: explicit grants only
 hop config path                     # print the host config directory
 ```
 
@@ -496,15 +498,27 @@ hop admin orch fleet-tag abc123 --add production --remove staging
 | `--admin` | macOS admin group membership |
 | `--groups <GROUPS>` | Extra Unix groups (comma-separated) |
 | `--shell <SHELL>` | Override default shell |
+| `--exec-tags <TAGS>` | Host-tags this role may shell/exec/transfer on (empty = open, `*` = all) — G23 capability scoping |
+| `--search-tags <TAGS>` | Host-tags this role may **read-only search** on (`hop fleet grep`/audit) — the tier between `network-only` and full exec |
 
 ```bash
 hop admin orch role create developer --tags developer,staging --shared
+hop admin orch role create developer --exec-tags dev --search-tags dev,staging
 hop admin orch role list
-hop admin orch role update developer --add-tags production
+hop admin orch role update developer --exec-tags dev --search-tags dev,staging,prod
 hop admin orch role delete intern
 ```
 
-**`role update` flags:** `--add-tags`, `--remove-tags`, `--sudo <bool>`, `--admin <bool>`
+**`role update` flags:** `--add-tags`, `--remove-tags`, `--sudo <bool>`, `--admin <bool>`, `--exec-tags <TAGS>`, `--search-tags <TAGS>`
+
+**Capability scoping (G23).** `exec_tags` / `search_tags` scope *which* hosts (by tag)
+a role may open mutating sessions (`exec`) vs read-only searches (`search`) on — not
+just whether it's a member. Empty `exec_tags` = open (today's behavior; a small team
+just works); set to restrict. `network_only` roles get no sessions unless granted
+`search_tags`. A host can require explicit grants with
+`hop config set require_explicit_access true` (admins are never locked out). Every
+denial is audited (`hop audit --category reach`). See
+[federated-observability.md](federated-observability.md#who-can-search-access-control).
 
 ---
 

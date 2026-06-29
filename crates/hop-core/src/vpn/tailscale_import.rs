@@ -202,6 +202,8 @@ pub fn import_tailscale_policy(hujson: &str) -> Result<ImportResult> {
             shell: None,
             sandbox: Default::default(),
             capabilities,
+            exec_tags: vec![],
+            search_tags: vec![],
         });
     }
     result.roles.sort_by(|a, b| a.name.cmp(&b.name));

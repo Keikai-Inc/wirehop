@@ -314,6 +314,18 @@ pub struct RoleDefinition {
     /// a member reaches so they can self-authorize. Empty for most roles.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub capabilities: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    /// Host-tags this role may open shell/exec/transfer/tunnel sessions on (G23
+    /// capability scoping). **Empty = open** — any host the role is admitted to
+    /// (today's behavior; no regression). Set to scope (`["dev"]`); `*` = all.
+    /// `network_only` overrides to none. Enforced host-side at session dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_tags: Vec<String>,
+    /// Host-tags this role may run READ-ONLY searches on (`hop fleet grep` /
+    /// audit-read / metrics). Empty = same scope as `exec`; set to grant search
+    /// beyond exec, or read-only search to an otherwise `network_only` role. `*` =
+    /// all. The middle tier between `network_only` (none) and full `exec`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_tags: Vec<String>,
 }
 
 /// Whether users for a role get individual or shared Unix accounts.
@@ -337,6 +349,13 @@ pub struct RoleUpdates {
     pub user_mode: Option<UserMode>,
     pub network_only: Option<bool>,
     pub sandbox: Option<SandboxPolicy>,
+    /// Replace the role's session (exec) tag scope (G23). `Some(vec![])` clears it
+    /// back to open; `None` leaves it unchanged.
+    #[serde(default)]
+    pub exec_tags: Option<Vec<String>>,
+    /// Replace the role's read-only search tag scope (G23).
+    #[serde(default)]
+    pub search_tags: Option<Vec<String>>,
 }
 
 /// Entry returned when redeeming an aggregate invite.

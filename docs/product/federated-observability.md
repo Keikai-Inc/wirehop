@@ -58,23 +58,49 @@ keeps one slow node from stalling the run.
 
 ### Who can search? (access control)
 
-Searching a host is the **exec** path, so it is gated by the same rules — search is
-**not** something every warren member can do to everyone:
+Searching a host is the **exec** path, so it is gated by **capability scoping** — a
+role grants `reach` / `search` / `exec` **per host tag**, and search is *not*
+something every warren member can do to everyone:
 
 - **Membership** — the host must have admitted you (an unauthorized node is reported
   as unreachable, not searched).
-- **`network_only` roles can't search at all.** A role marked `network_only` gets L3
-  VPN reach but **no** shell/exec/transfer/search sessions — e.g. a "marketing" role
-  that only needs to reach a shared service.
-- **Per-role sandbox** confines what runs (read-only here).
+- **`search` is a distinct, read-only tier** between `network_only` (no sessions at
+  all) and full `exec`. A host derives it from the request: a read-only operation
+  (`hop fleet grep`, an exec under `--read-only`) needs the **`search`** capability;
+  anything that could mutate the host needs **`exec`**.
+- **Scoped by host tag.** A role's `exec_tags` / `search_tags` say *which* hosts it
+  may exec / search (by tag; `*` = all). Examples:
 
-> **Planned (roadmap G23):** finer **capability scoping by host tag** — a read-only
-> `search` capability between `network_only` and full `exec`, so a role can be granted
-> "search `dev` + `staging`, exec `dev`" while another gets all and another gets none
-> (IT searches every laptop; a developer only their tier; marketing none). Today a
-> *non*-`network_only` member can search any host that admits it; G23 scopes that by
-> tag, admin-managed via `hop acl policy` / `hop role` and recorded in the audit log.
-> Until then, scope access with `network_only` roles and which hosts admit whom.
+  | Role | `exec_tags` | `search_tags` | Can do |
+  |---|---|---|---|
+  | `it` | `*` | — | exec + search every host |
+  | `developer` | `dev` | `staging` | exec `dev`; **search** `dev`+`staging`; nothing on `prod` |
+  | `marketing` | — | — (+`network_only`) | reach a shared service; **no** search/exec |
+
+- **Open by default, lockable.** Empty `exec_tags` = open (a small team just works);
+  set tags to restrict. A host can require explicit grants with
+  `require_explicit_access` (see below). Admin roles are never locked out.
+
+Manage it with [`hop role`](cli-reference.md#hop-role-action):
+
+```bash
+hop admin <host> role update developer --exec-tags dev --search-tags dev,staging
+```
+
+Every denied attempt is recorded in the audit log (category `reach`,
+`session.deny`), so refusals are visible to `hop fleet grep` over the audit source.
+
+#### Lock a host so peers can't search/exec it
+
+Default access is open within the warren. To make a host (e.g. a personal laptop)
+accessible only to roles **explicitly** granted its tags — denying unscoped roles —
+set on that host:
+
+```bash
+hop config set require-explicit-access true
+```
+
+Admin roles and explicit grants still pass; everyone else is denied (and audited).
 
 ## AI-aggregated search — `log-insights`
 

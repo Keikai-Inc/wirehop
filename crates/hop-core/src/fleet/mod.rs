@@ -335,6 +335,8 @@ impl RolesStore {
             shell: None,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         });
         true
     }
@@ -361,6 +363,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 RoleDefinition {
                     name: "admin".into(),
@@ -373,6 +377,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 RoleDefinition {
                     name: "ops".into(),
@@ -385,6 +391,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 // Warren-only: on the mesh with L3 reach to services it's tagged
                 // for, but cannot open host sessions (shell/exec/transfer).
@@ -399,6 +407,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 RoleDefinition {
                     name: "developer".into(),
@@ -411,6 +421,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 RoleDefinition {
                     name: "security".into(),
@@ -423,6 +435,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::preset_audit(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
                 RoleDefinition {
                     name: "ci".into(),
@@ -435,6 +449,8 @@ impl RolesStore {
                     shell: None,
                     sandbox: SandboxPolicy::preset_deploy(),
                     capabilities: Default::default(),
+                    exec_tags: vec![],
+                    search_tags: vec![],
                 },
             ],
         };
@@ -751,6 +767,12 @@ pub fn handle_update_role(config_dir: &Path, name: &str, updates: RoleUpdates) -
                 }
                 if let Some(sandbox) = updates.sandbox {
                     role.sandbox = sandbox;
+                }
+                if let Some(exec_tags) = updates.exec_tags {
+                    role.exec_tags = exec_tags;
+                }
+                if let Some(search_tags) = updates.search_tags {
+                    role.search_tags = search_tags;
                 }
                 if let Err(e) = store.save(config_dir) {
                     return AdminResponse::Error {
@@ -1150,6 +1172,8 @@ mod tests {
             shell,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         }
     }
 

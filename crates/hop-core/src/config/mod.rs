@@ -578,6 +578,16 @@ pub struct HostConfig {
     /// `off`). `HOP_AUDIT_LEVEL` overrides at runtime.
     #[serde(default = "default_audit_level")]
     pub audit_level: crate::audit::AuditLevel,
+
+    /// "Locked" session access (G23 capability scoping): when `true`, a peer may
+    /// only open exec/shell/transfer/search sessions on this host if its role
+    /// **explicitly** grants the matching tag (`exec_tags`/`search_tags`) — an
+    /// unscoped role is denied. When `false` (**default**), an unscoped non-
+    /// `network_only` role keeps open access (a small team just works). Admin roles
+    /// are never locked out. This is the owner's "lock down this host" switch — e.g.
+    /// flip it on for a personal laptop so peers can't search/exec it.
+    #[serde(default)]
+    pub require_explicit_access: bool,
 }
 
 fn default_audit_level() -> crate::audit::AuditLevel {
@@ -616,6 +626,7 @@ impl Default for HostConfig {
             tags: Vec::new(),
             vpn_enabled: default_vpn_enabled(),
             audit_level: default_audit_level(),
+            require_explicit_access: false,
         }
     }
 }

@@ -789,6 +789,14 @@ pub enum RoleAction {
         /// Override default shell
         #[arg(long)]
         shell: Option<String>,
+        /// Host-tags this role may shell/exec/transfer on (comma-separated; empty =
+        /// open, `*` = all). Scopes who may run mutating sessions on which hosts.
+        #[arg(long, value_delimiter = ',')]
+        exec_tags: Vec<String>,
+        /// Host-tags this role may READ-ONLY search on (`hop fleet grep`/audit). The
+        /// middle tier between `network-only` (none) and full exec.
+        #[arg(long, value_delimiter = ',')]
+        search_tags: Vec<String>,
     },
     /// List all roles
     List,
@@ -808,6 +816,12 @@ pub enum RoleAction {
         /// Set macOS admin
         #[arg(long)]
         admin: Option<bool>,
+        /// Replace the exec (session) tag scope (comma-separated; `*` = all)
+        #[arg(long, value_delimiter = ',')]
+        exec_tags: Option<Vec<String>>,
+        /// Replace the read-only search tag scope (comma-separated; `*` = all)
+        #[arg(long, value_delimiter = ',')]
+        search_tags: Option<Vec<String>>,
     },
     /// Delete a role
     Delete {

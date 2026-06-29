@@ -1527,22 +1527,72 @@ fn system_daemon_installed() -> bool {
     }
 }
 
-/// Whether the peer's named role is `network_only` (warren-only tier): on the
-/// mesh for L3 reach, but barred from host sessions. Resolves peers.json →
-/// role_name → the role definition. Best-effort: a missing role/peer = not
-/// network-only (fail open to normal authorization, which still applies).
-fn peer_is_network_only(config_dir: &std::path::Path, peer_id: &str) -> bool {
-    let Ok(peers) = hop_core::config::PeersStore::load(config_dir) else { return false };
-    let Some(role_name) = peers
+/// Resolve a peer's role definition: peers.json → role_name → RolesStore.
+fn peer_role_def(config_dir: &std::path::Path, peer_id: &str) -> Option<hop_core::proto::RoleDefinition> {
+    let peers = hop_core::config::PeersStore::load(config_dir).ok()?;
+    let role_name = peers
         .peers
         .iter()
         .find(|p| p.node_id == peer_id)
-        .and_then(|p| p.role_name.clone())
-    else {
-        return false;
+        .and_then(|p| p.role_name.clone())?;
+    let roles = hop_core::fleet::RolesStore::load(config_dir).ok()?;
+    roles.roles.into_iter().find(|r| r.name == role_name)
+}
+
+/// The capability an incoming session request needs (G23): a READ-ONLY operation
+/// (its effective sandbox can't mutate the host — e.g. `hop fleet grep`, an exec
+/// under a `read_only` sandbox) is a [`Search`]; anything that could change the
+/// host (shell / plain exec / transfer / tunnel) is an [`Exec`].
+///
+/// [`Search`]: hop_core::vpn::acl::Action::Search
+/// [`Exec`]: hop_core::vpn::acl::Action::Exec
+fn session_action(
+    msg: &Option<ClientMessage>,
+    peer_sandbox: &hop_core::sandbox::SandboxPolicy,
+) -> hop_core::vpn::acl::Action {
+    use hop_core::vpn::acl::Action;
+    let read_only = match msg {
+        Some(ClientMessage::RequestExec { .. })
+        | Some(ClientMessage::RequestShell)
+        | Some(ClientMessage::RequestShellV2 { .. }) => peer_sandbox.read_only,
+        Some(ClientMessage::RequestExecV2 { sandbox, .. })
+        | Some(ClientMessage::RequestShellV3 { sandbox, .. }) => {
+            peer_sandbox.merge_stricter(sandbox).read_only
+        }
+        _ => false, // transfer, tunnel → exec
     };
-    let Ok(roles) = hop_core::fleet::RolesStore::load(config_dir) else { return false };
-    roles.roles.iter().any(|r| r.name == role_name && r.network_only)
+    if read_only { Action::Search } else { Action::Exec }
+}
+
+/// G23 capability gate: may `peer_id` perform `action` on THIS host? Returns
+/// `Some(reason)` if denied (the caller rejects + audits), `None` if allowed.
+/// Open by default; a peer with no resolvable role is allowed unless this host is
+/// locked (`require_explicit_access`). Subsumes the old `network_only` gate.
+fn session_capability_denied(
+    config_dir: &std::path::Path,
+    peer_id: &str,
+    action: hop_core::vpn::acl::Action,
+) -> Option<String> {
+    let host_cfg = hop_core::config::HostConfig::load(config_dir).unwrap_or_default();
+    let role = peer_role_def(config_dir, peer_id);
+    let allowed = match &role {
+        Some(r) => hop_core::vpn::acl::capability_allowed(
+            r,
+            action,
+            &host_cfg.tags,
+            host_cfg.require_explicit_access,
+        ),
+        None => !host_cfg.require_explicit_access, // no role: open unless locked
+    };
+    if allowed {
+        return None;
+    }
+    let role_name = role.map(|r| r.name).unwrap_or_else(|| "(unknown)".into());
+    Some(format!(
+        "denied: role '{role_name}' may not {} this host (tags {:?})",
+        action.verb(),
+        host_cfg.tags
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1646,9 +1696,11 @@ async fn dispatch_session(
     ext_dispatcher: hop_core::extensions::ExtensionDispatcher,
     netdoc: Option<std::sync::Arc<hop_core::netdoc::NetDoc>>,
 ) -> Result<()> {
-    // Warren-only tier: a peer whose role is `network_only` is on the mesh for
-    // L3 reach but must not open host sessions (shell/exec/transfer). Refuse
-    // those up front; datastore/admin requests are governed separately.
+    // G23 capability gate: an incoming session (shell/exec/transfer/tunnel/search)
+    // is scoped by the peer's role capability for THIS host's tags — not merely by
+    // membership. A read-only request (e.g. `hop fleet grep`) needs the `search`
+    // tier; a mutating one needs `exec`. Open by default; subsumes the old
+    // `network_only` gate. Datastore/admin requests are governed separately.
     let is_session_req = matches!(
         msg,
         Some(
@@ -1661,16 +1713,22 @@ async fn dispatch_session(
                 | ClientMessage::RequestTunnel { .. }
         )
     );
-    if is_session_req && peer_is_network_only(config_dir, peer_id) {
-        tracing::info!("Refusing host session for warren-only peer {}", &peer_id[..10.min(peer_id.len())]);
-        let _ = proto::write_message(
-            &mut send,
-            &proto::HostMessage::SessionError(
-                "this peer's role is warren-only (VPN reach, no host sessions)".to_string(),
-            ),
-        )
-        .await;
-        return Ok(());
+    if is_session_req {
+        let action = session_action(&msg, sandbox);
+        if let Some(reason) = session_capability_denied(config_dir, peer_id, action) {
+            tracing::info!("Capability {reason} (peer {})", &peer_id[..10.min(peer_id.len())]);
+            hop_core::audit::record(
+                hop_core::audit::AuditEvent::new(
+                    hop_core::audit::AuditCategory::Reach,
+                    "session.deny",
+                    hop_core::audit::AuditOutcome::Deny,
+                )
+                .actor(peer_id.to_string())
+                .detail(reason.clone()),
+            );
+            let _ = proto::write_message(&mut send, &proto::HostMessage::SessionError(reason)).await;
+            return Ok(());
+        }
     }
     match msg {
         Some(ClientMessage::RequestShell) => {
@@ -3610,6 +3668,8 @@ async fn cmd_admin(
                 admin,
                 groups,
                 shell,
+                exec_tags,
+                search_tags,
             } => AdminRequest::CreateRole {
                 definition: RoleDefinition {
                     name: name.clone(),
@@ -3622,6 +3682,8 @@ async fn cmd_admin(
                     shell: shell.clone(),
                     sandbox: hop_core::sandbox::SandboxPolicy::default(),
                     capabilities: Default::default(),
+                    exec_tags: exec_tags.clone(),
+                    search_tags: search_tags.clone(),
                 },
             },
             RoleAction::List => AdminRequest::ListRoles,
@@ -3631,6 +3693,8 @@ async fn cmd_admin(
                 remove_tags,
                 sudo,
                 admin,
+                exec_tags,
+                search_tags,
             } => AdminRequest::UpdateRole {
                 name: name.clone(),
                 updates: RoleUpdates {
@@ -3638,6 +3702,8 @@ async fn cmd_admin(
                     remove_tags: remove_tags.clone(),
                     sudo: *sudo,
                     admin: *admin,
+                    exec_tags: exec_tags.clone(),
+                    search_tags: search_tags.clone(),
                     ..Default::default()
                 },
             },
@@ -5513,8 +5579,19 @@ fn set_host_config_value(config_dir: &std::path::Path, key: &str, value: &str) -
             cfg.default_role = role.clone();
             format!("default_role set to {role}")
         }
+        "require_explicit_access" | "require-explicit-access" => {
+            // G23: "lock" this host — only roles explicitly granted its tags may open
+            // exec/shell/transfer/search sessions (admin roles excepted). Default off.
+            let on = parse_bool_value(value)?;
+            cfg.require_explicit_access = on;
+            format!(
+                "require_explicit_access set to {} ({})",
+                on,
+                if on { "host LOCKED — explicit grants only" } else { "open within the warren" }
+            )
+        }
         _ => anyhow::bail!(
-            "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role"
+            "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role, require_explicit_access"
         ),
     };
     cfg.save(config_dir)?;

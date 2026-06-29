@@ -3838,6 +3838,8 @@ mod tests {
             shell: None,
             sandbox: SandboxPolicy::default(),
             capabilities: Default::default(),
+            exec_tags: vec![],
+            search_tags: vec![],
         })
         .await
         .unwrap();

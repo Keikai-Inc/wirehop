@@ -189,8 +189,35 @@ it), exactly as Tailscale runs `tailscaled` everywhere.
 
 A **role** defines:
 - **Auth tier** — `member` vs `admin` (can it manage the warren?).
-- **Reach** — which host **tags** it can access (`host_tags`).
-- **Ports/services** — default all; tightenable.
+- **Reach** — which host **tags** it can L3-VPN-reach (`host_tags`).
+- **Session capability (G23)** — which hosts (by tag) it may **exec** (shell /
+  exec / transfer / tunnel — `exec_tags`) vs **search** (read-only: `hop fleet
+  grep` / audit-read — `search_tags`). See below.
+- **Sandbox** — what runs once in a session (read-only, scopes, command allowlist).
+
+##### Capability ladder (who may exec/search which hosts)
+
+Membership ≠ the right to exec or search everyone. A role grants three capabilities,
+each scoped **per host tag**:
+
+| Capability | Grants | Field |
+|---|---|---|
+| `reach` | L3 VPN connectivity | `host_tags` |
+| `search` | read-only: `hop fleet grep`, audit-read, metrics | `search_tags` |
+| `exec` | shell / exec / transfer / tunnel (can mutate the host) | `exec_tags` |
+
+The host derives `search` vs `exec` from the request (a read-only operation needs
+`search`; a mutating one needs `exec`) and checks the caller's role against **its
+own** tags. `search` is the middle tier between `network_only` (no sessions) and full
+`exec`. Semantics: empty `exec_tags` = **open** (a small team just works; today's
+behavior); set to scope (`["dev"]`, `*` = all); `network_only` → no sessions unless
+granted `search_tags`; **admin roles are never restricted**. A host can flip to
+deny-by-default with `hop config set require_explicit_access true`. Every denial is
+recorded in the audit log (`reach` / `session.deny`). Manage with `hop role
+create/update --exec-tags … --search-tags …`.
+
+Personas: **IT** `exec`+`search` on `*`; **developer** `exec` `dev`, `search`
+`dev,staging`; **marketing** `network_only` (reach a shared service, no search/exec).
 
 #### Default roles
 

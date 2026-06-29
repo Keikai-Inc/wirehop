@@ -27,6 +27,7 @@ A1_BUDGET="${A1_BUDGET:-40}"
 A2_BUDGET="${A2_BUDGET:-60}"
 A3_BUDGET="${A3_BUDGET:-40}"
 FG_BUDGET="${FG_BUDGET:-60}"
+CAP_BUDGET="${CAP_BUDGET:-40}"
 GUARD_BUDGET="${GUARD_BUDGET:-40}"
 
 PASS=0; FAIL=0; REPORT=""
@@ -302,6 +303,40 @@ if printf '%s' "$ALLOW" | grep -q '^ALLOW' && printf '%s' "$DENY" | grep -q '^DE
   P_OK=1; P_DETAIL="in-policy ALLOW, out-of-policy DENY"
 fi
 record "POSTURE acl-gate" "$P_OK" "${P_SECS:-20}" "20" "$P_DETAIL"
+
+#############################################################################
+say "CAPABILITY — host-tag-scoped exec vs read-only search (G23)"
+#############################################################################
+# A host tagged 'prod' + the 'developer' role scoped to exec 'dev' / search 'prod'.
+# A developer-role peer: a mutating EXEC on the prod host is DENIED, but a READ-ONLY
+# search is ALLOWED — proving capability scoping by host-tag (membership != full
+# access). The two requests differ ONLY in read-only-ness, so a working read-only
+# search + a blocked exec isolates the capability gate.
+CAP_OK=0; CAP_DETAIL="setup failed"; CAP_SECS=0
+run_node cap-host caphost
+docker exec cap-host sh -c 'printf "{\"tags\":[\"prod\"]}" > /cfg/host_config.json'
+docker exec -d cap-host bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 60); do docker exec cap-host test -f /cfg/creator_invite && break; sleep 1; done
+# Add a scoped role 'devscoped': exec only 'dev', read-only search 'prod'.
+docker exec cap-host sh -c 'for i in $(seq 1 30); do [ -f /cfg/roles.json ] && break; sleep 1; done; [ -f /cfg/roles.json ] || echo "{\"roles\":[]}" > /cfg/roles.json; jq ".roles += [{\"name\":\"devscoped\",\"host_tags\":[\"*\"],\"exec_tags\":[\"dev\"],\"search_tags\":[\"prod\"]}]" /cfg/roles.json > /cfg/roles.tmp && mv /cfg/roles.tmp /cfg/roles.json'
+TOKEN=$(docker exec cap-host hop --config /cfg invite --user hop --role devscoped --max-uses 5 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9_=-]+' | head -1)
+if [ -n "$TOKEN" ]; then
+  run_client cap-cli capcli
+  t0=$(nsec)
+  # Step 1 redeems + saves the host alias; the mutating exec is DENIED.
+  DENY=$(docker exec cap-cli bash -lc "hop --config /cfg exec '$TOKEN' -- echo CAPMARK 2>&1" || true)
+  # Step 2 reuses the saved alias (existing peer, no re-redeem); read-only search OK.
+  ALLOW=$(docker exec cap-cli bash -lc "hop --config /cfg exec caphost --read-only -- echo CAPMARK 2>&1" || true)
+  CAP_SECS=$(( $(nsec) - t0 ))
+  if ! printf '%s' "$DENY" | grep -q CAPMARK && printf '%s' "$ALLOW" | grep -q CAPMARK; then
+    CAP_OK=1; CAP_DETAIL="exec denied, read-only search allowed (host-tag scoped)"
+  else
+    CAP_DETAIL="deny=[$(printf '%s' "$DENY"|tr -d '\n'|head -c70)] allow=[$(printf '%s' "$ALLOW"|tr -d '\n'|head -c70)]"
+  fi
+else
+  CAP_DETAIL="no invite token"
+fi
+record "CAPABILITY tag-scoped" "$CAP_OK" "${CAP_SECS:-$CAP_BUDGET}" "$CAP_BUDGET" "$CAP_DETAIL"
 
 # --- report ---------------------------------------------------------------
 ART="${HOP_FIRSTRUN_ARTIFACT:-$SCRIPT_DIR/first-run-results.md}"
