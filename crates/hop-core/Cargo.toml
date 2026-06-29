@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 hop-vt.workspace = true
 iroh.workspace = true
+# Relay SERVER (the `server` feature) for `hop host --relay` — a member-only BYO
+# relay. iroh already pulls iroh-relay's CLIENT; this adds the server. Redirected
+# to the fork by [patch.crates-io] in the workspace root.
+iroh-relay = { version = "0.97", default-features = false, features = ["server"] }
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
 iroh-blobs.workspace = true

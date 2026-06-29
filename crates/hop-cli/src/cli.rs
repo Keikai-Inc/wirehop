@@ -27,6 +27,14 @@ pub enum Command {
         /// Suppress interactive output (for daemon/LaunchAgent use)
         #[arg(long)]
         quiet: bool,
+        /// Also run a member-only BYO relay on this host. Only warren members may
+        /// use it (the "open relay" fix). Members point `HOP_RELAY_URL` at
+        /// `http://<this-host>:<port>`.
+        #[arg(long)]
+        relay: bool,
+        /// HTTP port for `--relay` (default 3340).
+        #[arg(long, value_name = "PORT")]
+        relay_port: Option<u16>,
     },
 
     /// Generate a one-time invite token/URL

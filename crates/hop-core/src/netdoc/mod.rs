@@ -528,6 +528,15 @@ impl NetDoc {
         self.namespace
     }
 
+    /// This node's netdoc/VPN endpoint id — the identity the iroh-docs sync stack
+    /// AND the VPN data plane run on (distinct from the main host node-id;
+    /// `own_vpn_endpoint_value` advertises it). A member-only BYO relay must admit
+    /// this id, not just the main node-id, or netdoc sync + VPN egress over the
+    /// relay are denied.
+    pub fn netdoc_endpoint_id(&self) -> iroh::EndpointId {
+        self.endpoint.id()
+    }
+
     /// This host's iroh-docs author id, hex-encoded. The founder pins this in
     /// its invites (`InviteToken::founder_author`) as the C1 trust anchor;
     /// every node conveys its own to an admin so its self-owned entries can be

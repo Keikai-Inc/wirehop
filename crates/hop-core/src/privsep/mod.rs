@@ -1321,7 +1321,12 @@ fn apply_privilege_drop(cmd: &mut std::process::Command, username: &str, uid: u3
 /// worker exits, the monitor exits too and launchd/systemd `KeepAlive` restarts
 /// the pair. (Phase 1: the worker still runs as root; the `_hop` privilege drop
 /// is Phase 2. Behind the `HOP_PRIVSEP` flag — off by default.)
-pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
+pub fn run_monitor(
+    config_dir: &std::path::Path,
+    quiet: bool,
+    relay: bool,
+    relay_port: Option<u16>,
+) -> Result<()> {
     anyhow::ensure!(
         crate::unix_user::is_running_as_root(),
         "the privsep monitor must run as root"
@@ -1354,6 +1359,14 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
     cmd.arg("host").arg("--config").arg(config_dir);
     if quiet {
         cmd.arg("--quiet");
+    }
+    // Forward the BYO-relay flags to the worker — the worker is the process that
+    // actually runs `hop host`, so without this `--relay` is silently dropped.
+    if relay {
+        cmd.arg("--relay");
+        if let Some(port) = relay_port {
+            cmd.arg("--relay-port").arg(port.to_string());
+        }
     }
     cmd.env("HOP_PRIVSEP_WORKER", "1")
         .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string());
@@ -1703,7 +1716,7 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
                 "privsep worker crash-looped {MAX_FAST_FAILURES}x; falling back to a \
                  non-privsep root daemon so the node stays reachable"
             );
-            return run_non_privsep_fallback(config_dir, quiet);
+            return run_non_privsep_fallback(config_dir, quiet, relay, relay_port);
         }
         std::thread::sleep(std::time::Duration::from_millis(500)); // backoff
     } else {
@@ -1717,13 +1730,24 @@ pub fn run_monitor(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
 /// the current (root) process, so a host whose privsep worker can't stay up
 /// stays online instead of locking out. Clears the `HOP_PRIVSEP*` env so the
 /// re-exec takes the ordinary root-daemon path. Only returns on `exec` failure.
-fn run_non_privsep_fallback(config_dir: &std::path::Path, quiet: bool) -> Result<()> {
+fn run_non_privsep_fallback(
+    config_dir: &std::path::Path,
+    quiet: bool,
+    relay: bool,
+    relay_port: Option<u16>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().context("resolving current exe")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("host").arg("--config").arg(config_dir);
     if quiet {
         cmd.arg("--quiet");
+    }
+    if relay {
+        cmd.arg("--relay");
+        if let Some(port) = relay_port {
+            cmd.arg("--relay-port").arg(port.to_string());
+        }
     }
     cmd.env_remove("HOP_PRIVSEP")
         .env_remove("HOP_PRIVSEP_DROP")

@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Command::Host { quiet } => {
+        Command::Host { quiet, relay, relay_port } => {
             // The daemon owns the *host* config (identity, peers, warren, netdoc).
             // With --config (how the LaunchDaemon/systemd unit invokes us) this is
             // the override; a manual `hop host` with no --config resolves to the
@@ -112,10 +112,10 @@ async fn main() -> Result<()> {
                 && std::env::var_os("HOP_PRIVSEP_WORKER").is_none()
                 && hop_core::unix_user::is_running_as_root()
             {
-                return hop_core::privsep::run_monitor(&config_dir, quiet);
+                return hop_core::privsep::run_monitor(&config_dir, quiet, relay, relay_port);
             }
             let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_host(secret_key, &config_dir, quiet, reload_handle).await
+            cmd_host(secret_key, &config_dir, quiet, relay, relay_port, reload_handle).await
         }
         Command::Recover { quiet } => cmd_recover(quiet),
         Command::Invite { creator, user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
@@ -515,7 +515,48 @@ fn restart_system_daemon_privileged() -> bool {
     matches!(cmd.status(), Ok(s) if s.success())
 }
 
-async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, reload_handle: ReloadHandle) -> Result<()> {
+/// Rebuild the BYO relay's admit-set from the warren roster + this host's own id.
+/// Endpoints not in the set are denied at the relay handshake. Best-effort: a
+/// roster read failure leaves the previous set in place (fail-closed-ish).
+async fn refresh_relay_members(
+    net: &hop_core::netdoc::NetDoc,
+    host_node_id: &str,
+    members: &net::relay::MemberSet,
+) {
+    let mut set = std::collections::HashSet::new();
+    // Self: BOTH the main host node-id (hop/3 connect) and the netdoc/VPN endpoint
+    // id (iroh-docs sync + hop/vpn/1 data plane). Each hop node registers BOTH
+    // endpoints with its home relay, so the relay must admit both or it denies its
+    // own (and every member's) netdoc/VPN traffic.
+    if let Ok(id) = host_node_id.parse() {
+        set.insert(id);
+    }
+    set.insert(net.netdoc_endpoint_id());
+    // The netdoc/VPN endpoint id is the first whitespace-separated token of the
+    // `peer/N.vpn_endpoint` value ("{endpoint_id} {relay_url}").
+    let vpn_ep_id = |v: &str| v.split_whitespace().next().and_then(|t| t.parse().ok());
+    match net.list_peers().await {
+        Ok(peers) => {
+            for p in peers {
+                if let Ok(id) = p.node_id.parse() {
+                    set.insert(id);
+                }
+                if let Some(id) = p.vpn_endpoint.as_deref().and_then(vpn_ep_id) {
+                    set.insert(id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("relay: roster read failed, keeping previous member set: {e:#}");
+            return;
+        }
+    }
+    let n = set.len();
+    *members.write().await = set;
+    tracing::debug!("relay: admit-set refreshed ({n} endpoints)");
+}
+
+async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, quiet: bool, relay: bool, relay_port: Option<u16>, reload_handle: ReloadHandle) -> Result<()> {
     // If we are the privsep worker, watch the monitor-liveness pipe: should the
     // monitor die, shut down promptly so the datastore lock + TUN are released
     // (otherwise a stranded worker wedges every restart). No-op otherwise.
@@ -741,6 +782,55 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     }
 
                     let net = std::sync::Arc::new(net);
+
+                    // BYO relay (`hop host --relay`): run a member-only iroh relay
+                    // on this host. Only warren members (the roster + self) may use
+                    // it — the "open relay" fix. Independent of the VPN data plane:
+                    // members use it for NAT traversal / fallback transport (point
+                    // their HOP_RELAY_URL at http://<this-host>:<port>). Best-effort;
+                    // a bind failure just means members fall back to the public relay.
+                    if relay {
+                        let port = relay_port.unwrap_or(net::relay::DEFAULT_RELAY_PORT);
+                        let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+                        let members: net::relay::MemberSet = std::sync::Arc::new(
+                            tokio::sync::RwLock::new(std::collections::HashSet::new()),
+                        );
+                        // Seed before spawning so the first dials are admitted.
+                        refresh_relay_members(&net, &host_node_id, &members).await;
+                        match net::relay::spawn_member_relay(bind, members.clone()).await {
+                            Ok(server) => {
+                                tracing::info!(
+                                    "relay: member-only BYO relay up on http://0.0.0.0:{port} \
+                                     (members point HOP_RELAY_URL here)"
+                                );
+                                let net_r = net.clone();
+                                let hid = host_node_id.clone();
+                                // Refresh cadence (HOP_RELAY_REFRESH_SECS, default
+                                // 15) — how fast a freshly-joined member becomes
+                                // admittable. Lowered in e2e for tight timing.
+                                let refresh_secs = std::env::var("HOP_RELAY_REFRESH_SECS")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(15u64)
+                                    .max(1);
+                                tokio::spawn(async move {
+                                    // Hold the server for the process lifetime and
+                                    // keep the admit-set in sync with the roster.
+                                    let _server = server;
+                                    let mut tick = tokio::time::interval(
+                                        std::time::Duration::from_secs(refresh_secs),
+                                    );
+                                    loop {
+                                        tick.tick().await;
+                                        refresh_relay_members(&net_r, &hid, &members).await;
+                                    }
+                                });
+                            }
+                            Err(e) => tracing::warn!(
+                                "relay: BYO relay failed to start, members fall back to public relay: {e:#}"
+                            ),
+                        }
+                    }
 
                     // Robustness: iroh-docs only starts live sync on the first
                     // `import`; reopening the namespace (every restart, e.g. after

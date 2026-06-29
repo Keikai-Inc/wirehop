@@ -15,6 +15,7 @@ separate files have been consolidated here.
 | [warren.md](product/warren.md) | The warren — hop's zero-config private network: client vs node, role-is-the-access model, onboarding, plus **fleet/RBAC at scale** and the living gap analysis |
 | [data-and-automation.md](product/data-and-automation.md) | The datastore (KV, time-series, cron, secrets, retention), `hop cap` capabilities, and orchestration bindings (HTTP, OAuth proxy, email monitoring) |
 | [remote-access.md](product/remote-access.md) | Interactive shell sessions (persistence, reconnection, connection agent) and file transfer (`hop cp`, `hop sync`, delta + compression) |
+| [run-your-own-relay.md](product/run-your-own-relay.md) | `hop host --relay` — run a **member-only** BYO relay so your warren never depends on the public relay (the open-relay fix) |
 | [ai-and-scripting.md](product/ai-and-scripting.md) | MCP server, tools, skills library, AI-agent integration, and the complete `hop.*` JS runtime API |
 | [security.md](product/security.md) | Sandbox system, auth, invites, privilege separation (user-facing) |
 | [posture.md](product/posture.md) | Device posture: the signed health card (disk-encryption, OS version, firewall) and gating reach on it with `hop acl policy` |

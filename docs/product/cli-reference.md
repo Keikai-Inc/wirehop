@@ -22,11 +22,30 @@ Start hosting (listen for incoming connections).
 | Flag | Description |
 |---|---|
 | `--quiet` | Suppress interactive output (for daemon/LaunchAgent use) |
+| `--relay` | Also run a **member-only BYO relay** on this host (see below) |
+| `--relay-port <PORT>` | HTTP port for `--relay` (default `3340`) |
 
 ```bash
 hop host
-hop host --quiet    # systemd/launchd mode
+hop host --quiet              # systemd/launchd mode
+hop host --relay              # also serve a member-only relay on :3340
+hop host --relay --relay-port 8443
 ```
+
+**BYO relay (`--relay`).** Runs a member-only [iroh](https://iroh.computer) relay
+on this host so your warren never depends on the public relay for NAT traversal /
+fallback transport. Only warren **members** (the roster + this host) may use it —
+the relay rejects any other endpoint at the handshake, so it is not free transport
+for strangers who learn the URL ("the open-relay problem"). The relay is blind
+regardless: every byte it carries is end-to-end encrypted by iroh, so it only ever
+sees ciphertext; gating controls *who may use the transport*, not confidentiality.
+Members opt in by pointing `HOP_RELAY_URL` at `http://<this-host>:<port>`. The
+admit-set refreshes from the roster every `HOP_RELAY_REFRESH_SECS` (default 15s), so
+a freshly-joined member becomes admittable within that window. **Caveat:** a node
+that has not joined yet is not a member, so joins must use a fallback/public relay
+or a direct path — see [run-your-own-relay.md](run-your-own-relay.md). No TLS on the
+relay's HTTP endpoint by default (HTTPS/ACME for an internet-facing relay is a
+follow-up); +0.8 MB to the binary.
 
 **Warren VPN (on by default).** A new host brings up the warren VPN by default (a
 TUN device with a `100.64.0.0/10` virtual IP, role-gated reach), so a member

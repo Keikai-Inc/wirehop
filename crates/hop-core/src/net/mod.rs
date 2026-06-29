@@ -1,6 +1,7 @@
 //! iroh endpoint lifecycle and connection management.
 
 pub mod netmon;
+pub mod relay;
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
