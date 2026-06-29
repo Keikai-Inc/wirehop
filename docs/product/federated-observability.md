@@ -54,8 +54,27 @@ The search runs under the `audit` sandbox preset (`read_only` + `no_network`),
 requested via `RequestExecV2` and merged **stricter** by each host — so a node
 **cannot be mutated** by a search, regardless of what its invite allows. The pattern
 is single-quoted into the command (data, never shell code), and a per-node timeout
-keeps one slow node from stalling the run. A node that hasn't authorized you is
-reported as unreachable, not searched (host-enforced access).
+keeps one slow node from stalling the run.
+
+### Who can search? (access control)
+
+Searching a host is the **exec** path, so it is gated by the same rules — search is
+**not** something every warren member can do to everyone:
+
+- **Membership** — the host must have admitted you (an unauthorized node is reported
+  as unreachable, not searched).
+- **`network_only` roles can't search at all.** A role marked `network_only` gets L3
+  VPN reach but **no** shell/exec/transfer/search sessions — e.g. a "marketing" role
+  that only needs to reach a shared service.
+- **Per-role sandbox** confines what runs (read-only here).
+
+> **Planned (roadmap G23):** finer **capability scoping by host tag** — a read-only
+> `search` capability between `network_only` and full `exec`, so a role can be granted
+> "search `dev` + `staging`, exec `dev`" while another gets all and another gets none
+> (IT searches every laptop; a developer only their tier; marketing none). Today a
+> *non*-`network_only` member can search any host that admits it; G23 scopes that by
+> tag, admin-managed via `hop acl policy` / `hop role` and recorded in the audit log.
+> Until then, scope access with `network_only` roles and which hosts admit whom.
 
 ## AI-aggregated search — `log-insights`
 
