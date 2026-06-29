@@ -839,6 +839,34 @@ pub enum FleetAction {
         #[arg(required = true, last = true)]
         command: Vec<String>,
     },
+    /// Federated log search: fan a READ-ONLY search across matching warren members,
+    /// each node resolving its own source locally, and reduce the results — no
+    /// central collector. Runs under an audit (read-only) sandbox so a node can't be
+    /// mutated.
+    Grep {
+        /// Selector: a role name, a tag, a known-host group, or `all` (every member).
+        selector: String,
+        /// Search pattern (a fixed/literal substring; quoted safely per node).
+        pattern: String,
+        /// Where each node searches: `audit` (default — the structured hop audit log,
+        /// identical cross-platform), `system` (well-known system logs, resolved
+        /// per-OS: journalctl / /var/log / macOS system.log), or an explicit file
+        /// path.
+        #[arg(long, default_value = "audit")]
+        source: String,
+        /// Time window for the `audit`/`system` sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Max matching lines to keep per node.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Max nodes queried concurrently.
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+        /// Emit one aggregated JSON object instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Add a known host to the daemon's fleet store
     Add {
         /// Host alias from known_hosts

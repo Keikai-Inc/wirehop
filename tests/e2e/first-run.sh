@@ -26,6 +26,7 @@ BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/hop"
 A1_BUDGET="${A1_BUDGET:-40}"
 A2_BUDGET="${A2_BUDGET:-60}"
 A3_BUDGET="${A3_BUDGET:-40}"
+FG_BUDGET="${FG_BUDGET:-60}"
 GUARD_BUDGET="${GUARD_BUDGET:-40}"
 
 PASS=0; FAIL=0; REPORT=""
@@ -71,6 +72,7 @@ docker network create "$NET" >/dev/null 2>&1 || true
 # A2 must prove the VPN comes up from the config DEFAULT (the bare `--host` the
 # web builder emits), not a forced override.
 NODE_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1
+          -e HOP_WARREN_SNAPSHOT_SECS=3
           -e RUST_LOG="${FR_LOG:-hop=info,hop_core=warn}" --user root)
 # A pure client needs neither.
 CLIENT_ENV=(-e RUST_LOG="${FR_LOG:-hop=info,hop_core=warn}" --user root)
@@ -187,6 +189,37 @@ else
   A2_SECS=$A2_BUDGET
 fi
 record "A2 private-network" "$A2_OK" "${A2_SECS:-$A2_BUDGET}" "$A2_BUDGET" "$A2_DETAIL"
+
+#############################################################################
+say "FLEET-GREP — federated READ-ONLY log search across the warren (no central collector)"
+#############################################################################
+# Reuse the A2 founder + member (both warren members, role admin). Write a unique
+# marker to a file on EACH, then run `hop fleet grep` from the founder across the
+# `admin` selector and assert the marker is found on a remote node — proving the
+# fan-out + reduce. The search runs under the audit (read-only) sandbox.
+FG_OK=0; FG_DETAIL="skipped (needs A2)"; FG_SECS=0
+if [ "$A2_OK" = 1 ]; then
+  MARK="FLEETGREP-MARK-$$"
+  docker exec fr-founder sh -c "echo '$MARK founder-evidence' > /tmp/applog.txt"
+  docker exec fr-member  sh -c "echo '$MARK member-evidence'  > /tmp/applog.txt"
+  t0=$(nsec)
+  # The warren snapshot (the target roster) is rebuilt periodically, so poll until a
+  # member shows up and the read-only fan-out finds the marker.
+  FG_JSON=""
+  for _ in $(seq 1 12); do
+    FG_JSON=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet grep all '$MARK' --source /tmp/applog.txt --json 2>/dev/null" || true)
+    echo "$FG_JSON" | grep -q '"total":[1-9]' && break
+    sleep 3
+  done
+  FG_SECS=$(( $(nsec) - t0 ))
+  if echo "$FG_JSON" | grep -q '"total":[1-9]' && echo "$FG_JSON" | grep -q "$MARK"; then
+    TOTAL=$(echo "$FG_JSON" | grep -oE '"total":[0-9]+' | grep -oE '[0-9]+' | head -1)
+    FG_OK=1; FG_DETAIL="marker found on ${TOTAL:-?} node(s), read-only fan-out"
+  else
+    FG_DETAIL="no marker matches"; echo "  fleet-grep json: $(printf '%s' "$FG_JSON" | head -c 400)"
+  fi
+fi
+record "FLEET-GREP federated-search" "$FG_OK" "${FG_SECS:-$FG_BUDGET}" "$FG_BUDGET" "$FG_DETAIL"
 
 #############################################################################
 say "A3 — expose a local device (hop tunnel: forward a remote port to localhost)"

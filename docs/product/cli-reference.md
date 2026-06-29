@@ -519,16 +519,52 @@ Fleet management (host-side).
 | `status` | Show fleet registration status |
 | `list [group]` | List warren members (by node-id, name, role, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
 | `exec <group> -- <command...>` | Execute a command on all hosts in a group |
+| `grep <group> <pattern>` | **Federated log search** — fan a read-only search across the group, reduce the matches (see below) |
 | `add <name> --tags <TAGS>` | Add a known host to the daemon's fleet store |
 
 ```bash
 hop fleet status
 hop fleet list web
 hop fleet exec developer -- apt update
+hop fleet grep web "failed password" --source system     # search syslogs across the fleet
+hop fleet grep all rejected --source audit               # search the structured audit log
 hop fleet add my-server --tags web,production
 ```
 
 **`fleet status` flag:** `--fleet <NAME>` (required only if registered with multiple fleets)
+
+#### `hop fleet grep <selector> <pattern>`
+
+Federated log search: fans a **read-only** search across the warren members matching
+`selector` (a role, tag, or known-host group), each node resolving its **own** source
+locally, and reduces the per-node matches into one answer — **no central collector**.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--source <name>` | `audit` | Where each node searches (see tiers below) |
+| `--since <DURATION>` | `24h` | Time window for `audit`/`system` (e.g. `1h`, `7d`) |
+| `--limit <N>` | `100` | Max matching lines kept per node |
+| `--concurrency <N>` | `8` | Max nodes queried at once |
+| `--json` | — | Emit one aggregated JSON object (`{pattern, source, total, nodes:[…]}`) |
+
+**Source tiers** (each node resolves locally, so cross-platform is handled at the edge):
+
+| `--source` | What each node searches |
+|---|---|
+| `audit` *(default)* | the structured hop audit log (`hop audit --json`) — **identical on macOS + Linux**; the pattern is filtered over its events |
+| `system` | well-known system logs, resolved per-OS: `journalctl` on systemd, `/var/log/{syslog,auth.log,messages}` on other Linux, `/var/log/system.log` on macOS |
+| `<path>` (contains `/`) | an operator-named file, e.g. `--source /var/log/nginx/access.log` |
+
+**Read-only + safe.** The search runs under the `audit` sandbox preset (`read_only` +
+`no_network`), requested via `RequestExecV2` and merged *stricter* by each host — so a
+node **cannot be mutated** regardless of its invite. The pattern is single-quoted into
+the command (treated as data, never shell code), and a per-node timeout keeps one slow
+node from stalling the search. Access is gated by each host's authorization (a node
+that hasn't admitted the caller is reported as unreachable, not searched).
+
+For an **AI-summarized** answer across the fleet, use the `log-insights` capability
+(`hop cap run log-insights --targets <group> --param query=<pattern>`), which runs this
+search and reduces the matches with Claude.
 
 ---
 

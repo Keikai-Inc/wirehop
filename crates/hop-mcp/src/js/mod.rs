@@ -466,4 +466,21 @@ mod tests {
             .unwrap();
         assert!(result.contains("no webhook_url"), "expected no-URL no-op, got: {result}");
     }
+
+    #[tokio::test]
+    async fn log_insights_cap_script_runs_and_guards_no_query() {
+        // The embedded AI-aggregation cap parses + runs; with no query param it
+        // returns the validation error (proves the script is valid + the guard path,
+        // no network / Claude needed).
+        let runtime = JsRuntime::new();
+        let backend = test_backend();
+        let script = crate::capabilities::CapabilityDefinition::find("log-insights")
+            .expect("log-insights cap is registered")
+            .script;
+        let result = runtime
+            .execute(script, &backend, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(result.contains("query parameter required"), "expected no-query guard, got: {result}");
+    }
 }

@@ -1986,6 +1986,26 @@ pub async fn host_exec_session(
 /// Client side: run a remote command, stream I/O, and return the exit code.
 ///
 /// Does NOT enter raw terminal mode or send WindowSize/SetEnv.
+/// Like [`client_exec_session`] but **captures** the remote stdout into a string
+/// instead of streaming it, and sends no input (the command is non-interactive).
+/// Used by `hop fleet grep` to reduce per-node output. Returns
+/// `(captured_output, exit_code)`; `exit_code` is `-1` on a dropped connection.
+pub async fn client_exec_capture(
+    mut recv: impl tokio::io::AsyncRead + Unpin,
+) -> Result<(String, i32)> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match proto::read_message::<HostMessage>(&mut recv).await {
+            Ok(HostMessage::Output(data)) => buf.extend_from_slice(&data),
+            Ok(HostMessage::Exit(code)) => {
+                return Ok((String::from_utf8_lossy(&buf).into_owned(), code));
+            }
+            Ok(_) => {}
+            Err(_) => return Ok((String::from_utf8_lossy(&buf).into_owned(), -1)),
+        }
+    }
+}
+
 pub async fn client_exec_session(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,

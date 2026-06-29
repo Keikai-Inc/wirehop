@@ -2,6 +2,7 @@ mod agent;
 mod audit;
 mod cli;
 mod cpuprofile;
+mod fleet_grep;
 mod itemize;
 mod memprofile;
 mod netstats;
@@ -4004,6 +4005,20 @@ async fn cmd_fleet(
             }
             println!("Done: {ok} ok, {failed} failed.");
             Ok(())
+        }
+        FleetAction::Grep { selector, pattern, source, since, limit, concurrency, json } => {
+            fleet_grep::run(
+                host_config_dir,
+                user_config_dir,
+                &selector,
+                &pattern,
+                &source,
+                &since,
+                limit,
+                concurrency,
+                json,
+            )
+            .await
         }
     }
 }

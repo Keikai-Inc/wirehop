@@ -316,6 +316,7 @@ hop cap deploy <id> --targets prod  # deploy to remote nodes
 | `security-baseline` | Security Baseline | Audits SUID binaries, open ports, failed auth, SSH keys, world-writable files. Dual-mode with push. | Audit | Both | `0 0 3 * * *` (daily 3 AM) | security | Push |
 | `email-monitor` | Email Monitor | Daily Gmail triage and morning briefing. Classifies emails as URGENT/ACTION/FYI using Claude, sends briefing, marks FYI as read. | Connect | Both | `0 0 7 * * *` (daily 7 AM) | automation | Push |
 | `event-webhook` | Event Webhook | Fires a local HTTP POST to a secret-stored URL on warren events: a new member joins, this node's device posture fails, or rejected/denied activity crosses a threshold. Polls this node's audit log; no central collector. | Connect | Both | `0 */5 * * * *` (every 5 min) | automation | Push |
+| `log-insights` | Log Insights (AI) | AI-aggregated federated log search: fans a read-only search across target nodes (each greps its own logs), then reduces the matches with Claude into one summary of patterns/anomalies. | Connect | OnDemand | -- | operations | FanOut |
 
 #### Parameters
 
@@ -323,6 +324,8 @@ hop cap deploy <id> --targets prod  # deploy to remote nodes
 |---|---|---|---|---|
 | `log-search` | `query` | Yes | -- | Search term to grep for in system logs |
 | `event-webhook` | `deny_threshold` | No | `5` | Fire a summary alert when this many rejected/denied events accumulate since the last run |
+| `log-insights` | `query` | Yes | -- | Search pattern (literal substring) to find across nodes |
+| `log-insights` | `source` | No | `system` | Where each node searches: `audit`, `system`, or a file path |
 
 ### Permission Tiers
 
@@ -439,6 +442,25 @@ hop cap run event-webhook                          # run once now
 The URL **must be public** (`https`): the cap runs under the restricted `connect`
 sandbox, whose SSRF guard blocks loopback / private / CGNAT targets. (Slack,
 PagerDuty, Discord, or your own internet-facing endpoint all work.)
+
+#### log_insights.js
+
+AI-aggregated federated log search — the executable companion to
+[`hop fleet grep`](cli-reference.md#hop-fleet-grep-selector-pattern). Fans a
+**read-only** search across the `--targets` group (each node greps its own logs
+locally), collects the matches, and asks Claude to reduce them into one summary of
+patterns, anomalies, and the key finding — **no central collector**.
+
+```bash
+hop auth anthropic                                              # one-time
+hop cap run log-insights --targets web --param query="failed password"
+hop cap run log-insights --targets prod --param query=OOM --param source=system
+```
+
+`source` is `system` (default — per-OS system logs), `audit` (the structured hop
+audit log), or a file path. Connect tier (network) because `hop.claude` needs it;
+the per-node search is read-only (grep/journalctl/cat only). Without an Anthropic
+credential it still returns the raw per-host aggregation, just no AI summary.
 
 ### Email Monitor Setup
 

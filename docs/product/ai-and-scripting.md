@@ -318,6 +318,12 @@ Execute a command on all hosts in a fleet group.
 var results = hop.fleet.exec("web", "systemctl status nginx");
 ```
 
+> **Federated log search.** `hop.fleet.exec` + `hop.claude` (+ `hop.audit.query`) are
+> the building blocks of fleet-wide, no-central-collector observability. The native
+> [`hop fleet grep`](cli-reference.md#hop-fleet-grep-selector-pattern) primitive and
+> the `log-insights` capability (AI-aggregated search) compose them for you — see
+> [federated-observability.md](federated-observability.md).
+
 ---
 
 ### Admin

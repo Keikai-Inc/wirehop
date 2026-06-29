@@ -16,6 +16,7 @@ separate files have been consolidated here.
 | [data-and-automation.md](product/data-and-automation.md) | The datastore (KV, time-series, cron, secrets, retention), `hop cap` capabilities, and orchestration bindings (HTTP, OAuth proxy, email monitoring) |
 | [remote-access.md](product/remote-access.md) | Interactive shell sessions (persistence, reconnection, connection agent) and file transfer (`hop cp`, `hop sync`, delta + compression) |
 | [run-your-own-relay.md](product/run-your-own-relay.md) | `hop host --relay` — run a **member-only** BYO relay so your warren never depends on the public relay (the open-relay fix) |
+| [federated-observability.md](product/federated-observability.md) | Fleet-wide log search with **no central collector**: `hop fleet grep` (read-only, per-OS source resolution) + the AI-aggregating `log-insights` cap |
 | [ai-and-scripting.md](product/ai-and-scripting.md) | MCP server, tools, skills library, AI-agent integration, and the complete `hop.*` JS runtime API |
 | [security.md](product/security.md) | Sandbox system, auth, invites, privilege separation (user-facing) |
 | [posture.md](product/posture.md) | Device posture: the signed health card (disk-encryption, OS version, firewall) and gating reach on it with `hop acl policy` |

@@ -67,6 +67,35 @@ pub fn builtin_capabilities() -> &'static [CapabilityDefinition] {
             ],
         },
         CapabilityDefinition {
+            id: "log-insights",
+            name: "Log Insights (AI)",
+            description: "AI-aggregated federated log search: fans a READ-ONLY search \
+                across target nodes (each greps its own logs locally — no central \
+                collector), then asks Claude to reduce the matches into one summary of \
+                patterns, anomalies, and the key finding. `--param query=<pattern> \
+                [--param source=audit|system|<path>]`, `--targets <group>`.",
+            tier: PermissionTier::Connect,
+            trigger: TriggerMode::OnDemand,
+            data_pattern: DataPattern::FanOut,
+            script: include_str!("scripts/log_insights.js"),
+            category: "operations",
+            params: &[
+                ParamDef {
+                    name: "query",
+                    description: "Search pattern (literal substring) to find across nodes",
+                    required: true,
+                    default: None,
+                },
+                ParamDef {
+                    name: "source",
+                    description: "Where each node searches: audit, system (default), or a file path",
+                    required: false,
+                    default: Some("system"),
+                },
+            ],
+            auth_requirements: &[AuthRequirement { provider: "anthropic", description: "Anthropic" }],
+        },
+        CapabilityDefinition {
             id: "event-webhook",
             name: "Event Webhook",
             description: "Fires a local HTTP POST to a secret-stored URL on warren \
