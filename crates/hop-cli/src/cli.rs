@@ -359,6 +359,32 @@ pub enum Command {
     #[command(name = "__ps", hide = true)]
     Ps,
 
+    /// Internal (G24): emit this node's searchable log sources as NDJSON. Backs
+    /// `hop fleet sources`.
+    #[command(name = "__logsources", hide = true)]
+    LogSources,
+
+    /// Internal (G24): search a log source on this node, emitting matching lines
+    /// as NDJSON. Backs `hop fleet search` (one-shot + the interactive TUI).
+    #[command(name = "__logsearch", hide = true)]
+    LogSearch {
+        /// Source id: `system` (default), `audit`, a well-known name, or a path.
+        #[arg(long, default_value = "system")]
+        source: String,
+        /// Time window for time-bounded sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Optional smart-case substring pre-filter (server-side, to bound transfer).
+        #[arg(long)]
+        grep: Option<String>,
+        /// Max matching lines to emit.
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+        /// Max source lines to scan (back-pressure on a chatty source).
+        #[arg(long, default_value_t = 50000)]
+        line_cap: usize,
+    },
+
     /// Internal: privilege-separation feasibility gate (privsep-node.md §8.1).
     /// Run as root (e.g. `sudo hop __privsep-probe`); creates a TUN, hands the
     /// fd to a non-root child, and reports whether non-root TUN I/O is permitted.
@@ -911,6 +937,51 @@ pub enum FleetAction {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+    /// Search logs across the warren (G24). Interactive fzf-style filter in a TTY;
+    /// one-shot structured output when piped or with --json. Defaults to the OS
+    /// SYSTEM logs (macOS unified log / journald/syslog) — hop's own events are
+    /// `--source audit`. See searchable sources with `hop fleet sources`.
+    Search {
+        /// Selector: a role, a tag, a known-host group, or `all` (every member).
+        selector: String,
+        /// Search pattern (smart-case substring). Optional — omit to browse, then
+        /// filter live in the interactive view.
+        pattern: Option<String>,
+        /// Which log to search on each node: `system` (default), `audit`, a
+        /// well-known name (`nginx`, `auth`, …), or a file path. `hop fleet
+        /// sources` lists what each node offers.
+        #[arg(long, default_value = "system")]
+        source: String,
+        /// Time window for time-bounded sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Max matching lines per node.
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+        /// Emit aggregated JSON instead of the interactive/table view (forces
+        /// one-shot; this is what agents/MCP use).
+        #[arg(long)]
+        json: bool,
+        /// Also search members that look offline (stale last_seen).
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// List the log sources searchable on each warren node (discoverability) —
+    /// resolved per-OS (macOS unified log, journald/syslog, hop audit, files).
+    Sources {
+        /// Selector for which nodes to query: a role, a tag, or `all` (default).
+        #[arg(default_value = "all")]
+        selector: String,
+        /// Also query members that look offline.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
     },
     /// Add a known host to the daemon's fleet store
     Add {

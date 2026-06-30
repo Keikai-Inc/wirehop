@@ -543,25 +543,69 @@ Fleet management (host-side).
 |---|---|
 | `status` | Show fleet registration status |
 | `list [group]` | List warren members (node-id, name, role, **online/offline**, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
+| `search <group> [pattern]` | **Federated log search** — interactive fzf-style filter in a TTY, one-shot/JSON when piped. Defaults to the **OS system logs** (see below) |
+| `sources [group]` | **Discover** what logs are searchable on each machine (resolved per-OS) |
 | `exec <group> -- <command...>` | Execute a command on all **online** hosts in a group |
-| `grep <group> <pattern>` | **Federated log search** — fan a read-only search across the **online** group, reduce the matches (see below) |
+| `grep <group> <pattern>` | Federated search of the **structured audit log** (older form; `search` is the general front door) |
 | `prune [--older-than DUR]` | Remove warren members not seen for a while (admin-gated, replicated revocation) |
 | `add <name> --tags <TAGS>` | Add a known host to the daemon's fleet store |
 
 ```bash
 hop fleet status
 hop fleet list                                           # members with online/offline
-hop fleet list web --stale-after 1h                      # online = seen within 1h
+hop fleet sources                                        # what logs can I search, on which machines?
+hop fleet search web "failed password"                   # interactive search of the OS logs
+hop fleet search all error --source audit                # search hop's own audit events instead
+hop fleet search web rejected --json | jq                # one-shot structured (agents/pipes)
 hop fleet exec developer -- apt update                   # skips offline members
-hop fleet exec developer --include-offline -- apt update # force-include offline
-hop fleet grep web "failed password" --source system     # search syslogs across the fleet
-hop fleet grep all rejected --source audit               # search the structured audit log
 hop fleet prune --older-than 30d --dry-run               # preview stale members
-hop fleet prune --older-than 30d                         # revoke them (replicated)
 hop fleet add my-server --tags web,production
 ```
 
 **`fleet status` flag:** `--fleet <NAME>` (required only if registered with multiple fleets)
+
+#### `hop fleet search` — interactive federated log search
+
+Fans a **read-only** search across the warren's **online** members; each node resolves
+its OWN source per-OS and matches **in-process** (fast, smart-case), so you never shell
+`grep` or learn a per-OS log path. Results carry `node · source · time` provenance.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--source <id>` | `system` | What to search per node — see sources below, or `hop fleet sources` |
+| `--since <DUR>` | `1h` | Time window for time-bounded sources (`30m`, `1h`, `7d`) |
+| `--limit <N>` | `2000` | Max matching lines per node |
+| `--json` | — | One-shot aggregated JSON (forces non-interactive; what agents/MCP use) |
+| `--include-offline` / `--stale-after <DUR>` | — / `15m` | Target offline members / set the liveness window |
+
+**Two modes, chosen automatically:**
+- **Interactive (a TTY):** opens a live, fzf-style filter — the fan-out streams once into
+  a local buffer and you filter it **instantly as you type** (no per-keystroke network).
+  Keys: type to filter, `↑/↓` `PgUp/PgDn` `Home/End` scroll, `Ctrl-U` clear, `Enter` print
+  the selected line (pipe-friendly), `Esc`/`Ctrl-C` quit. The status bar shows
+  `matches/total · nodes scanned`.
+- **One-shot (piped or `--json`):** collect and print with provenance — for scripts, pipes,
+  and agents.
+
+**`--source` resolves per-OS** (the default `system` is what people mean by "the logs"):
+
+| Source | macOS | Linux |
+|---|---|---|
+| `system` *(default)* | the **unified log** (`log show`) | `journalctl`, else `/var/log/{syslog,messages}` |
+| `audit` | hop's structured audit log (`hop audit`) — identical on every OS | same |
+| `<name>` | a well-known file if present (`nginx`, `auth`, …) | same |
+| `<path>` | that file (`--source /var/log/nginx/access.log`) | same |
+
+#### `hop fleet sources` — discover searchable logs
+
+Lists, per machine, what `--source` values are available (resolved to the real command or
+file path, with a `✗` for anything unreadable) — so the menu of logs is discoverable
+instead of a guessed flag.
+
+```bash
+hop fleet sources                 # this node + every online member
+hop fleet search web nginx --source nginx   # then search one you found
+```
 
 #### Liveness, offline-skip & pruning (roster hygiene)
 

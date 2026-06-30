@@ -224,6 +224,40 @@ fi
 record "FLEET-GREP federated-search" "$FG_OK" "${FG_SECS:-$FG_BUDGET}" "$FG_BUDGET" "$FG_DETAIL"
 
 #############################################################################
+say "SEARCH — fleet log search + source discovery (G24: hop fleet search/sources)"
+#############################################################################
+# Reuse the A2 founder + member. `hop fleet search` (one-shot when piped) fans a
+# read-only search across the warren with [node·source·time] provenance; `hop
+# fleet sources` makes the searchable logs discoverable per machine.
+SR_BUDGET="${SR_BUDGET:-60}"
+SR_OK=0; SR_DETAIL="skipped (needs A2)"; SR_SECS=0
+if [ "$A2_OK" = 1 ]; then
+  SMARK="FLEETSEARCH-MARK-$$"
+  docker exec fr-member sh -c "echo '$SMARK member-evidence' > /tmp/searchlog.txt"
+  t0=$(nsec)
+  # search: find the marker on a remote node with provenance (one-shot JSON).
+  SR_JSON=""
+  for _ in $(seq 1 12); do
+    SR_JSON=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet search all '$SMARK' --source /tmp/searchlog.txt --json 2>/dev/null" || true)
+    echo "$SR_JSON" | grep -q '"total":[1-9]' && break
+    sleep 3
+  done
+  FOUND=0
+  echo "$SR_JSON" | grep -q '"total":[1-9]' && echo "$SR_JSON" | grep -q "$SMARK" && echo "$SR_JSON" | grep -q '"node"' && FOUND=1
+  # sources: the discovery menu fans out and lists the audit + system sources.
+  SR_SRC=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet sources all 2>/dev/null" || true)
+  SRC_OK=0
+  echo "$SR_SRC" | grep -q "audit" && echo "$SR_SRC" | grep -q "system" && SRC_OK=1
+  SR_SECS=$(( $(nsec) - t0 ))
+  if [ "$FOUND" = 1 ] && [ "$SRC_OK" = 1 ]; then
+    SR_OK=1; SR_DETAIL="search found marker w/ provenance; sources lists audit+system per node"
+  else
+    SR_DETAIL="found=$FOUND sources=$SRC_OK"; echo "  search json: $(printf '%s' "$SR_JSON" | head -c 300)"
+  fi
+fi
+record "SEARCH fleet-search+sources" "$SR_OK" "${SR_SECS:-$SR_BUDGET}" "$SR_BUDGET" "$SR_DETAIL"
+
+#############################################################################
 say "A3 — expose a local device (hop tunnel: forward a remote port to localhost)"
 #############################################################################
 # Reuse the A2 founder + member. A trivial marker service on the founder's

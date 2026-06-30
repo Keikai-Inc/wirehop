@@ -2006,6 +2006,51 @@ pub async fn client_exec_capture(
     }
 }
 
+/// Stream a remote exec's stdout to a callback **one line at a time**, live, as
+/// the host produces it (G24 federated log search). Unlike `client_exec_capture`
+/// (which batches all output until `Exit`), this splits the incoming `Output`
+/// chunks on `\n` and invokes `on_line` per complete line, so the caller can
+/// render an aggregated, streaming view (e.g. NDJSON log hits in the TUI).
+/// Returns the exit code (`-1` on a dropped connection). A trailing partial line
+/// is flushed at the end.
+pub async fn client_exec_stream(
+    mut recv: impl tokio::io::AsyncRead + Unpin,
+    mut on_line: impl FnMut(String),
+) -> Result<i32> {
+    let mut buf: Vec<u8> = Vec::new();
+    let flush_lines = |buf: &mut Vec<u8>, on_line: &mut dyn FnMut(String)| {
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = buf.drain(..=pos).collect();
+            line.pop(); // drop the '\n'
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            on_line(String::from_utf8_lossy(&line).into_owned());
+        }
+    };
+    loop {
+        match proto::read_message::<HostMessage>(&mut recv).await {
+            Ok(HostMessage::Output(data)) => {
+                buf.extend_from_slice(&data);
+                flush_lines(&mut buf, &mut on_line);
+            }
+            Ok(HostMessage::Exit(code)) => {
+                if !buf.is_empty() {
+                    on_line(String::from_utf8_lossy(&buf).into_owned());
+                }
+                return Ok(code);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if !buf.is_empty() {
+                    on_line(String::from_utf8_lossy(&buf).into_owned());
+                }
+                return Ok(-1);
+            }
+        }
+    }
+}
+
 pub async fn client_exec_session(
     mut send: impl tokio::io::AsyncWrite + Unpin,
     mut recv: impl tokio::io::AsyncRead + Unpin,

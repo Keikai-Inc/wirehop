@@ -3,6 +3,8 @@ mod audit;
 mod cli;
 mod cpuprofile;
 mod fleet_grep;
+mod fleet_search;
+mod fleet_search_tui;
 mod itemize;
 mod memprofile;
 mod netstats;
@@ -346,6 +348,10 @@ async fn main() -> Result<()> {
         }
         Command::Ps => {
             cmd_ps()
+        }
+        Command::LogSources => cmd_logsources(),
+        Command::LogSearch { source, since, grep, limit, line_cap } => {
+            cmd_logsearch(&source, &since, grep.as_deref(), limit, line_cap)
         }
         Command::InstallDaemon { stage, vpn, tier, default_role, tags, promote_from, no_promote } => {
             cmd_install_daemon(InstallDaemonArgs {
@@ -2672,6 +2678,40 @@ fn cmd_privsep_probe(uid: Option<u32>, gid: Option<u32>) -> Result<()> {
     }
 }
 
+/// `hop __logsources` — emit this node's searchable log sources as NDJSON (G24).
+fn cmd_logsources() -> Result<()> {
+    use std::io::Write;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for src in hop_core::logsearch::discover_sources() {
+        if let Ok(j) = serde_json::to_string(&src) {
+            let _ = writeln!(w, "{j}");
+        }
+    }
+    Ok(())
+}
+
+/// `hop __logsearch` — search a log source on this node, emitting matching lines
+/// as NDJSON (G24). Flushes per line so the client renders the stream live.
+fn cmd_logsearch(
+    source: &str,
+    since: &str,
+    grep: Option<&str>,
+    limit: usize,
+    line_cap: usize,
+) -> Result<()> {
+    use std::io::Write;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    hop_core::logsearch::search(source, since, grep, limit, line_cap, |hit| {
+        if let Ok(j) = serde_json::to_string(&hit) {
+            let _ = writeln!(w, "{j}");
+            let _ = w.flush();
+        }
+    })?;
+    Ok(())
+}
+
 fn cmd_ps() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -4222,6 +4262,34 @@ async fn cmd_fleet(
         }
         FleetAction::Prune { older_than, dry_run, yes } => {
             cmd_fleet_prune(host_config_dir, &older_than, dry_run, yes).await
+        }
+        FleetAction::Search {
+            selector, pattern, source, since, limit, json, include_offline, stale_after,
+        } => {
+            let window = match stale_after.as_deref() {
+                Some(d) => parse_duration_ms(d)? / 1000,
+                None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
+            };
+            // Interactive fzf-style view only when attached to a TTY and not piped
+            // to JSON; otherwise one-shot structured output (pipe/agent/MCP).
+            let interactive = !json && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            fleet_search::run_search(
+                host_config_dir,
+                user_config_dir,
+                fleet_search::SearchOpts {
+                    selector, pattern, source, since, limit, include_offline,
+                    window_secs: window, json, interactive,
+                },
+            )
+            .await
+        }
+        FleetAction::Sources { selector, include_offline, stale_after } => {
+            let window = match stale_after.as_deref() {
+                Some(d) => parse_duration_ms(d)? / 1000,
+                None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
+            };
+            fleet_search::run_sources(host_config_dir, user_config_dir, &selector, include_offline, window)
+                .await
         }
     }
 }

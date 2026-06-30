@@ -7,6 +7,7 @@ pub mod datastore;
 pub mod extensions;
 pub mod fleet;
 pub mod invite;
+pub mod logsearch;
 pub mod net;
 pub mod netdoc;
 pub mod netstats;
