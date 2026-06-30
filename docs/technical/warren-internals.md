@@ -124,6 +124,37 @@ never reconverge (membership/role/IP updates wouldn't propagate). The persisted
 namespace id (`netdoc.json`), local replica, and deterministic virtual IP mean a
 rebooted node rejoins the *same* warren with the *same* address.
 
+#### Membership lifecycle (admin mutations)
+
+Every admin mutation that changes the roster — invite-redeem, `grant`/`SetPeerRole`,
+`remove-peer`, `rename`, `create-user`, role create/update, fleet-tag — runs the
+**same post-mutation reconcile** regardless of whether it arrived over the network
+(`RequestAdmin` handler) or through the local datastore socket (`hop admin self …`):
+
+1. **Local store write** — the handler updates `peers.json` / `roles.json`.
+2. **Explicit revoke (removals only)** — `remove-peer` writes a
+   `revocation/<id>` tombstone via `NetDoc::revoke`. This is required because
+   `reconcile` is **additive-only** in a federated/shared namespace (it never
+   deletes doc entries), so a removal that isn't tombstoned would never propagate.
+3. **Reconcile (additions)** — `reconcile(peers, roles)` re-publishes any roster
+   entries missing from the doc. It only *adds*, so it can't cross-revoke another
+   host's members.
+4. **Upsert (in-place updates)** — a `grant` or `rename` changes an **existing**
+   peer, which reconcile skips. `NetDoc::put_peer` force-writes that one peer's
+   `peer/<id>` blob so the new `role_name` / display name actually reach the doc
+   (and therefore the warren snapshot).
+5. **Refresh admin authors + re-export snapshot** — `refresh_admin_authors`
+   re-resolves who may write admin entries; `export_warren_snapshot` rebuilds the
+   member/role view that `hop fleet` reads.
+
+`propagate_admin_mutation` (netdoc/mod.rs) encapsulates steps 2–5 and is invoked by
+both paths. The local-socket path is what lets a **sole-admin warren** self-admin:
+the admin node can't mux-connect to itself, so `hop admin self …` resolves the
+target as local (`admin_target_is_local`) and routes the mutation through
+`DsRequest::Admin`, after which the daemon runs the identical reconcile — a revoke
+on the admin node propagates a tombstone, drops the member from the snapshot, and
+denies that peer's next session, with no second admin required.
+
 #### VPN data plane (`hop/vpn/1`)
 
 When the VPN is enabled (off by default; see below), `NetDoc::enable_vpn`:

@@ -28,6 +28,7 @@ A2_BUDGET="${A2_BUDGET:-60}"
 A3_BUDGET="${A3_BUDGET:-40}"
 FG_BUDGET="${FG_BUDGET:-60}"
 CAP_BUDGET="${CAP_BUDGET:-40}"
+LC_BUDGET="${LC_BUDGET:-120}"
 GUARD_BUDGET="${GUARD_BUDGET:-40}"
 
 PASS=0; FAIL=0; REPORT=""
@@ -337,6 +338,46 @@ else
   CAP_DETAIL="no invite token"
 fi
 record "CAPABILITY tag-scoped" "$CAP_OK" "${CAP_SECS:-$CAP_BUDGET}" "$CAP_BUDGET" "$CAP_DETAIL"
+
+#############################################################################
+say "LIFECYCLE — full peer lifecycle from the admin node (G26: local self-admin)"
+#############################################################################
+# The sole admin can't mux-dial itself, so grant/rename/revoke must work via the
+# LOCAL daemon socket AND propagate. Drive the whole lifecycle from the admin node:
+# a member joins → appears in the warren snapshot → `hop admin self grant` (verify
+# role) → `hop peers rename` (verify PROPAGATED name) → `hop admin self remove-peer`
+# (verify the member LEAVES `hop fleet list` — the replicated revocation).
+LC_OK=0; LC_DETAIL="setup failed"; LC_SECS=0
+run_node lc-admin lcadmin
+docker exec -d lc-admin bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 90); do docker exec lc-admin grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+INV=$(docker exec lc-admin cat /cfg/creator_invite 2>/dev/null)
+if [ -n "$INV" ]; then
+  run_node lc-member lcmember
+  docker exec lc-member sh -c "hop --config /cfg connect '$INV' --warren >/cfg/join.log 2>&1" || true
+  docker exec -d lc-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+  for _ in $(seq 1 90); do docker exec lc-member grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+  MID=$(docker exec lc-member hop --config /cfg id 2>/dev/null | cut -c1-10)
+  t0=$(nsec)
+  fleet_has() { docker exec lc-admin hop --config /cfg fleet list 2>/dev/null | grep -q "$1"; }
+  APPEAR=0; for _ in $(seq 1 25); do fleet_has "$MID" && { APPEAR=1; break; }; sleep 2; done
+  # grant a role via LOCAL self-admin, then verify it shows in the snapshot.
+  docker exec lc-admin hop --config /cfg admin self grant "$MID" ops >/dev/null 2>&1 || true
+  GRANTED=0; for _ in $(seq 1 15); do docker exec lc-admin hop --config /cfg fleet list 2>/dev/null | grep "$MID" | grep -q "ops" && { GRANTED=1; break; }; sleep 2; done
+  # rename via `hop peers rename` — must PROPAGATE to the snapshot.
+  docker exec lc-admin hop --config /cfg peers rename "$MID" renamed-lc >/dev/null 2>&1 || true
+  RENAMED=0; for _ in $(seq 1 15); do fleet_has "renamed-lc" && { RENAMED=1; break; }; sleep 2; done
+  # revoke via LOCAL self-admin — the member must LEAVE the snapshot (tombstone).
+  docker exec lc-admin hop --config /cfg admin self remove-peer "$MID" >/dev/null 2>&1 || true
+  GONE=0; for _ in $(seq 1 25); do fleet_has "$MID" || { GONE=1; break; }; sleep 2; done
+  LC_SECS=$(( $(nsec) - t0 ))
+  if [ "$APPEAR" = 1 ] && [ "$GRANTED" = 1 ] && [ "$RENAMED" = 1 ] && [ "$GONE" = 1 ]; then
+    LC_OK=1; LC_DETAIL="join→appear, grant→ops, rename→propagated, revoke→gone (all local self-admin)"
+  else
+    LC_DETAIL="appear=$APPEAR granted=$GRANTED renamed=$RENAMED gone=$GONE"
+  fi
+fi
+record "LIFECYCLE peer-admin" "$LC_OK" "${LC_SECS:-$LC_BUDGET}" "$LC_BUDGET" "$LC_DETAIL"
 
 # --- report ---------------------------------------------------------------
 ART="${HOP_FIRSTRUN_ARTIFACT:-$SCRIPT_DIR/first-run-results.md}"

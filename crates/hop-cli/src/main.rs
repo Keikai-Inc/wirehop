@@ -1240,9 +1240,16 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // Spawn Unix socket listener for out-of-process datastore access (e.g. `hop mcp`)
     // and operator-admin ops (the local CLI mints invites / reads identity through
     // the daemon, so it needs no root or `_hop`-owned config — privsep §6).
-    let _socket_listener =
-        hop_core::datastore::socket::spawn_listener(config_dir, datastore.clone(), public_key)
-            .await?;
+    // Hand the socket server the netdoc cell so the LOCAL self-admin path can
+    // propagate mutations to the warren (G26) — the cell is populated by the netdoc
+    // task above; admin ops before it's ready just skip propagation.
+    let _socket_listener = hop_core::datastore::socket::spawn_listener(
+        config_dir,
+        datastore.clone(),
+        public_key,
+        netdoc_cell.clone(),
+    )
+    .await?;
 
     // Spawn cron scheduler: every 15s, check for due jobs and execute them.
     // Uses DirectBackend so cron jobs connect via the daemon's own iroh endpoint
@@ -1888,6 +1895,10 @@ async fn dispatch_session(
             let relay_url = std::fs::read_to_string(config_dir.join("relay_url")).ok();
             let secret_key = config::load_identity(config_dir)?;
             let host_public_key = secret_key.public();
+            // Capture the removed/renamed node-id BEFORE the mutation (reconcile
+            // skips removals when federated, and only ADDS — not updates — peers).
+            let revoke_id = hop_core::admin::removed_peer_full_id(config_dir, &request);
+            let upsert_id = hop_core::admin::upserted_peer_full_id(config_dir, &request);
             let response = hop_core::admin::handle_admin_request(
                 request,
                 config_dir,
@@ -1895,27 +1906,14 @@ async fn dispatch_session(
                 &host_public_key,
                 Some(&datastore),
             );
-            // Mirror peer/role state into the network document after any admin
-            // mutation (best-effort). Reconcile is idempotent and self-healing —
-            // it adds new peers/roles and revokes ones removed from peers.json,
-            // so RemovePeer immediately writes a doc revocation.
+            // Propagate the mutation to the warren (revoke / reconcile / refresh
+            // admins / re-export snapshot) — the SAME path the local self-admin
+            // socket now uses (G26). Best-effort.
             if let Some(nd) = &netdoc
                 && !matches!(response, AdminResponse::Error { .. })
             {
-                let peers = hop_core::config::PeersStore::load(config_dir)
-                    .map(|p| p.peers)
-                    .unwrap_or_default();
-                let roles = hop_core::fleet::RolesStore::load(config_dir)
-                    .map(|r| r.roles)
-                    .unwrap_or_default();
-                if let Err(e) = nd.reconcile(&peers, &roles).await {
-                    tracing::warn!("netdoc: reconcile after admin request failed: {e:#}");
-                }
-                // A grant/revoke of admin role changes the trusted-admin set.
-                nd.refresh_admin_authors().await;
-                // Refresh the fleet snapshot immediately so the admin change
-                // shows in `hop fleet list` without waiting for the 30s tick.
-                hop_core::fleet::export_warren_snapshot(nd.as_ref(), config_dir).await;
+                nd.propagate_admin_mutation(config_dir, revoke_id.as_deref(), upsert_id.as_deref())
+                    .await;
             }
             proto::write_message(&mut send, &proto::HostMessage::AdminResponse(response)).await?;
         }
@@ -3605,6 +3603,25 @@ fn cmd_creator_invite(config_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether an `hop admin <target>` should run against the LOCAL daemon (G26):
+/// the sentinels `self`/`local`/`localhost`, or a `target` that prefixes this
+/// node's own node-id (asked of the local daemon). False when there's no local
+/// daemon — then it's a normal remote admin.
+fn admin_target_is_local(config_dir: &std::path::Path, target: &str) -> bool {
+    let t = target.trim().to_ascii_lowercase();
+    if t == "self" || t == "local" || t == "localhost" {
+        return true;
+    }
+    // Auto-detect: the operator typed this node's own id (full or a prefix).
+    if t.len() >= 6
+        && let Ok(Some(self_id)) = id_via_daemon(config_dir)
+        && self_id.to_ascii_lowercase().starts_with(&t)
+    {
+        return true;
+    }
+    false
+}
+
 async fn cmd_admin(
     _secret_key: iroh::SecretKey,
     target: &str,
@@ -3711,7 +3728,27 @@ async fn cmd_admin(
         },
     };
 
-    // Connect and send admin request
+    // Local self-admin (G26): the sole admin node can't mux-dial itself
+    // ("connecting to ourself is not supported"), so route a SELF target —
+    // `self`/`local`/`localhost`, or this node's own node-id — through the local
+    // daemon socket. The daemon runs the same post-mutation reconcile (revoke /
+    // mirror / re-export snapshot), so a local mutation propagates to the warren
+    // exactly like the network admin path.
+    if admin_target_is_local(config_dir, target) {
+        use hop_core::datastore::protocol::{DsRequest, DsResponse};
+        use hop_core::datastore::socket::DaemonConnection;
+        let conn = DaemonConnection::connect(config_dir).context(
+            "local admin needs the daemon socket on THIS machine — is `hop host` running here?",
+        )?;
+        match conn.request(&DsRequest::Admin(Box::new(request)))? {
+            DsResponse::Admin(resp) => display_admin_response(&action, *resp),
+            DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+        return Ok(());
+    }
+
+    // Connect and send admin request (remote host)
     let (_resolved, _send, mut recv) = mux::connect_to_host(
         config_dir,
         target,
@@ -3777,6 +3814,13 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
         AdminResponse::PeerRemoved { success } => {
             if success {
                 println!("Peer removed.");
+            } else {
+                println!("No peer found with that ID prefix.");
+            }
+        }
+        AdminResponse::PeerRenamed { success } => {
+            if success {
+                println!("Peer renamed.");
             } else {
                 println!("No peer found with that ID prefix.");
             }
@@ -6533,14 +6577,34 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
             Ok(())
         }
         Some(PeersAction::Rename { id, name }) => {
-            if peers.rename_peer(&id, name.clone()) {
-                peers.save(host_config_dir)?;
-                println!("Peer renamed to '{name}'.");
+            use hop_core::datastore::protocol::{DsRequest, DsResponse};
+            use hop_core::datastore::socket::DaemonConnection;
+            // A WARREN PEER rename routes through the daemon so it PROPAGATES to
+            // every node's `hop fleet list` (G26 — the local self-admin path), not
+            // just this machine's peers.json. Fall back to a local known-host alias
+            // (a client concern) or a local peers.json edit if there's no daemon.
+            let propagated = match DaemonConnection::connect(host_config_dir) {
+                Ok(conn) => matches!(
+                    conn.request(&DsRequest::Admin(Box::new(
+                        hop_core::proto::AdminRequest::RenamePeer {
+                            node_id_prefix: id.clone(),
+                            name: name.clone(),
+                        }
+                    ))),
+                    Ok(DsResponse::Admin(r)) if matches!(*r, hop_core::proto::AdminResponse::PeerRenamed { success: true })
+                ),
+                Err(_) => false,
+            };
+            if propagated {
+                println!("Peer renamed to '{name}' (propagated to the warren).");
             } else {
                 let mut hosts = KnownHostsStore::load(user_config_dir)?;
                 if hosts.rename_host(&id, name.clone()) {
                     hosts.save(user_config_dir)?;
                     println!("Known host renamed to '{name}'.");
+                } else if peers.rename_peer(&id, name.clone()) {
+                    peers.save(host_config_dir)?;
+                    println!("Peer renamed to '{name}' (local only — no daemon to propagate).");
                 } else {
                     println!("No peer or known host found matching '{id}'.");
                 }

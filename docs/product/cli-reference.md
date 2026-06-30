@@ -374,6 +374,17 @@ hop peers rename abc123 my-server
 
 Remote administration (requires creator role).
 
+**Local mode (self-admin).** When `<target>` resolves to *this* node — the
+literal `self`, `local`, or `localhost`, or a prefix of the local node id — the
+mutation is routed through the daemon's local datastore socket instead of dialing
+the warren (mux can't connect to itself). The admin node can therefore manage its
+own roster: `hop admin self grant <id> ops`, `hop admin self remove-peer <id>`,
+etc. Local mutations run the same post-mutation reconcile as the network path
+(revocation tombstones, netdoc peer/role upsert, `refresh_admin_authors`, warren
+snapshot re-export), so changes propagate to every member immediately. This is
+what lets a **sole-admin warren** revoke a stale peer or elevate a member without
+a second admin node.
+
 | Subcommand | Description |
 |---|---|
 | `invite` | Create an invite on the remote host |

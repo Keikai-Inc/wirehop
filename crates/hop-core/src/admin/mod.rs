@@ -14,6 +14,22 @@ use crate::proto::{AdminRequest, AdminResponse, PeerInfo};
 
 pub use crate::proto::{AdminRequest as Request, AdminResponse as Response};
 
+/// The FULL node-id a `RemovePeer` request will remove (resolving its prefix
+/// against `peers.json`), captured BEFORE the removal so the caller can write an
+/// explicit netdoc revocation tombstone afterward (reconcile alone skips removals
+/// in a federated namespace). `None` for any non-removal request.
+pub fn removed_peer_full_id(config_dir: &Path, request: &AdminRequest) -> Option<String> {
+    let AdminRequest::RemovePeer { node_id_prefix } = request else {
+        return None;
+    };
+    let store = PeersStore::load(config_dir).ok()?;
+    store
+        .peers
+        .iter()
+        .find(|p| p.node_id.starts_with(node_id_prefix.as_str()))
+        .map(|p| p.node_id.clone())
+}
+
 /// Handle an admin request from a creator peer.
 ///
 /// Caller must verify the peer has Creator role before calling this.
@@ -41,6 +57,9 @@ pub fn handle_admin_request(
         AdminRequest::ListPeers => handle_list_peers(config_dir),
         AdminRequest::RemovePeer { node_id_prefix } => {
             handle_remove_peer(config_dir, &node_id_prefix)
+        }
+        AdminRequest::RenamePeer { node_id_prefix, name } => {
+            handle_rename_peer(config_dir, &node_id_prefix, name)
         }
         AdminRequest::SetPeerRole { node_id_prefix, role_name } => {
             handle_set_peer_role(config_dir, &node_id_prefix, &role_name)
@@ -208,6 +227,40 @@ fn handle_set_peer_role(config_dir: &Path, node_id_prefix: &str, role_name: &str
         }
         Err(e) => AdminResponse::Error { message: format!("failed to load peers: {e}") },
     }
+}
+
+fn handle_rename_peer(config_dir: &Path, node_id_prefix: &str, name: String) -> AdminResponse {
+    match PeersStore::load(config_dir) {
+        Ok(mut store) => {
+            let success = store.rename_peer(node_id_prefix, name);
+            if success
+                && let Err(e) = store.save(config_dir)
+            {
+                return AdminResponse::Error { message: format!("renamed but failed to save: {e}") };
+            }
+            AdminResponse::PeerRenamed { success }
+        }
+        Err(e) => AdminResponse::Error { message: format!("failed to load peers: {e}") },
+    }
+}
+
+/// The FULL node-id of a peer whose entry was changed IN PLACE (role grant or
+/// rename) — resolving the request's prefix. `reconcile` only ADDS missing peers,
+/// so the caller must `put_peer` this entry to push the updated role/name into the
+/// doc (else the change never shows in another node's `hop fleet list`). `None`
+/// for requests that don't modify an existing peer entry.
+pub fn upserted_peer_full_id(config_dir: &Path, request: &AdminRequest) -> Option<String> {
+    let prefix = match request {
+        AdminRequest::RenamePeer { node_id_prefix, .. } => node_id_prefix,
+        AdminRequest::SetPeerRole { node_id_prefix, .. } => node_id_prefix,
+        _ => return None,
+    };
+    let store = PeersStore::load(config_dir).ok()?;
+    store
+        .peers
+        .iter()
+        .find(|p| p.node_id.starts_with(prefix.as_str()))
+        .map(|p| p.node_id.clone())
 }
 
 fn handle_remove_peer(config_dir: &Path, node_id_prefix: &str) -> AdminResponse {

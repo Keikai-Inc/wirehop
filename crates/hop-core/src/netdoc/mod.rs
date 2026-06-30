@@ -3391,6 +3391,47 @@ impl NetDoc {
         }
     }
 
+    /// Propagate a local admin mutation (RemovePeer / grant / role / rename / …)
+    /// to the warren — the canonical "after an admin write, push it to the doc"
+    /// sequence shared by the network admin path AND the local self-admin (datastore
+    /// socket) path. `revoke_id` is the FULL node-id removed by a RemovePeer (None
+    /// otherwise): an explicit [`revoke`](Self::revoke) is needed because
+    /// [`reconcile`](Self::reconcile) deliberately **skips removals in a federated
+    /// namespace**, so a RemovePeer would otherwise leave no tombstone. Then mirror
+    /// peers/roles into the doc, refresh the trusted-admin set, and re-export the
+    /// warren snapshot so `hop fleet list` reflects the change immediately.
+    pub async fn propagate_admin_mutation(
+        &self,
+        config_dir: &std::path::Path,
+        revoke_id: Option<&str>,
+        upsert_id: Option<&str>,
+    ) {
+        if let Some(id) = revoke_id
+            && let Err(e) = self.revoke(id, "admin removal", &now_timestamp()).await
+        {
+            tracing::warn!("netdoc: explicit revoke of {id} failed: {e:#}");
+        }
+        let peers = crate::config::PeersStore::load(config_dir)
+            .map(|p| p.peers)
+            .unwrap_or_default();
+        let roles = crate::fleet::RolesStore::load(config_dir)
+            .map(|r| r.roles)
+            .unwrap_or_default();
+        if let Err(e) = self.reconcile(&peers, &roles).await {
+            tracing::warn!("netdoc: reconcile after admin mutation failed: {e:#}");
+        }
+        // `reconcile` only ADDS missing peers, so an in-place change (e.g. a rename)
+        // to an existing peer must be upserted explicitly.
+        if let Some(id) = upsert_id
+            && let Some(p) = peers.iter().find(|p| p.node_id == id)
+            && let Err(e) = self.put_peer(p).await
+        {
+            tracing::warn!("netdoc: upsert of renamed peer {id} failed: {e:#}");
+        }
+        self.refresh_admin_authors().await;
+        crate::fleet::export_warren_snapshot(self, config_dir).await;
+    }
+
     // ── Internals ────────────────────────────────────────────────────────
 
     /// Decode an entry's content into `T`, returning `None` for tombstones.

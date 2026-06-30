@@ -92,6 +92,13 @@ pub fn operator_group_gid() -> Option<u32> {
         .map(|g| g.gid.as_raw())
 }
 
+/// A lazily-populated handle to the daemon's netdoc, shared with the socket server
+/// so the **local** admin path can propagate mutations (revoke/reconcile/snapshot)
+/// exactly like the network admin path. Empty until the netdoc finishes coming up;
+/// admin mutations before then simply skip propagation (best-effort).
+pub type NetDocHandle =
+    std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<crate::netdoc::NetDoc>>>;
+
 /// Spawn a Unix socket listener that serves datastore + operator-admin requests.
 ///
 /// `host_public_key` lets the daemon answer operator `AdminRequest`s (mint
@@ -104,6 +111,7 @@ pub async fn spawn_listener(
     config_dir: &Path,
     datastore: Datastore,
     host_public_key: iroh::PublicKey,
+    netdoc: NetDocHandle,
 ) -> Result<JoinHandle<()>> {
     let path = socket_path(config_dir);
 
@@ -143,8 +151,9 @@ pub async fn spawn_listener(
                 Ok((stream, _addr)) => {
                     let ds = datastore.clone();
                     let cfg = config_dir.clone();
+                    let nd = netdoc.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, ds, cfg, host_public_key).await {
+                        if let Err(e) = handle_connection(stream, ds, cfg, host_public_key, nd).await {
                             tracing::debug!("Socket client disconnected: {e:#}");
                         }
                     });
@@ -172,6 +181,7 @@ async fn handle_connection(
     ds: Datastore,
     config_dir: std::path::PathBuf,
     host_public_key: iroh::PublicKey,
+    netdoc: NetDocHandle,
 ) -> Result<()> {
     loop {
         // Read request frame
@@ -189,6 +199,18 @@ async fn handle_connection(
         let (req, _): (DsRequest, _) =
             bincode::serde::decode_from_slice(&payload, bincode::config::standard())?;
 
+        // Local self-admin (G26): a mutating admin op via this socket must propagate
+        // to the warren just like the network admin path. Capture the bits we need
+        // BEFORE `req` is moved into the blocking dispatch.
+        let is_admin = matches!(req, DsRequest::Admin(_));
+        let (admin_revoke_id, admin_upsert_id) = match &req {
+            DsRequest::Admin(a) => (
+                crate::admin::removed_peer_full_id(&config_dir, a),
+                crate::admin::upserted_peer_full_id(&config_dir, a),
+            ),
+            _ => (None, None),
+        };
+
         // Dispatch (blocking) on a thread pool — both datastore ops and the
         // operator-admin handler are sync.
         let ds_clone = ds.clone();
@@ -196,6 +218,22 @@ async fn handle_connection(
         let resp =
             tokio::task::spawn_blocking(move || dispatch_request(&ds_clone, &cfg, &host_public_key, req))
                 .await??;
+
+        // After a successful admin mutation, run the SAME post-mutation propagate the
+        // network admin path runs (reconcile → refresh admins → re-export snapshot,
+        // plus an explicit revoke for RemovePeer) so local admin reaches the warren —
+        // the fix for "the sole admin node can't self-admin" (mux can't self-dial).
+        if is_admin
+            && !matches!(&resp, DsResponse::Admin(b) if matches!(b.as_ref(), crate::proto::AdminResponse::Error { .. }))
+            && let Some(nd) = netdoc.get()
+        {
+            nd.propagate_admin_mutation(
+                &config_dir,
+                admin_revoke_id.as_deref(),
+                admin_upsert_id.as_deref(),
+            )
+            .await;
+        }
 
         // Write response frame
         let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
@@ -319,7 +357,7 @@ mod tests {
         let ds_path = dir.path().join("test.redb");
         let ds = Datastore::open(&ds_path).unwrap();
 
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
             .await
             .unwrap();
 
@@ -373,7 +411,7 @@ mod tests {
     async fn socket_roundtrip_netstats() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -400,7 +438,7 @@ mod tests {
     async fn socket_roundtrip_ts() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -449,7 +487,7 @@ mod tests {
     async fn socket_roundtrip_cron() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public())
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

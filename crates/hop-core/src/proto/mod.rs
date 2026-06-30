@@ -151,6 +151,9 @@ pub enum AdminRequest {
     ListPeers,
     /// Remove a peer by node_id prefix.
     RemovePeer { node_id_prefix: String },
+    /// Rename a peer (G26) — propagated to the warren doc so the new name shows in
+    /// every node's `hop fleet list`, not just the local one.
+    RenamePeer { node_id_prefix: String, name: String },
     /// Create a Unix user on this host.
     CreateUser {
         username: String,
@@ -226,6 +229,7 @@ pub enum AdminResponse {
     PeerList { peers: Vec<PeerInfo> },
     /// A peer was removed.
     PeerRemoved { success: bool },
+    PeerRenamed { success: bool },
     /// A peer's role was changed.
     PeerRoleUpdated { success: bool },
     /// A Unix user was created.
