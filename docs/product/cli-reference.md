@@ -542,21 +542,51 @@ Fleet management (host-side).
 | Subcommand | Description |
 |---|---|
 | `status` | Show fleet registration status |
-| `list [group]` | List warren members (by node-id, name, role, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
-| `exec <group> -- <command...>` | Execute a command on all hosts in a group |
-| `grep <group> <pattern>` | **Federated log search** — fan a read-only search across the group, reduce the matches (see below) |
+| `list [group]` | List warren members (node-id, name, role, **online/offline**, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
+| `exec <group> -- <command...>` | Execute a command on all **online** hosts in a group |
+| `grep <group> <pattern>` | **Federated log search** — fan a read-only search across the **online** group, reduce the matches (see below) |
+| `prune [--older-than DUR]` | Remove warren members not seen for a while (admin-gated, replicated revocation) |
 | `add <name> --tags <TAGS>` | Add a known host to the daemon's fleet store |
 
 ```bash
 hop fleet status
-hop fleet list web
-hop fleet exec developer -- apt update
+hop fleet list                                           # members with online/offline
+hop fleet list web --stale-after 1h                      # online = seen within 1h
+hop fleet exec developer -- apt update                   # skips offline members
+hop fleet exec developer --include-offline -- apt update # force-include offline
 hop fleet grep web "failed password" --source system     # search syslogs across the fleet
 hop fleet grep all rejected --source audit               # search the structured audit log
+hop fleet prune --older-than 30d --dry-run               # preview stale members
+hop fleet prune --older-than 30d                         # revoke them (replicated)
 hop fleet add my-server --tags web,production
 ```
 
 **`fleet status` flag:** `--fleet <NAME>` (required only if registered with multiple fleets)
+
+#### Liveness, offline-skip & pruning (roster hygiene)
+
+A member is **online** when its last contact — the later of a control-plane connection
+and a VPN data-plane datagram (the founder receives each active member's keepalive
+every ~5s) — is within the **liveness window** (`--stale-after`, default **15m**).
+
+| Command/flag | Effect |
+|---|---|
+| `hop fleet list` | shows `online`/`offline` per member; this node is always `online` |
+| `--stale-after <DUR>` | the freshness window for `list`/`exec`/`grep` (e.g. `15m`, `1h`, `7d`) |
+| `hop fleet exec` / `grep` | target only **online** members by default (offline ones would just time out); the count of skipped offline members is reported |
+| `--include-offline` | also target members that look offline |
+| `hop fleet prune [--older-than DUR]` | revoke (replicated tombstone) every member whose last contact is older than `--older-than` (default **30d**). Never removes this node or a member with **no recorded contact** (a fresh, never-connected invite). `--dry-run` previews; prompts unless `--yes` |
+
+**Auto-evict TTL.** Set `hop config set prune_after 30d` so the **founder's** daemon
+auto-prunes members idle longer than the TTL on its periodic sweep (the automated
+form of `hop fleet prune`); `hop config set prune_after off` disables it (default).
+
+**Name backfill.** A member admitted without a bound username shows as `peer-XXXX`
+until its self-registered hostname replicates; the founder then backfills the roster
+name to the real hostname automatically (no action needed).
+
+`hop fleet prune` runs against **this** host's daemon over the local operator socket
+(admin-gated, like `hop admin self`), so the sole admin can prune its own warren.
 
 #### `hop fleet grep <selector> <pattern>`
 

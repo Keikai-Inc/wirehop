@@ -842,6 +842,10 @@ pub enum FleetAction {
     List {
         /// Group/role to filter by
         group: Option<String>,
+        /// Liveness window: a member seen within this duration is shown `online`
+        /// (e.g. `15m`, `1h`, `7d`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
     },
     /// Run a command on all warren members (or known hosts) matching a selector.
     /// The selector matches a warren member's role or any of its tags (from the
@@ -849,6 +853,13 @@ pub enum FleetAction {
     Exec {
         /// Selector: a role name, a tag, or a known-host group.
         selector: String,
+        /// Also target members that look offline (stale `last_seen`). By default
+        /// fan-out skips them — they'd just time out.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
         /// Command and arguments
         #[arg(required = true, last = true)]
         command: Vec<String>,
@@ -880,6 +891,26 @@ pub enum FleetAction {
         /// Emit one aggregated JSON object instead of a table.
         #[arg(long)]
         json: bool,
+        /// Also search members that look offline (stale `last_seen`). By default
+        /// the fan-out skips them — they'd just time out.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// Remove warren members not seen for a while (admin-gated; writes a replicated
+    /// revocation so every node drops them). Never removes this node.
+    Prune {
+        /// Remove members whose last contact is older than this (e.g. `30d`, `12h`).
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Show what would be pruned without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Add a known host to the daemon's fleet store
     Add {

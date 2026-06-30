@@ -61,6 +61,11 @@ pub fn handle_admin_request(
         AdminRequest::RenamePeer { node_id_prefix, name } => {
             handle_rename_peer(config_dir, &node_id_prefix, name)
         }
+        // Prune needs async netdoc + VPN-liveness access, so the daemon socket
+        // intercepts it before this sync dispatch. Reaching here means no warren.
+        AdminRequest::PruneMembers { .. } => AdminResponse::Error {
+            message: "prune requires the warren netdoc (handled by the daemon socket)".to_string(),
+        },
         AdminRequest::SetPeerRole { node_id_prefix, role_name } => {
             handle_set_peer_role(config_dir, &node_id_prefix, &role_name)
         }

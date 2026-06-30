@@ -154,6 +154,11 @@ pub enum AdminRequest {
     /// Rename a peer (G26) — propagated to the warren doc so the new name shows in
     /// every node's `hop fleet list`, not just the local one.
     RenamePeer { node_id_prefix: String, name: String },
+    /// Prune (revoke) every warren member not seen for `older_than_secs` (G25
+    /// roster hygiene). Handled out-of-band by the daemon socket (needs async
+    /// netdoc + VPN-liveness access); writes a replicated revocation per member.
+    /// `dry_run` returns the would-prune list without revoking anything.
+    PruneMembers { older_than_secs: u64, dry_run: bool },
     /// Create a Unix user on this host.
     CreateUser {
         username: String,
@@ -230,6 +235,8 @@ pub enum AdminResponse {
     /// A peer was removed.
     PeerRemoved { success: bool },
     PeerRenamed { success: bool },
+    /// Result of a `PruneMembers`: the `(node_id, name)` of every member revoked.
+    Pruned { members: Vec<(String, String)> },
     /// A peer's role was changed.
     PeerRoleUpdated { success: bool },
     /// A Unix user was created.

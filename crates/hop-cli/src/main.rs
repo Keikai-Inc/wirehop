@@ -974,6 +974,33 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                                 tokio::time::interval(std::time::Duration::from_secs(secs));
                             loop {
                                 tick.tick().await;
+                                // Roster hygiene (G25): backfill any unnamed `peer-XXXX`
+                                // entry with the member's real hostname once its
+                                // self-registered `name/` has replicated (idempotent),
+                                // and — if an auto-evict TTL is configured — prune
+                                // members not seen for that long (founder only; a
+                                // non-anchor's revocations don't validate).
+                                net_snap.backfill_peer_names().await;
+                                if let Some(ttl) =
+                                    hop_core::config::HostConfig::load(&cfg_snap)
+                                        .ok()
+                                        .and_then(|c| c.prune_after_secs)
+                                    && ttl > 0
+                                {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    let pruned = net_snap
+                                        .prune_stale_members(&cfg_snap, ttl, now)
+                                        .await;
+                                    if !pruned.is_empty() {
+                                        tracing::info!(
+                                            "roster auto-evict: pruned {} stale member(s)",
+                                            pruned.len()
+                                        );
+                                    }
+                                }
                                 hop_core::fleet::export_warren_snapshot(net_snap.as_ref(), &cfg_snap)
                                     .await;
                             }
@@ -2051,7 +2078,7 @@ fn invite_via_daemon(
 
 /// Ask the running daemon for this host's node id (privsep §6). `Ok(None)` ⇒ no
 /// daemon (caller reads identity.json directly).
-fn id_via_daemon(config_dir: &std::path::Path) -> Result<Option<String>> {
+pub(crate) fn id_via_daemon(config_dir: &std::path::Path) -> Result<Option<String>> {
     use hop_core::datastore::protocol::{DsRequest, DsResponse};
     use hop_core::datastore::socket::DaemonConnection;
     let conn = match DaemonConnection::connect(config_dir) {
@@ -3847,6 +3874,11 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
                 println!("No peer found with that ID prefix.");
             }
         }
+        AdminResponse::Pruned { members } => {
+            // `hop fleet prune` formats its own richer output; this is the fallback
+            // for a generic admin caller.
+            println!("Pruned {} member(s).", members.len());
+        }
         AdminResponse::PeerRoleUpdated { success } => {
             if success {
                 println!("Peer role updated.");
@@ -4027,7 +4059,7 @@ async fn cmd_fleet(
             println!("Added {} ({}) to fleet{tag_display}", name, &host.node_id[..10]);
             Ok(())
         }
-        FleetAction::List { group } => {
+        FleetAction::List { group, stale_after } => {
             let mut seen = HashSet::new();
             let mut any = false;
 
@@ -4038,6 +4070,11 @@ async fn cmd_fleet(
             // daemon — members carry their real hostname now, not the string
             // "self"). No daemon → no marker, not an error.
             let self_id = id_via_daemon(host_config_dir).ok().flatten();
+            let window = match stale_after.as_deref() {
+                Some(d) => parse_duration_ms(d)? / 1000,
+                None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
+            };
+            let now = unix_now_secs();
             if let Some(ns) = &snap.namespace {
                 println!("warren {} — {} member(s)", &ns[..8.min(ns.len())], snap.members.len());
             }
@@ -4048,8 +4085,11 @@ async fn cmd_fleet(
                 let id = &m.node_id[..10.min(m.node_id.len())];
                 let vip = m.vip.as_deref().map(|v| format!("  {v}")).unwrap_or_default();
                 let tags = if m.tags.is_empty() { String::new() } else { format!("  [{}]", m.tags.join(", ")) };
-                let me = if self_id.as_deref() == Some(m.node_id.as_str()) { "  (this node)" } else { "" };
-                println!("  {id}  {}  role={}{vip}{tags}{me}", m.name, m.role);
+                let is_self = self_id.as_deref() == Some(m.node_id.as_str());
+                let me = if is_self { "  (this node)" } else { "" };
+                // This node is always online; others from last_seen staleness.
+                let status = if is_self || m.is_online(now, window) { "online" } else { "offline" };
+                println!("  {id}  {}  role={}  {status}{vip}{tags}{me}", m.name, m.role);
                 any = true;
             }
 
@@ -4074,7 +4114,7 @@ async fn cmd_fleet(
             }
             Ok(())
         }
-        FleetAction::Exec { selector, command } => {
+        FleetAction::Exec { selector, include_offline, stale_after, command } => {
             // Build the target set: warren members (from the replicated netdoc
             // snapshot) whose role or tags match the selector, plus known-host
             // groups (legacy). Each target is (connect_target, display_name) —
@@ -4082,10 +4122,25 @@ async fn cmd_fleet(
             let mut seen = HashSet::new();
             let mut targets: Vec<(String, String)> = Vec::new();
 
+            let window = match stale_after.as_deref() {
+                Some(d) => parse_duration_ms(d)? / 1000,
+                None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
+            };
+            let now = unix_now_secs();
+            let self_id = id_via_daemon(host_config_dir).ok().flatten();
+            let mut skipped_offline = 0usize;
             let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
             for m in &snap.members {
                 let hit = m.role == selector || m.tags.iter().any(|t| t == &selector);
-                if hit && seen.insert(m.node_id.clone()) {
+                if !hit { continue; }
+                // Skip self (can't connect to ourselves) and, by default, members
+                // that look offline (stale last_seen) — they'd just time out.
+                if self_id.as_deref() == Some(m.node_id.as_str()) { continue; }
+                if !include_offline && !m.is_online(now, window) {
+                    skipped_offline += 1;
+                    continue;
+                }
+                if seen.insert(m.node_id.clone()) {
                     targets.push((m.node_id.clone(), m.name.clone()));
                 }
             }
@@ -4096,11 +4151,16 @@ async fn cmd_fleet(
                 }
             }
 
+            let offline_note = if skipped_offline > 0 {
+                format!(" ({skipped_offline} offline skipped — use --include-offline)")
+            } else {
+                String::new()
+            };
             if targets.is_empty() {
-                println!("No warren members or known hosts match '{selector}'.");
+                println!("No reachable warren members or known hosts match '{selector}'.{offline_note}");
                 return Ok(());
             }
-            println!("Running on {} host(s) matching '{selector}':", targets.len());
+            println!("Running on {} host(s) matching '{selector}'{offline_note}:", targets.len());
             let command_str = command.join(" ");
             let (mut ok, mut failed) = (0u32, 0u32);
             for (target, name) in &targets {
@@ -4138,7 +4198,13 @@ async fn cmd_fleet(
             println!("Done: {ok} ok, {failed} failed.");
             Ok(())
         }
-        FleetAction::Grep { selector, pattern, source, since, limit, concurrency, json } => {
+        FleetAction::Grep {
+            selector, pattern, source, since, limit, concurrency, json, include_offline, stale_after,
+        } => {
+            let window = match stale_after.as_deref() {
+                Some(d) => parse_duration_ms(d)? / 1000,
+                None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
+            };
             fleet_grep::run(
                 host_config_dir,
                 user_config_dir,
@@ -4149,10 +4215,90 @@ async fn cmd_fleet(
                 limit,
                 concurrency,
                 json,
+                include_offline,
+                window,
             )
             .await
         }
+        FleetAction::Prune { older_than, dry_run, yes } => {
+            cmd_fleet_prune(host_config_dir, &older_than, dry_run, yes).await
+        }
     }
+}
+
+/// `hop fleet prune` — remove warren members not seen for `older_than` (G25). The
+/// daemon is the single source of truth: it computes staleness from the live roster
+/// and VPN liveness, then writes a replicated revocation per member. `--dry-run`
+/// returns the would-prune list without changing anything. Runs against THIS host's
+/// daemon (admin-gated by the operator-group socket), like `hop admin self`.
+async fn cmd_fleet_prune(
+    host_config_dir: &std::path::Path,
+    older_than: &str,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    let older_than_secs = parse_duration_ms(older_than)? / 1000;
+
+    let conn = DaemonConnection::connect(host_config_dir).context(
+        "fleet prune needs the daemon socket on THIS machine — is `hop host` running here?",
+    )?;
+
+    // Preview first (dry-run) so a real prune can confirm against the actual list.
+    let preview = conn.request(&DsRequest::Admin(Box::new(
+        hop_core::proto::AdminRequest::PruneMembers { older_than_secs, dry_run: true },
+    )))?;
+    let stale = match preview {
+        DsResponse::Admin(r) => match *r {
+            hop_core::proto::AdminResponse::Pruned { members } => members,
+            hop_core::proto::AdminResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        },
+        DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
+
+    if stale.is_empty() {
+        println!("No members older than {older_than} — nothing to prune.");
+        return Ok(());
+    }
+
+    println!("{} member(s) not seen in {older_than}:", stale.len());
+    for (id, name) in &stale {
+        println!("  {}  {name}", &id[..10.min(id.len())]);
+    }
+    if dry_run {
+        println!("\n(dry run — nothing removed; re-run without --dry-run to prune)");
+        return Ok(());
+    }
+    if !yes {
+        eprint!("\nRevoke these {} member(s) from the warren? [y/N] ", stale.len());
+        use std::io::Write as _;
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let resp = conn.request(&DsRequest::Admin(Box::new(
+        hop_core::proto::AdminRequest::PruneMembers { older_than_secs, dry_run: false },
+    )))?;
+    match resp {
+        DsResponse::Admin(r) => match *r {
+            hop_core::proto::AdminResponse::Pruned { members } => {
+                println!("Pruned {} member(s) (replicated revocation written).", members.len());
+            }
+            hop_core::proto::AdminResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        },
+        DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+    Ok(())
 }
 
 /// Run `hop auth <provider>` — authenticate with a service and store credentials.
@@ -5594,6 +5740,14 @@ fn cmd_config(action: Option<ConfigAction>, config_dir: &std::path::Path) -> Res
                 "tags             {}",
                 if cfg.tags.is_empty() { "(none)".to_string() } else { cfg.tags.join(", ") }
             );
+            println!(
+                "prune_after      {}",
+                match cfg.prune_after_secs {
+                    Some(s) if s >= 86400 => format!("{}d", s / 86400),
+                    Some(s) => format!("{s}s"),
+                    None => "off".to_string(),
+                }
+            );
         }
         Some(ConfigAction::Set { key, value }) => {
             let confirmation = set_host_config_value(config_dir, &key, &value)?;
@@ -5656,8 +5810,21 @@ fn set_host_config_value(config_dir: &std::path::Path, key: &str, value: &str) -
                 if on { "host LOCKED — explicit grants only" } else { "open within the warren" }
             )
         }
+        "prune_after" | "prune-after" => {
+            // G25 auto-evict TTL: members not seen for this long are pruned
+            // (replicated revocation) by the daemon. `off`/`0`/empty disables.
+            let v = value.trim().to_ascii_lowercase();
+            if v.is_empty() || v == "off" || v == "none" || v == "0" {
+                cfg.prune_after_secs = None;
+                "prune_after disabled (manual pruning only)".to_string()
+            } else {
+                let secs = parse_duration_value(value)?;
+                cfg.prune_after_secs = Some(secs);
+                format!("prune_after set to {secs}s (auto-evict members idle this long)")
+            }
+        }
         _ => anyhow::bail!(
-            "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role, require_explicit_access"
+            "Unknown config key '{key}'. Valid keys: session_timeout, max_sessions, vpn, tags, default_role, require_explicit_access, prune_after"
         ),
     };
     cfg.save(config_dir)?;
@@ -6433,7 +6600,7 @@ fn parse_duration_value(s: &str) -> Result<u64> {
     }
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

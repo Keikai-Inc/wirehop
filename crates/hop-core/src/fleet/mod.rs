@@ -49,6 +49,30 @@ pub struct WarrenMemberInfo {
     pub last_seen: Option<String>,
 }
 
+/// Default liveness window: a member seen within this many seconds counts as
+/// "online" in `hop fleet list` and is targeted by fan-out (`grep`/`exec`) without
+/// `--include-offline`. Chosen to comfortably exceed the member→admin contact
+/// cadence (announce/redial/keepalive) so a live-but-idle node isn't mislabeled.
+pub const DEFAULT_LIVENESS_WINDOW_SECS: u64 = 15 * 60;
+
+impl WarrenMemberInfo {
+    /// Seconds since this member was last seen, if `last_seen` parses as an
+    /// epoch-seconds timestamp (the format the daemon writes). `None` when there's
+    /// no timestamp or it's unparseable (unknown liveness).
+    pub fn last_seen_age_secs(&self, now: u64) -> Option<u64> {
+        let ls = self.last_seen.as_deref()?.trim().parse::<u64>().ok()?;
+        Some(now.saturating_sub(ls))
+    }
+
+    /// Whether the member counts as **online**: seen within `window_secs`. A member
+    /// with no/unparseable `last_seen` is treated as **offline** (unknown liveness).
+    /// NOTE: the founder's own self-entry has no `last_seen`; a renderer that knows
+    /// "this node" should force it online rather than rely on this.
+    pub fn is_online(&self, now: u64, window_secs: u64) -> bool {
+        self.last_seen_age_secs(now).map(|age| age <= window_secs).unwrap_or(false)
+    }
+}
+
 impl WarrenSnapshot {
     pub fn load(config_dir: &Path) -> Result<Self> {
         let path = config_dir.join("warren-members.json");
@@ -111,15 +135,30 @@ fn join_warren_snapshot(
 
 /// Build a membership snapshot from the live netdoc (daemon side).
 pub async fn build_warren_snapshot(netdoc: &crate::netdoc::NetDoc) -> Result<WarrenSnapshot> {
-    let peers = netdoc.list_peers().await.context("list_peers")?;
+    let mut peers = netdoc.list_peers().await.context("list_peers")?;
     let roles = netdoc.list_roles().await.unwrap_or_default();
     let vips = netdoc.list_virtual_ips().await.unwrap_or_default();
     let tags = netdoc.list_host_tags().await.unwrap_or_default();
-    let mut snap = join_warren_snapshot(peers, roles, vips, tags, Some(netdoc.namespace().to_string()));
-    snap.updated_at = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Merge VPN data-plane liveness into `last_seen`: control-plane `last_seen`
+    // misses a VPN-active-but-idle member (it only refreshes on a hop/3 connect),
+    // but the founder receives that member's keepalive every ~5s. Take the later of
+    // the two so liveness in `hop fleet list` / fan-out reflects real reachability.
+    for p in &mut peers {
+        if let Some(ep) = p.vpn_endpoint.as_deref()
+            && let Some(vpn_seen) = netdoc.vpn_last_rx_epoch(ep, now).await
+        {
+            let cp = p.last_seen.as_deref().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            if vpn_seen > cp {
+                p.last_seen = Some(vpn_seen.to_string());
+            }
+        }
+    }
+    let mut snap = join_warren_snapshot(peers, roles, vips, tags, Some(netdoc.namespace().to_string()));
+    snap.updated_at = now;
     Ok(snap)
 }
 
@@ -1042,6 +1081,34 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::proto::UserMode;
+
+    fn member_seen(last_seen: Option<&str>) -> WarrenMemberInfo {
+        WarrenMemberInfo {
+            node_id: "n".into(),
+            name: "m".into(),
+            role: "member".into(),
+            vip: None,
+            tags: vec![],
+            last_seen: last_seen.map(String::from),
+        }
+    }
+
+    #[test]
+    fn member_liveness_from_last_seen() {
+        let now = 1_000_000u64;
+        // Fresh (10s ago) → online within a 15-min window.
+        assert!(member_seen(Some("999990")).is_online(now, 900));
+        assert_eq!(member_seen(Some("999990")).last_seen_age_secs(now), Some(10));
+        // Stale (1 day ago) → offline within a 15-min window.
+        assert!(!member_seen(Some(&(now - 86400).to_string())).is_online(now, 900));
+        // No timestamp → unknown → offline (the renderer forces self online).
+        assert!(!member_seen(None).is_online(now, 900));
+        assert_eq!(member_seen(None).last_seen_age_secs(now), None);
+        // Garbage timestamp → offline, no panic.
+        assert!(!member_seen(Some("not-a-number")).is_online(now, 900));
+        // Future timestamp (clock skew) → age 0 → online.
+        assert!(member_seen(Some(&(now + 50).to_string())).is_online(now, 900));
+    }
 
     fn peer(node_id: &str, name: &str, role_name: Option<&str>, vip: Option<&str>) -> crate::config::Peer {
         crate::config::Peer {

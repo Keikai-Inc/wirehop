@@ -3491,16 +3491,197 @@ impl NetDoc {
         if let Err(e) = self.reconcile(&peers, &roles).await {
             tracing::warn!("netdoc: reconcile after admin mutation failed: {e:#}");
         }
-        // `reconcile` only ADDS missing peers, so an in-place change (e.g. a rename)
-        // to an existing peer must be upserted explicitly.
+        // `reconcile` only ADDS missing peers, so an in-place change (rename / role
+        // grant) to an existing peer must be upserted explicitly. MERGE the local
+        // change onto the existing netdoc entry rather than overwriting it — the doc
+        // entry carries admin-allocated fields (vip / vpn_endpoint / self_doc /
+        // site_id / netdoc_author) that `peers.json` does NOT, so a blind put would
+        // wipe the member's data-plane addressing (and its vIP, which name-backfill
+        // and routing rely on).
         if let Some(id) = upsert_id
-            && let Some(p) = peers.iter().find(|p| p.node_id == id)
-            && let Err(e) = self.put_peer(p).await
+            && let Some(local) = peers.iter().find(|p| p.node_id == id)
         {
-            tracing::warn!("netdoc: upsert of renamed peer {id} failed: {e:#}");
+            let merged = match self.get_peer(id).await.ok().flatten() {
+                Some(mut existing) => {
+                    existing.name = local.name.clone();
+                    existing.role = local.role.clone();
+                    existing.role_name = local.role_name.clone();
+                    existing.username = local.username.clone();
+                    existing.sandbox = local.sandbox.clone();
+                    existing
+                }
+                None => local.clone(),
+            };
+            if let Err(e) = self.put_peer(&merged).await {
+                tracing::warn!("netdoc: upsert of peer {id} failed: {e:#}");
+            }
         }
         self.refresh_admin_authors().await;
         crate::fleet::export_warren_snapshot(self, config_dir).await;
+    }
+
+    // ── Roster hygiene (G25): liveness, name backfill, stale pruning ──────
+
+    /// The wall-clock epoch (seconds) at which we last received a VPN datagram from
+    /// the peer advertising `endpoint_value` (the `peer/N.vpn_endpoint` string,
+    /// `"<endpoint-id-hex> <relay>"`), or `None` if we've heard nothing. This is the
+    /// data-plane liveness signal `last_seen` (control-plane only) misses — the
+    /// founder gets each VPN-active member's keepalive every ~5s. `vpn_last_rx`
+    /// stores a monotonic `Instant`, so we project it back from `now`.
+    pub async fn vpn_last_rx_epoch(&self, endpoint_value: &str, now: u64) -> Option<u64> {
+        let id = endpoint_value.split_whitespace().next()?;
+        let map = self.vpn_last_rx.read().await;
+        let inst = map.get(id)?;
+        Some(now.saturating_sub(inst.elapsed().as_secs()))
+    }
+
+    /// Reverse map `vIP → bare hostname` from author-validated `name/<host> = <vIP>`
+    /// entries (the member's self-registered MagicDNS name), scanning the main doc
+    /// plus every imported member self-doc. Used to backfill an unnamed `peer-XXXX`
+    /// roster entry with the member's real hostname.
+    async fn names_by_vip(&self) -> std::collections::HashMap<std::net::Ipv4Addr, String> {
+        let mut out = std::collections::HashMap::new();
+        // A read-ticket member's `name/<host>` lives ONLY in its self-doc, so make
+        // sure each member's self-doc is imported + syncing before scanning — else a
+        // federated member's hostname is invisible to the founder and never backfills.
+        // `member_self_doc` caches, so this is a no-op once imported.
+        for peer in self.list_peers().await.unwrap_or_default() {
+            if peer.self_doc.is_some() {
+                let _ = self.member_self_doc(&peer.node_id).await;
+            }
+        }
+        let member_docs: Vec<Doc> =
+            self.member_docs.read().await.values().map(|(d, _)| d.clone()).collect();
+        let enforce = self.validation_mode() == ValidationMode::Enforce;
+        for doc in std::iter::once(&self.doc).chain(member_docs.iter()) {
+            let query = Query::key_prefix(b"name/").build();
+            let Ok(stream) = doc.get_many(query).await else { continue };
+            let mut stream = std::pin::pin!(stream);
+            while let Some(Ok(entry)) = stream.next().await {
+                if entry.content_len() == 0 {
+                    continue;
+                }
+                let key = String::from_utf8_lossy(entry.key()).into_owned();
+                let Some(label) = key.strip_prefix("name/") else { continue };
+                let Ok(bytes) = self.fs_store.get_bytes(entry.content_hash()).await else { continue };
+                let Ok(addr) = String::from_utf8_lossy(&bytes).trim().parse::<std::net::Ipv4Addr>()
+                else {
+                    continue;
+                };
+                // Honor the same C1 author binding as `lookup_name`: the name's
+                // author must be the vouched owner of that vIP (no spoofed names).
+                if enforce && !self.name_author_ok(addr, &entry.author()).await {
+                    continue;
+                }
+                out.entry(addr).or_insert_with(|| label.to_string());
+            }
+        }
+        out
+    }
+
+    /// Backfill unnamed roster entries with the member's real hostname, resolved
+    /// from its self-registered `name/<host>` (via [`names_by_vip`]). Only rewrites
+    /// an entry whose name is still one of `generate_peer_display_name`'s **opaque
+    /// fallbacks** (`peer-<id>` / `creator-<id>` — no bound username); a
+    /// username-derived name (`alice-<id>`) or an already-real hostname is left
+    /// alone. The role is shown separately, so swapping `creator-XXXX` for the
+    /// hostname loses no information and makes the member identifiable. Returns the
+    /// number renamed. Idempotent.
+    pub async fn backfill_peer_names(&self) -> usize {
+        let by_vip = self.names_by_vip().await;
+        if by_vip.is_empty() {
+            return 0;
+        }
+        // Resolve each peer's vIP the SAME way the snapshot does — `peer/N.vip` OR
+        // the admin-owned `ip/` table — since a peer entry's own `vip` field can be
+        // absent (the allocation lives in `ip/`; a rename/upsert can also drop it).
+        let ip_owner: std::collections::HashMap<String, std::net::Ipv4Addr> = self
+            .list_virtual_ips()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(addr, node)| (node, addr))
+            .collect();
+        let mut renamed = 0;
+        for mut p in self.list_peers().await.unwrap_or_default() {
+            if !(p.name.starts_with("peer-") || p.name.starts_with("creator-")) {
+                continue;
+            }
+            let Some(vip) = p
+                .vip
+                .as_deref()
+                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                .or_else(|| ip_owner.get(&p.node_id).copied())
+            else {
+                continue;
+            };
+            if let Some(host) = by_vip.get(&vip)
+                && host != &p.name
+            {
+                p.name = host.clone();
+                if self.put_peer(&p).await.is_ok() {
+                    renamed += 1;
+                    tracing::info!("netdoc: backfilled member name → {host}");
+                }
+            }
+        }
+        renamed
+    }
+
+    /// Members whose last contact (the later of control-plane `last_seen` and
+    /// VPN-data-plane `vpn_last_rx`) is older than `older_than_secs`. Never includes
+    /// this node (the founder's own entry has no `last_seen`). Returns
+    /// `(node_id, name, age_secs)`, newest-stale first. The basis for `hop fleet
+    /// prune` (preview) and the auto-evict sweep.
+    pub async fn stale_members(&self, older_than_secs: u64, now: u64) -> Vec<(String, String, u64)> {
+        let self_id = self.own_host_node_id();
+        let mut out = Vec::new();
+        for p in self.list_peers().await.unwrap_or_default() {
+            if Some(p.node_id.as_str()) == self_id.as_deref() {
+                continue;
+            }
+            let cp = p.last_seen.as_deref().and_then(|s| s.trim().parse::<u64>().ok());
+            let vpn = match p.vpn_endpoint.as_deref() {
+                Some(ep) => self.vpn_last_rx_epoch(ep, now).await,
+                None => None,
+            };
+            // Only prune a member we can DATE: a known last-contact older than the
+            // threshold. A member with no `last_seen` at all (never connected — could
+            // be a fresh invite) is left for an explicit `remove-peer`, not auto-pruned.
+            if let Some(last) = cp.max(vpn) {
+                let age = now.saturating_sub(last);
+                if age > older_than_secs {
+                    out.push((p.node_id.clone(), p.name.clone(), age));
+                }
+            }
+        }
+        out.sort_by_key(|(_, _, age)| *age);
+        out
+    }
+
+    /// Revoke every member not seen for `older_than_secs` (writes a replicated
+    /// revocation tombstone per member, then re-exports the snapshot). Never touches
+    /// this node. Returns the `(node_id, name)` list pruned. Admin-gated by the
+    /// caller (the local datastore socket / network admin path).
+    pub async fn prune_stale_members(
+        &self,
+        config_dir: &std::path::Path,
+        older_than_secs: u64,
+        now: u64,
+    ) -> Vec<(String, String)> {
+        let stale = self.stale_members(older_than_secs, now).await;
+        let mut pruned = Vec::new();
+        for (node_id, name, _age) in stale {
+            match self.revoke(&node_id, "pruned (stale)", &now_timestamp()).await {
+                Ok(()) => pruned.push((node_id, name)),
+                Err(e) => tracing::warn!("netdoc: prune revoke of {node_id} failed: {e:#}"),
+            }
+        }
+        if !pruned.is_empty() {
+            self.refresh_admin_authors().await;
+            crate::fleet::export_warren_snapshot(self, config_dir).await;
+        }
+        pruned
     }
 
     // ── Internals ────────────────────────────────────────────────────────
@@ -3959,6 +4140,80 @@ mod tests {
             net.list_peers().await.unwrap().into_iter().map(|p| p.node_id).collect();
         assert!(ids.contains(&"selfNODEID00".to_string()), "self in roster: {ids:?}");
         assert!(ids.contains(&"memberNODE01".to_string()), "member in roster: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn stale_members_and_prune() {
+        // G25: stale_members dates a member by control-plane last_seen; prune revokes
+        // the stale ones (replicated tombstone) and never touches self or undated ones.
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+        net.record_founder_anchor(None);
+        net.set_host_node_id("selfNODEID00");
+
+        let now = 1_800_000_000u64; // ~2027, comfortably larger than the day offsets
+        let mut fresh = sample_peer("freshNODE001", "fresh");
+        fresh.last_seen = Some((now - 60).to_string()); // 1 min ago
+        let mut stale = sample_peer("staleNODE002", "stale");
+        stale.last_seen = Some((now - 40 * 86400).to_string()); // 40 days ago
+        let undated = sample_peer("undatedNODE03", "undated"); // last_seen None
+        let mut self_old = sample_peer("selfNODEID00", "rexmundi");
+        self_old.last_seen = Some((now - 99 * 86400).to_string()); // ancient but self
+        for p in [&fresh, &stale, &undated, &self_old] {
+            net.put_peer(p).await.unwrap();
+        }
+
+        // Stale at >30d = only the 40-day member (not fresh, not undated, not self).
+        let s = net.stale_members(30 * 86400, now).await;
+        assert_eq!(s.len(), 1, "only the dated 40-day member is stale: {s:?}");
+        assert_eq!(s[0].0, "staleNODE002");
+
+        let pruned = net.prune_stale_members(dir.path(), 30 * 86400, now).await;
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].0, "staleNODE002");
+        assert!(net.is_revoked("staleNODE002").await.unwrap(), "stale member tombstoned");
+        assert!(!net.is_revoked("selfNODEID00").await.unwrap(), "self never pruned");
+        assert!(!net.is_revoked("freshNODE001").await.unwrap(), "fresh kept");
+        assert!(!net.is_revoked("undatedNODE03").await.unwrap(), "undated (maybe fresh invite) kept");
+    }
+
+    #[tokio::test]
+    async fn backfill_names_unnamed_members() {
+        // G25: an opaque `peer-`/`creator-` roster entry is renamed to the member's
+        // real hostname once its self-registered `name/<host>` is visible; a
+        // username-derived name is left alone.
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc"); // Observe mode → names_by_vip skips author check
+
+        let mut unnamed = sample_peer("memberAAA001", "peer-memberAAA0");
+        unnamed.vip = Some("100.64.0.7".to_string());
+        let mut creator = sample_peer("memberBBB002", "creator-memberBB");
+        creator.vip = Some("100.64.0.8".to_string());
+        let mut named = sample_peer("memberCCC003", "alice-memberCCC");
+        named.vip = Some("100.64.0.9".to_string());
+        for p in [&unnamed, &creator, &named] {
+            net.put_peer(p).await.unwrap();
+        }
+        // The members self-register their hostnames (mirrored into the main doc).
+        net.register_name("webhost", "100.64.0.7".parse().unwrap()).await.unwrap();
+        net.register_name("dbhost", "100.64.0.8".parse().unwrap()).await.unwrap();
+        net.register_name("alicebox", "100.64.0.9".parse().unwrap()).await.unwrap();
+
+        let n = net.backfill_peer_names().await;
+        assert_eq!(n, 2, "only the two opaque names are backfilled");
+        assert_eq!(net.get_peer("memberAAA001").await.unwrap().unwrap().name, "webhost");
+        assert_eq!(net.get_peer("memberBBB002").await.unwrap().unwrap().name, "dbhost");
+        assert_eq!(
+            net.get_peer("memberCCC003").await.unwrap().unwrap().name,
+            "alice-memberCCC",
+            "a username-derived name is NOT overwritten"
+        );
+        // Idempotent: a second pass renames nothing.
+        assert_eq!(net.backfill_peer_names().await, 0);
     }
 
     #[tokio::test]

@@ -383,6 +383,64 @@ if [ -n "$INV" ]; then
 fi
 record "LIFECYCLE peer-admin" "$LC_OK" "${LC_SECS:-$LC_BUDGET}" "$LC_BUDGET" "$LC_DETAIL"
 
+#############################################################################
+say "ROSTER — liveness, name backfill, offline-skip, prune (G25)"
+#############################################################################
+# A member joins via the creator invite, so it admits with an OPAQUE generated name
+# (`creator-XXXX` — no bound hostname), comes up on the VPN, and self-registers its
+# hostname. The founder should: (1) BACKFILL the opaque name → the member's real
+# hostname; then once the member is stopped (genuinely offline): (2) show it
+# `offline` in `fleet list`, (3) SKIP it in fan-out (`fleet grep`) by default, and
+# (4) PRUNE it (replicated revocation) so it leaves the roster.
+RH_BUDGET="${RH_BUDGET:-160}"
+RH_OK=0; RH_DETAIL="setup failed"; RH_SECS=0
+run_node rh-admin rhadmin
+docker exec -d rh-admin bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 90); do docker exec rh-admin grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+RINV=$(docker exec rh-admin cat /cfg/creator_invite 2>/dev/null)
+if [ -n "$RINV" ]; then
+  run_node rh-member rhmember
+  docker exec rh-member sh -c "hop --config /cfg connect '$RINV' --warren >/cfg/join.log 2>&1" || true
+  docker exec -d rh-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+  for _ in $(seq 1 90); do docker exec rh-member grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+  MID=$(docker exec rh-member hop --config /cfg id 2>/dev/null | cut -c1-10)
+  t0=$(nsec)
+  member_row() { docker exec rh-admin hop --config /cfg fleet list "$@" 2>/dev/null | grep "$MID"; }
+  # Wait for the member to appear in the roster.
+  for _ in $(seq 1 25); do member_row >/dev/null && break; sleep 2; done
+  # NAMED: simulate an UNNAMED member by forcing an opaque `peer-` roster name, then
+  # the founder must BACKFILL it to the member's real hostname (`rhmember`), resolved
+  # from the member's self-registered `name/` (self-doc imported by the founder).
+  docker exec rh-admin hop --config /cfg peers rename "$MID" peer-unnamed >/dev/null 2>&1 || true
+  NAMED=0
+  for _ in $(seq 1 40); do
+    if member_row | grep -q "rhmember"; then NAMED=1; break; fi
+    sleep 2
+  done
+  # Fresh member must NOT be pruned by a 30d threshold.
+  FRESH_NOOP=0
+  docker exec rh-admin hop --config /cfg fleet prune --older-than 30d --dry-run 2>/dev/null | grep -q "$MID" || FRESH_NOOP=1
+  # Now make the member genuinely offline: stop its process (no VPN keepalive, no
+  # control-plane), then let last_seen age past a small window.
+  docker stop rh-member >/dev/null 2>&1
+  sleep 9
+  # OFFLINE: fleet list with a tight window labels it offline.
+  OFFLINE=0; member_row --stale-after 5s | grep -q "offline" && OFFLINE=1
+  # SKIP: default fan-out skips the offline member ("offline skipped" note).
+  SKIP=0
+  docker exec rh-admin hop --config /cfg fleet grep all rosterprobe --since 1h --stale-after 5s 2>/dev/null | grep -qi "offline skipped" && SKIP=1
+  # PRUNE: remove members idle > 5s; the member must leave the roster.
+  docker exec rh-admin hop --config /cfg fleet prune --older-than 5s --yes >/dev/null 2>&1 || true
+  PRUNED=0; for _ in $(seq 1 15); do member_row >/dev/null || { PRUNED=1; break; }; sleep 2; done
+  RH_SECS=$(( $(nsec) - t0 ))
+  if [ "$NAMED" = 1 ] && [ "$FRESH_NOOP" = 1 ] && [ "$OFFLINE" = 1 ] && [ "$SKIP" = 1 ] && [ "$PRUNED" = 1 ]; then
+    RH_OK=1; RH_DETAIL="peer-XXXX→hostname backfill, offline labeled, fan-out skipped offline, stale pruned (replicated)"
+  else
+    RH_DETAIL="named=$NAMED fresh_noop=$FRESH_NOOP offline=$OFFLINE skip=$SKIP pruned=$PRUNED"
+  fi
+fi
+record "ROSTER hygiene" "$RH_OK" "${RH_SECS:-$RH_BUDGET}" "$RH_BUDGET" "$RH_DETAIL"
+
 # --- report ---------------------------------------------------------------
 ART="${HOP_FIRSTRUN_ARTIFACT:-$SCRIPT_DIR/first-run-results.md}"
 STAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

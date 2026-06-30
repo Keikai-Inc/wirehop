@@ -211,19 +211,58 @@ async fn handle_connection(
             _ => (None, None),
         };
 
-        // Dispatch (blocking) on a thread pool — both datastore ops and the
-        // operator-admin handler are sync.
-        let ds_clone = ds.clone();
-        let cfg = config_dir.clone();
-        let resp =
+        // Prune (G25) is the one admin op that needs ASYNC netdoc access — stale
+        // computation reads `vpn_last_rx` + the roster — so it can't go through the
+        // sync dispatch. Handle it here; it self-exports the snapshot, so it skips
+        // the propagate below.
+        let prune: Option<(u64, bool)> = match &req {
+            DsRequest::Admin(a) => match a.as_ref() {
+                crate::proto::AdminRequest::PruneMembers { older_than_secs, dry_run } => {
+                    Some((*older_than_secs, *dry_run))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let resp = if let Some((older, dry_run)) = prune {
+            match netdoc.get() {
+                Some(nd) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let members = if dry_run {
+                        nd.stale_members(older, now)
+                            .await
+                            .into_iter()
+                            .map(|(id, name, _age)| (id, name))
+                            .collect()
+                    } else {
+                        nd.prune_stale_members(&config_dir, older, now).await
+                    };
+                    DsResponse::Admin(Box::new(crate::proto::AdminResponse::Pruned { members }))
+                }
+                None => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Error {
+                    message: "warren not active (no netdoc) — cannot prune".to_string(),
+                })),
+            }
+        } else {
+            // Dispatch (blocking) on a thread pool — both datastore ops and the
+            // operator-admin handler are sync.
+            let ds_clone = ds.clone();
+            let cfg = config_dir.clone();
             tokio::task::spawn_blocking(move || dispatch_request(&ds_clone, &cfg, &host_public_key, req))
-                .await??;
+                .await??
+        };
 
         // After a successful admin mutation, run the SAME post-mutation propagate the
         // network admin path runs (reconcile → refresh admins → re-export snapshot,
         // plus an explicit revoke for RemovePeer) so local admin reaches the warren —
         // the fix for "the sole admin node can't self-admin" (mux can't self-dial).
+        // Prune self-propagates, so it's excluded.
         if is_admin
+            && prune.is_none()
             && !matches!(&resp, DsResponse::Admin(b) if matches!(b.as_ref(), crate::proto::AdminResponse::Error { .. }))
             && let Some(nd) = netdoc.get()
         {

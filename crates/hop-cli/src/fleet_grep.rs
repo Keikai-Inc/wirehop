@@ -106,6 +106,8 @@ pub async fn run(
     limit: usize,
     concurrency: usize,
     json: bool,
+    include_offline: bool,
+    liveness_window_secs: u64,
 ) -> Result<()> {
     // Target set: warren members (the roster snapshot) whose role or tags match the
     // selector, plus legacy known-host groups. Members are connected by node-id; the
@@ -115,10 +117,25 @@ pub async fn run(
     let all = selector == "all" || selector == "*";
     let mut seen = HashSet::new();
     let mut targets: Vec<(String, String)> = Vec::new();
+    let mut skipped_offline = 0usize;
+    let now = crate::unix_now_secs();
+    let self_id = crate::id_via_daemon(host_config_dir).ok().flatten();
     let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
     for m in &snap.members {
         let hit = all || m.role == selector || m.tags.iter().any(|t| t == selector);
-        if hit && seen.insert(m.node_id.clone()) {
+        if !hit {
+            continue;
+        }
+        // Skip self (can't connect to ourselves) and, by default, offline members
+        // (stale last_seen) — they'd just time out and clutter the result.
+        if self_id.as_deref() == Some(m.node_id.as_str()) {
+            continue;
+        }
+        if !include_offline && !m.is_online(now, liveness_window_secs) {
+            skipped_offline += 1;
+            continue;
+        }
+        if seen.insert(m.node_id.clone()) {
             targets.push((m.node_id.clone(), m.name.clone()));
         }
     }
@@ -130,6 +147,12 @@ pub async fn run(
         }
     }
 
+    let offline_note = if skipped_offline > 0 {
+        format!(" ({skipped_offline} offline skipped — use --include-offline)")
+    } else {
+        String::new()
+    };
+
     if targets.is_empty() {
         if json {
             println!(
@@ -139,7 +162,7 @@ pub async fn run(
                 })?
             );
         } else {
-            println!("No warren members or known hosts match '{selector}'.");
+            println!("No reachable warren members or known hosts match '{selector}'.{offline_note}");
         }
         return Ok(());
     }
@@ -151,7 +174,7 @@ pub async fn run(
 
     if !json {
         println!(
-            "Searching {} (source={source}, since={since}) across {} node(s) matching '{selector}':\n",
+            "Searching {} (source={source}, since={since}) across {} node(s) matching '{selector}'{offline_note}:\n",
             shq(pattern),
             targets.len()
         );

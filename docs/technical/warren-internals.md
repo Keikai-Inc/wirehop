@@ -150,6 +150,40 @@ Every admin mutation that changes the roster — invite-redeem, `grant`/`SetPeer
 `propagate_admin_mutation` (netdoc/mod.rs) encapsulates steps 2–5 and is invoked by
 both paths.
 
+**Roster hygiene (G25): liveness, name backfill, pruning.** The roster is
+append-only — a member persists until explicitly revoked — so liveness and stale
+removal are layered on top:
+
+- **Liveness.** `last_seen` on a roster `Peer` refreshes only on a new authenticated
+  *control-plane* connection (a VPN-only-but-idle member would look dead), so the
+  daemon merges the **VPN data-plane** signal at snapshot-export time:
+  `build_warren_snapshot` takes, per member, the later of `last_seen` and
+  `vpn_last_rx` (the founder receives each active member's keepalive every ~5s, keyed
+  by the member's `vpn_endpoint` id). `WarrenMemberInfo::is_online(now, window)`
+  then drives `online`/`offline` in `hop fleet list` and the fan-out filter (the
+  default 15-min window is `fleet::DEFAULT_LIVENESS_WINDOW_SECS`). `hop fleet
+  exec`/`grep` skip offline members by default (`--include-offline` forces all).
+- **Name backfill.** A member admitted without a bound username gets the
+  `generate_peer_display_name` fallback `peer-<short_id>`. Each member self-registers
+  `name/<hostname> = <vIP>` in its self-doc; the founder's periodic sweep
+  (`NetDoc::backfill_peer_names`, on the snapshot tick) reverse-maps a `peer-XXXX`
+  entry's vIP to that hostname (author-validated, same C1 binding as `lookup_name`)
+  and rewrites `peer/<id>.name`. Idempotent; runs once the member's self-doc lands.
+- **Pruning.** `NetDoc::stale_members(older_than, now)` dates each member by the
+  merged liveness and returns those past the threshold — **never** this node, and
+  never a member with no recorded contact at all (a fresh, never-connected invite).
+  `prune_stale_members` revokes each (a replicated tombstone) and re-exports.
+  `hop fleet prune` drives this over the local operator socket (admin-gated, like
+  `hop admin self`), so the sole admin can prune its own warren; `--dry-run` returns
+  the would-prune set without mutating. An optional `prune_after_secs` HostConfig
+  TTL makes the founder's daemon auto-evict on its sweep.
+- **Source of duplicates.** A *new* roster node-id is only ever admitted at invite
+  redemption (`auth/mod.rs`, recording the redeemer's `remote_id`); there is no guard
+  that it's a daemon vs a transient client endpoint. The protection is the unified
+  machine identity (the CLI/agent and daemon share one on-disk key), which is what
+  stops a client endpoint from being recorded as a second member; pruning + backfill
+  clean up legacy residue from before that discipline.
+
 **Reconcile never revokes self.** On a non-federated (single-owner) namespace
 `reconcile`'s removal sweep revokes any netdoc peer absent from `peers.json`. The
 founder's own `peer/<self>` is written straight to the netdoc by `enable_vpn` and

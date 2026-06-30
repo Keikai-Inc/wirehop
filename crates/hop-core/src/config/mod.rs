@@ -350,7 +350,12 @@ impl PeersStore {
                 node_id: id_str,
                 name,
                 authorized_at: chrono_now(),
-                last_seen: None,
+                // Date the member from admission (G25): invite-redeem doesn't open a
+                // fresh control-plane connection, so without this a just-joined
+                // member would have NO `last_seen` — it would never count as online
+                // and could never be pruned (prune skips undated members). Seeding
+                // it to "now" makes liveness + pruning work from join.
+                last_seen: Some(chrono_now()),
                 username,
                 role,
                 role_name: None,
@@ -588,6 +593,16 @@ pub struct HostConfig {
     /// flip it on for a personal laptop so peers can't search/exec it.
     #[serde(default)]
     pub require_explicit_access: bool,
+
+    /// Auto-evict TTL (G25 roster hygiene): when set, the daemon periodically
+    /// **prunes** (writes a replicated revocation for) any warren member not seen
+    /// for this many seconds — the automated form of `hop fleet prune`. `None`
+    /// (**default**) leaves pruning manual. Only the warren admin/founder's daemon
+    /// acts on this (a non-anchor node's revocations don't validate). Never evicts
+    /// this node or a member with no recorded `last_seen` (a fresh, never-contacted
+    /// invite). Set e.g. to 30 days to keep the roster self-cleaning.
+    #[serde(default)]
+    pub prune_after_secs: Option<u64>,
 }
 
 fn default_audit_level() -> crate::audit::AuditLevel {
@@ -627,6 +642,7 @@ impl Default for HostConfig {
             vpn_enabled: default_vpn_enabled(),
             audit_level: default_audit_level(),
             require_explicit_access: false,
+            prune_after_secs: None,
         }
     }
 }
