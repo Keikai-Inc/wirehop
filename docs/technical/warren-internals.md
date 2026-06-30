@@ -148,7 +148,19 @@ Every admin mutation that changes the roster — invite-redeem, `grant`/`SetPeer
    member/role view that `hop fleet` reads.
 
 `propagate_admin_mutation` (netdoc/mod.rs) encapsulates steps 2–5 and is invoked by
-both paths. The local-socket path is what lets a **sole-admin warren** self-admin:
+both paths.
+
+**Reconcile never revokes self.** On a non-federated (single-owner) namespace
+`reconcile`'s removal sweep revokes any netdoc peer absent from `peers.json`. The
+founder's own `peer/<self>` is written straight to the netdoc by `enable_vpn` and
+is *not* in `peers.json`, so the sweep must skip it — `NetDoc::set_host_node_id`
+records the host's own id (before the startup reconcile, and again in `enable_vpn`)
+and the sweep skips that id. Without this skip a runtime `propagate_admin_mutation`
+tombstoned the founder out of its own roster (startup masked it because `enable_vpn`
+re-creates the entry right after). `enable_vpn` also clears any stale founder
+self-revocation on bringup (`clear_revocation` → `is_revoked` reads a content-empty
+tombstone-over-tombstone as not-revoked), which is the general un-revoke / re-admit
+primitive. The local-socket path is what lets a **sole-admin warren** self-admin:
 the admin node can't mux-connect to itself, so `hop admin self …` resolves the
 target as local (`admin_target_is_local`) and routes the mutation through
 `DsRequest::Admin`, after which the daemon runs the identical reconcile — a revoke

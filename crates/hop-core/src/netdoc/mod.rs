@@ -330,6 +330,17 @@ pub struct NetDoc {
     /// entries (see `refresh_admin_authors`), so a co-admin can't elevate itself
     /// — only the founder grants admin authority. Always contains the founder.
     admin_authors: std::sync::Mutex<std::collections::HashSet<AuthorId>>,
+    /// This host's OWN node-id (the founder/member's main identity), recorded when
+    /// the VPN comes up. `reconcile` uses it to never revoke the host's own
+    /// self-entry: on a non-federated (single-owner) namespace the founder's
+    /// `peer/<self>` lives in the netdoc but NOT in `peers.json`, so the removal
+    /// sweep would otherwise tombstone the founder from its own roster (it only
+    /// "healed" because `enable_vpn` re-creates the entry right after the startup
+    /// reconcile — a runtime mutation via `propagate_admin_mutation` had no such
+    /// re-create and dropped the founder until the next restart). `None` until the
+    /// VPN is enabled (the startup reconcile-before-enable_vpn is still re-created
+    /// by enable_vpn, so it doesn't need this).
+    host_node_id: std::sync::Mutex<Option<String>>,
 }
 
 /// Author-validation enforcement level for replicated doc entries (C1).
@@ -520,7 +531,23 @@ impl NetDoc {
             entry_authors: std::sync::Mutex::new(std::collections::HashMap::new()),
             founder_author: std::sync::Mutex::new(None),
             admin_authors: std::sync::Mutex::new(std::collections::HashSet::new()),
+            host_node_id: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record this host's own node-id so `reconcile` never revokes the founder's
+    /// own self-entry (see the [`host_node_id`](Self::host_node_id) field). Call
+    /// this BEFORE the startup reconcile (and `enable_vpn` sets it again) so even
+    /// the first reconcile of a boot protects self.
+    pub fn set_host_node_id(&self, node_id: &str) {
+        if let Ok(mut g) = self.host_node_id.lock() {
+            *g = Some(node_id.to_string());
+        }
+    }
+
+    /// This host's own node-id, if the VPN has come up and recorded it.
+    fn own_host_node_id(&self) -> Option<String> {
+        self.host_node_id.lock().ok().and_then(|g| g.clone())
     }
 
     /// The network's namespace id (persist this to re-open later).
@@ -906,7 +933,19 @@ impl NetDoc {
         // them. (Per-entry ownership scoping + Owner/Admin-capability-gated writes
         // are the deeper hardening; see docs/technical/p2p-network.md.)
         if !self.federated {
+            // Never revoke our OWN self-entry: on a single-owner namespace the
+            // founder's `peer/<self>` is written straight to the doc (by
+            // `enable_vpn`), NOT into `peers.json`, so it's legitimately absent from
+            // `desired_peers`. Without this skip the removal sweep tombstones the
+            // founder from its own roster — invisible at startup (enable_vpn
+            // re-creates it) but a real drop for a runtime
+            // `propagate_admin_mutation`. `None` until the VPN records it, in which
+            // case the startup-before-enable_vpn reconcile is healed by enable_vpn.
+            let self_id = self.own_host_node_id();
             for existing in self.list_peers().await? {
+                if Some(existing.node_id.as_str()) == self_id.as_deref() {
+                    continue;
+                }
                 if !desired_peers.contains(existing.node_id.as_str()) {
                     self.revoke(&existing.node_id, "removed", &now_timestamp()).await?;
                 }
@@ -2166,6 +2205,20 @@ impl NetDoc {
         host_tags: &[String],
         authored_policy: Option<&str>,
     ) -> Result<std::net::Ipv4Addr> {
+        // Record our own node-id so `reconcile` (incl. the one inside
+        // `propagate_admin_mutation`) never revokes the founder's own self-entry.
+        self.set_host_node_id(host_node_id);
+        // Heal a stale self-revocation: before the reconcile self-skip existed, a
+        // non-federated startup reconcile (self ∉ peers.json) revoked the founder
+        // every boot, leaving a `revocation/<self>` tombstone the next reconcile
+        // would honor. Clear it on bringup so the founder is never self-revoked.
+        if !self.federated && self.is_revoked(host_node_id).await.unwrap_or(false) {
+            if let Err(e) = self.clear_revocation(host_node_id).await {
+                tracing::warn!("netdoc: clearing stale self-revocation failed: {e:#}");
+            } else {
+                tracing::info!("netdoc: cleared stale founder self-revocation");
+            }
+        }
         // vIP acquisition (#3b): a federated member's vIP is allocated by the
         // admin at admission (`peer/N.vip`, with a matching `ip/` claim) — wait
         // briefly for it to replicate instead of self-claiming, since a
@@ -3385,10 +3438,28 @@ impl NetDoc {
         let query = Query::single_latest_per_key().key_exact(key.as_bytes()).build();
         // A revocation only counts if it passes author validation — in enforce
         // mode a revocation forged by a non-admin must not lock anyone out (C1).
+        // A content-empty entry is a CLEARED revocation (see `clear_revocation`),
+        // i.e. a tombstone-over-the-tombstone — treat it as NOT revoked so an admin
+        // can re-admit a previously-revoked node (e.g. heal a founder self-revoke).
         match self.doc.get_one(query).await.context("get_one revocation")? {
-            Some(entry) => Ok(self.validate_entry(entry.key(), entry.author())),
+            Some(entry) => {
+                Ok(entry.content_len() > 0 && self.validate_entry(entry.key(), entry.author()))
+            }
             None => Ok(false),
         }
+    }
+
+    /// Clear a revocation (un-revoke): delete the `revocation/<id>` entry so
+    /// [`is_revoked`](Self::is_revoked) reads false again. Used to heal a founder
+    /// self-revocation; an admin re-admits a node by clearing then re-`put_peer`.
+    pub async fn clear_revocation(&self, node_id: &str) -> Result<()> {
+        let key = format!("{KEY_REVOCATION_PREFIX}{node_id}");
+        self.doc
+            .del(self.author, key.into_bytes())
+            .await
+            .context("clearing revocation entry")?;
+        self.invalidate_reach_cache().await;
+        Ok(())
     }
 
     /// Propagate a local admin mutation (RemovePeer / grant / role / rename / …)
@@ -3857,6 +3928,58 @@ mod tests {
         assert_eq!(peers[0].node_id, "a1");
         assert!(net.is_revoked("b2").await.unwrap());
         assert!(!net.is_revoked("a1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_revokes_self() {
+        // Regression: on a non-federated namespace the founder's own `peer/<self>`
+        // lives in the doc but NOT in peers.json. reconcile's removal sweep must
+        // skip it, else a runtime mutation (propagate_admin_mutation) tombstones
+        // the founder from its own roster.
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+        net.record_founder_anchor(None);
+
+        // Founder writes its own self-entry straight to the doc (as enable_vpn does)
+        // and records its node-id.
+        let me = sample_peer("selfNODEID00", "rexmundi");
+        net.put_peer(&me).await.unwrap();
+        net.set_host_node_id("selfNODEID00");
+
+        // A member is admitted via peers.json.
+        let member = sample_peer("memberNODE01", "alice");
+        net.reconcile(std::slice::from_ref(&member), &[]).await.unwrap();
+
+        // Self must survive (not in peers.json, but is our own id); member present.
+        assert!(!net.is_revoked("selfNODEID00").await.unwrap(), "self must NOT be revoked");
+        assert!(net.get_peer("selfNODEID00").await.unwrap().is_some(), "self entry must survive");
+        let ids: Vec<String> =
+            net.list_peers().await.unwrap().into_iter().map(|p| p.node_id).collect();
+        assert!(ids.contains(&"selfNODEID00".to_string()), "self in roster: {ids:?}");
+        assert!(ids.contains(&"memberNODE01".to_string()), "member in roster: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn revocation_can_be_cleared() {
+        // A cleared revocation (del over the tombstone) reads as not-revoked, so an
+        // admin can re-admit a previously-revoked node (heals a founder self-revoke).
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+        net.record_founder_anchor(None);
+
+        net.revoke("victimNODE01", "test", &now_timestamp()).await.unwrap();
+        assert!(net.is_revoked("victimNODE01").await.unwrap());
+
+        net.clear_revocation("victimNODE01").await.unwrap();
+        assert!(!net.is_revoked("victimNODE01").await.unwrap(), "cleared revocation reads false");
+
+        // Re-admit now succeeds (reconcile no longer skips it as revoked).
+        net.reconcile(&[sample_peer("victimNODE01", "v")], &[]).await.unwrap();
+        assert!(net.get_peer("victimNODE01").await.unwrap().is_some(), "re-admitted after clear");
     }
 
     #[tokio::test]

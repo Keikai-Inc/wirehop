@@ -358,6 +358,7 @@ if [ -n "$INV" ]; then
   docker exec -d lc-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
   for _ in $(seq 1 90); do docker exec lc-member grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
   MID=$(docker exec lc-member hop --config /cfg id 2>/dev/null | cut -c1-10)
+  AID=$(docker exec lc-admin hop --config /cfg id 2>/dev/null | cut -c1-10)
   t0=$(nsec)
   fleet_has() { docker exec lc-admin hop --config /cfg fleet list 2>/dev/null | grep -q "$1"; }
   APPEAR=0; for _ in $(seq 1 25); do fleet_has "$MID" && { APPEAR=1; break; }; sleep 2; done
@@ -370,11 +371,14 @@ if [ -n "$INV" ]; then
   # revoke via LOCAL self-admin — the member must LEAVE the snapshot (tombstone).
   docker exec lc-admin hop --config /cfg admin self remove-peer "$MID" >/dev/null 2>&1 || true
   GONE=0; for _ in $(seq 1 25); do fleet_has "$MID" || { GONE=1; break; }; sleep 2; done
+  # The admin (founder) must REMAIN in its own roster after the mutation — a
+  # non-federated reconcile must never revoke the founder's own self-entry.
+  SELFKEPT=0; fleet_has "$AID" && SELFKEPT=1
   LC_SECS=$(( $(nsec) - t0 ))
-  if [ "$APPEAR" = 1 ] && [ "$GRANTED" = 1 ] && [ "$RENAMED" = 1 ] && [ "$GONE" = 1 ]; then
-    LC_OK=1; LC_DETAIL="join→appear, grant→ops, rename→propagated, revoke→gone (all local self-admin)"
+  if [ "$APPEAR" = 1 ] && [ "$GRANTED" = 1 ] && [ "$RENAMED" = 1 ] && [ "$GONE" = 1 ] && [ "$SELFKEPT" = 1 ]; then
+    LC_OK=1; LC_DETAIL="join→appear, grant→ops, rename→propagated, revoke→gone, founder-self-kept (all local self-admin)"
   else
-    LC_DETAIL="appear=$APPEAR granted=$GRANTED renamed=$RENAMED gone=$GONE"
+    LC_DETAIL="appear=$APPEAR granted=$GRANTED renamed=$RENAMED gone=$GONE selfkept=$SELFKEPT"
   fi
 fi
 record "LIFECYCLE peer-admin" "$LC_OK" "${LC_SECS:-$LC_BUDGET}" "$LC_BUDGET" "$LC_DETAIL"

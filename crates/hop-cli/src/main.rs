@@ -224,9 +224,21 @@ async fn main() -> Result<()> {
             cmd_peers(action, &host_config_dir, &user_config_dir)
         }
         Command::Admin { target, action } => {
-            let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            let secret_key = config::load_or_generate_identity(&config_dir)?;
-            cmd_admin(secret_key, &target, &config_dir, action).await
+            // Local self-admin (G26) talks to THIS host's daemon socket (the system
+            // config dir, or an explicit --config) and needs no client identity —
+            // the daemon owns it, and under privsep the operator can't even read
+            // `identity.json`. Remote admin from a client uses the user config dir +
+            // that client's identity / known-hosts.
+            let host_dir = match cli.config.as_deref() {
+                Some(p) => p.to_path_buf(),
+                None => config::resolve_host_config_dir(None)?,
+            };
+            if admin_target_is_local(&host_dir, &target) {
+                cmd_admin_local(&host_dir, action)
+            } else {
+                let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
+                cmd_admin_remote(&target, &config_dir, action).await
+            }
         }
         Command::Fleet { action } => {
             // The daemon writes the warren snapshot to ITS config dir: honor an
@@ -787,6 +799,10 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         .filter(|s| !s.is_empty());
                     net.record_founder_anchor(founder_hex.as_deref());
 
+                    // Record our own node-id BEFORE reconcile so the removal sweep
+                    // never revokes the founder's own self-entry (it lives in the
+                    // netdoc, not peers.json — see NetDoc::set_host_node_id).
+                    net.set_host_node_id(&host_node_id);
                     // Reconcile the document with the host's peers.json/roles.json
                     // on every start (initial migration on first run, drift
                     // correction afterwards). Best-effort.
@@ -3622,13 +3638,8 @@ fn admin_target_is_local(config_dir: &std::path::Path, target: &str) -> bool {
     false
 }
 
-async fn cmd_admin(
-    _secret_key: iroh::SecretKey,
-    target: &str,
-    config_dir: &std::path::Path,
-    action: AdminAction,
-) -> Result<()> {
-    let request = match &action {
+fn build_admin_request(action: &AdminAction) -> AdminRequest {
+    match action {
         AdminAction::Invite { user, role, creator, .. } => AdminRequest::CreateInvite {
             username: user.clone(),
             role: if *creator { PeerRole::Creator } else { PeerRole::Peer },
@@ -3726,29 +3737,40 @@ async fn cmd_admin(
             },
             RoleAction::Delete { name } => AdminRequest::DeleteRole { name: name.clone() },
         },
-    };
-
-    // Local self-admin (G26): the sole admin node can't mux-dial itself
-    // ("connecting to ourself is not supported"), so route a SELF target —
-    // `self`/`local`/`localhost`, or this node's own node-id — through the local
-    // daemon socket. The daemon runs the same post-mutation reconcile (revoke /
-    // mirror / re-export snapshot), so a local mutation propagates to the warren
-    // exactly like the network admin path.
-    if admin_target_is_local(config_dir, target) {
-        use hop_core::datastore::protocol::{DsRequest, DsResponse};
-        use hop_core::datastore::socket::DaemonConnection;
-        let conn = DaemonConnection::connect(config_dir).context(
-            "local admin needs the daemon socket on THIS machine — is `hop host` running here?",
-        )?;
-        match conn.request(&DsRequest::Admin(Box::new(request)))? {
-            DsResponse::Admin(resp) => display_admin_response(&action, *resp),
-            DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
-            other => anyhow::bail!("unexpected daemon response: {other:?}"),
-        }
-        return Ok(());
     }
+}
 
-    // Connect and send admin request (remote host)
+/// Local self-admin (G26): the sole admin node can't mux-dial itself
+/// ("connecting to ourself is not supported"), so route a SELF target —
+/// `self`/`local`/`localhost`, or this node's own node-id — through the local
+/// daemon socket. The daemon runs the same post-mutation reconcile (revoke /
+/// mirror / re-export snapshot), so a local mutation propagates to the warren
+/// exactly like the network admin path. Needs no client identity (the daemon
+/// owns it), so it works on a privsep host where the operator can't read
+/// `identity.json`.
+fn cmd_admin_local(config_dir: &std::path::Path, action: AdminAction) -> Result<()> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    let request = build_admin_request(&action);
+    let conn = DaemonConnection::connect(config_dir).context(
+        "local admin needs the daemon socket on THIS machine — is `hop host` running here?",
+    )?;
+    match conn.request(&DsRequest::Admin(Box::new(request)))? {
+        DsResponse::Admin(resp) => display_admin_response(&action, *resp),
+        DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Network admin against a remote host (the admin runs from a client machine
+/// that owns its own identity / known-hosts in `config_dir`).
+async fn cmd_admin_remote(
+    target: &str,
+    config_dir: &std::path::Path,
+    action: AdminAction,
+) -> Result<()> {
+    let request = build_admin_request(&action);
     let (_resolved, _send, mut recv) = mux::connect_to_host(
         config_dir,
         target,
