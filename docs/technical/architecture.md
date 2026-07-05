@@ -249,9 +249,31 @@ async fn write_message_compressed<T: Serialize>(stream, msg) -> Result<()>
 #### Read
 
 ```rust
-// Transparently handles both compressed and uncompressed frames
+// Transparently handles both compressed and uncompressed frames.
+// NOT cancellation-safe — only use in a plain read loop.
 async fn read_message<T: Deserialize>(stream) -> Result<T>
+
+// Cancellation-safe: partial-frame state lives in the struct, so `next()` can be
+// a `tokio::select!` branch — a cancelled read resumes where it left off.
+struct FramedReader<R> { /* ... */ }
+impl FramedReader { async fn next<T: Deserialize>(&mut self) -> Result<T> }
 ```
+
+**Cancellation safety (why interactive sessions use `FramedReader`).** The bare
+`read_message` future holds partial-frame state (the length prefix, the payload
+accumulator) on its own stack across two `read_exact` awaits. If that future is
+dropped mid-frame — which happens **every time it loses a `tokio::select!` race** —
+the bytes it already pulled off the QUIC stream are lost, and the next read starts
+mid-frame and desyncs (surfacing as `frame too large` / `decode failed`). The
+interactive PTY loops (both client and host) multiplex the message read against
+other branches in a `select!` — an always-ready `output_rx` (host) and a 10 s
+heartbeat tick (client) — so under a sustained **output flood** (e.g. scrolling a
+tmux buffer) one of those branches reliably cancels the read mid-frame, dropping
+the session. (Plain `exec` and the VPN data plane were immune: exec uses a bare
+read loop with no `select!`; the VPN is raw datagram forwarding.) `FramedReader`
+fixes this by keeping the partial frame in the struct and advancing it with single,
+individually cancel-safe `read()` calls, so its `next()` is safe as a `select!`
+branch. All four live interactive/flood read loops use it.
 
 ### HostMessage (Host -> Client)
 

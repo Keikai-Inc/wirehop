@@ -772,9 +772,30 @@ pub async fn write_message_compressed<T: Serialize>(
     Ok(())
 }
 
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// Decode a raw frame payload (`raw_len` = the on-wire length word, high bit =
+/// zstd) into `T`. Shared by [`read_message`] and [`FramedReader`].
+fn decode_frame<T: for<'de> Deserialize<'de>>(raw_len: u32, payload: Vec<u8>) -> Result<T> {
+    let compressed = raw_len & COMPRESS_FLAG != 0;
+    let decode_buf = if compressed {
+        zstd::bulk::decompress(&payload, MAX_DECOMPRESSED).context("zstd decompress failed")?
+    } else {
+        payload
+    };
+    let (msg, _) = bincode::serde::decode_from_slice(&decode_buf, bincode::config::standard())
+        .context("decode failed")?;
+    Ok(msg)
+}
+
 /// Read a length-prefixed bincode frame from a stream.
 ///
 /// Transparently decompresses zstd frames (high bit set in length prefix).
+///
+/// NOTE: this future holds partial-frame state on its own stack, so it is **not
+/// cancellation-safe** — dropping it mid-frame (e.g. losing a `tokio::select!`
+/// race) discards already-consumed bytes and desyncs the stream. Use it only in
+/// a plain read loop. For a `select!` branch, use [`FramedReader`].
 pub async fn read_message<T: for<'de> Deserialize<'de>>(
     stream: &mut (impl AsyncReadExt + Unpin),
 ) -> Result<T> {
@@ -784,10 +805,9 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
         .await
         .context("read frame length")?;
     let raw_len = u32::from_be_bytes(len_buf);
-    let compressed = raw_len & COMPRESS_FLAG != 0;
     let len = (raw_len & !COMPRESS_FLAG) as usize;
 
-    if len > 16 * 1024 * 1024 {
+    if len > MAX_FRAME_LEN {
         anyhow::bail!("frame too large: {len} bytes");
     }
 
@@ -797,23 +817,200 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
         .await
         .context("read frame payload")?;
 
-    let decode_buf = if compressed {
-        zstd::bulk::decompress(&payload, MAX_DECOMPRESSED)
-            .context("zstd decompress failed")?
-    } else {
-        payload
-    };
+    decode_frame(raw_len, payload)
+}
 
-    let (msg, _) =
-        bincode::serde::decode_from_slice(&decode_buf, bincode::config::standard())
-            .context("decode failed")?;
-    Ok(msg)
+/// A **cancellation-safe** framed message reader.
+///
+/// The bare [`read_message`] future keeps partial-frame state (length prefix,
+/// payload accumulator) on its own stack, so if it's dropped mid-frame — which
+/// happens every time it loses a `tokio::select!` race — the bytes it already
+/// pulled from the stream are lost and the next read starts mid-frame, desyncing
+/// the connection (surfacing as `frame too large` / `decode failed` → a spurious
+/// disconnect). That is the root cause of interactive `hop <host>` sessions
+/// dropping under heavy output: the always-ready output/heartbeat `select!`
+/// branches cancel the read mid-frame during a flood.
+///
+/// `FramedReader` moves that partial state into the struct and advances it with
+/// single, individually cancel-safe `read()` calls (a cancelled `read()` reads
+/// nothing). So [`next`](Self::next) can be raced in a `select!` freely: if the
+/// future is dropped, it resumes exactly where it left off on the next call.
+pub struct FramedReader<R> {
+    inner: R,
+    len_buf: [u8; 4],
+    len_got: usize,
+    raw_len: u32,
+    payload: Vec<u8>,
+    payload_len: Option<usize>,
+    payload_got: usize,
+}
+
+impl<R: AsyncReadExt + Unpin> FramedReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            len_buf: [0u8; 4],
+            len_got: 0,
+            raw_len: 0,
+            payload: Vec::new(),
+            payload_len: None,
+            payload_got: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len_got = 0;
+        self.payload_len = None;
+        self.payload_got = 0;
+        self.payload = Vec::new();
+    }
+
+    /// Read the next complete message. **Cancellation-safe** — safe as a
+    /// `tokio::select!` branch.
+    pub async fn next<T: for<'de> Deserialize<'de>>(&mut self) -> Result<T> {
+        loop {
+            match self.payload_len {
+                None => {
+                    // Reading the 4-byte length prefix (resumable).
+                    let n = self
+                        .inner
+                        .read(&mut self.len_buf[self.len_got..])
+                        .await
+                        .context("read frame length")?;
+                    if n == 0 {
+                        anyhow::bail!("connection closed");
+                    }
+                    self.len_got += n;
+                    if self.len_got == 4 {
+                        self.raw_len = u32::from_be_bytes(self.len_buf);
+                        let len = (self.raw_len & !COMPRESS_FLAG) as usize;
+                        if len > MAX_FRAME_LEN {
+                            anyhow::bail!("frame too large: {len} bytes");
+                        }
+                        self.payload = vec![0u8; len];
+                        self.payload_len = Some(len);
+                        self.payload_got = 0;
+                    }
+                }
+                Some(len) => {
+                    if self.payload_got < len {
+                        let n = self
+                            .inner
+                            .read(&mut self.payload[self.payload_got..])
+                            .await
+                            .context("read frame payload")?;
+                        if n == 0 {
+                            anyhow::bail!("connection closed");
+                        }
+                        self.payload_got += n;
+                    }
+                    if self.payload_got >= len {
+                        let raw_len = self.raw_len;
+                        let payload = std::mem::take(&mut self.payload);
+                        self.reset();
+                        return decode_frame(raw_len, payload);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::SandboxPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serialize a message to its exact on-wire frame bytes.
+    async fn frame_of(msg: &ClientMessage) -> Vec<u8> {
+        let (mut w, mut r) = tokio::io::duplex(1 << 20);
+        write_message(&mut w, msg).await.unwrap();
+        drop(w);
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// The core guarantee: `FramedReader::next` survives repeated mid-frame
+    /// cancellation (losing a `select!` race) without desyncing the stream. A
+    /// partial length prefix AND a partial payload are each interrupted, then
+    /// resumed — the message must still decode intact. This is the exact
+    /// situation that dropped interactive sessions under output floods.
+    #[tokio::test]
+    async fn framed_reader_survives_midframe_cancellation() {
+        let msg = ClientMessage::Input(b"scroll the tmux buffer fast".to_vec());
+        let frame = frame_of(&msg).await;
+        assert!(frame.len() > 6, "need a multi-byte frame to split");
+
+        let (mut w, r) = tokio::io::duplex(1 << 20);
+        let mut framed = FramedReader::new(r);
+
+        // 1) Feed 2 of the 4 length-prefix bytes, then cancel a read mid-prefix.
+        w.write_all(&frame[..2]).await.unwrap();
+        tokio::select! {
+            biased;
+            _ = std::future::ready(()) => {}                 // always-ready → cancels next()
+            _ = framed.next::<ClientMessage>() => panic!("should not complete yet"),
+        }
+
+        // 2) Feed the rest of the prefix + part of the payload, cancel again.
+        w.write_all(&frame[2..5]).await.unwrap();
+        tokio::select! {
+            biased;
+            _ = std::future::ready(()) => {}
+            _ = framed.next::<ClientMessage>() => panic!("should not complete yet"),
+        }
+
+        // 3) Feed the remainder — the message must decode intact despite two
+        //    mid-frame cancellations.
+        w.write_all(&frame[5..]).await.unwrap();
+        let got: ClientMessage = framed.next().await.unwrap();
+        assert!(matches!(got, ClientMessage::Input(ref d) if d == b"scroll the tmux buffer fast"));
+    }
+
+    fn input_bytes(m: &ClientMessage) -> Vec<u8> {
+        match m {
+            ClientMessage::Input(d) => d.clone(),
+            _ => panic!("expected Input"),
+        }
+    }
+
+    /// Back-to-back frames read through repeated cancellation stay in order.
+    #[tokio::test]
+    async fn framed_reader_multiple_frames_with_cancellation() {
+        let msgs: Vec<ClientMessage> = (0..5)
+            .map(|i| ClientMessage::Input(vec![i as u8; 3 + i as usize]))
+            .collect();
+        let mut wire = Vec::new();
+        for m in &msgs {
+            wire.extend(frame_of(m).await);
+        }
+
+        let (mut w, r) = tokio::io::duplex(1 << 20);
+        let mut framed = FramedReader::new(r);
+        // Dribble the concatenated frames one byte at a time; between each byte,
+        // race next() against an always-ready branch so it's cancelled constantly.
+        let feeder = tokio::spawn(async move {
+            for b in wire {
+                w.write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            drop(w);
+        });
+
+        let mut got: Vec<ClientMessage> = Vec::new();
+        while got.len() < msgs.len() {
+            tokio::select! {
+                r = framed.next::<ClientMessage>() => got.push(r.unwrap()),
+                _ = tokio::task::yield_now() => {}   // frequently cancels the read
+            }
+        }
+        feeder.await.unwrap();
+        let got_bytes: Vec<Vec<u8>> = got.iter().map(input_bytes).collect();
+        let want_bytes: Vec<Vec<u8>> = msgs.iter().map(input_bytes).collect();
+        assert_eq!(got_bytes, want_bytes);
+    }
 
     #[test]
     fn sandbox_policy_bincode_roundtrip() {

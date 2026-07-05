@@ -14,18 +14,25 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, S
 
 use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
 
-/// True if `ip` falls in hop's VPN overlay range (`100.64.0.0/10`, CGNAT).
+/// True if `ip` is a hop VPN *overlay* address — reachable only THROUGH the hop
+/// tunnel, never a valid *underlay* transport path. Covers both:
+/// - **IPv4 CGNAT** `100.64.0.0/10` (the vIP range on the `utun`/TUN device), and
+/// - **IPv6 ULA** `fd00::/8` (unique-local) — hop's **4via6** overlay
+///   (`fd68:6f70:…`) plus any other ULA that can't be a real underlay path.
 ///
-/// Such an address is the VPN *overlay* — reachable only THROUGH the hop tunnel,
-/// never a valid *underlay* transport path. See [`hop_addr_filter`].
-fn is_cgnat_v4(ip: IpAddr) -> bool {
+/// Advertising either as an iroh direct address makes peers hole-punch through
+/// the tunnel itself (a routing loop back into the TUN). See [`hop_addr_filter`].
+fn is_vpn_overlay_addr(ip: IpAddr) -> bool {
     match ip {
         // 100.64.0.0/10 == 100.64.0.0 – 100.127.255.255 (second octet 64..=127).
         IpAddr::V4(v4) => {
             let o = v4.octets();
             o[0] == 100 && (64..=127).contains(&o[1])
         }
-        IpAddr::V6(_) => false,
+        // fc00::/7 unique-local; hop only ever assigns fd00::/8 (the via6 overlay
+        // lives at fd68:6f70:…). A ULA is not routable off-link, so it can never
+        // be a legitimate underlay hole-punch target for a remote peer.
+        IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc,
     }
 }
 
@@ -46,7 +53,7 @@ fn hop_addr_filter() -> AddrFilter {
         addrs
             .iter()
             .filter(|a| match a {
-                TransportAddr::Ip(sa) => !is_cgnat_v4(sa.ip()),
+                TransportAddr::Ip(sa) => !is_vpn_overlay_addr(sa.ip()),
                 // Relays + custom transports (the enum is #[non_exhaustive]): keep.
                 _ => true,
             })
@@ -354,8 +361,8 @@ mod tests {
     use std::net::SocketAddr;
 
     #[test]
-    fn cgnat_range_detection() {
-        let cg = |s: &str| is_cgnat_v4(s.parse().unwrap());
+    fn overlay_range_detection() {
+        let cg = |s: &str| is_vpn_overlay_addr(s.parse().unwrap());
         // Inside 100.64.0.0/10 (the VPN overlay) — must be filtered.
         assert!(cg("100.64.0.0"));
         assert!(cg("100.93.75.76")); // the address observed looping in the wild
@@ -368,8 +375,13 @@ mod tests {
         assert!(!cg("10.0.0.1"));
         assert!(!cg("136.38.27.175")); // a real public peer addr from the same trace
         assert!(!cg("127.0.0.1"));
-        // IPv6 is never in the (IPv4-only) VPN range.
-        assert!(!is_cgnat_v4("2605:a601:a9dd:ee00::1".parse().unwrap()));
+        // IPv6 ULA (fd00::/8) — hop's via6 overlay + any unique-local — filtered.
+        assert!(cg("fd68:6f70:7669:6136::1")); // via6 overlay prefix
+        assert!(cg("fdff::1"));
+        assert!(cg("fc00::1")); // fc00::/7 lower half
+        // Real/global IPv6 — must survive.
+        assert!(!cg("2605:a601:a9dd:ee00::1"));
+        assert!(!cg("fe80::1")); // link-local is not ULA (kept; iroh handles scoping)
     }
 
     #[test]

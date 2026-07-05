@@ -474,6 +474,10 @@ pub async fn host_shell_session(
     // Main loop: multiplex between PTY output, client input, and child exit
     let compress = protocol_version >= 3;
     let mut clean_exit = false;
+    // Cancellation-safe reader (legacy V0 shell path) — same fix as the persistent
+    // loop: a bare `read_message` select! branch loses bytes if `output_rx` cancels
+    // it mid-frame under a flood, desyncing the stream.
+    let mut framed = proto::FramedReader::new(&mut recv);
     loop {
         tokio::select! {
             // PTY output -> send to client
@@ -484,7 +488,7 @@ pub async fn host_shell_session(
                 }
             }
             // Client messages -> write to PTY
-            msg = proto::read_message::<ClientMessage>(&mut recv) => {
+            msg = framed.next::<ClientMessage>() => {
                 match msg {
                     Ok(ClientMessage::Input(data)) => {
                         let writer = pty_writer.clone();
@@ -1034,6 +1038,11 @@ async fn run_attached_loop(
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
     tokio::pin!(read_deadline);
 
+    // Cancellation-safe framed reader — the symmetric half of the client fix. The
+    // always-ready `output_rx` branch would otherwise cancel a mid-frame client
+    // read during a flood, desyncing the stream and disconnecting the session.
+    let mut framed = proto::FramedReader::new(&mut *recv);
+
     let outcome = loop {
         tokio::select! {
             Some(data) = output_rx.recv() => {
@@ -1046,7 +1055,7 @@ async fn run_attached_loop(
                 tracing::debug!("Host write failed, client disconnected");
                 break AttachOutcome::Disconnected;
             }
-            msg = proto::read_message::<ClientMessage>(recv) => {
+            msg = framed.next::<ClientMessage>() => {
                 // Any message from the client means the connection is alive
                 read_deadline.as_mut().reset(tokio::time::Instant::now() + READ_DEADLINE);
 
@@ -1656,6 +1665,15 @@ where
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
     tokio::pin!(read_deadline);
 
+    // Cancellation-safe framed reader: the bare `read_message` future loses
+    // already-consumed bytes if the `select!` cancels it mid-frame (which the
+    // heartbeat tick guarantees during any multi-second output flood), desyncing
+    // the stream into a spurious disconnect. `FramedReader::next` keeps the
+    // partial frame in the struct, so racing it here is safe. THIS is what made
+    // interactive sessions drop under heavy output (scrolling tmux) while plain
+    // exec — a bare read loop — was fine.
+    let mut framed = proto::FramedReader::new(&mut *recv);
+
     let outcome = loop {
         tokio::select! {
             // Stdin -> enqueue for the writer task (never blocks this loop).
@@ -1676,7 +1694,7 @@ where
                 break Ok(SessionOutcome::Disconnected);
             }
             // Host messages -> write to stdout
-            msg = proto::read_message::<HostMessage>(recv) => {
+            msg = framed.next::<HostMessage>() => {
                 // Any message from the host means the connection is alive
                 read_deadline.as_mut().reset(tokio::time::Instant::now() + READ_DEADLINE);
 
@@ -2057,6 +2075,9 @@ pub async fn client_exec_session(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<SessionOutcome> {
     let mut stdout = std::io::stdout();
+    // Cancellation-safe reader: if stdin is active while the host floods output,
+    // a bare `read_message` select! branch could be cancelled mid-frame.
+    let mut framed = proto::FramedReader::new(&mut recv);
 
     loop {
         tokio::select! {
@@ -2065,7 +2086,7 @@ pub async fn client_exec_session(
                     return Ok(SessionOutcome::Disconnected);
                 }
             }
-            msg = proto::read_message::<HostMessage>(&mut recv) => {
+            msg = framed.next::<HostMessage>() => {
                 match msg {
                     Ok(HostMessage::Output(data)) => {
                         stdout.write_all(&data)?;
