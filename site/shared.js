@@ -3,9 +3,8 @@
     { label: 'Features',     href: '#features',     cross: 'index.html#features' },
     { label: 'Install',      href: '#install',      cross: 'index.html#install' },
     { label: 'How It Works', href: '#how-it-works', cross: 'index.html#how-it-works' },
+    { label: 'AI Agents',    href: '#ai-agents',    cross: 'index.html#ai-agents' },
     { label: 'Private Network', href: '#private-network', cross: 'index.html#private-network' },
-    { label: 'Daemon',       href: '#daemon',       cross: 'index.html#daemon' },
-    { label: 'AI',           href: '#ai',           cross: 'index.html#ai' },
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
   ];

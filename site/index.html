@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>hop: Remote access without the headaches</title>
-  <meta name="description" content="Secure peer-to-peer remote access to any machine: shell, file transfer, and your own private network. No servers to run, no ports to forward, no config. One binary: install, invite, connect.">
+  <meta name="description" content="Turn your machines into one secure private network you — or your AI agents — can reach, run commands on, and search from anywhere. One binary. No servers, no ports, no accounts, no company in the middle.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -281,9 +281,9 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> Secure peer-to-peer remote access</div>
+    <div class="badge"><span class="dot"></span> Secure remote access for humans and AI agents</div>
     <h1>Remote access<br><span class="gradient">without the headaches</span></h1>
-    <p>A secure shell, file transfer, and remote access to any machine: direct, encrypted, peer-to-peer. No servers to run, no ports to forward, no config. One binary: <strong>install, invite, connect</strong>.</p>
+    <p>One binary turns your machines &mdash; laptop, server, cloud, or a Pi &mdash; into a secure private network you <strong>and your AI agents</strong> can reach, run commands on, and search from anywhere. No accounts, no servers, and <strong>no company in the middle</strong>. Just install, invite, connect.</p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Get Started</a>
       <a href="#how-it-works" class="btn btn-ghost">How It Works</a>
@@ -300,70 +300,54 @@
     </div>
   </div>
 
+  <!-- Sovereignty strip -->
+  <div style="border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border); background: var(--color-surface);">
+    <div class="container" style="padding-top: 1.25rem; padding-bottom: 1.25rem; text-align: center;">
+      <p style="margin: 0; color: var(--color-text-secondary); font-size: 1rem;">
+        <strong style="color: var(--color-text);">No accounts. No third party. No one in the middle.</strong> Your machines connect directly and privately &mdash; by design.
+      </p>
+    </div>
+  </div>
+
   <!-- Why hop -->
   <section id="features">
     <div class="container">
       <div class="section-header">
         <h2>Why hop?</h2>
-        <p>Existing tools all have tradeoffs. hop was built to eliminate them.</p>
+        <p>One binary. No accounts. No company in the middle &mdash; for you and the agents you run.</p>
       </div>
 
       <div class="grid grid-3">
-        <div class="card card-red">
-          <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          </div>
-          <h3>End-to-End Encrypted</h3>
-          <p>TLS 1.3 over QUIC. Your traffic is never decrypted by a relay or third-party service. Keys stay on your machines.</p>
-        </div>
-
         <div class="card card-teal">
           <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           </div>
-          <h3>NAT Traversal Built In</h3>
-          <p>Works behind ISP NAT, double NAT, and carrier-grade NAT. No port forwarding or router configuration needed.</p>
+          <h3>No third party, ever</h3>
+          <p>Your machines connect directly and privately, end-to-end encrypted. Unlike Tailscale, there's no coordination server to phone home to, no account, no third party in your trust path. Your keys stay on your machines.</p>
         </div>
 
         <div class="card card-amber">
           <div class="card-icon card-icon-amber">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
           </div>
-          <h3>Single Binary</h3>
-          <p>One download. No runtime dependencies, no accounts to create. The CLI client needs no daemon; always-on hosts run one. Just run it.</p>
+          <h3>Works anywhere, one binary</h3>
+          <p>One small download, no dependencies, no config. Punches through any NAT automatically, home, cloud, or a Raspberry Pi. Install, invite, connect &mdash; in under a minute.</p>
         </div>
 
         <div class="card card-green">
           <div class="card-icon card-icon-green">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
           </div>
-          <h3>One-Time Invite Links</h3>
-          <p>Share a link or token to grant access. Each invite is single-use and cryptographically verified. No shared passwords.</p>
+          <h3>Agent-ready today</h3>
+          <p>Add one skill and your AI tools can reach, run commands on, and search across every machine &mdash; inside the limits you set. No integration to build, and nothing central to breach.</p>
         </div>
-
-        <div class="card card-amber">
-          <div class="card-icon card-icon-amber">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-          </div>
-          <h3>File Transfer Built In</h3>
-          <p>Copy files with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop cp</code> or sync directories with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop sync</code>. No separate SCP/rsync needed, transfers use the same encrypted P2P connection.</p>
-        </div>
-
-        <div class="card card-green">
-          <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-          </div>
-          <h3>Persistent Sessions</h3>
-          <p>Your shell survives disconnects. If your connection drops, hop reconnects and resumes where you left off, no tmux needed.</p>
-        </div>
-
       </div>
 
       <p style="text-align: center; margin-top: 2.5rem; max-width: 760px; margin-left: auto; margin-right: auto; color: var(--color-text-tertiary); font-size: 0.95rem; line-height: 1.8;">
-        Plus remote command execution, encrypted secrets, scheduled automation, and kernel-level sandboxing (macOS Seatbelt / Linux Landlock), with deeper tooling for
+        Also built in: encrypted file transfer, sessions that survive disconnects, secrets, and scheduled automation &mdash; with deeper tooling for
         <a href="fleet.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">fleet management</a>,
         <a href="orchestration.html" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">AI orchestration</a>, and
-        <a href="https://tap.keikai.ai" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">terminal session audit (tap)</a>.
+        <a href="https://tap.keikai.ai" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">session audit (tap)</a>.
       </p>
     </div>
   </section>
@@ -383,9 +367,9 @@
           <div class="comparison-cell comparison-header">SSH / Tailscale / ngrok</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Router / NAT config</div>
-          <div class="comparison-cell hop-col">Never</div>
-          <div class="comparison-cell comparison-other">SSH / ngrok often need it</div>
+          <div class="comparison-cell comparison-label">Third party in the middle</div>
+          <div class="comparison-cell hop-col">None &mdash; nothing to sign up for</div>
+          <div class="comparison-cell comparison-other">Tailscale needs its coordinator; ngrok its servers</div>
         </div>
         <div class="comparison-row">
           <div class="comparison-cell comparison-label">Account required</div>
@@ -393,64 +377,24 @@
           <div class="comparison-cell comparison-other">Tailscale, ngrok require accounts</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Private network</div>
-          <div class="comparison-cell hop-col">Built in, peer-to-peer</div>
-          <div class="comparison-cell comparison-other">Tailscale (separate WireGuard mesh)</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Control plane</div>
-          <div class="comparison-cell hop-col">None, fully P2P</div>
-          <div class="comparison-cell comparison-other">Tailscale routes trust through their coordinator</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Traffic routing</div>
-          <div class="comparison-cell hop-col">Direct P2P</div>
-          <div class="comparison-cell comparison-other">ngrok routes through their servers</div>
-        </div>
-        <div class="comparison-row">
           <div class="comparison-cell comparison-label">Setup</div>
-          <div class="comparison-cell hop-col">One curl command</div>
-          <div class="comparison-cell comparison-other">VPN config, daemon install, signup</div>
+          <div class="comparison-cell hop-col">One command, under a minute</div>
+          <div class="comparison-cell comparison-other">VPN config, daemon, signup</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">NAT traversal</div>
-          <div class="comparison-cell hop-col">Automatic (QUIC)</div>
-          <div class="comparison-cell comparison-other">Tailscale (WireGuard), SSH (none)</div>
+          <div class="comparison-cell comparison-label">Works through NAT</div>
+          <div class="comparison-cell hop-col">Automatically, anywhere</div>
+          <div class="comparison-cell comparison-other">SSH needs port-forwarding</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">File transfer</div>
-          <div class="comparison-cell hop-col">Built in (cp &amp; sync)</div>
-          <div class="comparison-cell comparison-other">Separate tool (scp/rsync over SSH)</div>
+          <div class="comparison-cell comparison-label">Private network</div>
+          <div class="comparison-cell hop-col">Built in</div>
+          <div class="comparison-cell comparison-other">Tailscale only (separate tool)</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Session persistence</div>
-          <div class="comparison-cell hop-col">Built-in (auto-reconnect)</div>
-          <div class="comparison-cell comparison-other">Requires tmux/screen</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">AI integration</div>
-          <div class="comparison-cell hop-col">Built-in MCP server</div>
-          <div class="comparison-cell comparison-other">None (external tools only)</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Built-in automation</div>
-          <div class="comparison-cell hop-col">Cron + capabilities</div>
-          <div class="comparison-cell comparison-other">External tools (crontab, Ansible)</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Encrypted secrets</div>
-          <div class="comparison-cell hop-col">Built-in (ChaCha20-Poly1305)</div>
-          <div class="comparison-cell comparison-other">Vault, external KMS</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Remote management</div>
-          <div class="comparison-cell hop-col">Built-in secrets &amp; tasks</div>
-          <div class="comparison-cell comparison-other">SSH + separate tools</div>
-        </div>
-        <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Kernel sandboxing</div>
-          <div class="comparison-cell hop-col">Built-in (Seatbelt / Landlock)</div>
-          <div class="comparison-cell comparison-other">Manual config (SELinux, AppArmor)</div>
+          <div class="comparison-cell comparison-label">Usable by AI agents</div>
+          <div class="comparison-cell hop-col">Yes &mdash; one skill, works today</div>
+          <div class="comparison-cell comparison-other">None</div>
         </div>
       </div>
     </div>
@@ -506,20 +450,52 @@
 
 <span class="comment"># Run a command without opening a shell</span>
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">server</span> -- ps aux
-<span class="output">USER       PID %CPU  COMMAND</span>
-<span class="output">root         1  0.0  /sbin/init</span>
 
-<span class="comment"># Copy files to the server</span>
+<span class="comment"># Copy files over the same encrypted connection</span>
 <span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./project server:~/project
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
 
-<span class="comment"># Sync a directory (rsync-compatible)</span>
-<span class="prompt">$</span> <span class="cmd">hop sync</span> <span class="flag">-i</span> server:~/project/src ./src
-<span class="output">&gt;f+++++++++ main.rs</span>
-<span class="output">          4,512 100%    0.00kB/s    0:00:00 (xfr#1, to-chk=1/2)</span>
-<span class="output">&gt;f.st...... lib.rs</span>
-<span class="output">          1,203 100%   11.75kB/s    0:00:00 (xfr#2, to-chk=0/2)</span>
-<span class="output"></span>
-<span class="output">total size is 5,715  2 file(s) in 0.1s</span>
+  <!-- hop for AI agents -->
+  <section id="ai-agents">
+    <div class="container">
+      <div class="section-header">
+        <h2>Give your AI agents safe hands, today</h2>
+        <p>Agents can reason and call tools, but they still can't safely reach the machines you actually run. Add the hop skill and yours can &mdash; immediately, with no integration to build.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One skill, your whole fleet</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1.25rem;">Give your AI tool the hop skill and it can reach every machine on your network, run a command across all of them at once, and search their logs together &mdash; in plain language, inside the limits you set. It works today, over the same <strong>install, invite, connect</strong> you just saw. Nothing to wire up.</p>
+          <ul class="daemon-features">
+            <li>Works right now &mdash; no integration project, no API to build</li>
+            <li>Reaches any machine and runs commands across the whole fleet at once</li>
+            <li>Stays inside the limits you set, so it can't touch what you haven't allowed</li>
+            <li>No third-party service in the loop to breach or lock you in</li>
+          </ul>
+          <a href="orchestration.html" class="btn btn-ghost" style="margin-top: 1.75rem;">See how it connects to your AI tools &rarr;</a>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+            <span class="code-title">Your AI tool</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Add the hop skill to your agent &mdash; that's it</span>
+<span class="prompt">$</span> <span class="cmd">hop mcp</span>
+
+<span class="comment"># Now, in plain language:</span>
+<span class="output">"restart the API on every production box,</span>
+<span class="output"> and show me any errors from the last hour"</span>
+
+<span class="output">&rarr; runs it across all production machines</span>
+<span class="output">&rarr; searches every machine's logs, together</span>
+<span class="output">&rarr; stops at whatever your rules don't allow</span>
           </div>
         </div>
       </div>
@@ -626,10 +602,9 @@
 
       <div class="grid grid-2" style="align-items: center; gap: 3rem;">
         <div>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">What's a warren?</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Your private group of machines. Add one and it answers by name (<code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver</code> at <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach, from anywhere. No port-forwarding, no VPN appliance, no coordination server in someone else's cloud. The tools you already use (SSH, scp, VNC) just work.</p>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Start one, then invite</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">An always-on host (below) creates your warren, with you as owner. Run <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop invite</code> on any member, hand over the token, and the new machine runs <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop connect &lt;invite&gt;</code> to pick up a private IP and a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">name.hop</code> address, reachable by everyone. Each invite is single-use, time-limited, and its role sets what the new member can reach.</p>
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">Your machines, reachable by name</h3>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Invite a machine and it answers by name (<code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">myserver.hop</code>) on a private address only <em>your</em> machines can reach, from anywhere. No port-forwarding, no VPN appliance, no coordination server in someone else's cloud. The tools you already use &mdash; SSH, scp, VNC &mdash; just work.</p>
+          <p style="color: var(--color-text-secondary);">You can also <strong>bridge devices that can't run hop</strong> (a printer, a NAS, a whole home or office LAN) through one machine that's on it, or <strong>forward a remote port to your laptop</strong> like <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">ssh -L</code>. <a href="https://docs.hop.keikai.ai" style="color: var(--color-primary); text-decoration: none; font-weight: 500;">See the docs &rarr;</a></p>
         </div>
 
         <div class="code-block">
@@ -652,86 +627,6 @@
 <span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">myserver.hop</span>
 <span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">myserver.hop</span>:~
 <span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- LAN bridging -->
-  <section id="lan-bridging" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Reach the things that can't run hop</h2>
-        <p>Printers, a NAS, cameras, a smart TV, your whole home network, bridged onto your warren through one machine that's already on it.</p>
-      </div>
-
-      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
-        <div>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One machine bridges the rest</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Plenty of devices will never run a VPN. Pick one machine that's on your warren (a home server, a Raspberry Pi) and tell it which network to share. Every member then reaches that whole LAN by its real address, from anywhere. <strong>One command</strong>, no config files, no appliance.</p>
-
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin: 1.75rem 0 0.75rem;">Even when the addresses collide</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Home and cabin both on <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">192.168.1.x</code>? That normally breaks a VPN: two devices, same address. hop keeps them straight and routes to the right one. Access stays gated by role: a bridged device is only reachable by members you've allowed.</p>
-        </div>
-
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Terminal</span>
-          </div>
-          <div class="code-body">
-<span class="comment"># On the machine that sits on the LAN you want to share</span>
-<span class="prompt">$</span> <span class="cmd">hop lan advertise</span> <span class="flag">192.168.1.0/24</span>
-<span class="output">Advertising 192.168.1.0/24 to the warren</span>
-
-<span class="comment"># Or share just one device</span>
-<span class="prompt">$</span> <span class="cmd">hop lan advertise</span> <span class="flag">192.168.1.50/32</span>
-
-<span class="comment"># From any other machine on the warren, reach it directly</span>
-<span class="prompt">$</span> <span class="cmd">ping</span> <span class="flag">192.168.1.50</span>
-<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">http://192.168.1.50</span>
-
-<span class="comment"># See what's on offer across the warren</span>
-<span class="prompt">$</span> <span class="cmd">hop lan ls</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Port forwarding -->
-  <section id="port-forward" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Reach a remote port as if it were local</h2>
-        <p>A database, a dashboard, a dev server on a machine you can reach: forward its port to your laptop with one command, through NAT, with no router setup and nothing exposed to the internet.</p>
-      </div>
-
-      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
-        <div>
-          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 1rem;">One command, encrypted end to end</h3>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1rem;">Pick a machine you can already reach and the port you want. hop opens that port on your laptop and pipes it straight to the service on the other side, encrypted. Access stays gated by role, so only the people you've allowed can connect.</p>
-        </div>
-
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Terminal</span>
-          </div>
-          <div class="code-body">
-<span class="comment"># Reach myserver's :3000 at localhost:3000</span>
-<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 3000
-
-<span class="comment"># Or land it on a different local port</span>
-<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 8080:3000
-
-<span class="comment"># Now use it like it's running here</span>
-<span class="prompt">$</span> <span class="cmd">open</span> http://localhost:8080
           </div>
         </div>
       </div>
@@ -831,142 +726,22 @@
     </div>
   </section>
 
-  <!-- Daemon -->
-  <section id="daemon" style="padding-bottom: 8rem;">
+  <!-- Explore more -->
+  <section id="explore" style="padding-top: 0; padding-bottom: 8rem;">
     <div class="container">
-      <div class="section-header">
-        <h2>Always-on machines</h2>
-        <p>One command turns a machine into a <strong>node</strong>, a machine that stays on your private network and reachable by name, even across reboots. macOS or Linux.</p>
-      </div>
-
-      <div class="daemon-grid">
-        <div class="daemon-info">
-          <h3>Always reachable</h3>
-          <p>The installer detects your platform and sets up hop as a native system service that starts at boot and stays on your private network, with a stable private IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address. Ideal for home servers, dev boxes, VPS instances, or any always-on machine.</p>
-          <ul class="daemon-features">
-            <li>Installs binary to <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">/usr/local/bin/hop</code></li>
-            <li>Registers a native service (LaunchDaemon on macOS, systemd on Linux)</li>
-            <li>Starts <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">hop host</code> at boot, on your private network with a private IP and a <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">name.hop</code> address</li>
-            <li>Built-in P2P VPN is on by default and fail-safe: shell/exec/transfer keep working whether or not it's enabled (turn it off with <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-vpn</code>)</li>
-            <li>Automatic restarts on crash</li>
-            <li>Works on macOS (Apple Silicon &amp; Intel) and Linux (x86_64, ARM64, ARMv7)</li>
-          </ul>
-        </div>
-
-        <div>
-          <div class="install-cmd" onclick="copyCmd('daemon-install', 'copy-daemon')" style="margin-bottom: 1rem;">
-            <code><span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-daemon">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            </button>
-          </div>
-          <p style="color: var(--color-text-tertiary); font-size: 0.8rem; margin-bottom: 1.5rem;">
-            Detects your platform, installs the binary, sets up the system service, and starts the daemon. Prompts for sudo.
-          </p>
-          <div class="code-block">
-            <div class="code-header">
-              <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
-              <span class="code-title">Terminal</span>
-            </div>
-            <div class="code-body">
-<span class="comment"># The daemon is running, create an invite</span>
-<span class="prompt">$</span> <span class="cmd">hop invite</span>
-<span class="output">Invite token: eyJ0eX...</span>
-
-<span class="comment"># Connect from your laptop</span>
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>
-<span class="prompt">myserver $</span> <span class="cmd">_</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- AI Orchestration -->
-  <section id="ai">
-    <div class="container">
-      <div class="section-header">
-        <h2>AI-Powered Fleet Management</h2>
-        <p><code style="font-family: var(--font-mono); font-size: 0.95rem; color: var(--color-accent-teal);">hop mcp</code> turns hop into an MCP server that AI coding tools can use to manage your infrastructure.</p>
-      </div>
-
-      <div class="daemon-grid">
-        <div class="daemon-info">
-          <h3>Model Context Protocol</h3>
-          <p>Expose fleet management to AI agents through the standard MCP protocol. Claude Code, Cursor, and other compatible tools can orchestrate your infrastructure through natural language.</p>
-          <ul class="daemon-features">
-            <li><strong style="color: var(--color-text);">Sandboxed JS Runtime</strong>: execute JavaScript with full fleet bindings: remote exec, HTTP requests, secrets, metrics, and more</li>
-            <li><strong style="color: var(--color-text);">90+ Built-in Skills</strong>: searchable library across 14 categories that agents use to discover fleet, security, monitoring, and deployment patterns</li>
-            <li><strong style="color: var(--color-text);">Claude Code, Cursor, etc.</strong>: standard MCP protocol, plug into any compatible AI tool</li>
-            <li><strong style="color: var(--color-text);">Safe by Design</strong>: memory limits, execution timeouts, no shell escape. Agents operate within defined boundaries</li>
-            <li><strong style="color: var(--color-text);">Sandbox Presets</strong>: restrict agents to read-only monitoring, auditing, or scoped deploys. Clients can self-restrict for defense-in-depth</li>
-          </ul>
-        </div>
-
-        <div>
-          <div class="code-block">
-            <div class="code-header">
-              <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
-              <span class="code-title">Terminal</span>
-            </div>
-            <div class="code-body">
-<span class="comment"># Add hop as an MCP server in Claude Code</span>
-<span class="prompt">$</span> <span class="cmd">hop mcp</span>
-
-<span class="comment"># AI agent queries available skills</span>
-<span class="output">&rarr; hop_skills(query: "deploy to production hosts")</span>
-
-<span class="comment"># AI agent executes fleet operations</span>
-<span class="output">&rarr; hop_exec(`</span>
-<span class="output">  const hosts = await hop.fleet.list("production");</span>
-<span class="output">  for (const h of hosts) {</span>
-<span class="output">    await hop.exec("systemctl restart myapp",</span>
-<span class="output">      { host: h.name });</span>
-<span class="output">  }</span>
-<span class="output">`)</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Fleet teaser -->
-  <section id="fleet-teaser" style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;">
-        <div style="max-width: 36rem;">
-          <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Managing a fleet of machines?</h2>
-          <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">hop scales from a single machine to thousands. Define roles, tag hosts, and invite your team with one command. Same simplicity, any scale.</p>
-        </div>
-        <a href="fleet.html" class="btn btn-primary" style="flex-shrink: 0;">Fleet Management &rarr;</a>
-      </div>
-    </div>
-  </section>
-
-  <!-- Automation teaser -->
-  <section id="automation-teaser" style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;">
-        <div style="max-width: 36rem;">
-          <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Automate your infrastructure with AI</h2>
-          <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">Schedule cron jobs, monitor email, call external APIs, all from a single binary. Set up once, runs forever.</p>
-        </div>
-        <a href="orchestration.html" class="btn btn-primary" style="flex-shrink: 0;">Automation & Orchestration &rarr;</a>
-      </div>
-    </div>
-  </section>
-
-  <!-- Tap teaser (external sibling product) -->
-  <section id="tap-teaser" style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;">
-        <div style="max-width: 36rem;">
-          <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Auditing Linux terminal sessions? See <em>tap</em>.</h2>
-          <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65;">tap is a Linux-only sister product, eBPF-driven session capture with a kernel-authoritative permission model. Standalone on its own, or paired with hop for remote and AI/MCP access.</p>
-        </div>
-        <a href="https://tap.keikai.ai" class="btn btn-primary" style="flex-shrink: 0;">tap.keikai.ai &rarr;</a>
+      <div class="grid grid-3">
+        <a href="fleet.html" class="card" style="text-decoration: none; display: block;">
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 0.5rem;">Fleet management &rarr;</h3>
+          <p style="color: var(--color-text-secondary); font-size: 0.9rem; margin: 0;">Scale from one machine to thousands. Roles, tags, and one-command team invites.</p>
+        </a>
+        <a href="orchestration.html" class="card" style="text-decoration: none; display: block;">
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 0.5rem;">AI &amp; automation &rarr;</h3>
+          <p style="color: var(--color-text-secondary); font-size: 0.9rem; margin: 0;">Wire hop into your AI tools, and let it run jobs and react on a schedule.</p>
+        </a>
+        <a href="https://tap.keikai.ai" class="card" style="text-decoration: none; display: block;">
+          <h3 style="font-family: var(--font-display); font-weight: 700; margin-bottom: 0.5rem;">Session audit (tap) &rarr;</h3>
+          <p style="color: var(--color-text-secondary); font-size: 0.9rem; margin: 0;">A Linux sister product: kernel-level capture of every terminal session.</p>
+        </a>
       </div>
     </div>
   </section>
@@ -980,7 +755,6 @@
       'install-latest':  'curl -fsSL https://hop.keikai.ai/install.sh | bash',
       'install-version': 'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --version 0.9.17',
       'install-dir':     'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --dir ~/.local/bin',
-      'daemon-install':  'curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host',
       'install-builder': 'curl -fsSL https://hop.keikai.ai/install.sh | bash',
     };
 
