@@ -678,15 +678,65 @@ async fn check_idle_actor(
 // Main agent entry point
 // ---------------------------------------------------------------------------
 
+/// Wire the "network changed → flush the connection pool" machinery for a mux
+/// service and hand back the flush channel to give the netmon watchers.
+///
+/// Every mux host MUST install this — both the standalone agent and the host
+/// daemon. A pool that is never flushed hands the next `hop connect` a pooled
+/// connection whose path died with the old network; `open_bi` on it then stalls
+/// until the QUIC idle timeout instead of re-dialing. That is not hypothetical:
+/// the daemon's mux service originally shipped without this wiring, so once
+/// client connects moved onto the daemon every dial after a laptop changed
+/// networks stalled ~30s. Keeping it in ONE function is the point — the bug was
+/// two copies of this setup drifting apart.
+fn spawn_pool_flush_watchers(
+    endpoint: Endpoint,
+    handle: AgentHandle,
+) -> tokio::sync::mpsc::Sender<()> {
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Sleep/wake: carrying the laptop to a new network is the #1 cause of a
+    // stale path. A wake almost always means the old path is dead, so force
+    // re-discovery AND flush — flushing alone leaves iroh's endpoint pointed at
+    // the old network until its own netwatch catches up.
+    let wake_handle = handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let before = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if before.elapsed() > Duration::from_secs(10) {
+                tracing::info!("Detected sleep/wake, forcing re-discovery + flushing pool");
+                endpoint.network_change().await;
+                wake_handle.flush_all().await;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while flush_rx.recv().await.is_some() {
+            tracing::info!("Flushing mux connection pool after network change");
+            handle.flush_all().await;
+        }
+    });
+
+    flush_tx
+}
+
 /// Bind a mux IPC socket on `sock_path` and serve `MuxConnect` requests using
-/// `endpoint`. Shared by the standalone agent and — crucially — the host daemon:
-/// a machine running `hop host` serves client connects (`hop connect`) through
-/// ITS single endpoint instead of letting the client spawn a *second* endpoint
-/// under the same node-id, which the relay prunes against the daemon every few
-/// seconds (the identity collision). Additive + defensive: a bind failure is
-/// returned to the caller (the daemon logs and continues — the mux is a
-/// convenience, never load-bearing for the daemon's own VPN/inbound roles).
-pub fn spawn_mux_listener(endpoint: Endpoint, sock_path: std::path::PathBuf) -> Result<()> {
+/// `endpoint`. Used by the host daemon: a machine running `hop host` serves
+/// client connects (`hop connect`) through ITS single endpoint instead of
+/// letting the client spawn a *second* endpoint under the same node-id, which
+/// the relay prunes against the daemon every few seconds (the identity
+/// collision). Additive + defensive: a bind failure is returned to the caller
+/// (the daemon logs and continues — the mux is a convenience, never
+/// load-bearing for the daemon's own VPN/inbound roles).
+///
+/// Returns the pool-flush channel: the caller MUST hand it to the netmon
+/// watchers, or the pool it serves is never flushed on a network change.
+pub fn spawn_mux_listener(
+    endpoint: Endpoint,
+    sock_path: std::path::PathBuf,
+) -> Result<tokio::sync::mpsc::Sender<()>> {
     if sock_path.exists() {
         let _ = std::fs::remove_file(&sock_path);
     }
@@ -700,7 +750,8 @@ pub fn spawn_mux_listener(endpoint: Endpoint, sock_path: std::path::PathBuf) -> 
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
     }
-    let handle = spawn_agent_actor(endpoint);
+    let handle = spawn_agent_actor(endpoint.clone());
+    let flush_tx = spawn_pool_flush_watchers(endpoint, handle.clone());
     let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
@@ -722,7 +773,7 @@ pub fn spawn_mux_listener(endpoint: Endpoint, sock_path: std::path::PathBuf) -> 
         }
     });
     tracing::info!("daemon mux service listening on {}", sock_path.display());
-    Ok(())
+    Ok(flush_tx)
 }
 
 async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle) -> Result<()> {
@@ -761,46 +812,17 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
 
     tracing::info!("Agent started (PID {})", std::process::id());
 
-    // Network-change detectors all feed one flush channel: on a detected change
-    // they force iroh path re-discovery and signal a pool flush, so the next
-    // connect re-dials on the new path instead of proxying onto a dead one.
-    let (netmon_flush_tx, mut netmon_flush_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    // Sleep/wake: carrying the laptop to a new network is the #1 cause of a
-    // stale path. A wake almost always means the old path is dead, so force
-    // re-discovery AND flush — previously this only flushed, leaving iroh's
-    // endpoint pointed at the old network until its own netwatch caught up.
-    let wake_handle = handle.clone();
-    let wake_endpoint = endpoint.clone();
-    tokio::spawn(async move {
-        loop {
-            let before = std::time::Instant::now();
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            if before.elapsed() > Duration::from_secs(10) {
-                tracing::info!("Agent detected sleep/wake, forcing re-discovery + flushing pool");
-                wake_endpoint.network_change().await;
-                wake_handle.flush_all().await;
-            }
-        }
-    });
+    // Network-change → pool-flush wiring. Shared with the daemon's mux service
+    // (`spawn_mux_listener`) so the two can never drift apart again.
+    let flush_tx = spawn_pool_flush_watchers(endpoint.clone(), handle.clone());
 
     // Interface-address watcher (calls network_change internally on change).
-    let _netmon =
-        net::netmon::spawn_interface_watcher(endpoint.clone(), Some(netmon_flush_tx.clone()));
-    // Relay-health watcher (parity with the host daemon): catches a dead path
-    // when the local interface address looks unchanged — same DHCP range or
-    // carried while asleep — which the interface watcher cannot see. This is the
-    // gap that made a network move strand the agent on a dead pooled connection.
-    let _relay_health =
-        net::netmon::spawn_relay_health_watcher(endpoint.clone(), Some(netmon_flush_tx));
-
-    let netmon_handle = handle.clone();
-    tokio::spawn(async move {
-        while netmon_flush_rx.recv().await.is_some() {
-            tracing::info!("Flushing agent connection pool after network change");
-            netmon_handle.flush_all().await;
-        }
-    });
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), Some(flush_tx.clone()));
+    // Relay-health watcher: catches a dead path when the local interface address
+    // looks unchanged — same DHCP range or carried while asleep — which the
+    // interface watcher cannot see. This is the gap that made a network move
+    // strand the agent on a dead pooled connection.
+    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), Some(flush_tx));
 
     loop {
         tokio::select! {

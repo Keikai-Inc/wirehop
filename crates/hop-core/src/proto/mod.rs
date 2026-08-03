@@ -19,9 +19,6 @@ pub const ALPN_V2: &[u8] = b"hop/2";
 /// ALPN protocol identifier for hop v3 (zstd compression on large frames).
 pub const ALPN_V3: &[u8] = b"hop/3";
 
-/// Legacy alias — kept so existing callers that reference `ALPN` still compile.
-pub const ALPN: &[u8] = ALPN_V0;
-
 /// Messages sent from the host to the client.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HostMessage {

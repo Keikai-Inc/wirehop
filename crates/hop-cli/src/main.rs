@@ -736,25 +736,37 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         });
     }
 
-    // Network interface change detector — belt-and-suspenders over iroh's netwatch.
-    // Polls interface addresses every 5s and calls endpoint.network_change() on change.
-    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), None);
-
-    // Relay reachability watcher. Probes the home relay every 30s and forces
-    // re-discovery after 3 consecutive failures. Catches cert expiry / relay
-    // crashes the interface watcher misses (the daemon's TCP session can stay
-    // ESTABLISHED for hours after the relay link is functionally broken).
-    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), None);
-
     // Serve `hop connect` through THIS daemon's endpoint: a machine running the
     // daemon must not let the client spawn a second iroh endpoint under the same
     // node-id (the relay prunes the two against each other every few seconds —
     // the identity collision). Routing client connects through the daemon's sole
     // endpoint is the fix. Additive + non-fatal: if it can't bind, clients fall
     // back to their own agent (collision returns, but the daemon is unharmed).
-    if let Err(e) = agent::spawn_mux_listener(endpoint.clone(), config_dir.join("agent.sock")) {
-        tracing::warn!("daemon mux service unavailable (clients will spawn their own agent): {e:#}");
-    }
+    //
+    // Spawned BEFORE the watchers below so they can be wired to its pool-flush
+    // channel: the daemon owns the mux pool now, so a network change has to flush
+    // it. Without that, the next `hop connect` after a move gets handed a pooled
+    // connection whose path died with the old network and stalls on `open_bi`.
+    let mux_flush = match agent::spawn_mux_listener(endpoint.clone(), config_dir.join("agent.sock"))
+    {
+        Ok(tx) => Some(tx),
+        Err(e) => {
+            tracing::warn!(
+                "daemon mux service unavailable (clients will spawn their own agent): {e:#}"
+            );
+            None
+        }
+    };
+
+    // Network interface change detector — belt-and-suspenders over iroh's netwatch.
+    // Polls interface addresses every 5s and calls endpoint.network_change() on change.
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), mux_flush.clone());
+
+    // Relay reachability watcher. Probes the home relay every 30s and forces
+    // re-discovery after 3 consecutive failures. Catches cert expiry / relay
+    // crashes the interface watcher misses (the daemon's TCP session can stay
+    // ESTABLISHED for hours after the relay link is functionally broken).
+    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), mux_flush);
 
     // Network document (Phase 1): spawn the iroh-docs replication stack on its
     // own isolated endpoint and migrate existing peers/roles on first run. This
