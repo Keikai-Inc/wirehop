@@ -35,6 +35,28 @@ TransferMsg::Negotiated {
 
 For `hop/0`, `NegotiatedParams::legacy()` is used: no compression, 64 KiB chunks.
 
+#### Features Version
+
+`features_version` gates the listing encoding. Each side sends its own value and
+reads the peer's, so both independently compute `min(ours, theirs)` — no extra
+wire field is needed (bincode ignores `#[serde(default)]`, so existing messages
+must never grow fields).
+
+| Version | Listing encoding |
+|---|---|
+| `1` | Single uncompressed `FileList` / `TransferPlan` frame |
+| `2` | zstd-compressed `FileListChunk` / `TransferPlanChunk` batches of `LIST_CHUNK_ENTRIES` (5,000) |
+
+Version 1 caps a transfer at whatever fits in one frame: `MAX_FRAME_LEN` is
+16 MiB, roughly 140k entries. Past that the receiver rejects the frame and the
+sender sees only a broken pipe. A Rust checkout with its `target/` directory
+reaches this easily. Version 2 bounds frame size for any tree.
+
+Readers accept **both** encodings regardless of what was negotiated, so a version
+mismatch degrades to working rather than `expected FileList, got FileListChunk`.
+The privsep transfer helper receives the negotiated value via
+`--features-version` (default `1`).
+
 ## TransferMsg Enum
 
 See [Architecture & Protocol](architecture.md) for the full `TransferMsg` definition. Key message flows:
@@ -63,6 +85,11 @@ Client                          Host
   |<-- FileAck              ---|
   |-- Done                  -->  |
 ```
+
+At `features_version >= 2` each `FileList` / `TransferPlan` above is instead a
+run of compressed `FileListChunk` / `TransferPlanChunk` messages, the final one
+carrying `last: true`. An empty listing still sends exactly one terminating
+chunk — otherwise the reader would block waiting for `last`.
 
 ## Delta Algorithm
 
@@ -146,13 +173,17 @@ const DELTA_MIN_FILE_SIZE: u64 = 64 * 1024;   // Don't bother with delta for sma
 pub struct NegotiatedParams {
     pub compression: Option<Compression>,  // Zstd { level: i32 }
     pub max_chunk_size: usize,
+    pub features_version: u32,             // min(ours, peer's)
 }
 ```
 
 Factory methods:
-- `legacy()`: no compression, 64 KiB chunks (hop/0)
-- `v1_default()`: zstd level 3, 1 MiB max chunk (hop/1+)
-- `from_negotiated(compression, chunk_size, zstd_level)`: from wire values, clamped to `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]`
+- `legacy()`: no compression, 64 KiB chunks, features version 1 (hop/0)
+- `v1_default()`: zstd level 3, 1 MiB max chunk, features version 1 (hop/1+)
+- `from_negotiated(compression, chunk_size, zstd_level, peer_features_version)`: from wire values, chunk size clamped to `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]` and features version clamped to `TRANSFER_FEATURES_VERSION`
+
+`chunked_listing()` returns `features_version >= 2` — the single switch deciding
+which listing encoding the writers emit.
 
 ### Adaptive Chunk Sizing
 

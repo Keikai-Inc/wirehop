@@ -453,6 +453,9 @@ pub enum Command {
         /// Max chunk size in bytes
         #[arg(long, default_value = "65536")]
         chunk_size: usize,
+        /// Negotiated transfer features version (gates chunked listings)
+        #[arg(long, default_value = "1")]
+        features_version: u32,
     },
 
     /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")

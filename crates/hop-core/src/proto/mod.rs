@@ -525,6 +525,24 @@ pub const DELTA_BLOCK_SIZE: usize = TRANSFER_CHUNK_SIZE;
 /// Minimum file size to consider for delta transfer.
 pub const DELTA_MIN_FILE_SIZE: u64 = 64 * 1024;
 
+/// Transfer features version advertised in [`TransferMsg::Capabilities`]. Each
+/// side sends its own and reads the peer's, so both independently compute
+/// `min(ours, theirs)` — no extra wire field is needed (bincode ignores
+/// `#[serde(default)]`, so existing messages must never grow fields).
+///
+/// - `1`: listings sent as a single uncompressed `FileList` / `TransferPlan`
+///   frame. A tree whose listing exceeds `MAX_FRAME_LEN` (16 MiB — roughly
+///   140k entries) simply fails, and the sender only sees a broken pipe.
+/// - `2`: listings sent as zstd-compressed `FileListChunk` /
+///   `TransferPlanChunk` batches, so listing size is bounded for any tree.
+pub const TRANSFER_FEATURES_VERSION: u32 = 2;
+
+/// Entries per listing chunk when both peers are at features version ≥ 2.
+/// A `FileEntry` serializes to roughly 120 B (path-dominated), so 5k entries
+/// lands near 600 KB before compression — an order of magnitude under
+/// `MAX_FRAME_LEN` with room for pathological path lengths.
+pub const LIST_CHUNK_ENTRIES: usize = 5_000;
+
 /// Request to initiate a file transfer session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferRequest {
@@ -638,6 +656,28 @@ pub enum TransferMsg {
     DeltaOp(DeltaOperation),
     /// End of delta operations for a file.
     DeltaEnd,
+
+    // -- Chunked listings (features version >= 2) --
+    //
+    // Appended at the END of the enum on purpose: bincode encodes the variant
+    // index, so adding variants here leaves every existing discriminant intact.
+    // A features-version-1 peer cannot decode these, which is why they are only
+    // sent once the negotiated version is >= 2.
+    /// One batch of a file listing. `last` marks the final batch (an empty
+    /// listing is a single batch with no entries and `last: true`).
+    FileListChunk {
+        entries: Vec<FileEntry>,
+        last: bool,
+    },
+    /// One batch of a transfer plan. `last` marks the final batch. `dry_run` is
+    /// repeated in every batch and is identical across them; the receiver takes
+    /// it from whichever batch it sees.
+    TransferPlanChunk {
+        files_to_send: Vec<FileEntry>,
+        files_to_delete: Vec<String>,
+        dry_run: bool,
+        last: bool,
+    },
 }
 
 /// Metadata for a file/directory entry used in listings and sync comparison.

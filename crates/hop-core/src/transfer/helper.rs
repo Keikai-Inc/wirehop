@@ -60,6 +60,11 @@ pub async fn proxy_via_helper(
     }
     helper_args.push("--chunk-size".to_string());
     helper_args.push(params.max_chunk_size.to_string());
+    // The helper talks to the client directly over its stdio, so it needs the
+    // negotiated features version to pick the listing encoding the client
+    // expects. Defaults to 1 if absent, keeping an older helper binary safe.
+    helper_args.push("--features-version".to_string());
+    helper_args.push(params.features_version.to_string());
 
     // Acquire the helper's I/O. When this worker is unprivileged (privsep), it
     // can't switch users, so the root monitor spawns the helper (`SpawnHelper`)
@@ -389,17 +394,12 @@ pub async fn run_transfer_helper(
             } else {
                 Vec::new()
             };
-            crate::proto::write_message(&mut stdout, &TransferMsg::FileList(dest_entries)).await?;
+            super::write_file_list(&mut stdout, dest_entries, params.chunked_listing()).await?;
             tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
 
             // 2. Read client's transfer plan
-            let plan_msg: TransferMsg = crate::proto::read_message(&mut stdin).await?;
-            let (files_to_send, _files_to_delete, dry_run) = match plan_msg {
-                TransferMsg::TransferPlan { files_to_send, files_to_delete, dry_run } =>
-                    (files_to_send, files_to_delete, dry_run),
-                TransferMsg::Error(e) => bail!("client error: {e}"),
-                other => bail!("expected TransferPlan, got: {other:?}"),
-            };
+            let (files_to_send, _files_to_delete, dry_run) =
+                super::read_transfer_plan(&mut stdin).await?;
 
             if dry_run {
                 crate::proto::write_message(&mut stdout, &TransferMsg::PlanAck { proceed: true }).await?;
@@ -441,12 +441,7 @@ pub async fn run_transfer_helper(
             let delete_extraneous = mode == "sync-send-delete";
 
             // 1. Read client's file list
-            let client_list_msg: TransferMsg = crate::proto::read_message(&mut stdin).await?;
-            let client_entries = match client_list_msg {
-                TransferMsg::FileList(entries) => entries,
-                TransferMsg::Error(e) => bail!("client error: {e}"),
-                other => bail!("expected FileList, got: {other:?}"),
-            };
+            let client_entries = super::read_file_list(&mut stdin).await?;
 
             // 2. Walk source and compute plan. Explicit metadata() so the
             // caller sees the real errno rather than the misleading
@@ -480,11 +475,14 @@ pub async fn run_transfer_helper(
             let plan = super::listing::compute_sync_plan(&source_entries, &client_entries, delete_extraneous);
 
             // 3. Send plan
-            crate::proto::write_message(&mut stdout, &TransferMsg::TransferPlan {
-                files_to_send: plan.files_to_send.clone(),
-                files_to_delete: plan.files_to_delete.clone(),
-                dry_run: false,
-            }).await?;
+            super::write_transfer_plan(
+                &mut stdout,
+                plan.files_to_send.clone(),
+                plan.files_to_delete.clone(),
+                false,
+                params.chunked_listing(),
+            )
+            .await?;
             tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
 
             // 4. Read PlanAck

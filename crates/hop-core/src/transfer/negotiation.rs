@@ -2,7 +2,9 @@
 
 use std::time::Instant;
 
-use crate::proto::{DEFAULT_ZSTD_LEVEL, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
+use crate::proto::{
+    DEFAULT_ZSTD_LEVEL, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, TRANSFER_FEATURES_VERSION,
+};
 
 /// Compression algorithm in use for a session.
 #[derive(Debug, Clone)]
@@ -15,6 +17,9 @@ pub enum Compression {
 pub struct NegotiatedParams {
     pub compression: Option<Compression>,
     pub max_chunk_size: usize,
+    /// `min(ours, peer's)` from the `Capabilities` exchange. Gates listing
+    /// encoding — see [`Self::chunked_listing`].
+    pub features_version: u32,
 }
 
 impl NegotiatedParams {
@@ -23,6 +28,7 @@ impl NegotiatedParams {
         Self {
             compression: None,
             max_chunk_size: MIN_CHUNK_SIZE,
+            features_version: 1,
         }
     }
 
@@ -33,14 +39,17 @@ impl NegotiatedParams {
                 level: DEFAULT_ZSTD_LEVEL,
             }),
             max_chunk_size: MAX_CHUNK_SIZE,
+            features_version: 1,
         }
     }
 
-    /// Build from negotiated message values.
+    /// Build from negotiated message values. `peer_features_version` is the
+    /// value the other side advertised in its `Capabilities`.
     pub fn from_negotiated(
         compression: Option<&str>,
         chunk_size: u32,
         zstd_level: Option<i32>,
+        peer_features_version: u32,
     ) -> Self {
         let comp = match compression {
             Some("zstd") => Some(Compression::Zstd {
@@ -51,7 +60,15 @@ impl NegotiatedParams {
         Self {
             compression: comp,
             max_chunk_size: (chunk_size as usize).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE),
+            features_version: peer_features_version.min(TRANSFER_FEATURES_VERSION),
         }
+    }
+
+    /// Whether listings may be sent as compressed `FileListChunk` /
+    /// `TransferPlanChunk` batches. False against an older peer, which only
+    /// understands a single uncompressed frame.
+    pub fn chunked_listing(&self) -> bool {
+        self.features_version >= 2
     }
 
     pub fn is_compressed(&self) -> bool {
@@ -138,7 +155,7 @@ mod tests {
 
     #[test]
     fn from_negotiated_zstd() {
-        let p = NegotiatedParams::from_negotiated(Some("zstd"), 512 * 1024, Some(5));
+        let p = NegotiatedParams::from_negotiated(Some("zstd"), 512 * 1024, Some(5), 1);
         assert!(p.is_compressed());
         assert_eq!(p.zstd_level(), 5);
         assert_eq!(p.max_chunk_size, 512 * 1024);
@@ -146,26 +163,26 @@ mod tests {
 
     #[test]
     fn from_negotiated_no_compression() {
-        let p = NegotiatedParams::from_negotiated(None, 128 * 1024, None);
+        let p = NegotiatedParams::from_negotiated(None, 128 * 1024, None, 1);
         assert!(!p.is_compressed());
         assert_eq!(p.max_chunk_size, 128 * 1024);
     }
 
     #[test]
     fn from_negotiated_unknown_compression() {
-        let p = NegotiatedParams::from_negotiated(Some("lz4"), 256 * 1024, None);
+        let p = NegotiatedParams::from_negotiated(Some("lz4"), 256 * 1024, None, 1);
         assert!(!p.is_compressed());
     }
 
     #[test]
     fn from_negotiated_chunk_size_clamped_low() {
-        let p = NegotiatedParams::from_negotiated(None, 100, None);
+        let p = NegotiatedParams::from_negotiated(None, 100, None, 1);
         assert_eq!(p.max_chunk_size, MIN_CHUNK_SIZE);
     }
 
     #[test]
     fn from_negotiated_chunk_size_clamped_high() {
-        let p = NegotiatedParams::from_negotiated(None, 10 * 1024 * 1024, None);
+        let p = NegotiatedParams::from_negotiated(None, 10 * 1024 * 1024, None, 1);
         assert_eq!(p.max_chunk_size, MAX_CHUNK_SIZE);
     }
 

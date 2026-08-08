@@ -17,10 +17,154 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::proto::{
     self, FileEntry, TransferDirection, TransferMode, TransferMsg, TransferRequest,
-    MAX_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL,
+    LIST_CHUNK_ENTRIES, MAX_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL, TRANSFER_FEATURES_VERSION,
 };
 use negotiation::NegotiatedParams;
 use progress::{ProgressReporter, SilentProgress, TransferSummary};
+
+// ---------------------------------------------------------------------------
+// Listing wire format
+// ---------------------------------------------------------------------------
+//
+// A listing is the one message whose size scales with the tree, so it is the
+// one that outgrows `MAX_FRAME_LEN` (16 MiB ≈ 140k entries — a Rust repo with
+// its `target/` dir gets there easily). Everything else on the wire is bounded.
+//
+// When both peers are at features version >= 2 the listing goes out as
+// zstd-compressed batches of `LIST_CHUNK_ENTRIES`, which bounds frame size for
+// any tree. Against an older peer it falls back to the original single
+// uncompressed frame, preserving the exact bytes that peer expects.
+//
+// The readers accept BOTH encodings regardless of what was negotiated: being
+// liberal here costs nothing and means a version mismatch degrades to "works"
+// rather than "expected FileList, got FileListChunk".
+
+/// Send a file listing, batching + compressing when `chunked`.
+pub async fn write_file_list(
+    send: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    entries: Vec<FileEntry>,
+    chunked: bool,
+) -> Result<()> {
+    if !chunked {
+        proto::write_message(send, &TransferMsg::FileList(entries)).await?;
+        return Ok(());
+    }
+    // `chunks` yields nothing for an empty slice, so an empty listing still
+    // needs one terminating batch or the reader would block forever.
+    if entries.is_empty() {
+        proto::write_message_compressed(
+            send,
+            &TransferMsg::FileListChunk { entries: Vec::new(), last: true },
+        )
+        .await?;
+        return Ok(());
+    }
+    let total = entries.len();
+    let mut sent = 0usize;
+    for batch in entries.chunks(LIST_CHUNK_ENTRIES) {
+        sent += batch.len();
+        proto::write_message_compressed(
+            send,
+            &TransferMsg::FileListChunk { entries: batch.to_vec(), last: sent == total },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Read a file listing written by [`write_file_list`], in either encoding.
+pub async fn read_file_list(
+    recv: &mut (impl tokio::io::AsyncReadExt + Unpin),
+) -> Result<Vec<FileEntry>> {
+    let mut acc: Vec<FileEntry> = Vec::new();
+    loop {
+        let msg: TransferMsg = proto::read_message(recv).await?;
+        match msg {
+            TransferMsg::FileList(entries) => return Ok(entries),
+            TransferMsg::FileListChunk { entries, last } => {
+                acc.extend(entries);
+                if last {
+                    return Ok(acc);
+                }
+            }
+            TransferMsg::Error(e) => bail!("peer error: {e}"),
+            other => bail!("expected FileList, got: {other:?}"),
+        }
+    }
+}
+
+/// Send a transfer plan, batching + compressing when `chunked`.
+pub async fn write_transfer_plan(
+    send: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    files_to_send: Vec<FileEntry>,
+    files_to_delete: Vec<String>,
+    dry_run: bool,
+    chunked: bool,
+) -> Result<()> {
+    if !chunked {
+        proto::write_message(
+            send,
+            &TransferMsg::TransferPlan { files_to_send, files_to_delete, dry_run },
+        )
+        .await?;
+        return Ok(());
+    }
+    // Both vectors scale with the tree. Batch them independently and let the
+    // deletes ride along with the first batches; `last` is driven by whichever
+    // list still has entries left.
+    let send_batches = files_to_send.len().div_ceil(LIST_CHUNK_ENTRIES).max(1);
+    let del_batches = files_to_delete.len().div_ceil(LIST_CHUNK_ENTRIES).max(1);
+    let total_batches = send_batches.max(del_batches);
+
+    for i in 0..total_batches {
+        let s = i * LIST_CHUNK_ENTRIES;
+        let batch_send: Vec<FileEntry> = files_to_send
+            .get(s..(s + LIST_CHUNK_ENTRIES).min(files_to_send.len()))
+            .unwrap_or(&[])
+            .to_vec();
+        let batch_del: Vec<String> = files_to_delete
+            .get(s..(s + LIST_CHUNK_ENTRIES).min(files_to_delete.len()))
+            .unwrap_or(&[])
+            .to_vec();
+        proto::write_message_compressed(
+            send,
+            &TransferMsg::TransferPlanChunk {
+                files_to_send: batch_send,
+                files_to_delete: batch_del,
+                dry_run,
+                last: i + 1 == total_batches,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Read a transfer plan written by [`write_transfer_plan`], in either encoding.
+/// Returns `(files_to_send, files_to_delete, dry_run)`.
+pub async fn read_transfer_plan(
+    recv: &mut (impl tokio::io::AsyncReadExt + Unpin),
+) -> Result<(Vec<FileEntry>, Vec<String>, bool)> {
+    let mut acc_send: Vec<FileEntry> = Vec::new();
+    let mut acc_del: Vec<String> = Vec::new();
+    loop {
+        let msg: TransferMsg = proto::read_message(recv).await?;
+        match msg {
+            TransferMsg::TransferPlan { files_to_send, files_to_delete, dry_run } => {
+                return Ok((files_to_send, files_to_delete, dry_run));
+            }
+            TransferMsg::TransferPlanChunk { files_to_send, files_to_delete, dry_run, last } => {
+                acc_send.extend(files_to_send);
+                acc_del.extend(files_to_delete);
+                if last {
+                    return Ok((acc_send, acc_del, dry_run));
+                }
+            }
+            TransferMsg::Error(e) => bail!("peer error: {e}"),
+            other => bail!("expected TransferPlan, got: {other:?}"),
+        }
+    }
+}
 
 /// Parsed path specification: local path or remote `host:path`.
 #[derive(Debug, Clone)]
@@ -317,19 +461,10 @@ async fn host_sync_receive(
     } else {
         Vec::new()
     };
-    proto::write_message(send, &TransferMsg::FileList(dest_entries)).await?;
+    write_file_list(send, dest_entries, params.chunked_listing()).await?;
 
     // 2. Client computes the plan and sends TransferPlan
-    let plan_msg: TransferMsg = proto::read_message(recv).await?;
-    let (files_to_send, files_to_delete, dry_run) = match plan_msg {
-        TransferMsg::TransferPlan {
-            files_to_send,
-            files_to_delete,
-            dry_run,
-        } => (files_to_send, files_to_delete, dry_run),
-        TransferMsg::Error(e) => bail!("client error: {e}"),
-        other => bail!("expected TransferPlan, got: {other:?}"),
-    };
+    let (files_to_send, files_to_delete, dry_run) = read_transfer_plan(recv).await?;
 
     if dry_run {
         // Dry run — nothing to transfer
@@ -391,15 +526,11 @@ async fn host_sync_send(
 ) -> Result<()> {
     // 1. Read the client's local file list
     tracing::debug!("host_sync_send: waiting for FileList from client...");
-    let client_list_msg: TransferMsg = proto::read_message(recv).await?;
-    let client_entries = match client_list_msg {
-        TransferMsg::FileList(entries) => {
-            tracing::debug!("host_sync_send: got FileList with {} entries", entries.len());
-            entries
-        }
-        TransferMsg::Error(e) => bail!("client error: {e}"),
-        other => bail!("expected FileList, got: {other:?}"),
-    };
+    let client_entries = read_file_list(recv).await?;
+    tracing::debug!(
+        "host_sync_send: got FileList with {} entries",
+        client_entries.len()
+    );
 
     // 2. Walk our source and compute the plan
     let (source_entries, base_dir) = if source.is_dir() {
@@ -435,13 +566,12 @@ async fn host_sync_send(
         listing::compute_sync_plan(&source_entries, &client_entries, request.delete_extraneous);
 
     // 3. Send the plan
-    proto::write_message(
+    write_transfer_plan(
         send,
-        &TransferMsg::TransferPlan {
-            files_to_send: plan.files_to_send.clone(),
-            files_to_delete: plan.files_to_delete.clone(),
-            dry_run: request.dry_run,
-        },
+        plan.files_to_send.clone(),
+        plan.files_to_delete.clone(),
+        request.dry_run,
+        params.chunked_listing(),
     )
     .await?;
 
@@ -672,14 +802,10 @@ pub async fn client_push_sync_negotiate(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
     request: &TransferRequest,
+    chunked: bool,
 ) -> Result<PushSyncNegotiation> {
     // 1. Read the host's destination file listing
-    let remote_list_msg: TransferMsg = proto::read_message(recv).await?;
-    let remote_entries = match remote_list_msg {
-        TransferMsg::FileList(entries) => entries,
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => bail!("expected FileList from host, got: {other:?}"),
-    };
+    let remote_entries = read_file_list(recv).await?;
 
     // 2. Walk local directory and compute plan
     let local_entries = listing::walk_directory(local_dir)?;
@@ -687,13 +813,12 @@ pub async fn client_push_sync_negotiate(
         listing::compute_sync_plan(&local_entries, &remote_entries, request.delete_extraneous);
 
     // 3. Send plan
-    proto::write_message(
+    write_transfer_plan(
         send,
-        &TransferMsg::TransferPlan {
-            files_to_send: plan.files_to_send.clone(),
-            files_to_delete: plan.files_to_delete.clone(),
-            dry_run: request.dry_run,
-        },
+        plan.files_to_send.clone(),
+        plan.files_to_delete.clone(),
+        request.dry_run,
+        chunked,
     )
     .await?;
 
@@ -797,7 +922,8 @@ pub async fn client_push_sync(
     progress: &dyn ProgressReporter,
     params: &NegotiatedParams,
 ) -> Result<TransferSummary> {
-    let negotiation = client_push_sync_negotiate(send, recv, local_dir, request).await?;
+    let negotiation =
+        client_push_sync_negotiate(send, recv, local_dir, request, params.chunked_listing()).await?;
     client_push_sync_transfer(send, recv, local_dir, request, negotiation, progress, params).await
 }
 
@@ -816,6 +942,7 @@ pub async fn client_pull_sync_negotiate(
     send: &mut (impl tokio::io::AsyncWrite + Unpin),
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     local_dir: &Path,
+    chunked: bool,
 ) -> Result<SyncPlanResult> {
     // 1. Walk local directory and send listing to host
     let local_entries = if local_dir.is_dir() {
@@ -824,32 +951,22 @@ pub async fn client_pull_sync_negotiate(
         Vec::new()
     };
     tracing::debug!("sync: sending FileList ({} entries)", local_entries.len());
-    proto::write_message(send, &TransferMsg::FileList(local_entries)).await?;
+    write_file_list(send, local_entries, chunked).await?;
 
     // 2. Read the host's TransferPlan
     tracing::debug!("sync: waiting for TransferPlan from host...");
-    let plan_msg: TransferMsg = proto::read_message(recv).await?;
-    match plan_msg {
-        TransferMsg::TransferPlan {
-            files_to_send,
-            files_to_delete,
-            dry_run,
-        } => {
-            tracing::debug!(
-                "sync: got TransferPlan: {} to send, {} to delete, dry_run={}",
-                files_to_send.len(),
-                files_to_delete.len(),
-                dry_run
-            );
-            Ok(SyncPlanResult {
-                files_to_send,
-                files_to_delete,
-                dry_run,
-            })
-        }
-        TransferMsg::Error(e) => bail!("host error: {e}"),
-        other => bail!("expected TransferPlan from host, got: {other:?}"),
-    }
+    let (files_to_send, files_to_delete, dry_run) = read_transfer_plan(recv).await?;
+    tracing::debug!(
+        "sync: got TransferPlan: {} to send, {} to delete, dry_run={}",
+        files_to_send.len(),
+        files_to_delete.len(),
+        dry_run
+    );
+    Ok(SyncPlanResult {
+        files_to_send,
+        files_to_delete,
+        dry_run,
+    })
 }
 
 /// Client-side sync-pull phase 2: transfer files according to the plan.
@@ -963,14 +1080,14 @@ async fn negotiate_host(
         &TransferMsg::Capabilities {
             compression: vec!["zstd".to_string()],
             max_chunk_size: MAX_CHUNK_SIZE as u32,
-            features_version: 1,
+            features_version: TRANSFER_FEATURES_VERSION,
         },
     )
     .await?;
 
     // Read client capabilities
     let client_caps: TransferMsg = proto::read_message(recv).await?;
-    let (_client_compression, client_max_chunk, _client_version) = match client_caps {
+    let (_client_compression, client_max_chunk, client_version) = match client_caps {
         TransferMsg::Capabilities {
             compression,
             max_chunk_size,
@@ -998,6 +1115,7 @@ async fn negotiate_host(
         use_compression.as_deref(),
         chunk_size,
         zstd_level,
+        client_version,
     ))
 }
 
@@ -1008,7 +1126,7 @@ pub async fn negotiate_client(
 ) -> Result<NegotiatedParams> {
     // Read host capabilities
     let host_caps: TransferMsg = proto::read_message(recv).await?;
-    let (_host_compression, _host_max_chunk, _host_version) = match host_caps {
+    let (_host_compression, _host_max_chunk, host_version) = match host_caps {
         TransferMsg::Capabilities {
             compression,
             max_chunk_size,
@@ -1023,7 +1141,7 @@ pub async fn negotiate_client(
         &TransferMsg::Capabilities {
             compression: vec!["zstd".to_string()],
             max_chunk_size: MAX_CHUNK_SIZE as u32,
-            features_version: 1,
+            features_version: TRANSFER_FEATURES_VERSION,
         },
     )
     .await?;
@@ -1039,6 +1157,7 @@ pub async fn negotiate_client(
             compression.as_deref(),
             chunk_size,
             zstd_level,
+            host_version,
         )),
         other => bail!("expected Negotiated from host, got: {other:?}"),
     }
@@ -1116,6 +1235,251 @@ fn home_dir_for_user(username: &str) -> Result<PathBuf> {
 #[cfg(not(unix))]
 fn home_dir_for_user(_username: &str) -> Result<PathBuf> {
     dirs_home()
+}
+
+#[cfg(test)]
+mod listing_wire_tests {
+    use super::*;
+
+    fn entry(path: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size: 1234,
+            mtime: 99,
+            mode: 0o644,
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            content_hash: None,
+        }
+    }
+
+    fn entries(n: usize) -> Vec<FileEntry> {
+        // Deep, highly-repetitive paths — the shape that made a real listing
+        // 16.8 MB (a Rust `target/` tree).
+        (0..n)
+            .map(|i| entry(&format!("target/debug/build/some-crate-abcdef0123456789/out/file{i}.rs")))
+            .collect()
+    }
+
+    async fn roundtrip(list: Vec<FileEntry>, chunked: bool) -> Vec<FileEntry> {
+        let mut buf: Vec<u8> = Vec::new();
+        write_file_list(&mut buf, list, chunked).await.unwrap();
+        read_file_list(&mut buf.as_slice()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_list_roundtrips_single_frame() {
+        let out = roundtrip(entries(10), false).await;
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[9].path, entries(10)[9].path);
+    }
+
+    #[tokio::test]
+    async fn file_list_roundtrips_chunked() {
+        let out = roundtrip(entries(10), true).await;
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[9].path, entries(10)[9].path);
+    }
+
+    #[tokio::test]
+    async fn empty_list_terminates_in_both_encodings() {
+        // An empty listing must still produce exactly one terminating message,
+        // or the reader blocks forever waiting for `last`.
+        assert!(roundtrip(Vec::new(), true).await.is_empty());
+        assert!(roundtrip(Vec::new(), false).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_multiple_of_chunk_size_sets_last() {
+        // Boundary: len % LIST_CHUNK_ENTRIES == 0 must still mark a final batch.
+        let out = roundtrip(entries(LIST_CHUNK_ENTRIES * 2), true).await;
+        assert_eq!(out.len(), LIST_CHUNK_ENTRIES * 2);
+    }
+
+    #[tokio::test]
+    async fn chunked_list_preserves_order_across_batches() {
+        let src = entries(LIST_CHUNK_ENTRIES + 7);
+        let out = roundtrip(src.clone(), true).await;
+        assert_eq!(out.len(), src.len());
+        for (a, b) in src.iter().zip(out.iter()) {
+            assert_eq!(a.path, b.path);
+        }
+    }
+
+    /// The regression this work exists for: a listing that overflows
+    /// MAX_FRAME_LEN (16 MiB) as one frame must succeed when chunked.
+    #[tokio::test]
+    async fn oversized_listing_fails_unchunked_but_succeeds_chunked() {
+        let big = entries(250_000);
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_file_list(&mut buf, big.clone(), false).await.unwrap();
+        // Assert the fixture really is over the cap, so this test can't quietly
+        // stop testing anything if FileEntry's encoding gets smaller.
+        assert!(
+            buf.len() > 16 * 1024 * 1024,
+            "fixture must exceed MAX_FRAME_LEN to be meaningful, got {} bytes",
+            buf.len()
+        );
+
+        // The write succeeds; the READER enforces the cap — which is exactly why
+        // the sending side only ever saw "Broken pipe".
+        match read_file_list(&mut buf.as_slice()).await {
+            // Don't unwrap_err(): Debug-printing 250k entries floods the output.
+            Ok(v) => panic!("expected frame-too-large, but read {} entries", v.len()),
+            Err(e) => assert!(
+                format!("{e:#}").contains("frame too large"),
+                "expected frame-too-large, got: {e:#}"
+            ),
+        }
+
+        let out = roundtrip(big.clone(), true).await;
+        assert_eq!(out.len(), big.len());
+    }
+
+    #[tokio::test]
+    async fn transfer_plan_roundtrips_both_encodings() {
+        let send = entries(LIST_CHUNK_ENTRIES + 3);
+        let del: Vec<String> = (0..10).map(|i| format!("stale/{i}.txt")).collect();
+
+        for chunked in [false, true] {
+            let mut buf: Vec<u8> = Vec::new();
+            write_transfer_plan(&mut buf, send.clone(), del.clone(), true, chunked)
+                .await
+                .unwrap();
+            let (got_send, got_del, dry) = read_transfer_plan(&mut buf.as_slice()).await.unwrap();
+            assert_eq!(got_send.len(), send.len(), "chunked={chunked}");
+            assert_eq!(got_del, del, "chunked={chunked}");
+            assert!(dry, "dry_run must survive, chunked={chunked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_plan_handles_lopsided_lists() {
+        // deletes far outnumber sends: batching is driven by whichever list is
+        // longer, and neither may be truncated.
+        let send = entries(2);
+        let del: Vec<String> = (0..LIST_CHUNK_ENTRIES * 2 + 5)
+            .map(|i| format!("gone/{i}"))
+            .collect();
+        let mut buf: Vec<u8> = Vec::new();
+        write_transfer_plan(&mut buf, send.clone(), del.clone(), false, true)
+            .await
+            .unwrap();
+        let (got_send, got_del, _) = read_transfer_plan(&mut buf.as_slice()).await.unwrap();
+        assert_eq!(got_send.len(), send.len());
+        assert_eq!(got_del.len(), del.len());
+    }
+
+    #[tokio::test]
+    async fn reader_surfaces_peer_error() {
+        let mut buf: Vec<u8> = Vec::new();
+        proto::write_message(&mut buf, &TransferMsg::Error("boom".into()))
+            .await
+            .unwrap();
+        let err = read_file_list(&mut buf.as_slice()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn negotiation_gates_chunking_on_older_peer() {
+        // Peer at features version 1 → single-frame encoding.
+        let old = negotiation::NegotiatedParams::from_negotiated(Some("zstd"), 65536, Some(3), 1);
+        assert!(!old.chunked_listing());
+        // Peer at our version → chunked.
+        let new = negotiation::NegotiatedParams::from_negotiated(
+            Some("zstd"),
+            65536,
+            Some(3),
+            TRANSFER_FEATURES_VERSION,
+        );
+        assert!(new.chunked_listing());
+        // A peer claiming a FUTURE version must clamp to what we implement.
+        let future =
+            negotiation::NegotiatedParams::from_negotiated(Some("zstd"), 65536, Some(3), 99);
+        assert_eq!(future.features_version, TRANSFER_FEATURES_VERSION);
+    }
+
+    /// Drive the REAL `negotiate_client` against a peer advertising
+    /// `peer_version`, and report whether it decides to chunk. e2e can't cover
+    /// this: it runs both ends on the same binary, so the older-peer fallback
+    /// would never be exercised.
+    async fn negotiated_against_peer(peer_version: u32) -> NegotiatedParams {
+        let mut host_side: Vec<u8> = Vec::new();
+        proto::write_message(
+            &mut host_side,
+            &TransferMsg::Capabilities {
+                compression: vec!["zstd".to_string()],
+                max_chunk_size: MAX_CHUNK_SIZE as u32,
+                features_version: peer_version,
+            },
+        )
+        .await
+        .unwrap();
+        proto::write_message(
+            &mut host_side,
+            &TransferMsg::Negotiated {
+                compression: Some("zstd".to_string()),
+                chunk_size: MAX_CHUNK_SIZE as u32,
+                zstd_level: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        negotiate_client(&mut sink, &mut host_side.as_slice())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn negotiate_client_falls_back_against_v1_host() {
+        let p = negotiated_against_peer(1).await;
+        assert!(
+            !p.chunked_listing(),
+            "must not send FileListChunk to a host that cannot decode it"
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_client_enables_chunking_against_current_host() {
+        let p = negotiated_against_peer(TRANSFER_FEATURES_VERSION).await;
+        assert!(p.chunked_listing());
+    }
+
+    /// A listing written for a v1 peer must be byte-identical to what the old
+    /// code produced — a single uncompressed `FileList` frame — or upgrading one
+    /// end silently breaks the other.
+    #[tokio::test]
+    async fn v1_encoding_is_unchanged_on_the_wire() {
+        let list = entries(50);
+        let mut new_writer: Vec<u8> = Vec::new();
+        write_file_list(&mut new_writer, list.clone(), false).await.unwrap();
+
+        let mut legacy: Vec<u8> = Vec::new();
+        proto::write_message(&mut legacy, &TransferMsg::FileList(list)).await.unwrap();
+
+        assert_eq!(new_writer, legacy, "v1 framing must not drift");
+    }
+
+    /// Compression must actually pay off on listing data, otherwise chunking is
+    /// carrying the whole fix alone.
+    #[tokio::test]
+    async fn chunked_listing_is_substantially_smaller_on_the_wire() {
+        let list = entries(20_000);
+        let mut plain: Vec<u8> = Vec::new();
+        write_file_list(&mut plain, list.clone(), false).await.unwrap();
+        let mut packed: Vec<u8> = Vec::new();
+        write_file_list(&mut packed, list, true).await.unwrap();
+        assert!(
+            packed.len() * 5 < plain.len(),
+            "expected >5x shrink, got {} -> {}",
+            plain.len(),
+            packed.len()
+        );
+    }
 }
 
 #[cfg(test)]

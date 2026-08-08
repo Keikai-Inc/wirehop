@@ -368,8 +368,9 @@ async fn main() -> Result<()> {
         Command::PrivsepProbe { .. } | Command::PrivsepProbeChild { .. } => {
             anyhow::bail!("privsep probe is unix-only")
         }
-        Command::TransferHelper { mode, dest, compression, chunk_size } => {
-            cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size).await
+        Command::TransferHelper { mode, dest, compression, chunk_size, features_version } => {
+            cmd_transfer_helper(&mode, &dest, compression.as_deref(), chunk_size, features_version)
+                .await
         }
         Command::External(args) => {
             // Check for remote subcommand: hop <host> secrets/cap/kv/cron ...
@@ -2317,7 +2318,13 @@ fn cmd_sandbox_shell(policy_json: &str, shell_args: &[String]) -> Result<()> {
 ///
 /// Runs as the target user (spawned by the daemon with uid/gid set).
 /// Reads TransferMsg from stdin, writes files, sends acks to stdout.
-async fn cmd_transfer_helper(mode: &str, dest: &str, compression: Option<&str>, chunk_size: usize) -> Result<()> {
+async fn cmd_transfer_helper(
+    mode: &str,
+    dest: &str,
+    compression: Option<&str>,
+    chunk_size: usize,
+    features_version: u32,
+) -> Result<()> {
     use hop_core::transfer::negotiation::{Compression, NegotiatedParams};
 
     let params = NegotiatedParams {
@@ -2329,6 +2336,7 @@ async fn cmd_transfer_helper(mode: &str, dest: &str, compression: Option<&str>, 
             }
         }),
         max_chunk_size: chunk_size,
+        features_version,
     };
 
     let dest_path = std::path::Path::new(dest);
@@ -3464,8 +3472,14 @@ async fn cmd_sync(
         );
 
         // Phase 1: negotiate (get plan + local/remote entries for itemize)
-        let negotiation =
-            transfer::client_push_sync_negotiate(&mut send, &mut recv, &local_dir, &request).await?;
+        let negotiation = transfer::client_push_sync_negotiate(
+            &mut send,
+            &mut recv,
+            &local_dir,
+            &request,
+            params.chunked_listing(),
+        )
+        .await?;
 
         // Check if nothing to do
         if negotiation.plan.files_to_send.is_empty()
@@ -3582,8 +3596,13 @@ async fn cmd_sync(
         let params = transfer::negotiate_client(&mut send, &mut recv).await?;
 
         // Phase 1: plan exchange (before progress UI so no "0/0 files" flash)
-        let plan =
-            transfer::client_pull_sync_negotiate(&mut send, &mut recv, &effective_dir).await?;
+        let plan = transfer::client_pull_sync_negotiate(
+            &mut send,
+            &mut recv,
+            &effective_dir,
+            params.chunked_listing(),
+        )
+        .await?;
 
         if plan.files_to_send.is_empty() && plan.files_to_delete.is_empty() && !plan.dry_run {
             // Nothing to transfer — still need to complete the protocol:
