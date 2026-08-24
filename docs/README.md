@@ -29,6 +29,7 @@ separate files have been consolidated here.
 | [architecture.md](technical/architecture.md) | Crate layout, module map, dependency flow, and the wire protocol (ALPN V1/V2/V3, message types, admin protocol) |
 | [warren-internals.md](technical/warren-internals.md) | The warren's full internal design: iroh endpoint/relay/netmon networking + VPN data plane, orchestratorless iroh-docs state (the 13 design decisions), per-member write-isolated self-docs (C1), install/invite capability tiers, and the Cedar-based ACL (with a Tailscale comparison) |
 | [security.md](technical/security.md) | Security internals: Ed25519/Argon2/ChaCha20 crypto, the sandbox (validator/broker, Seatbelt, Landlock), privilege separation (monitor/worker), and the standing source-level security audit with remediation status |
+| [cron-security.md](technical/cron-security.md) | Cron scheduler trust model and hardening roadmap: what the JS runtime can/can't reach, known gaps, priority order |
 | [datastore.md](technical/datastore.md) | redb tables, IPC protocol, DsRequest/DsResponse, retention |
 | [transfer.md](technical/transfer.md) | Delta algorithm, negotiation, privilege-separated helper |
 | [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |

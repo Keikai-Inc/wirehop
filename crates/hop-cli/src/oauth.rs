@@ -54,7 +54,12 @@ static GMAIL: OAuthProvider = OAuthProvider {
     name: "gmail",
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
     token_url: "https://oauth2.googleapis.com/token",
-    // hop's registered Desktop app OAuth client (hop-keik-ai project)
+    // hop's registered Desktop-app OAuth client (hop-keik-ai project).
+    // INTENTIONALLY EMBEDDED — not a leak. Installed-app client secrets are
+    // not confidential per Google's docs; PKCE is the protection, and the
+    // pair ships in every release binary regardless. See SECURITY.md
+    // ("Known, intentional non-vulnerabilities") before reporting. Override:
+    // HOP_GOOGLE_CLIENT_ID / HOP_GOOGLE_CLIENT_SECRET.
     client_id: "REDACTED.apps.googleusercontent.com",
     client_secret: "REDACTED",
     scopes: &[
