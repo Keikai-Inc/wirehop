@@ -2874,7 +2874,7 @@ fn get_proc_uid(pid: i32) -> Option<u32> {
 #[cfg(target_os = "macos")]
 fn resolve_username(uid: u32) -> Option<String> {
     Some(
-        users::get_user_by_uid(uid)
+        uzers::get_user_by_uid(uid)
             .map(|u| u.name().to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{uid}"))
     )

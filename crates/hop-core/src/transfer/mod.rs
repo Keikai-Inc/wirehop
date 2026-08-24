@@ -1226,8 +1226,8 @@ fn dirs_home() -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn home_dir_for_user(username: &str) -> Result<PathBuf> {
-    use users::os::unix::UserExt;
-    let user = users::get_user_by_name(username)
+    use uzers::os::unix::UserExt;
+    let user = uzers::get_user_by_name(username)
         .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
     Ok(user.home_dir().to_path_buf())
 }

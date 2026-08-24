@@ -126,7 +126,7 @@ fn resolve_real_binary(command: &str) -> Option<PathBuf> {
 /// Change ownership of a path to the given username (best-effort, requires root).
 #[cfg(unix)]
 fn chown_to_user(path: &Path, username: &str) {
-    let Some(user) = users::get_user_by_name(username) else { return };
+    let Some(user) = uzers::get_user_by_name(username) else { return };
     let _ = nix::unistd::chown(
         path,
         Some(nix::unistd::Uid::from_raw(user.uid())),

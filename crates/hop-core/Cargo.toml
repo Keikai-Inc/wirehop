@@ -34,7 +34,7 @@ anyhow.workspace = true
 tracing.workspace = true
 libc = { workspace = true }
 nix = { workspace = true }
-users = { workspace = true }
+uzers = { workspace = true }
 hostname = { workspace = true }
 filetime = { workspace = true }
 zstd = { workspace = true }

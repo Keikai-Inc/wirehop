@@ -1,0 +1,23 @@
+# cargo-audit configuration. Every ignore carries a justification; adding an
+# entry requires one. Run: cargo audit  (config auto-loaded from audit.toml)
+#
+# Reviewed 2026-08-24. Direct/updatable advisories were FIXED instead of
+# ignored (quinn-proto 0.11.17, rustls-webpki 0.103.15, h2 0.4.19,
+# crossbeam-epoch 0.9.20, lru 0.16.4; `users` replaced with maintained
+# `uzers`). What remains is transitively pinned:
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.x — pinned by iroh 0.97's hickory-resolver (DNS
+    # discovery). Fix requires iroh bumping to 0.26; raised upstream with n0.
+    # Surface: hop resolves discovery/relay names, not arbitrary
+    # attacker-supplied zones; DNSSEC validation (the NSEC3 loop path) is not
+    # enabled in iroh's resolver usage.
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0118",
+    # quick-xml — two pinned parents, neither parses attacker-controlled XML:
+    # plist 1.x (reads LOCAL macOS system plists) and inferno (the
+    # `hop debug cpu-profile` flamegraph dev tool parsing its own output).
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+]

@@ -539,7 +539,7 @@ pub async fn run_transfer_helper(
 /// Look up uid and gid for a username.
 #[cfg(unix)]
 pub fn lookup_uid_gid(username: &str) -> Result<(u32, u32)> {
-    let user = users::get_user_by_name(username)
+    let user = uzers::get_user_by_name(username)
         .ok_or_else(|| anyhow::anyhow!("user not found: {username}"))?;
     Ok((user.uid(), user.primary_group_id()))
 }

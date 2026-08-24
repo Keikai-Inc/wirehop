@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 #[cfg(unix)]
-use users::os::unix::UserExt;
+use uzers::os::unix::UserExt;
 
 /// Returns `true` if the current process is running as root (euid == 0).
 pub fn is_running_as_root() -> bool {
@@ -11,13 +11,13 @@ pub fn is_running_as_root() -> bool {
 
 /// Returns the username of the current (real) user, or `None` on failure.
 pub fn current_username() -> Option<String> {
-    users::get_current_username()
+    uzers::get_current_username()
         .map(|name| name.to_string_lossy().to_string())
 }
 
 /// Returns `true` if `username` exists on the system.
 pub fn user_exists(username: &str) -> bool {
-    users::get_user_by_name(username).is_some()
+    uzers::get_user_by_name(username).is_some()
 }
 
 /// Returns the login shell for `username` from the passwd database.
@@ -26,7 +26,7 @@ pub fn user_exists(username: &str) -> bool {
 pub fn user_login_shell(username: &str) -> String {
     let fallback = || std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
 
-    users::get_user_by_name(username)
+    uzers::get_user_by_name(username)
         .and_then(|u| {
             let shell = u.shell().to_string_lossy().to_string();
             if shell.is_empty() { None } else { Some(shell) }
