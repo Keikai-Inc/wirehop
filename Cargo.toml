@@ -5,7 +5,8 @@ resolver = "2"
 [workspace.package]
 version = "0.9.31"
 edition = "2024"
-license = "LicenseRef-Proprietary"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Keikai-Inc/wirehop"
 
 [workspace.dependencies]
 # Internal

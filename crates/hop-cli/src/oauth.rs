@@ -98,6 +98,27 @@ pub fn oauth_provider(name: &str) -> Option<&'static OAuthProvider> {
     }
 }
 
+/// The Google OAuth client pair, with env override.
+///
+/// The embedded defaults are hop's registered **Desktop-app** client. Google
+/// explicitly does not treat installed-app client secrets as confidential
+/// (PKCE + the loopback redirect are the actual protection), and this pair
+/// ships inside every release binary regardless — embedding it in source is
+/// the standard OSS pattern (rclone, gcloud). `HOP_GOOGLE_CLIENT_ID` /
+/// `HOP_GOOGLE_CLIENT_SECRET` let self-hosters bring their own client (and
+/// escape shared-client quota if this one is ever throttled).
+fn google_client(provider: &OAuthProvider) -> (String, String) {
+    let id = std::env::var("HOP_GOOGLE_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| provider.client_id.to_string());
+    let secret = std::env::var("HOP_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| provider.client_secret.to_string());
+    (id, secret)
+}
+
 pub fn api_key_provider(name: &str) -> Option<&'static ApiKeyProvider> {
     match name {
         "anthropic" => Some(&ANTHROPIC),
@@ -110,6 +131,7 @@ pub fn api_key_provider(name: &str) -> Option<&'static ApiKeyProvider> {
 /// Run the full OAuth 2.0 + PKCE flow for a provider.
 /// Returns a list of (secret_name, secret_value) pairs to store.
 pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>> {
+    let (client_id, client_secret) = google_client(provider);
     // 1. Generate PKCE verifier + challenge
     let (verifier, challenge) = generate_pkce();
 
@@ -129,7 +151,7 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
         provider.auth_url,
-        url_encode(provider.client_id),
+        url_encode(&client_id),
         url_encode(&redirect_uri),
         url_encode(&scopes),
         url_encode(&state),
@@ -154,8 +176,8 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
     let token_response = exchange_code(
         provider.token_url,
         &code,
-        provider.client_id,
-        provider.client_secret,
+        &client_id,
+        &client_secret,
         &redirect_uri,
         &verifier,
     )?;
@@ -169,8 +191,8 @@ pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>>
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .ok_or_else(|| anyhow::anyhow!("Token response missing field: {field}"))?,
-            SecretSource::ClientId => provider.client_id.to_string(),
-            SecretSource::ClientSecret => provider.client_secret.to_string(),
+            SecretSource::ClientId => client_id.clone(),
+            SecretSource::ClientSecret => client_secret.clone(),
             SecretSource::Fixed(val) => val.to_string(),
         };
         secrets.push((secret_name.to_string(), value));
