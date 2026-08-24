@@ -646,21 +646,60 @@ async fn poll_user_action(
     action
 }
 
-/// Classify a single stdin chunk during the reconnect dialog. A lone byte with
-/// no paste buffered yet is a deliberate keypress (`q`/Ctrl+C → Quit, CR/LF →
-/// RetryNow, neither is buffered); anything else is appended to `pending_input`
-/// for replay. Shared by the countdown poll and the connect-phase select so
-/// keys behave identically whether the dialog is waiting or actively dialing.
+/// Classify a single stdin chunk during the reconnect dialog. A lone byte is a
+/// deliberate keypress (`q`/Ctrl+C → Quit, CR/LF → RetryNow) unless we're
+/// inside a bracketed paste; anything else is appended to `pending_input` for
+/// replay. Shared by the countdown poll and the connect-phase select so keys
+/// behave identically whether the dialog is waiting or actively dialing.
+///
+/// HISTORY — the "Enter/q do nothing" bug: this used to gate control keys on
+/// `pending_input.is_empty()`, so the FIRST stray keypress (everyone mashes
+/// keys at a frozen terminal — arrows, space, anything) poisoned the buffer
+/// and permanently disabled q/Enter for the rest of the reconnect episode.
+/// `pending` only drains on a successful reconnect, which is why keys
+/// mysteriously "came back" for a moment after each brief success in a flap
+/// storm. The correct discriminator for "was this typed or pasted?" is
+/// bracketed-paste state, not buffer emptiness: real pastes arrive wrapped in
+/// ESC[200~ … ESC[201~ (the session enables bracketed paste), and a LONE byte
+/// outside those markers is always a human keypress no matter what junk was
+/// typed earlier.
 fn classify_chunk(data: &[u8], pending_input: &mut Vec<u8>) -> PollAction {
-    if data.len() == 1 && pending_input.is_empty() {
-        match data[0] {
-            b'q' | 0x03 => return PollAction::Quit,
-            0x0d | 0x0a => return PollAction::RetryNow,
-            _ => {}
+    if data.len() == 1 {
+        let b = data[0];
+        // Ctrl+C always quits — a lone 0x03 chunk is a real keypress even if
+        // a paste is mid-flight (pastes deliver in large chunks), and a user
+        // hammering Ctrl+C during a stuck paste wants OUT.
+        if b == 0x03 {
+            return PollAction::Quit;
+        }
+        if !inside_bracketed_paste(pending_input) {
+            match b {
+                b'q' => return PollAction::Quit,
+                0x0d | 0x0a => return PollAction::RetryNow,
+                _ => {}
+            }
         }
     }
     pending_input.extend_from_slice(data);
     PollAction::None
+}
+
+/// True if `pending` ends inside an unterminated bracketed paste — i.e. the
+/// last ESC[200~ (paste start) has no matching ESC[201~ (paste end) after it.
+fn inside_bracketed_paste(pending: &[u8]) -> bool {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+    let find_last = |needle: &[u8]| -> Option<usize> {
+        if pending.len() < needle.len() {
+            return None;
+        }
+        (0..=pending.len() - needle.len()).rev().find(|&i| &pending[i..i + needle.len()] == needle)
+    };
+    match (find_last(OPEN), find_last(CLOSE)) {
+        (Some(o), Some(c)) => o > c,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 /// Send WindowSize + SetEnv setup messages to the host.
@@ -789,5 +828,60 @@ mod tests {
 
         assert_eq!(action, PollAction::RetryNow);
         assert!(pending.is_empty());
+    }
+
+    /// THE regression test for the "Enter/q do nothing 99% of the time" bug:
+    /// after any stray keypress lands in pending (everyone mashes keys at a
+    /// frozen terminal), control keys must STILL work. The old
+    /// `pending_input.is_empty()` gate made the first stray byte permanently
+    /// disable q/Enter for the whole reconnect episode.
+    #[test]
+    fn enter_and_q_work_after_stray_keypresses() {
+        let mut pending = Vec::new();
+        // Mash: arrow key (3-byte escape), a letter, a space.
+        assert_eq!(classify_chunk(b"\x1b[A", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b"x", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b" ", &mut pending), PollAction::None);
+        assert!(!pending.is_empty());
+        // Enter must still retry, q must still quit.
+        assert_eq!(classify_chunk(b"\r", &mut pending), PollAction::RetryNow);
+        assert_eq!(classify_chunk(b"q", &mut pending), PollAction::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_always_quits_even_inside_paste() {
+        let mut pending = Vec::new();
+        assert_eq!(classify_chunk(b"\x1b[200~", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b"pasted text", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b"\x03", &mut pending), PollAction::Quit);
+    }
+
+    #[test]
+    fn pasted_q_and_newlines_do_not_trigger_controls() {
+        let mut pending = Vec::new();
+        assert_eq!(classify_chunk(b"\x1b[200~", &mut pending), PollAction::None);
+        // Inside the paste: lone q / CR chunks are CONTENT, not commands.
+        assert_eq!(classify_chunk(b"q", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b"\r", &mut pending), PollAction::None);
+        assert_eq!(classify_chunk(b"\x1b[201~", &mut pending), PollAction::None);
+        // Paste closed: controls live again.
+        assert_eq!(classify_chunk(b"q", &mut pending), PollAction::Quit);
+    }
+
+    #[test]
+    fn multibyte_chunks_are_never_controls() {
+        let mut pending = Vec::new();
+        // Coalesced typing ("xq") buffers rather than quitting.
+        assert_eq!(classify_chunk(b"xq", &mut pending), PollAction::None);
+        assert_eq!(pending, b"xq");
+    }
+
+    #[test]
+    fn bracketed_paste_state_tracking() {
+        assert!(!inside_bracketed_paste(b""));
+        assert!(!inside_bracketed_paste(b"hello"));
+        assert!(inside_bracketed_paste(b"\x1b[200~partial"));
+        assert!(!inside_bracketed_paste(b"\x1b[200~done\x1b[201~"));
+        assert!(inside_bracketed_paste(b"\x1b[200~a\x1b[201~b\x1b[200~again"));
     }
 }
