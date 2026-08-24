@@ -197,16 +197,16 @@ impl ExtensionDispatcher {
         peer: PeerContext,
         ext_id: String,
         payload: Vec<u8>,
-    ) -> Result<StreamHandle, PeerResponse> {
+    ) -> Result<StreamHandle, Box<PeerResponse>> {
         if let Err(e) = self.registry.ensure_connected(&ext_id).await {
-            return Err(PeerResponse::Error(format!(
+            return Err(Box::new(PeerResponse::Error(format!(
                 "extension {ext_id} unavailable: {e:#}"
-            )));
+            ))));
         }
         if let Err(e) = self.ensure_demux(&ext_id).await {
-            return Err(PeerResponse::Error(format!(
+            return Err(Box::new(PeerResponse::Error(format!(
                 "starting demux for {ext_id}: {e:#}"
-            )));
+            ))));
         }
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +233,7 @@ impl ExtensionDispatcher {
         if let Err(e) = self.registry.send_to(&ext_id, msg).await {
             let mut pending = self.pending_stream_open.lock().await;
             pending.remove(&request_id);
-            return Err(PeerResponse::Error(format!("send to {ext_id}: {e:#}")));
+            return Err(Box::new(PeerResponse::Error(format!("send to {ext_id}: {e:#}"))));
         }
 
         // Wait for the demux to deliver the assigned stream_id.
@@ -242,9 +242,9 @@ impl ExtensionDispatcher {
                 stream_id,
                 frames: frame_rx,
             }),
-            Err(_) => Err(PeerResponse::Error(format!(
+            Err(_) => Err(Box::new(PeerResponse::Error(format!(
                 "extension {ext_id} disconnected before opening stream {request_id}"
-            ))),
+            )))),
         }
     }
 

@@ -62,11 +62,11 @@ fn csum_fold(mut sum: u32) -> u16 {
 
 /// Accumulate `data` into a running 32-bit checksum sum (pre-fold).
 fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum = sum.wrapping_add(u16::from_be_bytes([c[0], c[1]]) as u32);
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes(*c) as u32);
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum = sum.wrapping_add((*last as u32) << 8);
     }
     sum

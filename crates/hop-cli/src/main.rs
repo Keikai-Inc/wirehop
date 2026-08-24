@@ -1,4 +1,5 @@
 mod agent;
+mod agent_out;
 mod audit;
 mod cli;
 mod cpuprofile;
@@ -56,7 +57,21 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    // Route every top-level error through one exit point so `--json` can emit a
+    // structured envelope instead of anyhow's prose. Handlers that call
+    // `std::process::exit` directly (exec exit-code passthrough, session close)
+    // bypass this on purpose.
+    match real_main().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            agent_out::emit_error(&e);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn real_main() -> Result<()> {
     // Heap profiler: held for the whole process; on a clean exit (SIGTERM, which
     // the daemon handles by returning) its Drop writes dhat-heap.json.
     #[cfg(feature = "dhat-heap")]
@@ -79,6 +94,7 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    agent_out::set_json_mode(cli.json);
 
     // Initialize tracing — respect RUST_LOG if set, otherwise use verbosity flag.
     // Uses a reload layer so the host daemon can toggle debug logging at runtime via SIGUSR1.
@@ -289,7 +305,7 @@ async fn main() -> Result<()> {
             };
             hop_mcp::run_stdio_server_with_datastore(&config_dir, datastore).await
         }
-        Command::Audit { since, category, actor, limit, json } => {
+        Command::Audit { since, category, actor, limit } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             audit::run(
                 &config_dir,
@@ -297,7 +313,7 @@ async fn main() -> Result<()> {
                 category.as_deref(),
                 actor.as_deref(),
                 limit,
-                json,
+                agent_out::json_mode(),
             )
         }
         Command::Id => {
@@ -305,11 +321,14 @@ async fn main() -> Result<()> {
             // it owns the `_hop` identity, so no root needed); fall back to reading
             // identity.json directly when no daemon is up (a client-only machine).
             let config_dir = config::ensure_host_config_dir(cli.config.as_deref())?;
-            if let Some(node_id) = id_via_daemon(&config_dir)? {
-                println!("{node_id}");
+            let node_id = match id_via_daemon(&config_dir)? {
+                Some(id) => id,
+                None => config::load_or_generate_identity(&config_dir)?.public().to_string(),
+            };
+            if agent_out::json_mode() {
+                agent_out::emit(&serde_json::json!({ "node_id": node_id }));
             } else {
-                let secret_key = config::load_or_generate_identity(&config_dir)?;
-                println!("{}", secret_key.public());
+                println!("{node_id}");
             }
             Ok(())
         }
@@ -338,9 +357,9 @@ async fn main() -> Result<()> {
                 memprofile::run(act, &config_dir)
             }
             DebugAction::CpuProfile { secs, pid, out } => cpuprofile::run(secs, pid, out),
-            DebugAction::NetStats { watch, interval, json } => {
+            DebugAction::NetStats { watch, interval } => {
                 let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-                netstats::run(&config_dir, watch, interval, json)
+                netstats::run(&config_dir, watch, interval, agent_out::json_mode())
             }
         },
         Command::SandboxShell { policy, shell_args } => {
@@ -1911,7 +1930,7 @@ async fn dispatch_session(
                     Err(err_resp) => {
                         proto::write_message(
                             &mut send,
-                            &proto::HostMessage::PeerResponse(err_resp),
+                            &proto::HostMessage::PeerResponse(*err_resp),
                         )
                         .await?;
                     }
@@ -2060,6 +2079,25 @@ fn parse_invite_tier(s: Option<&str>) -> Result<Option<hop_core::invite::InviteT
 }
 
 /// One-line description of what redeeming a tier does, for the `hop invite` output.
+/// `--json`: emit one structured line for a finished transfer and return true
+/// (the caller skips the human-readable summary).
+fn emit_transfer_summary_json(summary: &hop_core::transfer::progress::TransferSummary) -> bool {
+    if !agent_out::json_mode() {
+        return false;
+    }
+    agent_out::emit(&serde_json::json!({
+        "files_transferred": summary.files_transferred,
+        "files_skipped": summary.files_skipped,
+        "files_deleted": summary.files_deleted,
+        "dirs_created": summary.dirs_created,
+        "bytes_transferred": summary.bytes_transferred,
+        "bytes_saved": summary.bytes_saved,
+        "elapsed_ms": summary.elapsed.as_millis() as u64,
+        "errors": summary.errors,
+    }));
+    true
+}
+
 fn tier_summary(t: hop_core::invite::InviteTier) -> &'static str {
     use hop_core::invite::InviteTier;
     match t {
@@ -2148,6 +2186,20 @@ fn cmd_invite(config_dir: &std::path::Path, mut params: hop_core::invite::Invite
     let max_uses = params.max_uses;
     let expiry = params.expiry;
     let sandbox = &params.sandbox;
+
+    // Agent mode: the token as a field, not prose to scrape.
+    if agent_out::json_mode() {
+        agent_out::emit(&serde_json::json!({
+            "token": token,
+            "connect_command": format!("hop connect {token}"),
+            "tier": tier.map(|t| t.as_str()),
+            "expires_in_secs": expiry.unwrap_or(15 * 60),
+            "max_uses": max_uses.unwrap_or(1),
+            "read_only": sandbox.read_only,
+            "no_network": sandbox.no_network,
+        }));
+        return Ok(());
+    }
 
     if let Some(t) = tier {
         println!("Tier: {} — {}", t.as_str(), tier_summary(t));
@@ -3324,7 +3376,9 @@ async fn cmd_cp(
             transfer::client_push_copy(&mut send, &mut recv, &local_paths, &source_contents_only, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        eprintln!("{summary}");
+        if !emit_transfer_summary_json(&summary) {
+            eprintln!("{summary}");
+        }
     } else {
         // Pull: remote source -> local dest
         if source_specs.len() != 1 {
@@ -3382,7 +3436,9 @@ async fn cmd_cp(
             transfer::client_pull_copy(&mut send, &mut recv, &effective_dest, &state, &params).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        eprintln!("{summary}");
+        if !emit_transfer_summary_json(&summary) {
+            eprintln!("{summary}");
+        }
     }
 
     Ok(())
@@ -3548,9 +3604,11 @@ async fn cmd_sync(
         ).await?;
         state.mark_finished();
         let _ = render_handle.await;
-        eprintln!("{}", summary.format_rsync());
-        if stats {
-            eprintln!("\n{}", summary.format_stats());
+        if !emit_transfer_summary_json(&summary) {
+            eprintln!("{}", summary.format_rsync());
+            if stats {
+                eprintln!("\n{}", summary.format_stats());
+            }
         }
     } else {
         // Pull sync: remote -> local
@@ -3688,9 +3746,11 @@ async fn cmd_sync(
             .await?;
             state.mark_finished();
             let _ = render_handle.await;
-            eprintln!("{}", summary.format_rsync());
-            if stats {
-                eprintln!("\n{}", summary.format_stats());
+            if !emit_transfer_summary_json(&summary) {
+                eprintln!("{}", summary.format_rsync());
+                if stats {
+                    eprintln!("\n{}", summary.format_stats());
+                }
             }
         }
     }
@@ -4081,6 +4141,17 @@ async fn cmd_fleet(
             // (warren-members.json) from the host config dir. Every node has the
             // same view — no orchestrator.
             let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+            if agent_out::json_mode() {
+                let age = (snap.updated_at > 0)
+                    .then(|| unix_now_secs().saturating_sub(snap.updated_at));
+                agent_out::emit(&serde_json::json!({
+                    "namespace": snap.namespace,
+                    "members": snap.members.len(),
+                    "roles": snap.roles.len(),
+                    "snapshot_age_secs": age,
+                }));
+                return Ok(());
+            }
             match &snap.namespace {
                 Some(ns) => {
                     println!("warren namespace  {ns}");
@@ -4146,6 +4217,49 @@ async fn cmd_fleet(
                 None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
             };
             let now = unix_now_secs();
+
+            // Agent mode: the same member+known-host view, structured.
+            if agent_out::json_mode() {
+                let hosts = KnownHostsStore::load(user_config_dir)?;
+                let members: Vec<serde_json::Value> = snap
+                    .members
+                    .iter()
+                    .filter(|m| group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true))
+                    .map(|m| {
+                        seen.insert(m.node_id.clone());
+                        let is_self = self_id.as_deref() == Some(m.node_id.as_str());
+                        serde_json::json!({
+                            "node_id": m.node_id,
+                            "name": m.name,
+                            "role": m.role,
+                            "online": is_self || m.is_online(now, window),
+                            "vip": m.vip,
+                            "tags": m.tags,
+                            "this_node": is_self,
+                        })
+                    })
+                    .collect();
+                let known_hosts: Vec<serde_json::Value> = hosts
+                    .hosts
+                    .iter()
+                    .filter(|h| !seen.contains(&h.node_id))
+                    .filter(|h| group.as_ref().map(|g| h.groups.contains(g)).unwrap_or(true))
+                    .map(|h| {
+                        serde_json::json!({
+                            "node_id": h.node_id,
+                            "name": h.name,
+                            "groups": h.groups,
+                        })
+                    })
+                    .collect();
+                agent_out::emit(&serde_json::json!({
+                    "namespace": snap.namespace,
+                    "members": members,
+                    "known_hosts": known_hosts,
+                }));
+                return Ok(());
+            }
+
             if let Some(ns) = &snap.namespace {
                 println!("warren {} — {} member(s)", &ns[..8.min(ns.len())], snap.members.len());
             }
@@ -4270,8 +4384,9 @@ async fn cmd_fleet(
             Ok(())
         }
         FleetAction::Grep {
-            selector, pattern, source, since, limit, concurrency, json, include_offline, stale_after,
+            selector, pattern, source, since, limit, concurrency, include_offline, stale_after,
         } => {
+            let json = agent_out::json_mode();
             let window = match stale_after.as_deref() {
                 Some(d) => parse_duration_ms(d)? / 1000,
                 None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
@@ -4295,8 +4410,9 @@ async fn cmd_fleet(
             cmd_fleet_prune(host_config_dir, &older_than, dry_run, yes).await
         }
         FleetAction::Search {
-            selector, pattern, source, since, limit, json, include_offline, stale_after,
+            selector, pattern, source, since, limit, include_offline, stale_after,
         } => {
+            let json = agent_out::json_mode();
             let window = match stale_after.as_deref() {
                 Some(d) => parse_duration_ms(d)? / 1000,
                 None => hop_core::fleet::DEFAULT_LIVENESS_WINDOW_SECS,
@@ -4843,7 +4959,24 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
     match action {
         CronAction::List => {
             let jobs = ds.cron_list()?;
-            if jobs.is_empty() {
+            if agent_out::json_mode() {
+                let out: Vec<serde_json::Value> = jobs
+                    .iter()
+                    .map(|j| {
+                        serde_json::json!({
+                            "id": j.id,
+                            "name": j.name,
+                            "enabled": j.enabled,
+                            "schedule": j.schedule,
+                            "targets": j.targets,
+                            "tags": j.tags,
+                            "last_run": j.last_run,
+                            "next_run": j.next_run,
+                        })
+                    })
+                    .collect();
+                agent_out::emit(&serde_json::json!({ "jobs": out }));
+            } else if jobs.is_empty() {
                 println!("No cron jobs.");
             } else {
                 for j in &jobs {
@@ -6657,6 +6790,15 @@ async fn cmd_warren(
                 .map(|c| c.vpn_enabled)
                 .unwrap_or(true);
 
+            if agent_out::json_mode() {
+                agent_out::emit(&serde_json::json!({
+                    "namespace": ns.as_ref().map(|n| n.to_string()),
+                    "pending_join": ns.is_none() && has_join,
+                    "vpn_enabled": vpn_enabled,
+                }));
+                return Ok(());
+            }
+
             match &ns {
                 Some(n) => println!("warren namespace  {n}"),
                 None if has_join => println!("warren namespace  (pending — joins on next host start)"),
@@ -6812,6 +6954,38 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
 
     match action {
         None => {
+            if agent_out::json_mode() {
+                let peer_rows: Vec<serde_json::Value> = peers
+                    .peers
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "node_id": p.node_id,
+                            "name": p.name,
+                            "role": match p.role { PeerRole::Creator => "creator", PeerRole::Peer => "peer" },
+                            "username": p.username,
+                            "authorized_at": p.authorized_at,
+                            "last_seen": p.last_seen,
+                        })
+                    })
+                    .collect();
+                let host_rows: Vec<serde_json::Value> = hosts
+                    .hosts
+                    .iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "node_id": h.node_id,
+                            "name": h.name,
+                            "added_at": h.added_at,
+                        })
+                    })
+                    .collect();
+                agent_out::emit(&serde_json::json!({
+                    "authorized_peers": peer_rows,
+                    "known_hosts": host_rows,
+                }));
+                return Ok(());
+            }
             if !peers.peers.is_empty() {
                 println!("Authorized peers:");
                 for peer in &peers.peers {

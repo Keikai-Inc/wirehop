@@ -240,7 +240,7 @@ pub fn resolve_target(
             .transpose()
             .ok()
             .flatten();
-        println!("Resolved '{}' -> {}...", target, host_id.fmt_short());
+        crate::agent_out::banner(&format!("Resolved '{}' -> {}...", target, host_id.fmt_short()));
         return Ok(ConnectPlan { host_id, relay_url, auth: AuthStep::None });
     }
 
@@ -261,7 +261,7 @@ pub fn resolve_target(
             .map(String::from)
             .or(token.host_name)
             .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
-        println!("Connecting to host {}...", host_id.fmt_short());
+        crate::agent_out::banner(&format!("Connecting to host {}...", host_id.fmt_short()));
         return Ok(ConnectPlan {
             host_id,
             relay_url,
@@ -280,7 +280,7 @@ pub fn resolve_target(
         .parse()
         .context("Unknown host alias, invalid invite token, or invalid NodeId")?;
     let relay_url: Option<iroh::RelayUrl> = hop_core::net::HOP_RELAY_URL.parse().ok();
-    println!("Connecting to {}...", host_id.fmt_short());
+    crate::agent_out::banner(&format!("Connecting to {}...", host_id.fmt_short()));
     Ok(ConnectPlan { host_id, relay_url, auth: AuthStep::None })
 }
 

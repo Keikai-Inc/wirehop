@@ -1,7 +1,7 @@
 # CLI Reference
 
 ```
-hop [--config <PATH>] [-v...] <command>
+hop [--config <PATH>] [-v...] [--json] <command>
 hop --version
 ```
 
@@ -9,7 +9,62 @@ hop --version
 |---|---|
 | `--config <PATH>` | Override config directory |
 | `-v`, `--verbose` | Increase log verbosity (repeat for more) |
+| `--json` | Machine-readable output (see below). Also enabled by `HOP_JSON=1` |
 | `-V`, `--version` | Print the hop version and exit |
+
+## Machine-readable output (`--json`)
+
+`--json` (or `HOP_JSON=1`) switches supporting commands to emit exactly one
+JSON document on **stdout**. Progress/diagnostics stay on stderr. Commands
+with structured output:
+
+| Command | JSON shape |
+|---|---|
+| `hop id` | `{"node_id"}` |
+| `hop invite` | `{"token","connect_command","tier","expires_in_secs","max_uses","read_only","no_network"}` |
+| `hop peers` | `{"authorized_peers":[{node_id,name,role,username,authorized_at,last_seen}],"known_hosts":[...]}` |
+| `hop warren status` | `{"namespace","pending_join","vpn_enabled"}` |
+| `hop fleet status` | `{"namespace","members","roles","snapshot_age_secs"}` |
+| `hop fleet list` | `{"namespace","members":[{node_id,name,role,online,vip,tags,this_node}],"known_hosts":[...]}` |
+| `hop cron list` | `{"jobs":[{id,name,enabled,schedule,targets,tags,last_run,next_run}]}` |
+| `hop cp` / `hop sync` | `{"files_transferred","files_skipped","files_deleted","dirs_created","bytes_transferred","bytes_saved","elapsed_ms","errors"}` |
+| `hop audit` | one JSON object per line (OTel-aligned export schema) |
+| `hop fleet grep` / `hop fleet search` | one aggregated JSON object |
+| `hop debug net-stats` | raw counters snapshot |
+
+`hop exec` intentionally has no JSON wrapper: it streams the remote command's
+stdout/stderr verbatim and **exits with the remote command's exit code** —
+already machine-consumable.
+
+### Structured errors
+
+With `--json`, a failed command prints one error envelope on **stderr** and
+exits non-zero:
+
+```json
+{"error":{"code":"host_unreachable","message":"Connection timed out after 30s...",
+          "chain":["...","..."],"retryable":true,"hint":"host may be offline..."}}
+```
+
+| `code` | Meaning | `retryable` |
+|---|---|---|
+| `host_unreachable` | dial timed out / host offline / relay unreachable | yes |
+| `connection_lost` | established connection dropped mid-operation | yes |
+| `auth_rejected` | peer refused authorization | no |
+| `unknown_target` | not a NodeId, invite token, or known host alias | no |
+| `frame_too_large` | one side predates chunked listings (upgrade both ends) | no |
+| `permission_denied` | local or remote filesystem permission | no |
+| `not_found` | file or resource missing | no |
+| `error` | unclassified — read `message`/`chain` | no |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Any hop error (see the JSON envelope for the class) |
+| `2` | CLI usage error (bad flags/arguments) |
+| `N` | `hop exec` / interactive sessions: the remote command's own exit code, passed through |
 
 ---
 

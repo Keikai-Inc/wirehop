@@ -482,6 +482,40 @@ test_sync_push() {
     assert_contains "$output" "sync-a-updated"
 }
 
+test_json_output() {
+    # --json id: exactly one JSON object on stdout with a 64-hex node_id
+    local out
+    out=$(hop --config "$CONFIG_DIR" --json id 2>/dev/null)
+    echo "$out" | jq -e '.node_id | test("^[0-9a-f]{64}$")' >/dev/null \
+        || { echo "id --json bad: $out"; return 1; }
+
+    # HOP_JSON=1 env form is equivalent
+    out=$(HOP_JSON=1 hop --config "$CONFIG_DIR" id 2>/dev/null)
+    echo "$out" | jq -e '.node_id' >/dev/null \
+        || { echo "HOP_JSON=1 id bad: $out"; return 1; }
+
+    # peers: structured arrays present
+    out=$(hop --config "$CONFIG_DIR" --json peers 2>/dev/null)
+    echo "$out" | jq -e 'has("authorized_peers") and has("known_hosts")' >/dev/null \
+        || { echo "peers --json bad: $out"; return 1; }
+
+    # sync: stdout is ONE parseable summary object (banners/progress on stderr)
+    rm -rf /tmp/e2e-jsondir
+    mkdir -p /tmp/e2e-jsondir
+    echo "json-test" > /tmp/e2e-jsondir/x.txt
+    hop --config "$CONFIG_DIR" exec host-a -- rm -rf /tmp/e2e-jsondest 2>&1 || true
+    out=$(hop --config "$CONFIG_DIR" --json sync /tmp/e2e-jsondir/ host-a:/tmp/e2e-jsondest 2>/dev/null)
+    echo "$out" | jq -e '.files_transferred >= 1' >/dev/null \
+        || { echo "sync --json bad: $out"; return 1; }
+
+    # errors: bogus target -> structured envelope on stderr, non-zero exit
+    local errout
+    errout=$(hop --config "$CONFIG_DIR" --json exec not-a-real-host -- true 2>&1 >/dev/null) && \
+        { echo "expected failure for bogus target"; return 1; }
+    echo "$errout" | jq -e '.error.code == "unknown_target" and (.error.retryable == false)' >/dev/null \
+        || { echo "error envelope bad: $errout"; return 1; }
+}
+
 test_sync_pull() {
     # Sync pull: pull the files that sync_push placed on host-a back to local
     rm -rf /tmp/e2e-syncpull

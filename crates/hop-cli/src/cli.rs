@@ -16,6 +16,11 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Emit machine-readable JSON (for agents/scripts). Errors become a
+    /// structured envelope on stderr. Also enabled by HOP_JSON=1.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -316,9 +321,6 @@ pub enum Command {
         /// Maximum rows (most recent first). Default: 100.
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        /// Emit one JSON object per line (the OTel-aligned export schema).
-        #[arg(long)]
-        json: bool,
     },
 
     /// Print this node's identity (NodeId)
@@ -510,9 +512,6 @@ pub enum DebugAction {
         /// Seconds between refreshes in --watch mode (default: 2)
         #[arg(long, default_value = "2")]
         interval: u64,
-        /// Emit the raw snapshot as JSON instead of the formatted report
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -917,9 +916,6 @@ pub enum FleetAction {
         /// Max nodes queried concurrently.
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
-        /// Emit one aggregated JSON object instead of a table.
-        #[arg(long)]
-        json: bool,
         /// Also search members that look offline (stale `last_seen`). By default
         /// the fan-out skips them — they'd just time out.
         #[arg(long)]
@@ -962,10 +958,6 @@ pub enum FleetAction {
         /// Max matching lines per node.
         #[arg(long, default_value_t = 2000)]
         limit: usize,
-        /// Emit aggregated JSON instead of the interactive/table view (forces
-        /// one-shot; this is what agents/MCP use).
-        #[arg(long)]
-        json: bool,
         /// Also search members that look offline (stale last_seen).
         #[arg(long)]
         include_offline: bool,

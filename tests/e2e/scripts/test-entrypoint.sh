@@ -153,6 +153,7 @@ echo ""
 echo "--- Sync ---"
 run_test test_sync_push
 run_test test_sync_pull
+run_test test_json_output
 
 # ── JS Bindings (hop.exec / hop.fleet) ──
 echo ""

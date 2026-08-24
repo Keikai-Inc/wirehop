@@ -1379,7 +1379,7 @@ fn claude_resolve_binary(username: Option<&str>) -> Result<std::path::PathBuf> {
         .output();
 
     match install_result {
-        Ok(out) if dest.exists() => Ok(dest),
+        Ok(_out) if dest.exists() => Ok(dest),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("claude download failed: {stderr}")
