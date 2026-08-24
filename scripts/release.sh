@@ -356,11 +356,23 @@ for f in hop-*; do
 done
 cd "${PROJECT_ROOT}"
 
-# --- Sign artifacts (optional, security-audit H9) ----------------------------
-# If HOP_SIGNING_KEY (path to an RSA private PEM, see scripts/gen-signing-key.sh)
-# is set, produce a detached `openssl dgst -sha256` signature next to each
-# binary. install.sh verifies these against the public key embedded in it.
-# Unset → unsigned release (current behaviour); install.sh then checksum-only.
+# --- Sign artifacts (security-audit H9) --------------------------------------
+# Produce a detached `openssl dgst -sha256` signature next to each binary;
+# install.sh verifies these against the public key embedded in it.
+#
+# FAIL-CLOSED: once install.sh carries an embedded pubkey, install.sh REQUIRES
+# signatures — an unsigned release would break every install. So: default the
+# key from ~/.hop-signing, and hard-abort if the pubkey is embedded but no
+# private key is available.
+if [[ -z "${HOP_SIGNING_KEY:-}" && -f "${HOME}/.hop-signing/hop-release-private.pem" ]]; then
+  HOP_SIGNING_KEY="${HOME}/.hop-signing/hop-release-private.pem"
+fi
+if grep -q -- "-----BEGIN PUBLIC KEY-----" "${PROJECT_ROOT}/install.sh" \
+   && [[ -z "${HOP_SIGNING_KEY:-}" ]]; then
+  echo "Error: install.sh embeds a release pubkey, so releases MUST be signed." >&2
+  echo "       Set HOP_SIGNING_KEY or restore ~/.hop-signing/hop-release-private.pem" >&2
+  exit 1
+fi
 if [[ -n "${HOP_SIGNING_KEY:-}" ]]; then
   if [[ ! -f "${HOP_SIGNING_KEY}" ]]; then
     echo "Error: HOP_SIGNING_KEY=${HOP_SIGNING_KEY} not found" >&2

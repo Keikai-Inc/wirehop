@@ -29,9 +29,17 @@ BASE_URL="${HOP_CDN_URL:-https://hop.keikai.ai}"
 # below, and sign releases with HOP_SIGNING_KEY set. `openssl dgst -sha256
 # -verify` works on both OpenSSL and the LibreSSL shipped on macOS. Override for
 # testing with HOP_PUBKEY env.
-HOP_PUBKEY="${HOP_PUBKEY:-}"
-# -----BEGIN HOP_PUBKEY----- (paste -----BEGIN PUBLIC KEY----- … here)
-# -----END HOP_PUBKEY-----
+HOP_PUBKEY="${HOP_PUBKEY:------BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAs9+lmh3eyG/Bv6Iy7+EF
+RdKWcfFdrKfA0+On3glG80dOGTO50EXTLqi0+UrkgONc4GT5yN4+4pbG9LDTbYjL
+HW36fZMnA3nJE/kyBjikQmVAvNU4KdPM1GkyrTxHUrhcIAJYB69+2Y7AVLCAdfZg
+uhyM6eOFRwRA0XoO6hLtB4swyOSMAxUq0zHkUTlyuVROT1pS52oWIQ08Bh8lWV2U
+45L1rfCbUAxjlCdSxKeNiHq0xVC31aVDCcGB+fXV2m5zNUqndc64I+l7LNcTzCC8
+GGB1pQbht++j1HiBq95yjHFqXp2W9j5Dvrza1INc6NW3sCisSW1d0PM1dCQhqdlE
+2EKMaRcawiilxdfTE715PM7PW0eJyhVALGyas9cwMW3EN0N9RSJpwc5hW4nBt7ZV
+w33mZDDoGxM5HikxI1Foej5XbeGmxfh2MKk49g3r4ZvwgMJCCAzesiVQZYASt7JA
+G3Xt288I/yoPd4JA+cg+TDFUP1/EO4YtO90yrViFO/QJAgMBAAE=
+-----END PUBLIC KEY-----}"
 
 # --- Colour helpers (disabled when piped) ------------------------------------
 
