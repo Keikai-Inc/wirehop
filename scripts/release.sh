@@ -487,6 +487,41 @@ echo "==> Pushing to origin (with tags)"
 git -C "${PROJECT_ROOT}" push
 git -C "${PROJECT_ROOT}" push --tags
 
+# --- Public GitHub release ---------------------------------------------------
+# Mirror the artifacts onto the public repo's Releases page. The CDN stays the
+# canonical install path (install.sh points there); this makes the release
+# visible/downloadable to anyone browsing GitHub, which is where an
+# open-source project's users actually look.
+#
+# Set HOP_PUBLIC_REPO=owner/name to enable; unset → skipped. Non-fatal: a
+# GitHub hiccup must not fail a release whose artifacts are already live on
+# the CDN. Requires `gh auth login`.
+PUBLIC_REPO="${HOP_PUBLIC_REPO:-Keikai-Inc/wirehop}"
+if [[ -n "${PUBLIC_REPO}" ]] && command -v gh &>/dev/null; then
+  echo "==> Publishing GitHub release to ${PUBLIC_REPO}"
+  if gh release view "v${VERSION}" --repo "${PUBLIC_REPO}" &>/dev/null; then
+    echo "    Release v${VERSION} already exists — uploading assets (clobber)"
+    gh release upload "v${VERSION}" "${DIST_DIR}"/hop-* --repo "${PUBLIC_REPO}" --clobber \
+      || echo "    WARNING: asset upload failed (CDN artifacts are unaffected)"
+  else
+    gh release create "v${VERSION}" "${DIST_DIR}"/hop-* \
+      --repo "${PUBLIC_REPO}" \
+      --title "WireHop v${VERSION}" \
+      --notes "WireHop v${VERSION} — single binary \`hop\`.
+
+Install (verifies SHA-256 **and** an RSA signature against the key embedded in \`install.sh\`):
+
+\`\`\`bash
+curl -fsSL https://hop.keikai.ai/install.sh | bash
+\`\`\`
+
+Attached: per-arch binaries for macOS/Linux (x86_64, arm64, armv7) with \`.sha256\` and \`.sig\` sidecars, plus macOS \`.pkg\` installers." \
+      || echo "    WARNING: GitHub release creation failed (CDN artifacts are unaffected)"
+  fi
+else
+  echo "==> GitHub release skipped (HOP_PUBLIC_REPO unset or gh not installed)"
+fi
+
 # --- CloudFront invalidation ------------------------------------------------
 
 echo "==> Invalidating CloudFront cache"

@@ -2,10 +2,11 @@
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately to **security@wirehop.org**.
-Do not open public issues for security reports. We aim to acknowledge within
-72 hours. Coordinated disclosure is appreciated; we will credit reporters in
-release notes unless you prefer otherwise.
+Please report suspected vulnerabilities through GitHub's **private
+vulnerability reporting** on this repository (Security → Report a
+vulnerability). Do not open public issues for security reports. We aim to
+acknowledge within 72 hours. Coordinated disclosure is appreciated; we will
+credit reporters in release notes unless you prefer otherwise.
 
 WireHop does not currently operate a paid bug-bounty program.
 
