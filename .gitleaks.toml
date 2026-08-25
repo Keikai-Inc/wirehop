@@ -20,5 +20,9 @@ description = "Reviewed, intentional exceptions"
 regexes = [
   # Synthetic fixture exercising the `claude setup-token` output parser in
   # crates/hop-cli/src/oauth.rs. Not a live credential.
-  "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AAAA",
+  #
+  # Deliberately a PREFIX, not the whole token: writing the full value here
+  # would put a credential-shaped string in this file, which our own export
+  # gate correctly rejects (it caught exactly that).
+  "sk-ant-oat01-AbCdEf",
 ]

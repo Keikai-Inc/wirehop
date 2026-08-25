@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn obfuscation_round_trips() {
         // Mirror what build.rs does, then decode with the shipping path.
-        let sample = "123456789012-abcdefgh.apps.googleusercontent.com";
+        let sample = "111122223333-abcdefgh.apps.googleusercontent.com";
         let encoded: Vec<u8> = sample
             .as_bytes()
             .iter()
