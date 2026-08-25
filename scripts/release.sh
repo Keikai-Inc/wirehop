@@ -416,6 +416,16 @@ fi
 # build-pkg.sh wipes its staging dir on each call, so build + upload each one in
 # the same iteration before the next build clobbers it.
 for pkgarch in arm64 x86_64; do
+  # Apple signing/notarization is env-gated in build-pkg.sh and inherited from
+  # this environment. Warn loudly when absent: a .pkg downloaded via a browser
+  # is Gatekeeper-blocked unless signed AND notarized. (curl|bash installs are
+  # unaffected — curl sets no quarantine attribute.) Not a hard failure: the
+  # keychain is only reachable from a local/VNC session, so unattended runs
+  # legitimately produce unsigned .pkgs.
+  if [[ -z "${HOP_INSTALLER_ID:-}" || -z "${HOP_NOTARY_PROFILE:-}" ]]; then
+    echo "    WARNING: HOP_INSTALLER_ID/HOP_NOTARY_PROFILE unset — .pkg will be UNSIGNED"
+    echo "             (browser-downloaded installers will hit Gatekeeper)"
+  fi
   echo "==> Building macOS .pkg (${pkgarch})"
   "${PROJECT_ROOT}/pkg/build-pkg.sh" --arch "${pkgarch}" --binary-dir "${DIST_DIR}"
   PKG_SRC="${PROJECT_ROOT}/target/pkg-staging/output/hop-${VERSION}-${pkgarch}.pkg"

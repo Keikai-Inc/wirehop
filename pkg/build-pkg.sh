@@ -126,6 +126,28 @@ esac
 
 echo "Binary size: $(du -h "$BINARY" | cut -f1)"
 
+# --- Apple code signing (opt-in) --------------------------------------------
+# Gatekeeper blocks a browser-downloaded .pkg from an unidentified developer,
+# and Sequoia removed the easy right-click bypass — so a public .pkg must be
+# signed AND notarized. All three steps are env-gated so an unsigned local
+# build still works exactly as before:
+#
+#   HOP_CODESIGN_ID   "Developer ID Application: … (TEAMID)"  — signs the binary
+#   HOP_INSTALLER_ID  "Developer ID Installer: … (TEAMID)"    — signs the .pkg
+#   HOP_NOTARY_PROFILE  notarytool keychain profile name      — notarize+staple
+#
+# NOTE: keychain unlocks are per-security-session on macOS, so these must run
+# from a session that can see the login keychain (a local/VNC terminal), not a
+# detached SSH/tool context. --options runtime (hardened runtime) is safe here:
+# the JS runtime interprets, it does not JIT, so no extra entitlement is needed.
+if [[ -n "${HOP_CODESIGN_ID:-}" ]]; then
+    echo "Signing binary with: ${HOP_CODESIGN_ID}"
+    codesign --force --sign "${HOP_CODESIGN_ID}" --options runtime --timestamp "$BINARY"
+    codesign --verify --strict --verbose=1 "$BINARY" || { echo "Error: codesign verify failed"; exit 1; }
+else
+    echo "HOP_CODESIGN_ID unset — binary NOT signed (Gatekeeper will block a downloaded .pkg)"
+fi
+
 # Assemble payload
 cp "$BINARY" "$PAYLOAD/usr/local/bin/hop"
 cp "$SCRIPT_DIR/com.hop.daemon.plist" "$PAYLOAD/Library/LaunchDaemons/com.hop.daemon.plist"
@@ -180,11 +202,51 @@ pkgbuild \
 
 # Build product archive (the final .pkg)
 echo "Building product archive..."
-productbuild \
-    --distribution "$STAGING/distribution.xml" \
-    --resources "$RESOURCES" \
-    --package-path "$STAGING" \
-    "$OUTPUT/hop-${VERSION}${PKG_SUFFIX}.pkg"
+FINAL_PKG="$OUTPUT/hop-${VERSION}${PKG_SUFFIX}.pkg"
+if [[ -n "${HOP_INSTALLER_ID:-}" ]]; then
+    # productbuild --sign produces the signed archive directly (no separate
+    # productsign pass, which would require an unsigned intermediate).
+    echo "Signing installer with: ${HOP_INSTALLER_ID}"
+    productbuild \
+        --distribution "$STAGING/distribution.xml" \
+        --resources "$RESOURCES" \
+        --package-path "$STAGING" \
+        --sign "${HOP_INSTALLER_ID}" \
+        --timestamp \
+        "$FINAL_PKG"
+    pkgutil --check-signature "$FINAL_PKG" >/dev/null \
+        || { echo "Error: .pkg signature check failed"; exit 1; }
+else
+    echo "HOP_INSTALLER_ID unset — .pkg NOT signed"
+    productbuild \
+        --distribution "$STAGING/distribution.xml" \
+        --resources "$RESOURCES" \
+        --package-path "$STAGING" \
+        "$FINAL_PKG"
+fi
+
+# --- Notarize + staple (opt-in) ---------------------------------------------
+# Without stapling, Gatekeeper must reach Apple online to validate; a stapled
+# ticket makes the .pkg work offline and on first launch. Requires the .pkg to
+# be signed with a Developer ID Installer cert (Apple rejects unsigned
+# submissions), so this only runs when both are configured.
+if [[ -n "${HOP_NOTARY_PROFILE:-}" && -n "${HOP_INSTALLER_ID:-}" ]]; then
+    echo "Notarizing (this waits on Apple; typically 1-5 min)..."
+    if xcrun notarytool submit "$FINAL_PKG" \
+            --keychain-profile "${HOP_NOTARY_PROFILE}" --wait --timeout 30m; then
+        xcrun stapler staple "$FINAL_PKG" \
+            || { echo "Error: stapling failed"; exit 1; }
+        xcrun stapler validate "$FINAL_PKG" \
+            || { echo "Error: staple validation failed"; exit 1; }
+        echo "Notarized + stapled."
+    else
+        echo "Error: notarization FAILED — inspect with:"
+        echo "  xcrun notarytool log <submission-id> --keychain-profile ${HOP_NOTARY_PROFILE}"
+        exit 1
+    fi
+elif [[ -n "${HOP_NOTARY_PROFILE:-}" ]]; then
+    echo "HOP_NOTARY_PROFILE set but HOP_INSTALLER_ID unset — skipping notarization (Apple rejects unsigned submissions)"
+fi
 
 # Clean up intermediate files
 rm -f "$STAGING/hop-component.pkg"
