@@ -116,6 +116,7 @@ if pid == 0:
     os.environ["TERM"] = "xterm-256color"
     os.execvp("hop", ["hop", "--config", "/cfg", node_id])
 log = open("/cfg/session.log", "a", buffering=1)
+raw = open("/cfg/session.raw", "ab", buffering=0)
 log.write(f"START {int(time.time()*1000)}\n")
 last_tx = 0.0
 tx_count = 0
@@ -129,6 +130,7 @@ while True:
             log.write(f"EXIT {int(now)}\n"); break
         if not data:
             log.write(f"EXIT {int(now)}\n"); break
+        raw.write(data)
         if b"#" in data:
             log.write(f"MRX {int(now)}\n")
     if now - last_tx >= 300:
@@ -143,7 +145,7 @@ while True:
 PYEOF
 
 start_session() {
-  docker exec "$MEMBER" sh -c ": > /cfg/session.log"
+  docker exec "$MEMBER" sh -c ": > /cfg/session.log; : > /cfg/session.raw"
   docker exec -d "$MEMBER" sh -c "python3 /cfg/driver.py '$FOUNDER_ID' >/cfg/driver.err 2>&1"
 }
 kill_session() { docker exec "$MEMBER" pkill -9 -f driver.py >/dev/null 2>&1 || true; docker exec "$MEMBER" pkill -9 -f "hop --config /cfg $FOUNDER_ID" >/dev/null 2>&1 || true; }
@@ -209,7 +211,8 @@ r_zombie_path()  {
 d_host_restart() { stop_daemon "$FOUNDER"; sleep 3; }
 r_host_restart() { start_daemon "$FOUNDER"; }
 
-PERTS=(net_flap zombie_path host_restart)
+# PERTS env: space-separated subset for targeted soaks (default all).
+if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart); fi
 RDIR=$(mktemp -d)
 
 say "SESSION SOAK: $CYCLES cycles"
@@ -235,8 +238,22 @@ for c in $(seq 1 "$CYCLES"); do
   wait "$vpid" 2>/dev/null || true
   ttr=$(cat "$vpnfile" 2>/dev/null || echo "?")
 
+  budget_var_now="BUDGET_$name"
+  if [ "$srt" != "TIMEOUT" ] && [ "$srt" -gt "${!budget_var_now}" ]; then
+    echo "  --- over-budget forensics (cycle $c, SRT ${srt}ms):"
+    echo "  session.raw tail (what the client displayed):"
+    docker exec "$MEMBER" sh -c "tail -c 1500 /cfg/session.raw | cat -v" 2>/dev/null | sed 's/^/    /' || true
+    echo "  member daemon tail:"; docker exec "$MEMBER" sh -c "tail -8 /cfg/log" 2>/dev/null | sed 's/^/    /' || true
+  fi
   if [ "$srt" = "TIMEOUT" ]; then
     echo "  cycle $c  $name  -> SRT TIMEOUT (>${BACKSTOP_MS}ms)  vpn_ttr=${ttr}ms"
+    echo "  --- forensics (cycle $c):"
+    echo "  session.log tail:"; docker exec "$MEMBER" tail -4 /cfg/session.log 2>/dev/null | sed 's/^/    /' || true
+    echo "  client procs:"; docker exec "$MEMBER" sh -c "ps -ef | grep -E 'driver.py|hop --config /cfg [0-9a-f]' | grep -v grep" 2>/dev/null | sed 's/^/    /' || true
+    echo "  session.raw tail (what the client displayed):"
+    docker exec "$MEMBER" sh -c "tail -c 1500 /cfg/session.raw | cat -v" 2>/dev/null | sed 's/^/    /' || true
+    echo "  member daemon tail:"; docker exec "$MEMBER" sh -c "tail -8 /cfg/log" 2>/dev/null | sed 's/^/    /' || true
+    echo "  founder daemon tail:"; docker exec "$FOUNDER" sh -c "tail -6 /cfg/log" 2>/dev/null | sed 's/^/    /' || true
     echo "-1" >>"$RDIR/$name"
   else
     delta="?"

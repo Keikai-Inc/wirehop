@@ -524,18 +524,20 @@ pub async fn show_reconnect_tui_via_agent(
     }
 }
 
-/// Compute backoff delay for a given attempt: 0, 0, 1, 2, 4, 5, 5, ...
+/// Compute backoff delay for a given attempt: 0, 0, 1, 2, 2, 2, ...
 ///
 /// Tuned for interactive sessions: the first two attempts are instant (the common
-/// case is a brief blip), then a short exponential ramp capped at 5s. Reattach is
-/// cheap and the server persists the PTY, so aggressive retry is the right default
-/// — long 16/30s waits just feel like the session was abandoned.
+/// case is a brief blip), then a short ramp capped at 2s. Reattach is cheap, the
+/// server persists the PTY, and dials are 10s-bounded — so aggressive retry is
+/// right. The old 5s cap made host-restart recovery land a full backoff period
+/// AFTER the host was already reachable (a consistent ~+7s parity tax measured
+/// by session-resilience.sh); the VPN redials on its own tight cadence and won.
 fn backoff_secs(attempt: u32) -> u64 {
     if attempt <= 2 {
         return 0;
     }
-    let secs = 1u64.checked_shl(attempt.saturating_sub(3)).unwrap_or(5);
-    secs.min(5)
+    let secs = 1u64.checked_shl(attempt.saturating_sub(3)).unwrap_or(2);
+    secs.min(2)
 }
 
 /// Render one frame of the reconnection TUI.
@@ -756,16 +758,17 @@ mod tests {
         // attempts 1 & 2: zero backoff for instant reconnect on a brief blip
         assert_eq!(backoff_secs(1), 0);
         assert_eq!(backoff_secs(2), 0);
-        // then a short exponential ramp: 1, 2, 4, capped at 5
+        // then a short ramp: 1, capped at 2 — the old 5s cap made host-restart
+        // recovery land a full backoff period after the host was reachable.
         assert_eq!(backoff_secs(3), 1);
         assert_eq!(backoff_secs(4), 2);
-        assert_eq!(backoff_secs(5), 4);
-        assert_eq!(backoff_secs(6), 5);
-        assert_eq!(backoff_secs(7), 5);
+        assert_eq!(backoff_secs(5), 2);
+        assert_eq!(backoff_secs(6), 2);
+        assert_eq!(backoff_secs(7), 2);
         // edge: attempt 0 also gets zero
         assert_eq!(backoff_secs(0), 0);
-        // very large attempt stays capped at 5
-        assert_eq!(backoff_secs(100), 5);
+        // very large attempt stays capped at 2
+        assert_eq!(backoff_secs(100), 2);
     }
 
     /// A paste arriving as one chunk must be preserved byte-for-byte,
