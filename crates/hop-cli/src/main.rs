@@ -3064,6 +3064,10 @@ async fn cmd_connect(
     // Anti-flapping state: track recent reconnections to detect rapid cycling
     let mut last_reconnect_time: Option<std::time::Instant> = None;
     let mut flap_attempt_offset: u32 = 0;
+    // Interface-set watcher: a changed network resets flap history (the flaps
+    // were the OLD network's fault) so recovery on a fresh network gets the
+    // instant quick tier, not the punitive backoff (session-recovery-parity §1).
+    let mut disc_net_watcher = reconnect::NetWatcher::new();
 
     // Reconnection loop
     loop {
@@ -3073,6 +3077,10 @@ async fn cmd_connect(
                 std::process::exit(code);
             }
             SessionOutcome::Disconnected => {
+                // Phase-0 instrumentation: wall-clock from "client noticed the
+                // disconnect" to "session resumed" (HOP_SESSION_DEBUG=1 line
+                // printed at resume below).
+                let t_disconnected = std::time::Instant::now();
                 // Detect flapping: disconnect within 10s of last reconnect
                 if let Some(last) = last_reconnect_time {
                     if last.elapsed() < Duration::from_secs(10) {
@@ -3085,6 +3093,11 @@ async fn cmd_connect(
                     } else {
                         flap_attempt_offset = 0;
                     }
+                }
+                // Network changed since we last looked → flap history is stale.
+                if disc_net_watcher.changed() && flap_attempt_offset != 0 {
+                    tracing::info!("network changed — resetting flap backoff (was offset={flap_attempt_offset})");
+                    flap_attempt_offset = 0;
                 }
 
                 // Tier 1: Quick inline reconnect (non-disruptive, 5s window)
@@ -3140,6 +3153,23 @@ async fn cmd_connect(
                         buffered_input,
                     } => {
                         last_reconnect_time = Some(std::time::Instant::now());
+
+                        // Phase-0 instrumentation (session-recovery-parity):
+                        // one line per recovery so slow reconnects become
+                        // measurable instead of anecdotal.
+                        if std::env::var_os("HOP_SESSION_DEBUG").is_some() {
+                            eprint!(
+                                "\r\n[hop] session recovered in {}ms (tier={}, flap_offset={})\r\n",
+                                t_disconnected.elapsed().as_millis(),
+                                if via_quick { "quick" } else { "dialog" },
+                                flap_attempt_offset,
+                            );
+                        }
+                        tracing::info!(
+                            "session recovered in {}ms (tier={})",
+                            t_disconnected.elapsed().as_millis(),
+                            if via_quick { "quick" } else { "dialog" }
+                        );
 
                         // Rebuild the post-disconnect input stream: the chunk
                         // lost in flight, followed by whatever was buffered.

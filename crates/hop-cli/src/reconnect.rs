@@ -50,13 +50,13 @@ enum PollAction {
 /// flipped) and skip out of any pending exponential-backoff sleep. A fresh
 /// network is the most likely moment for a reconnect to actually succeed,
 /// so waiting out a 30-second backoff there is the exact wrong move.
-struct NetWatcher {
+pub(crate) struct NetWatcher {
     last_addrs: BTreeSet<IpAddr>,
     last_poll: Instant,
 }
 
 impl NetWatcher {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             last_addrs: netmon::current_interface_addrs(),
             last_poll: Instant::now(),
@@ -67,7 +67,7 @@ impl NetWatcher {
     /// Throttles to once per second so we don't hammer `getifaddrs` from a
     /// tight render loop. Updates `last_addrs` on change so a single
     /// transition only fires once.
-    fn changed(&mut self) -> bool {
+    pub(crate) fn changed(&mut self) -> bool {
         if self.last_poll.elapsed() < Duration::from_secs(1) {
             return false;
         }
@@ -116,7 +116,7 @@ pub async fn try_quick_reconnect(
         let secs_left = timeout.saturating_sub(start.elapsed()).as_secs();
         let _ = write!(
             stdout,
-            "\r\x1b[K\x1b[33m[hop]\x1b[0m Connection lost. Reconnecting... ({secs_left}s)"
+            "\r\x1b[K\x1b[33m[hop]\x1b[0m Connection lost. Reconnecting... ({secs_left}s · Enter: options · q: quit)"
         );
         let _ = stdout.flush();
 

@@ -388,8 +388,66 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
     }
 }
 
-/// Connect to a host via QUIC. Tries hop/3 (compressed) first, falls back to hop/2.
-/// Runs in a spawned task — never blocks the actor loop.
+/// Dial timeout for mux connects. Deliberately short (session-recovery-parity
+/// Phase 2): a dead path must FAIL FAST so the reconnect loop can retry — and
+/// because concurrent retry attempts JOIN the in-flight dial as waiters, one
+/// slow dial pins every "retry now" the user presses behind it. The old
+/// 30s-hop/3 + 30s-hop/2 sequence meant a dead path blocked all reconnect
+/// attempts for a full minute. The VPN data plane uses the same fail-fast
+/// rationale for its short dial timeout.
+const MUX_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After this long with zero received datagrams, a connection is a zombie.
+/// Both ends run hop's transport config (5s keepalives), so a healthy
+/// connection receives SOMETHING at least every ~5s even when idle; 15s of
+/// silence = 3 missed keepalives. QUIC's own idle timeout is 60s — waiting for
+/// it is what made dead sessions sit frozen for a minute before the reconnect
+/// machinery even started.
+const ZOMBIE_STALL: Duration = Duration::from_secs(15);
+const ZOMBIE_POLL: Duration = Duration::from_secs(3);
+
+/// Watch a pooled connection for rx-stall and close it as a zombie. Closing
+/// errors the proxied session streams immediately → the client sees EOF →
+/// its quick-reconnect tier engages within seconds instead of waiting out
+/// QUIC's 60s idle timeout (session-recovery-parity Phase 1).
+fn spawn_zombie_watchdog(conn: Connection, host_id: PublicKey) {
+    tokio::spawn(async move {
+        let mut last_rx = conn.stats().udp_rx.datagrams;
+        let mut last_progress = Instant::now();
+        loop {
+            tokio::time::sleep(ZOMBIE_POLL).await;
+            if conn.close_reason().is_some() {
+                return; // closed normally — watchdog done
+            }
+            let rx = conn.stats().udp_rx.datagrams;
+            if rx != last_rx {
+                last_rx = rx;
+                last_progress = Instant::now();
+                continue;
+            }
+            if last_progress.elapsed() >= ZOMBIE_STALL {
+                tracing::info!(
+                    "mux: connection to {} stalled ({}s without a datagram despite 5s keepalives) — closing zombie",
+                    host_id.fmt_short(),
+                    last_progress.elapsed().as_secs()
+                );
+                conn.close(0u32.into(), b"zombie-stall");
+                return;
+            }
+        }
+    });
+}
+
+/// True if the dial error was a timeout (dead/stale path) rather than a
+/// rejection. Matches the message produced by `connect_to_host_with_alpn_timeout`.
+fn is_dial_timeout(e: &anyhow::Error) -> bool {
+    format!("{e:#}").to_lowercase().contains("timed out")
+}
+
+/// Connect to a host via QUIC. Tries hop/3 (compressed) first; falls back to
+/// hop/2 ONLY when hop/3 was REJECTED (a pre-0.9.28 host refusing the ALPN) —
+/// a TIMEOUT means the path is dead and hop/2 would hang identically, doubling
+/// the stall for nothing. Runs in a spawned task — never blocks the actor loop.
 async fn do_connect(
     endpoint: &Endpoint,
     host_id: PublicKey,
@@ -404,25 +462,39 @@ async fn do_connect(
 
     tracing::debug!("do_connect: {} relay_hint={:?}", host_id.fmt_short(), relay.as_ref().map(|u| u.to_string()));
 
-    match net::connect_to_host_with_alpn(
+    match net::connect_to_host_with_alpn_timeout(
         endpoint,
         host_id,
         relay.as_ref(),
         hop_core::proto::ALPN_V3,
+        MUX_DIAL_TIMEOUT,
     )
     .await
     {
         Ok((conn, _)) => {
             tracing::debug!("do_connect: hop/3 connected to {}", host_id.fmt_short());
+            spawn_zombie_watchdog(conn.clone(), host_id);
             Ok(conn)
+        }
+        Err(e) if is_dial_timeout(&e) => {
+            tracing::debug!("do_connect: hop/3 dial to {} timed out — dead path, NOT falling back to hop/2", host_id.fmt_short());
+            Err(e)
         }
         Err(_) => {
             tracing::debug!(
                 "hop/3 not supported by {}, falling back to hop/2",
                 host_id.fmt_short()
             );
-            let (conn, _) = net::connect_to_host(endpoint, host_id, relay.as_ref()).await?;
+            let (conn, _) = net::connect_to_host_with_alpn_timeout(
+                endpoint,
+                host_id,
+                relay.as_ref(),
+                hop_core::proto::ALPN_V2,
+                MUX_DIAL_TIMEOUT,
+            )
+            .await?;
             tracing::debug!("do_connect: hop/2 fallback connected to {}", host_id.fmt_short());
+            spawn_zombie_watchdog(conn.clone(), host_id);
             Ok(conn)
         }
     }

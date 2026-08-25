@@ -238,6 +238,21 @@ else
   echo "==> SKIP_FIRSTRUN=1 — skipping first-run acceptance gate (NOT recommended)"
 fi
 
+# --- Session-resilience gate (session-recovery-parity) -----------------------
+# Interactive sessions must recover on the VPN's heels — SRT budgets per
+# perturbation, including the zombie-path (silent stall) detection proof.
+# Set SKIP_SESSION=1 to bypass (e.g. Docker unavailable) — only deliberately.
+if [[ "${SKIP_SESSION:-0}" != "1" ]]; then
+  echo "==> Running session-resilience gate (CYCLES=${CYCLES:-6})"
+  if ! "${PROJECT_ROOT}/tests/e2e/session-resilience.sh"; then
+    echo "Error: session resilience FAILED — session recovery exceeded SLA. Release aborted."
+    echo "       See tests/e2e/session-results.md for the per-perturbation breakdown."
+    exit 1
+  fi
+else
+  echo "==> SKIP_SESSION=1 — skipping session-resilience gate (NOT recommended)"
+fi
+
 # --- Build (parallel) --------------------------------------------------------
 
 rm -rf "${DIST_DIR}"

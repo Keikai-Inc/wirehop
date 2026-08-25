@@ -30,6 +30,33 @@ reconnect       -> session re-attached, VtScreen repainted to client
 timeout/exit    -> session reaped, PTY closed (sends SIGHUP to shell)
 ```
 
+### Recovery latency (session-recovery-parity)
+
+Interactive sessions are engineered to recover on the VPN's heels after a
+network event:
+
+- **Zombie detection**: the connection agent watches each pooled QUIC
+  connection's receive counters; 15s without a datagram (3 missed 5s
+  keepalives) closes the connection as a zombie instead of waiting out QUIC's
+  60s idle timeout, so the reconnect flow engages within seconds of a silent
+  path death.
+- **Fail-fast dials**: reconnect dials time out at 10s, and the hop/2 ALPN
+  fallback is skipped when hop/3 *timed out* (a dead path would hang it
+  identically) — the old worst case serialized 60s of dialing that every
+  "retry now" queued behind.
+- **Network-change reset**: an interface change resets the anti-flap backoff
+  (the flaps were the old network's fault) and re-enables the instant quick
+  reconnect tier.
+- During any reconnect state: `Enter` retries immediately, `q`/`Ctrl+C`
+  quits — including after stray keypresses (typed input is distinguished from
+  pasted input by bracketed-paste state).
+
+Set `HOP_SESSION_DEBUG=1` to print a one-line timing summary on every
+recovery. The release gate `tests/e2e/session-resilience.sh` enforces SRT
+(session-recovery-time) budgets per perturbation, including a silent-stall
+scenario, and reports the parity delta against the VPN's own recovery in the
+same event (artifact: `tests/e2e/session-results.md`).
+
 ---
 
 ### Multi-Session Support
