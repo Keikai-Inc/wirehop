@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.keikai-inc/wirehop",
+  "title": "WireHop",
+  "description": "Reach, run commands on, and network your own machines. P2P, no accounts, no server.",
+  "version": "0.9.32",
+  "repository": {
+    "url": "https://github.com/Keikai-Inc/wirehop",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/Keikai-Inc/wirehop",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@wirehop/wirehop",
+      "version": "0.9.32",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "isRequired": true,
+          "description": "Start WireHop's MCP server on stdio"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
