@@ -632,79 +632,119 @@ async fn wait_for_ipc_close(ipc_read: &mut tokio::net::unix::OwnedReadHalf) {
     }
 }
 
+/// How a proxy direction finished.
+#[derive(PartialEq)]
+enum Ended {
+    /// Clean EOF — the peer closed gracefully; let the other direction drain.
+    Eof,
+    /// Transport error — the stream is broken; the other direction must not
+    /// keep running, or it silently blackholes data (see `proxy_quic`).
+    Errored,
+}
+
 /// Bidirectional proxy between IPC socket and QUIC bi-stream.
 ///
-/// Both directions run as independent tasks. When one completes, it drops its
-/// owned resources, which propagates EOF to the other side, causing it to
-/// complete naturally. This avoids the old `select!` approach which would
-/// immediately cancel the reverse direction, potentially dropping unread data.
+/// Both directions run as independent tasks so a graceful close on one side
+/// lets the other drain (a `select!` would cancel the reverse direction and
+/// drop unread data).
+///
+/// But an ERROR is not a graceful close. If client→host dies on a broken QUIC
+/// stream while host→client keeps running, the IPC socket stays open and the
+/// client goes on writing input that nobody forwards: output still flows, no
+/// error is reported, and the session silently accepts keystrokes that never
+/// arrive — until the host's 75s read deadline reaps the attachment. That is
+/// exactly the "session came back but I couldn't type for a minute" bug.
+///
+/// So: clean EOF drains the peer; an error aborts it, tearing the whole proxy
+/// down so the client sees EOF and its reconnect logic engages immediately.
 async fn proxy_quic(
     mut ipc_read: tokio::net::unix::OwnedReadHalf,
     mut ipc_write: tokio::net::unix::OwnedWriteHalf,
     mut quic_send: iroh::endpoint::SendStream,
     mut quic_recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
-    // Host→Client: copy QUIC data to IPC, flushing after each chunk
-    // to avoid buffering delays on high-latency links.
-    // When this finishes, dropping ipc_write signals EOF to the client.
-    let h2c = tokio::spawn(async move {
+    // Host→Client: copy QUIC data to IPC, flushing after each chunk to avoid
+    // buffering delays on high-latency links.
+    let mut h2c = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
             match quic_recv.read(&mut buf).await {
-                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(0)) | Ok(None) => break Ended::Eof,
                 Ok(Some(n)) => {
                     if ipc_write.write_all(&buf[..n]).await.is_err() {
-                        break;
+                        break Ended::Errored;
                     }
                     if ipc_write.flush().await.is_err() {
-                        break;
+                        break Ended::Errored;
                     }
                 }
                 Err(e) => {
                     tracing::debug!("QUIC→IPC ended: {e:#}");
-                    break;
+                    break Ended::Errored;
                 }
             }
         }
     });
 
     // Client→Host: copy IPC data to QUIC, flushing after each chunk.
-    // When this finishes, quic_send.finish() signals FIN to the host.
-    let c2h = tokio::spawn(async move {
+    let mut c2h = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
-        loop {
+        let ended = loop {
             match ipc_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => break Ended::Eof,
                 Ok(n) => {
                     if quic_send.write_all(&buf[..n]).await.is_err() {
-                        break;
+                        break Ended::Errored;
                     }
                     if quic_send.flush().await.is_err() {
-                        break;
+                        break Ended::Errored;
                     }
                 }
                 Err(e) => {
                     tracing::debug!("IPC→QUIC ended: {e:#}");
-                    break;
+                    break Ended::Errored;
                 }
             }
+        };
+        // FIN only on a clean close: after an error the stream is already
+        // broken, and finishing it would mask the failure as an orderly EOF.
+        if ended == Ended::Eof {
+            let _ = quic_send.finish();
         }
-        let _ = quic_send.finish();
+        ended
     });
 
-    // Both tasks complete naturally via EOF propagation:
-    //   Pull: host finishes → h2c drops ipc_write → client sees EOF → client
-    //         drops socket → c2h's ipc_read sees EOF → c2h finishes
-    //   Push: client finishes → c2h calls finish() → host sees FIN → host
-    //         sends response + finishes → h2c's quic_recv sees EOF → h2c finishes
-    let _ = tokio::join!(h2c, c2h);
+    // Whichever finishes first decides the other's fate.
+    tokio::select! {
+        r = &mut h2c => {
+            if matches!(r, Ok(Ended::Errored)) {
+                tracing::debug!("proxy: host→client errored — aborting client→host");
+                c2h.abort();
+            } else {
+                let _ = c2h.await;
+            }
+        }
+        r = &mut c2h => {
+            if matches!(r, Ok(Ended::Errored)) {
+                // The direction whose silent death caused the "can't type" bug.
+                tracing::debug!("proxy: client→host errored — aborting host→client");
+                h2c.abort();
+            } else {
+                let _ = h2c.await;
+            }
+        }
+    }
 
     Ok(())
 }
 
 /// Generic bidirectional byte proxy between two async stream pairs.
 ///
-/// Used for testing with mock streams (tokio::io::duplex).
+/// A SIMPLIFIED double, not a mirror of [`proxy_quic`]: it uses `select!`, so
+/// either direction completing cancels the other. Several tests below encode
+/// that behaviour deliberately. For coverage of `proxy_quic`'s ACTUAL teardown
+/// rules — clean EOF drains the peer, an error aborts it — see
+/// [`proxy_pair_like_production`] and the tests that use it.
 #[cfg(test)]
 async fn proxy_streams(
     mut side_a_read: impl tokio::io::AsyncRead + Unpin,
@@ -718,6 +758,51 @@ async fn proxy_streams(
         }
         r = tokio::io::copy(&mut side_b_read, &mut side_a_write) => {
             r.context("B->A copy")?;
+        }
+    }
+    Ok(())
+}
+
+/// Faithful mirror of [`proxy_quic`]'s teardown logic over generic streams.
+///
+/// Kept byte-for-byte equivalent in STRUCTURE to the production function so the
+/// rules that matter can be tested: a clean EOF lets the peer drain; a transport
+/// ERROR aborts the peer so the whole proxy tears down. The production version
+/// can't be tested directly because it takes concrete iroh stream types.
+#[cfg(test)]
+async fn proxy_pair_like_production(
+    mut a_read: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut a_write: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    mut b_read: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut b_write: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+) -> Result<()> {
+    async fn pump(
+        r: &mut (impl tokio::io::AsyncRead + Unpin),
+        w: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Ended {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) => return Ended::Eof,
+                Ok(n) => {
+                    if w.write_all(&buf[..n]).await.is_err() || w.flush().await.is_err() {
+                        return Ended::Errored;
+                    }
+                }
+                Err(_) => return Ended::Errored,
+            }
+        }
+    }
+
+    let mut a2b = tokio::spawn(async move { pump(&mut a_read, &mut b_write).await });
+    let mut b2a = tokio::spawn(async move { pump(&mut b_read, &mut a_write).await });
+
+    tokio::select! {
+        r = &mut a2b => {
+            if matches!(r, Ok(Ended::Errored)) { b2a.abort(); } else { let _ = b2a.await; }
+        }
+        r = &mut b2a => {
+            if matches!(r, Ok(Ended::Errored)) { a2b.abort(); } else { let _ = a2b.await; }
         }
     }
     Ok(())
@@ -1341,5 +1426,84 @@ mod tests {
         });
 
         timeout.await.expect("agent_concurrent_clients timed out");
+    }
+
+    /// THE regression test for "session came back but I couldn't type".
+    ///
+    /// When one proxy direction dies on a transport ERROR, the other MUST NOT
+    /// keep running. It used to: host→client went on delivering output while
+    /// client→host was dead, so the IPC socket stayed open, the client's
+    /// keystrokes went into a socket nobody read, and no error surfaced — the
+    /// session looked alive (output flowing) but accepted no input until the
+    /// host's 75s read deadline reaped it.
+    ///
+    /// Note the setup: dropping the host end alone yields a clean EOF, not an
+    /// error. To hit the error path the proxy must actually WRITE to the dead
+    /// side, so the client sends a byte after the host is gone.
+    #[tokio::test]
+    async fn errored_direction_tears_down_the_whole_proxy() {
+        let (mut a_client, a_proxy) = tokio::io::duplex(4096);
+        let (b_proxy, b_host) = tokio::io::duplex(4096);
+        let (a_proxy_r, a_proxy_w) = tokio::io::split(a_proxy);
+        let (b_proxy_r, b_proxy_w) = tokio::io::split(b_proxy);
+
+        let proxy = tokio::spawn(async move {
+            proxy_pair_like_production(a_proxy_r, a_proxy_w, b_proxy_r, b_proxy_w).await
+        });
+
+        // Host is gone; the client keeps typing (exactly the reported case).
+        drop(b_host);
+        let _ = a_client.write_all(b"keystrokes").await;
+        let _ = a_client.flush().await;
+
+        // The proxy must tear down rather than sit half-alive forever.
+        tokio::time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .expect("proxy did not tear down after a direction errored — input would be blackholed")
+            .expect("proxy task panicked")
+            .expect("proxy returned an error");
+
+        // And the client must observe EOF, so its reconnect logic engages
+        // instead of writing into a black hole.
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), a_client.read(&mut buf))
+            .await
+            .expect("client socket never closed — the bug")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected EOF on the client side after proxy teardown");
+    }
+
+    /// A CLEAN eof on one side must still let the other drain — the property
+    /// the error-abort path must not regress.
+    #[tokio::test]
+    async fn clean_eof_still_drains_the_peer() {
+        let (mut a_client, a_proxy) = tokio::io::duplex(4096);
+        let (b_proxy, mut b_host) = tokio::io::duplex(4096);
+        let (a_proxy_r, a_proxy_w) = tokio::io::split(a_proxy);
+        let (b_proxy_r, b_proxy_w) = tokio::io::split(b_proxy);
+
+        let proxy = tokio::spawn(async move {
+            proxy_pair_like_production(a_proxy_r, a_proxy_w, b_proxy_r, b_proxy_w).await
+        });
+
+        a_client.write_all(b"hello").await.unwrap();
+        a_client.flush().await.unwrap();
+
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), b_host.read_exact(&mut buf))
+            .await
+            .expect("host never received the payload")
+            .unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // Close BOTH ends so the drain can complete: a clean EOF on one side
+        // deliberately waits for the peer, which is the property under test.
+        drop(a_client);
+        drop(b_host);
+        tokio::time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .expect("clean-EOF path did not complete")
+            .expect("proxy task panicked")
+            .expect("proxy returned an error");
     }
 }
