@@ -1,0 +1,53 @@
+{
+  "name": "@wirehop/wirehop",
+  "version": "0.9.32",
+  "description": "WireHop — secure peer-to-peer remote access and private networks. Single binary, no accounts, no port forwarding, no coordination server. Includes an MCP server so AI agents can reach and operate your machines.",
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "mcp-server",
+    "p2p",
+    "vpn",
+    "mesh",
+    "remote-access",
+    "ssh-alternative",
+    "networking",
+    "agent",
+    "ai-agent",
+    "fleet"
+  ],
+  "homepage": "https://github.com/Keikai-Inc/wirehop",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Keikai-Inc/wirehop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Keikai-Inc/wirehop/issues"
+  },
+  "license": "MIT OR Apache-2.0",
+  "author": "Keikai Inc.",
+  "mcpName": "io.github.keikai-inc/wirehop",
+  "bin": {
+    "wirehop": "bin/wirehop.js",
+    "hop": "bin/wirehop.js"
+  },
+  "files": [
+    "bin/wirehop.js",
+    "scripts/install.js",
+    "release-pubkey.pem",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
