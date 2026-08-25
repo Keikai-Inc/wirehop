@@ -25,8 +25,6 @@ pub struct OAuthProvider {
     pub name: &'static str,
     pub auth_url: &'static str,
     pub token_url: &'static str,
-    pub client_id: &'static str,
-    pub client_secret: &'static str,
     pub scopes: &'static [&'static str],
     /// Maps hop secret names to where their values come from.
     pub secrets_map: &'static [(&'static str, SecretSource)],
@@ -54,14 +52,9 @@ static GMAIL: OAuthProvider = OAuthProvider {
     name: "gmail",
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
     token_url: "https://oauth2.googleapis.com/token",
-    // hop's registered Desktop-app OAuth client (hop-keik-ai project).
-    // INTENTIONALLY EMBEDDED — not a leak. Installed-app client secrets are
-    // not confidential per Google's docs; PKCE is the protection, and the
-    // pair ships in every release binary regardless. See SECURITY.md
-    // ("Known, intentional non-vulnerabilities") before reporting. Override:
-    // HOP_GOOGLE_CLIENT_ID / HOP_GOOGLE_CLIENT_SECRET.
-    client_id: "REDACTED.apps.googleusercontent.com",
-    client_secret: "REDACTED",
+    // No client_id/client_secret fields: credentials are injected at BUILD
+    // time and resolved by `google_client()`, so the source contains no
+    // credential-shaped strings for scanners or push protection to trip on.
     scopes: &[
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.modify",
@@ -103,25 +96,54 @@ pub fn oauth_provider(name: &str) -> Option<&'static OAuthProvider> {
     }
 }
 
-/// The Google OAuth client pair, with env override.
+// Credentials baked (obfuscated) by build.rs from the release environment.
+include!(concat!(env!("OUT_DIR"), "/oauth_baked.rs"));
+
+/// Undo the build-time XOR obfuscation.
+fn deobfuscate(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(
+        &bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ OAUTH_PAD[i % OAUTH_PAD.len()])
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned()
+}
+
+/// Resolve the Google OAuth client pair, in priority order:
 ///
-/// The embedded defaults are hop's registered **Desktop-app** client. Google
-/// explicitly does not treat installed-app client secrets as confidential
-/// (PKCE + the loopback redirect are the actual protection), and this pair
-/// ships inside every release binary regardless — embedding it in source is
-/// the standard OSS pattern (rclone, gcloud). `HOP_GOOGLE_CLIENT_ID` /
-/// `HOP_GOOGLE_CLIENT_SECRET` let self-hosters bring their own client (and
-/// escape shared-client quota if this one is ever throttled).
-fn google_client(provider: &OAuthProvider) -> (String, String) {
-    let id = std::env::var("HOP_GOOGLE_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| provider.client_id.to_string());
-    let secret = std::env::var("HOP_GOOGLE_CLIENT_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| provider.client_secret.to_string());
-    (id, secret)
+/// 1. **Runtime env** — `HOP_GOOGLE_CLIENT_ID` / `HOP_GOOGLE_CLIENT_SECRET`.
+///    Bring your own client (also escapes the shared client's API quota).
+/// 2. **Baked at build time** — same variable names, read by `build.rs` and
+///    stored XOR-obfuscated so the source has no credential strings and
+///    `strings <binary>` does not surface one. Obfuscation, NOT encryption:
+///    installed-app client secrets are not confidential per Google, and the
+///    pair ships in every binary regardless. See SECURITY.md.
+/// 3. Otherwise: no client, and the error explains how to supply one.
+fn google_client(_provider: &OAuthProvider) -> Result<(String, String)> {
+    fn pick(runtime: &str, baked: Option<&[u8]>) -> Option<String> {
+        std::env::var(runtime)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| baked.map(deobfuscate))
+            .filter(|s| !s.is_empty())
+    }
+    let id = pick("HOP_GOOGLE_CLIENT_ID", OAUTH_CLIENT_ID);
+    let secret = pick("HOP_GOOGLE_CLIENT_SECRET", OAUTH_CLIENT_SECRET);
+    match (id, secret) {
+        (Some(i), Some(s)) => Ok((i, s)),
+        _ => anyhow::bail!(
+            "No Google OAuth client configured.\n\n\
+             Official release builds ship one; this build was compiled without \n\
+             credentials. Supply your own — which is also how you escape the \n\
+             shared client's API quota:\n\n\
+             \x20 1. Create a Desktop-app OAuth client at\n\
+             \x20    https://console.cloud.google.com/apis/credentials\n\
+             \x20 2. export HOP_GOOGLE_CLIENT_ID=... HOP_GOOGLE_CLIENT_SECRET=...\n\
+             \x20 3. hop auth gmail"
+        ),
+    }
 }
 
 pub fn api_key_provider(name: &str) -> Option<&'static ApiKeyProvider> {
@@ -136,7 +158,7 @@ pub fn api_key_provider(name: &str) -> Option<&'static ApiKeyProvider> {
 /// Run the full OAuth 2.0 + PKCE flow for a provider.
 /// Returns a list of (secret_name, secret_value) pairs to store.
 pub fn run_oauth_flow(provider: &OAuthProvider) -> Result<Vec<(String, String)>> {
-    let (client_id, client_secret) = google_client(provider);
+    let (client_id, client_secret) = google_client(provider)?;
     // 1. Generate PKCE verifier + challenge
     let (verifier, challenge) = generate_pkce();
 
@@ -509,5 +531,57 @@ mod tests {
     #[test]
     fn extract_token_returns_none_when_missing() {
         assert!(extract_token_from_output("no token here").is_none());
+    }
+
+    /// The build-time XOR must round-trip exactly — otherwise a release would
+    /// ship a corrupted client id and `hop auth gmail` would fail with an
+    /// opaque Google error rather than anything diagnosable.
+    #[test]
+    fn obfuscation_round_trips() {
+        // Mirror what build.rs does, then decode with the shipping path.
+        let sample = "123456789012-abcdefgh.apps.googleusercontent.com";
+        let encoded: Vec<u8> = sample
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ OAUTH_PAD[i % OAUTH_PAD.len()])
+            .collect();
+        assert_ne!(encoded.as_slice(), sample.as_bytes(), "must not be plaintext");
+        assert_eq!(deobfuscate(&encoded), sample);
+    }
+
+    /// Obfuscated bytes must not contain the recognizable credential prefixes
+    /// that scanners (and `strings`) look for.
+    #[test]
+    fn obfuscation_hides_recognizable_prefixes() {
+        for sample in ["GOCSPX-abcdefghijklmnop", "1234-xyz.apps.googleusercontent.com"] {
+            let encoded: Vec<u8> = sample
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ OAUTH_PAD[i % OAUTH_PAD.len()])
+                .collect();
+            let as_text = String::from_utf8_lossy(&encoded);
+            assert!(!as_text.contains("GOCSPX"));
+            assert!(!as_text.contains("googleusercontent"));
+        }
+    }
+
+    /// A runtime env var must win over anything baked in, so a self-hoster can
+    /// always bring their own client.
+    #[test]
+    fn runtime_env_overrides_baked_client() {
+        // SAFETY: single-threaded test process; restored before returning.
+        unsafe {
+            std::env::set_var("HOP_GOOGLE_CLIENT_ID", "runtime-id");
+            std::env::set_var("HOP_GOOGLE_CLIENT_SECRET", "runtime-secret");
+        }
+        let (id, secret) = google_client(&GMAIL).expect("env-provided client resolves");
+        unsafe {
+            std::env::remove_var("HOP_GOOGLE_CLIENT_ID");
+            std::env::remove_var("HOP_GOOGLE_CLIENT_SECRET");
+        }
+        assert_eq!(id, "runtime-id");
+        assert_eq!(secret, "runtime-secret");
     }
 }

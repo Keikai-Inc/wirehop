@@ -15,25 +15,23 @@ WireHop does not currently operate a paid bug-bounty program.
 Automated scanners will flag the following. They are deliberate, documented
 decisions — reports about them will be closed as informational.
 
-### Embedded Google OAuth client credentials
+### No embedded credentials
 
-`crates/hop-cli/src/oauth.rs` contains the client ID and client secret of
-WireHop's registered Google **Desktop-app** OAuth client, used by
-`hop auth gmail`. This is intentional:
+`hop auth gmail` uses a Google **Desktop-app** OAuth client. Those credentials
+are *not* in this repository: they are injected at build time from the release
+environment (`crates/hop-cli/build.rs`) and stored obfuscated in the binary.
 
-- For installed applications, Google's own documentation states the client
-  secret "is obviously not treated as a secret"
-  (<https://developers.google.com/identity/protocols/oauth2#installed>).
-  User security comes from PKCE and the loopback redirect, not from client
-  secrecy — the pair necessarily ships inside every distributed binary
-  regardless of whether it appears in source.
-- This is the standard pattern for open-source desktop tools (rclone and
-  gcloud, among many others, embed theirs the same way).
-- Self-hosters can substitute their own client via
-  `HOP_GOOGLE_CLIENT_ID` / `HOP_GOOGLE_CLIENT_SECRET`.
+To be explicit, since it would otherwise look like a security control: this is
+**obfuscation, not encryption**. Google does not treat installed-app client
+secrets as confidential — PKCE and the loopback redirect are the actual
+protection — and the pair necessarily ships inside every distributed binary,
+so anyone determined can recover it. The point is to keep the source tree free
+of credential-shaped strings so scanners and push protection don't fire on
+maintainers and contributors.
 
-Possession of these values does not grant access to any user's data or to any
-WireHop infrastructure.
+Self-hosters can supply their own client (also the way to escape the shared
+client's API quota) with `HOP_GOOGLE_CLIENT_ID` / `HOP_GOOGLE_CLIENT_SECRET`
+at runtime.
 
 ### Synthetic credentials in tests
 

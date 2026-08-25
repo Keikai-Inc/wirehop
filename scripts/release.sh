@@ -253,6 +253,17 @@ else
   echo "==> SKIP_SESSION=1 — skipping session-resilience gate (NOT recommended)"
 fi
 
+# --- Google OAuth client (build-time injection) ------------------------------
+# `hop auth gmail` needs a client baked in at compile time (build.rs reads
+# these and stores them obfuscated). A release built without them still works
+# for everything else — gmail auth just tells the user to bring their own — but
+# it is almost certainly not what you meant, so say so loudly.
+if [[ -z "${HOP_GOOGLE_CLIENT_ID:-}" || -z "${HOP_GOOGLE_CLIENT_SECRET:-}" ]]; then
+  echo "==> WARNING: HOP_GOOGLE_CLIENT_ID/SECRET unset — this release will ship"
+  echo "             WITHOUT a default Google OAuth client (\`hop auth gmail\`"
+  echo "             will ask users to supply their own)."
+fi
+
 # --- Build (parallel) --------------------------------------------------------
 
 rm -rf "${DIST_DIR}"

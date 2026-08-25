@@ -1,21 +1,24 @@
 # Gitleaks configuration for WireHop.
 #
-# Extends the default rules; the allowlist below documents every intentional
+# Extends the default rules; the allowlist documents every intentional
 # exception. Adding an entry requires a justification comment.
 
 [extend]
 useDefault = true
 
+# Google OAuth credentials must NEVER appear in source: they are injected at
+# build time (crates/hop-cli/build.rs) from the release environment and stored
+# obfuscated in the binary. This rule makes any occurrence in the tree a
+# finding — there is deliberately no path exemption for them.
+[[rules]]
+id = "wirehop-google-oauth-in-source"
+description = "Google OAuth credential in source (must be build-time injected)"
+regex = "(GOCSPX-[A-Za-z0-9_-]{20,}|[0-9]{10,}-[a-z0-9]{20,}\\.apps\\.googleusercontent\\.com)"
+
 [allowlist]
 description = "Reviewed, intentional exceptions"
-paths = [
-    # crates/hop-cli/src/oauth.rs — two reviewed matches, neither a leak:
-    #  1. Google Desktop-app OAuth client pair (embedded by design; Google
-    #     does not treat installed-app client secrets as confidential — PKCE
-    #     is the protection. Standard OSS pattern: rclone, gcloud. Overridable
-    #     via HOP_GOOGLE_CLIENT_ID/SECRET. Decision 2026-08-23; reassess if
-    #     the client goes through Google restricted-scope verification.)
-    #  2. Synthetic sk-ant-oat01 test fixture exercising the setup-token
-    #     output parser.
-    '''crates/hop-cli/src/oauth\.rs''',
+regexes = [
+  # Synthetic fixture exercising the `claude setup-token` output parser in
+  # crates/hop-cli/src/oauth.rs. Not a live credential.
+  "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AAAA",
 ]

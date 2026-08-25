@@ -21,6 +21,9 @@
 #   APPLE_API_KEY_ID             the .p8 key id
 #   APPLE_API_ISSUER_ID          App Store Connect issuer uuid
 #   HOP_SIGNING_KEY_PEM          the RSA release-signing private key (PEM text)
+#   HOP_GOOGLE_CLIENT_ID         Google Desktop-app OAuth client id
+#   HOP_GOOGLE_CLIENT_SECRET     …and its secret (baked in obfuscated by
+#                                crates/hop-cli/build.rs; NOT in the source)
 #   AWS_ROLE_ARN                 IAM role for OIDC (no long-lived AWS keys)
 #   CF_DISTRIBUTION_ID           CloudFront distribution id
 #
@@ -87,6 +90,8 @@ jobs:
       - name: Build
         env:
           AWS_LC_SYS_CMAKE_BUILDER: "1"
+          HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
+          HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
         run: cross build --release --target ${{ matrix.target }} -p hop-cli
       - name: Stage artifact
         run: |
@@ -127,6 +132,9 @@ jobs:
           key: macos-${{ matrix.arch }}
 
       - name: Build binary
+        env:
+          HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
+          HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           case "${{ matrix.arch }}" in
