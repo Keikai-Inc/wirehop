@@ -32,6 +32,24 @@
 # The App Store Connect API key (.p8) replaces the app-specific password used
 # interactively: it is revocable on its own, scoped, and does not carry an
 # Apple ID. Create at appstoreconnect.apple.com → Users and Access → Keys.
+#
+# ── Threat model for an open repo ────────────────────────────────────────────
+# Fork pull requests CANNOT read these secrets: GitHub withholds secrets from
+# `pull_request` runs from forks, and this workflow only triggers on tag pushes
+# and manual dispatch — neither is available to an outside contributor.
+#
+# The residual risk is code that gets MERGED and then executes here during a
+# release: a build.rs, a proc-macro, a new dependency, or an edit to
+# pkg/build-pkg.sh runs on this runner with the signing key and AWS role
+# present. Mitigations in force:
+#   1. `environment: release` with a required reviewer — secrets are not issued
+#      until a human approves the run (configure in Settings → Environments).
+#   2. Third-party actions pinned to commit SHAs, not moving tags, so a
+#      compromised upstream action cannot silently change what runs here.
+#   3. NEVER add a `pull_request_target` workflow that checks out PR code —
+#      that combination hands untrusted code a token with write access.
+#   4. Review dependency and build-script changes in PRs with release
+#      execution in mind, not just runtime behaviour.
 
 name: release
 
@@ -59,9 +77,9 @@ jobs:
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
@@ -81,7 +99,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/hop" "dist/$NAME"
           strip "dist/$NAME" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.target }}
           path: dist/
@@ -90,15 +108,21 @@ jobs:
   macos:
     # macos-14 is Apple Silicon; both slices cross-compile from it.
     runs-on: macos-14
+    # Secrets are scoped to this environment. Configure it in repo Settings →
+    # Environments → "release" with a REQUIRED REVIEWER (you): the job then
+    # pauses for explicit approval before any signing credential is exposed.
+    # This is the backstop against merged-then-released supply-chain code —
+    # a tag push alone cannot reach the certs.
+    environment: release
     strategy:
       matrix:
         arch: [arm64, x86_64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: macos-${{ matrix.arch }}
 
@@ -169,7 +193,7 @@ jobs:
           spctl --assess --type install "$PKG" 2>&1 | grep -q accepted
           cp "$PKG" dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.arch }}
           path: dist/
@@ -178,9 +202,11 @@ jobs:
   publish:
     needs: [linux, macos]
     runs-on: ubuntu-latest
+    # Same gate: holds the RSA release key and the AWS role.
+    environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staged
       - name: Collect artifacts
@@ -208,7 +234,7 @@ jobs:
           done
           rm -f "$RUNNER_TEMP/key.pem"
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
