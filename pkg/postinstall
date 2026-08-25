@@ -1,0 +1,157 @@
+#!/bin/bash
+# postinstall — Set permissions, migrate config, and start the hop daemon.
+# Runs as root during .pkg installation.
+#
+# IMPORTANT: This script must NOT fail the installation. The binary and plist
+# are already installed by the time this runs. If the daemon can't start,
+# warn the user but exit 0 so the pkg install succeeds.
+
+LABEL="com.hop.daemon"
+PLIST="/Library/LaunchDaemons/com.hop.daemon.plist"
+BINARY="/usr/local/bin/hop"
+SYSTEM_CONFIG="/Library/Application Support/hop"
+
+# Ensure /usr/local/bin exists
+mkdir -p /usr/local/bin
+
+# Create the `_hop` service account the privilege-separation worker drops to
+# (privsep-node.md Phase 2). Dormant unless the daemon runs with HOP_PRIVSEP_DROP
+# — creating it is harmless otherwise. macOS `_`-prefixed system accounts live in
+# the 200–400 UID range with a nologin shell and no home.
+if ! dscl . -read /Users/_hop >/dev/null 2>&1; then
+    LAST_UID=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 200 && $2 < 400 {print $2}' | sort -n | tail -1)
+    HOP_UID=$(( ${LAST_UID:-299} + 1 ))
+    HOP_GID=$HOP_UID
+    if ! dscl . -read /Groups/_hop >/dev/null 2>&1; then
+        dscl . -create /Groups/_hop 2>/dev/null || true
+        dscl . -create /Groups/_hop PrimaryGroupID "$HOP_GID" 2>/dev/null || true
+        dscl . -create /Groups/_hop RealName "hop service" 2>/dev/null || true
+    else
+        HOP_GID=$(dscl . -read /Groups/_hop PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    fi
+    dscl . -create /Users/_hop 2>/dev/null || true
+    dscl . -create /Users/_hop UserShell /usr/bin/false 2>/dev/null || true
+    dscl . -create /Users/_hop RealName "hop service" 2>/dev/null || true
+    dscl . -create /Users/_hop UniqueID "$HOP_UID" 2>/dev/null || true
+    dscl . -create /Users/_hop PrimaryGroupID "$HOP_GID" 2>/dev/null || true
+    dscl . -create /Users/_hop NFSHomeDirectory /var/empty 2>/dev/null || true
+    dscl . -create /Users/_hop IsHidden 1 2>/dev/null || true
+    echo "Created _hop service account (uid $HOP_UID)."
+fi
+
+# Set correct ownership and permissions
+chown root:wheel "$BINARY"
+chmod 755 "$BINARY"
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+# Create system-level config directory accessible to admin users.
+# setgid (2770) ensures new files inherit the admin group.
+mkdir -p "$SYSTEM_CONFIG"
+chown root:admin "$SYSTEM_CONFIG"
+chmod 2770 "$SYSTEM_CONFIG"
+
+# Migrate config from the installing user's per-user directory if the
+# system-level directory has no identity yet.
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+    USER_HOME=$(eval echo "~$CONSOLE_USER")
+    USER_CONFIG="$USER_HOME/Library/Application Support/hop"
+
+    if [ ! -f "$SYSTEM_CONFIG/identity.json" ] && [ -f "$USER_CONFIG/identity.json" ]; then
+        echo "Migrating hop config from $USER_CONFIG to $SYSTEM_CONFIG..."
+        cp -n "$USER_CONFIG/identity.json" "$SYSTEM_CONFIG/identity.json" 2>/dev/null || true
+        cp -n "$USER_CONFIG/peers.json" "$SYSTEM_CONFIG/peers.json" 2>/dev/null || true
+        cp -n "$USER_CONFIG/pending_invites.json" "$SYSTEM_CONFIG/pending_invites.json" 2>/dev/null || true
+        echo "Config migrated. User copy left in place."
+    fi
+fi
+
+# Set per-file permissions: identity is read-only for admin users,
+# peers and pending_invites are read-write (shared between daemon and CLI).
+for f in identity.json; do
+    [ -f "$SYSTEM_CONFIG/$f" ] && chown root:admin "$SYSTEM_CONFIG/$f" && chmod 640 "$SYSTEM_CONFIG/$f"
+done
+for f in peers.json pending_invites.json datastore.redb fleet.json roles.json; do
+    [ -f "$SYSTEM_CONFIG/$f" ] && chown root:admin "$SYSTEM_CONFIG/$f" && chmod 660 "$SYSTEM_CONFIG/$f"
+done
+
+echo "Starting hop daemon..."
+
+# --- Stop the old daemon and wait for it to actually die ---
+# launchctl bootout is async: it tells launchd to stop the service but the
+# process may linger while it flushes the redb database and closes sockets.
+# We must wait for the *process* to exit, not just for launchd to unregister it.
+
+# Grab the PID before bootout (if the service is loaded).
+OLD_PID=$(launchctl print "system/$LABEL" 2>/dev/null | grep -m1 'pid =' | awk '{print $3}')
+
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+
+if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "0" ]; then
+    echo "Waiting for old daemon (pid $OLD_PID) to exit..."
+    # Poll the actual process — kill -0 succeeds while the PID is alive.
+    for i in $(seq 1 10); do
+        if ! kill -0 "$OLD_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    # If it's still alive after 10s, force-kill it.
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "Old daemon still running after 10s, sending SIGKILL..."
+        kill -9 "$OLD_PID" 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
+# Also kill any orphaned hop host processes (e.g. from a crashed launchd state).
+pkill -f "hop host.*--config.*/Library/Application Support/hop" 2>/dev/null || true
+sleep 0.5
+
+# Remove stale Unix sockets and lock files.
+rm -f "$SYSTEM_CONFIG/daemon.sock"
+rm -f "$SYSTEM_CONFIG/agent.sock"
+
+# --- Load and start the new daemon ---
+STARTED=false
+if launchctl bootstrap system "$PLIST" 2>/dev/null; then
+    STARTED=true
+elif launchctl load -w "$PLIST" 2>/dev/null; then
+    STARTED=true
+elif launchctl kickstart -k "system/$LABEL" 2>/dev/null; then
+    STARTED=true
+fi
+
+if [ "$STARTED" = true ]; then
+    sleep 2
+
+    # Verify the daemon is actually running.
+    if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+        echo "Hop daemon started successfully."
+    else
+        echo "WARNING: Hop daemon may not be running. Check: /var/log/hop-stderr.log"
+    fi
+else
+    echo "WARNING: Could not start hop daemon automatically."
+    echo "The binary and configuration are installed. Start manually with:"
+    echo "  sudo launchctl bootstrap system $PLIST"
+    echo "Or check: /var/log/hop-stderr.log"
+fi
+
+# Display creator invite if available
+CREATOR_INVITE="$SYSTEM_CONFIG/creator_invite"
+if [ -f "$CREATOR_INVITE" ]; then
+    echo ""
+    echo "=== CREATOR INVITE (expires in 1 hour) ==="
+    echo ""
+    TOKEN=$(cat "$CREATOR_INVITE")
+    echo "  hop connect $TOKEN"
+    echo ""
+    echo "This grants full admin access. Use it to set up the first administrator."
+    echo "Re-read with: hop creator-invite"
+    echo ""
+fi
+
+# Always exit 0 — the install succeeded even if the daemon didn't start.
+exit 0

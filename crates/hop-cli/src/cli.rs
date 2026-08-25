@@ -1,0 +1,1178 @@
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "hop",
+    about = "Secure P2P remote access",
+    version = env!("CARGO_PKG_VERSION")
+)]
+pub struct Cli {
+    /// Override config directory
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Increase log verbosity
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Emit machine-readable JSON (for agents/scripts). Errors become a
+    /// structured envelope on stderr. Also enabled by HOP_JSON=1.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Start hosting (listen for connections)
+    Host {
+        /// Suppress interactive output (for daemon/LaunchAgent use)
+        #[arg(long)]
+        quiet: bool,
+        /// Also run a member-only BYO relay on this host. Only warren members may
+        /// use it (the "open relay" fix). Members point `HOP_RELAY_URL` at
+        /// `http://<this-host>:<port>`.
+        #[arg(long)]
+        relay: bool,
+        /// HTTP port for `--relay` (default 3340).
+        #[arg(long, value_name = "PORT")]
+        relay_port: Option<u16>,
+    },
+
+    /// Generate a one-time invite token/URL
+    Invite {
+        /// Print this host's standing **creator** invite (admin tier) instead of
+        /// minting a new one — useful for headless/Docker bootstrap. Ignores the
+        /// other invite-shaping flags.
+        #[arg(long)]
+        creator: bool,
+        /// Unix username the invited peer will log in as
+        #[arg(long)]
+        user: Option<String>,
+        /// Named role for the invited peer (e.g. developer, ops). Defaults to the
+        /// host's configured default role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Capability tier: client (reach this host only), warren-only (VPN reach,
+        /// no host sessions), node (warren member + reachable), admin (node +
+        /// mint/grant). Default: inferred (node if this host has a warren, else
+        /// client). Warren tiers require this host to have a warren.
+        #[arg(long, value_name = "TIER")]
+        tier: Option<String>,
+        /// Make the invite reusable up to N times — one token N hosts redeem to
+        /// join the warren (the warren-first "fleet invite"). Default: single-use.
+        #[arg(long, value_name = "N")]
+        max_uses: Option<u32>,
+        /// Invite lifetime in seconds (default: 900 = 15 minutes).
+        #[arg(long, value_name = "SECS")]
+        expiry: Option<u64>,
+        /// Human-readable name for this host (defaults to system hostname)
+        #[arg(long)]
+        name: Option<String>,
+        /// Restrict to read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Block outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
+    },
+
+    /// Connect to a host (NodeId, invite token, or known host alias)
+    Connect {
+        /// Host NodeId, invite token, or known host alias. Optional only with
+        /// `--warren` (resume warren membership from the stored ticket).
+        target: Option<String>,
+        /// Override the name saved for this host in known_hosts
+        #[arg(long)]
+        name: Option<String>,
+        /// Request read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Request blocking outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
+        /// Consent to the privileged node setup without prompting (when the invite
+        /// carries a warren, this installs/restarts the hop daemon via sudo).
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// How to resolve consuming a warren invite while already on a *different*
+        /// warren: `replace` (switch), `abort` (keep), `merge`/`multi-home`.
+        #[arg(long = "on-warren-conflict", value_enum)]
+        on_warren_conflict: Option<OnWarrenConflict>,
+        /// Join the warren without opening a shell: from the invite given as the
+        /// target, or — with no target — from the ticket stored by a prior
+        /// connection. The headless join that replaces `hop warren join`.
+        #[arg(long)]
+        warren: bool,
+    },
+
+    /// View or update host configuration
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+
+    /// Clean up stale hop state and restart the daemon (un-wedge / post-upgrade).
+    /// Kills leftover client agents, removes stale sockets, and restarts the host
+    /// daemon onto the current binary. Never touches identity or membership.
+    Recover {
+        /// Suppress the summary line (used by the installer).
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Manage this machine's warren (private network) membership
+    Warren {
+        #[command(subcommand)]
+        action: WarrenAction,
+    },
+
+    /// Inspect and import warren access policy (ACL)
+    Acl {
+        #[command(subcommand)]
+        action: AclAction,
+    },
+
+    /// Bridge a physical LAN into the warren: advertise subnet/exit routes so
+    /// warren members can reach devices that don't run hop (Tier 1 LAN bridging)
+    Lan {
+        #[command(subcommand)]
+        action: LanAction,
+    },
+
+    /// List authorized peers or known hosts
+    Peers {
+        #[command(subcommand)]
+        action: Option<PeersAction>,
+    },
+
+    /// Copy files to/from a remote host
+    Cp {
+        /// Copy directories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
+        /// Source and destination paths (use host:path for remote)
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+    },
+
+    /// Sync directories with a remote host
+    Sync {
+        /// Delete extraneous files from destination
+        #[arg(long)]
+        delete: bool,
+
+        /// Show what would be transferred without doing it
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+
+        /// Show itemized list of changes per file
+        #[arg(short = 'i', long = "itemize-changes", alias = "itemize")]
+        itemize: bool,
+
+        /// Show detailed transfer statistics
+        #[arg(long)]
+        stats: bool,
+
+        /// Suppress per-file progress (show only filenames)
+        #[arg(long)]
+        no_progress: bool,
+
+        // Compat no-ops (hidden from --help)
+        #[arg(short = 'a', long, hide = true)]
+        archive: bool,
+        #[arg(short = 'z', long, hide = true)]
+        compress: bool,
+        #[arg(short = 'P', hide = true)]
+        partial_progress: bool,
+        #[arg(long, hide = true)]
+        progress: bool,
+        #[arg(short = 'H', long = "human-readable", hide = true)]
+        human_readable: bool,
+
+        /// Source path (use host:path for remote)
+        source: String,
+
+        /// Destination path (use host:path for remote)
+        dest: String,
+    },
+
+    /// Execute a command on a remote host
+    Exec {
+        /// Host NodeId, invite token, or known host alias
+        target: String,
+        /// Request read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Request blocking outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
+        /// Command and arguments to execute
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+
+    /// Forward a local TCP port to a port on a remote host (like `ssh -L`).
+    /// Opens `localhost:<localport>` and bridges each connection to the host's
+    /// `127.0.0.1:<remoteport>` over the encrypted P2P link.
+    Tunnel {
+        /// Host NodeId, invite token, or known host alias
+        target: String,
+        /// Port forward: `<port>` (same local+remote) or `<localport>:<remoteport>`
+        spec: String,
+    },
+
+    /// Remote administration (requires creator role)
+    Admin {
+        /// Target host (alias, NodeId, or invite token)
+        target: String,
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+
+    /// Fleet management (host-side)
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
+
+    /// Manage built-in capabilities (health, log-search, security-baseline)
+    Cap {
+        #[command(subcommand)]
+        action: CapAction,
+    },
+
+    /// Manage cron jobs on the daemon
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
+
+    /// Read/write key-value data from the daemon datastore
+    Kv {
+        #[command(subcommand)]
+        action: KvAction,
+    },
+
+    /// Manage encrypted secrets in the daemon datastore
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+
+    /// Query time-series data from the daemon datastore
+    Ts {
+        #[command(subcommand)]
+        action: TsAction,
+    },
+
+    /// Authenticate with a service (gmail, anthropic)
+    Auth {
+        /// Service name (gmail, anthropic)
+        provider: String,
+    },
+
+    /// Start MCP server (Model Context Protocol) for AI agent integration
+    Mcp,
+
+    /// Query this node's per-node audit & flow log (who connected, what ran, what flowed)
+    Audit {
+        /// How far back to look (e.g. "1h", "30m", "7d"). Default: 24h.
+        #[arg(long)]
+        since: Option<String>,
+        /// Restrict to one category: connection, session, exec, transfer, reach,
+        /// flow, membership, config.
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter by actor — matches a node-id or username substring.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Maximum rows (most recent first). Default: 100.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+
+    /// Print this node's identity (NodeId)
+    Id,
+
+    /// Manage the connection multiplexer agent
+    Agent {
+        #[command(subcommand)]
+        action: Option<AgentAction>,
+
+        /// Start agent in daemon mode (background)
+        #[arg(long)]
+        daemon: bool,
+
+        /// Override config directory
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Debugging tools for the host daemon (memory/CPU profiling)
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+
+    /// Internal: apply sandbox and exec a shell (used by Linux PTY sandboxing)
+    #[command(name = "__sandbox-shell", hide = true)]
+    SandboxShell {
+        /// JSON-serialized SandboxPolicy
+        #[arg(long)]
+        policy: String,
+        /// Shell binary and args to exec
+        #[arg(required = true, last = true)]
+        shell_args: Vec<String>,
+    },
+
+    /// Internal: list processes without setuid (works inside macOS sandbox)
+    #[command(name = "__ps", hide = true)]
+    Ps,
+
+    /// Internal (G24): emit this node's searchable log sources as NDJSON. Backs
+    /// `hop fleet sources`.
+    #[command(name = "__logsources", hide = true)]
+    LogSources,
+
+    /// Internal (G24): search a log source on this node, emitting matching lines
+    /// as NDJSON. Backs `hop fleet search` (one-shot + the interactive TUI).
+    #[command(name = "__logsearch", hide = true)]
+    LogSearch {
+        /// Source id: `system` (default), `audit`, a well-known name, or a path.
+        #[arg(long, default_value = "system")]
+        source: String,
+        /// Time window for time-bounded sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Optional smart-case substring pre-filter (server-side, to bound transfer).
+        #[arg(long)]
+        grep: Option<String>,
+        /// Max matching lines to emit.
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+        /// Max source lines to scan (back-pressure on a chatty source).
+        #[arg(long, default_value_t = 50000)]
+        line_cap: usize,
+    },
+
+    /// Internal: privilege-separation feasibility gate (privsep-node.md §8.1).
+    /// Run as root (e.g. `sudo hop __privsep-probe`); creates a TUN, hands the
+    /// fd to a non-root child, and reports whether non-root TUN I/O is permitted.
+    #[command(name = "__privsep-probe", hide = true)]
+    PrivsepProbe {
+        /// Unprivileged uid the child drops to (default: $SUDO_UID).
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Unprivileged gid the child drops to (default: $SUDO_GID).
+        #[arg(long)]
+        gid: Option<u32>,
+    },
+
+    /// Internal: child half of the privsep probe — receives the TUN fd and
+    /// tests non-root I/O. Spawned by `__privsep-probe`; not run directly.
+    #[command(name = "__privsep-probe-child", hide = true)]
+    PrivsepProbeChild {
+        #[arg(long = "sock-fd")]
+        sock_fd: i32,
+    },
+
+    /// Internal: install + start the hop system daemon from embedded templates
+    /// (launchd on macOS, systemd on Linux). Must run as root. Invoked under the
+    /// self-upgrade `sudo` after the unprivileged user has decoded the invite and
+    /// staged the primer files (see install-and-invite-tiers.md §5).
+    #[command(name = "__install-daemon", hide = true)]
+    InstallDaemon {
+        /// User-owned staging dir holding primer files the unprivileged step
+        /// already wrote (netdoc-join.ticket, netdoc-founder.author,
+        /// netdoc-founder.node). Copied into the system config dir as root.
+        #[arg(long)]
+        stage: Option<PathBuf>,
+        /// Enable/disable the warren VPN data plane in the daemon config.
+        #[arg(long)]
+        vpn: Option<String>,
+        /// Capability tier (client|warren-only|node|admin) — informational.
+        #[arg(long)]
+        tier: Option<String>,
+        /// Default invite role for this node.
+        #[arg(long)]
+        default_role: Option<String>,
+        /// Host tags (comma-separated).
+        #[arg(long)]
+        tags: Option<String>,
+        /// Promote these (already-verified) binary bytes to the root-owned
+        /// /usr/local/bin/hop that the service unit points at.
+        #[arg(long)]
+        promote_from: Option<PathBuf>,
+        /// Skip promotion (the binary is already the root-owned /usr/local/bin/hop).
+        #[arg(long)]
+        no_promote: bool,
+    },
+
+    /// Internal: privilege-separated transfer helper (runs as target user)
+    #[command(name = "__transfer-helper", hide = true)]
+    TransferHelper {
+        /// Transfer mode: receive, send, sync-receive
+        #[arg(long)]
+        mode: String,
+        /// Destination/source directory
+        #[arg(long)]
+        dest: String,
+        /// Compression setting (e.g. "zstd:3")
+        #[arg(long)]
+        compression: Option<String>,
+        /// Max chunk size in bytes
+        #[arg(long, default_value = "65536")]
+        chunk_size: usize,
+        /// Negotiated transfer features version (gates chunked listings)
+        #[arg(long, default_value = "1")]
+        features_version: u32,
+    },
+
+    /// Catch-all: treat unknown subcommands as connect targets (e.g. "hop myhost")
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Stop the running agent
+    Stop,
+    /// Check agent status
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum DebugAction {
+    /// Memory-profile the host daemon. Restarts it in profiling mode (full speed,
+    /// serves traffic), snapshots its live heap, and restores the normal daemon.
+    /// Native profiler per platform: MallocStackLogging/malloc_history on macOS,
+    /// jemalloc on Linux.
+    #[command(name = "mem-profile")]
+    MemProfile {
+        #[command(subcommand)]
+        action: MemProfileAction,
+    },
+
+    /// CPU-profile the running host daemon (no restart): samples its call stacks
+    /// for a few seconds and reports the hottest functions. `sample` on macOS,
+    /// `perf` on Linux. Auto-targets the busiest `hop host` process.
+    #[command(name = "cpu-profile")]
+    CpuProfile {
+        /// Seconds to sample (default: 10)
+        #[arg(long, default_value = "10")]
+        secs: u64,
+        /// Profile this pid instead of auto-detecting the busiest `hop host`
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Write the report here (default: /tmp/hop-cpu-<pid>-<ts>.txt)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Show VPN data-plane counters from the running daemon: per-packet drops,
+    /// send-queue backpressure, and forwarding-latency histograms. Answers "are
+    /// packets being dropped / queues backing up / how long do we hold a packet".
+    #[command(name = "net-stats")]
+    NetStats {
+        /// Refresh continuously, showing per-second rates (Ctrl-C to stop)
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between refreshes in --watch mode (default: 2)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemProfileAction {
+    /// Restart the host daemon in memory-profiling mode (run with sudo)
+    On,
+    /// Write a sorted, symbolized heap report from the running profiling daemon
+    Snapshot {
+        /// Write the report here (default: /tmp/hop-heap-<pid>-<ts>.txt)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Restore the normal (privsep) daemon (run with sudo)
+    Off,
+    /// Internal: detached watchdog that restores the normal daemon after a deadline
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog {
+        #[arg(long)]
+        deadline: u64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AclAction {
+    /// Import a Tailscale tailnet policy file (HuJSON) → hop roles + reach
+    Import {
+        /// Path to the Tailscale policy file (HuJSON/JSON)
+        file: std::path::PathBuf,
+        /// Write the imported roles to roles.json (default: dry-run report only)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Check whether a role reaches a host with the given tags
+    Check {
+        /// Role name (from roles.json)
+        role: String,
+        /// Destination host tags
+        tags: Vec<String>,
+    },
+    /// Print the seeded/derived reach of every role
+    Show,
+    /// Show a role's application capability grants
+    Caps {
+        /// Role name (from roles.json)
+        role: String,
+    },
+    /// Author the warren's Cedar reach policy (posture/role/tag-gated rules)
+    Policy {
+        #[command(subcommand)]
+        action: AclPolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AclPolicyAction {
+    /// Save the authored Cedar policy (from a file, or stdin if omitted). The
+    /// daemon publishes it to the warren on (re)start; only an admin's write
+    /// takes effect (`acl/cedar` is admin-owned under C1 enforce).
+    Set {
+        /// Path to a `.cedar` policy file (reads stdin if omitted)
+        file: Option<std::path::PathBuf>,
+    },
+    /// Print the locally-saved authored policy.
+    Show,
+    /// Dry-run (offline): evaluate a principal (role + posture) reaching a tagged
+    /// host against a policy, and print ALLOW / DENY. Useful before rolling a
+    /// policy out.
+    Test {
+        /// Role name for the test principal (from roles.json)
+        #[arg(long)]
+        role: String,
+        /// Destination host tag(s) (the resource). Repeat for multiple.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Principal posture attributes, e.g. `--posture disk_encrypted=true --posture os=linux`
+        #[arg(long = "posture", value_name = "K=V")]
+        posture: Vec<String>,
+        /// Policy file to test against (default: the locally-saved authored policy)
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WarrenAction {
+    /// Leave the warren: tear down this machine's warren state (namespace,
+    /// tickets, store, vIP) after a backup. Does not uninstall the daemon.
+    Leave {
+        /// Skip the confirmation prompt (required non-interactively).
+        #[arg(long)]
+        yes: bool,
+        /// Don't back up the torn-down state to a .warren-backup-<ts> dir.
+        #[arg(long)]
+        no_backup: bool,
+    },
+    /// Show this machine's warren membership and VPN state.
+    Status,
+}
+
+/// How to resolve consuming a different warren's invite while already on one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnWarrenConflict {
+    /// Leave the current warren and join the new one (the KISS default).
+    Replace,
+    /// Federate the two warrens (not yet implemented).
+    Merge,
+    /// Stay on both warrens at once (not yet implemented).
+    MultiHome,
+    /// Keep the current warren; do nothing.
+    Abort,
+}
+
+/// `hop lan` — gateway subnet/exit route management (Tier 1 LAN bridging).
+#[derive(Subcommand)]
+pub enum LanAction {
+    /// Advertise a LAN subnet (or exit node) this machine will route for. Writes
+    /// `routes.json`; the daemon materializes it into the warren + sets up
+    /// forwarding on (re)start.
+    Advertise {
+        /// CIDR to bridge, e.g. `192.168.1.0/24`, or a single device `192.168.1.50/32`.
+        /// Omit with `--exit` to advertise the default route.
+        cidr: Option<String>,
+        /// Tags gating which roles may reach this route (defaults to the host's tags).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Don't masquerade forwarded traffic (preserve client source IP; requires
+        /// return routes on the target LAN — power-user / site-to-site).
+        #[arg(long)]
+        no_snat: bool,
+        /// Advertise as an internet exit node (`0.0.0.0/0`) instead of a subnet.
+        #[arg(long)]
+        exit: bool,
+    },
+    /// Stop advertising a previously-advertised route.
+    Withdraw {
+        /// The CIDR (or `0.0.0.0/0` for the exit route) to withdraw.
+        cidr: String,
+    },
+    /// List routes this machine advertises and routes available in the warren.
+    Ls,
+    /// Act as an app connector for a domain: resolve it and advertise its current
+    /// IP(s) as routes, so warren traffic to that domain egresses from here.
+    Connector {
+        /// The domain to resolve + advertise (e.g. `api.example.com`).
+        domain: String,
+        /// Tags gating which roles may reach it (defaults to the host's tags).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Split-DNS: resolve `<domain>` via a LAN nameserver (reachable over a warren
+    /// route) instead of MagicDNS. Applied on next daemon start.
+    Dns {
+        /// The domain suffix to route, e.g. `corp.example.com`.
+        domain: String,
+        /// The LAN nameserver IP to send those queries to.
+        nameserver: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Set a configuration value
+    Set {
+        /// Configuration key (session_timeout, max_sessions, vpn, tags, default_role)
+        key: String,
+        /// New value
+        value: String,
+    },
+    /// Print the resolved host config directory
+    Path,
+}
+
+#[derive(Subcommand)]
+pub enum AdminAction {
+    /// Create an invite on the remote host
+    Invite {
+        /// Unix username for the invited peer
+        #[arg(long)]
+        user: Option<String>,
+        /// Named role for the invited peer (e.g. developer, ops)
+        #[arg(long)]
+        role: Option<String>,
+        /// Create a creator invite (admin access)
+        #[arg(long)]
+        creator: bool,
+        /// Restrict to read-only filesystem access
+        #[arg(long)]
+        read_only: bool,
+        /// Block outbound network access
+        #[arg(long)]
+        no_network: bool,
+        /// Restrict filesystem access to these paths (can be repeated)
+        #[arg(long = "scope", value_name = "PATH")]
+        scopes: Vec<std::path::PathBuf>,
+        /// Only allow these commands (can be repeated)
+        #[arg(long = "allow-command", value_name = "CMD")]
+        allow_commands: Vec<String>,
+        /// Use a sandbox preset (monitor, audit, deploy)
+        #[arg(long)]
+        preset: Option<String>,
+    },
+    /// List authorized peers on the remote host
+    Peers,
+    /// Remove a peer from the remote host
+    RemovePeer {
+        /// NodeId prefix of the peer to remove
+        id: String,
+    },
+    /// Change a peer's role on the remote host (elevation/demotion)
+    Grant {
+        /// NodeId prefix of the peer
+        id: String,
+        /// Named role to assign (e.g. developer, ops, admin, member)
+        role: String,
+    },
+    /// Create a Unix user on the remote host
+    CreateUser {
+        /// Username to create
+        username: String,
+        /// Grant sudo access
+        #[arg(long)]
+        sudo: bool,
+        /// macOS admin group membership
+        #[arg(long)]
+        admin: bool,
+        /// Extra Unix groups (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Override default shell
+        #[arg(long)]
+        shell: Option<String>,
+        /// Also generate an invite for this user
+        #[arg(long)]
+        invite: bool,
+    },
+    /// Get status of the remote host
+    Status,
+    /// Create a fleet invite token (orchestrator)
+    FleetInvite {
+        /// Tags for fleet members using this invite
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Maximum number of uses (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_uses: u32,
+        /// Expiry in seconds (default: 24h)
+        #[arg(long, default_value = "86400")]
+        expiry: u64,
+        /// Capability tier for redeemers: client, warren-only, node, admin.
+        /// Default: admin (legacy behaviour). Warren tiers need a warren.
+        #[arg(long, value_name = "TIER")]
+        tier: Option<String>,
+    },
+    /// List fleet members (orchestrator)
+    FleetList {
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Remove a fleet member (orchestrator)
+    FleetRemove {
+        /// NodeId prefix of the member to remove
+        id: String,
+    },
+    /// Update tags on a fleet member (orchestrator)
+    FleetTag {
+        /// NodeId prefix of the member
+        id: String,
+        /// Tags to add
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        /// Tags to remove
+        #[arg(long, value_delimiter = ',')]
+        remove: Vec<String>,
+    },
+    /// Create a role definition (orchestrator)
+    #[command(subcommand)]
+    Role(RoleAction),
+}
+
+#[derive(Subcommand)]
+pub enum RoleAction {
+    /// Create a new role
+    Create {
+        /// Role name
+        name: String,
+        /// Host tags this role can access (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Use shared Unix accounts (default: individual)
+        #[arg(long)]
+        shared: bool,
+        /// Grant sudo access
+        #[arg(long)]
+        sudo: bool,
+        /// macOS admin group membership
+        #[arg(long)]
+        admin: bool,
+        /// Extra Unix groups (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Override default shell
+        #[arg(long)]
+        shell: Option<String>,
+        /// Host-tags this role may shell/exec/transfer on (comma-separated; empty =
+        /// open, `*` = all). Scopes who may run mutating sessions on which hosts.
+        #[arg(long, value_delimiter = ',')]
+        exec_tags: Vec<String>,
+        /// Host-tags this role may READ-ONLY search on (`hop fleet grep`/audit). The
+        /// middle tier between `network-only` (none) and full exec.
+        #[arg(long, value_delimiter = ',')]
+        search_tags: Vec<String>,
+    },
+    /// List all roles
+    List,
+    /// Update an existing role
+    Update {
+        /// Role name to update
+        name: String,
+        /// Tags to add
+        #[arg(long, value_delimiter = ',')]
+        add_tags: Vec<String>,
+        /// Tags to remove
+        #[arg(long, value_delimiter = ',')]
+        remove_tags: Vec<String>,
+        /// Set sudo access
+        #[arg(long)]
+        sudo: Option<bool>,
+        /// Set macOS admin
+        #[arg(long)]
+        admin: Option<bool>,
+        /// Replace the exec (session) tag scope (comma-separated; `*` = all)
+        #[arg(long, value_delimiter = ',')]
+        exec_tags: Option<Vec<String>>,
+        /// Replace the read-only search tag scope (comma-separated; `*` = all)
+        #[arg(long, value_delimiter = ',')]
+        search_tags: Option<Vec<String>>,
+    },
+    /// Delete a role
+    Delete {
+        /// Role name to delete
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FleetAction {
+    /// Show fleet registration status
+    Status {
+        /// Fleet name (required only if registered with multiple fleets)
+        #[arg(long)]
+        fleet: Option<String>,
+    },
+    /// List hosts in a fleet group
+    List {
+        /// Group/role to filter by
+        group: Option<String>,
+        /// Liveness window: a member seen within this duration is shown `online`
+        /// (e.g. `15m`, `1h`, `7d`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// Run a command on all warren members (or known hosts) matching a selector.
+    /// The selector matches a warren member's role or any of its tags (from the
+    /// replicated netdoc), or a known-host group.
+    Exec {
+        /// Selector: a role name, a tag, or a known-host group.
+        selector: String,
+        /// Also target members that look offline (stale `last_seen`). By default
+        /// fan-out skips them — they'd just time out.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+        /// Command and arguments
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+    /// Federated log search: fan a READ-ONLY search across matching warren members,
+    /// each node resolving its own source locally, and reduce the results — no
+    /// central collector. Runs under an audit (read-only) sandbox so a node can't be
+    /// mutated.
+    Grep {
+        /// Selector: a role name, a tag, a known-host group, or `all` (every member).
+        selector: String,
+        /// Search pattern (a fixed/literal substring; quoted safely per node).
+        pattern: String,
+        /// Where each node searches: `audit` (default — the structured hop audit log,
+        /// identical cross-platform), `system` (well-known system logs, resolved
+        /// per-OS: journalctl / /var/log / macOS system.log), or an explicit file
+        /// path.
+        #[arg(long, default_value = "audit")]
+        source: String,
+        /// Time window for the `audit`/`system` sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Max matching lines to keep per node.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Max nodes queried concurrently.
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+        /// Also search members that look offline (stale `last_seen`). By default
+        /// the fan-out skips them — they'd just time out.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// Remove warren members not seen for a while (admin-gated; writes a replicated
+    /// revocation so every node drops them). Never removes this node.
+    Prune {
+        /// Remove members whose last contact is older than this (e.g. `30d`, `12h`).
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Show what would be pruned without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Search logs across the warren (G24). Interactive fzf-style filter in a TTY;
+    /// one-shot structured output when piped or with --json. Defaults to the OS
+    /// SYSTEM logs (macOS unified log / journald/syslog) — hop's own events are
+    /// `--source audit`. See searchable sources with `hop fleet sources`.
+    Search {
+        /// Selector: a role, a tag, a known-host group, or `all` (every member).
+        selector: String,
+        /// Search pattern (smart-case substring). Optional — omit to browse, then
+        /// filter live in the interactive view.
+        pattern: Option<String>,
+        /// Which log to search on each node: `system` (default), `audit`, a
+        /// well-known name (`nginx`, `auth`, …), or a file path. `hop fleet
+        /// sources` lists what each node offers.
+        #[arg(long, default_value = "system")]
+        source: String,
+        /// Time window for time-bounded sources (e.g. `1h`, `30m`, `7d`).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Max matching lines per node.
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+        /// Also search members that look offline (stale last_seen).
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// List the log sources searchable on each warren node (discoverability) —
+    /// resolved per-OS (macOS unified log, journald/syslog, hop audit, files).
+    Sources {
+        /// Selector for which nodes to query: a role, a tag, or `all` (default).
+        #[arg(default_value = "all")]
+        selector: String,
+        /// Also query members that look offline.
+        #[arg(long)]
+        include_offline: bool,
+        /// Liveness window for the offline filter (e.g. `15m`, `1h`). Default: 15m.
+        #[arg(long)]
+        stale_after: Option<String>,
+    },
+    /// Add a known host to the daemon's fleet store
+    Add {
+        /// Host alias from known_hosts
+        name: String,
+        /// Tags for this fleet member (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CronAction {
+    /// List all cron jobs
+    List,
+    /// Show full details of a cron job
+    Get {
+        /// Job ID
+        id: String,
+    },
+    /// Create a new cron job
+    Create {
+        /// Job name
+        #[arg(long)]
+        name: String,
+        /// Cron schedule expression (e.g. "0 */5 * * * *")
+        #[arg(long)]
+        schedule: String,
+        /// Inline JavaScript source
+        #[arg(long, conflicts_with = "file")]
+        script: Option<String>,
+        /// Read script from a file
+        #[arg(long, conflicts_with = "script")]
+        file: Option<std::path::PathBuf>,
+        /// Fleet target tag (hosts matching this tag get injected as hop.targets)
+        #[arg(long)]
+        targets: Option<String>,
+        /// Tags for this job (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Delete a cron job
+    Delete {
+        /// Job ID
+        id: String,
+    },
+    /// Enable a cron job
+    Enable {
+        /// Job ID
+        id: String,
+    },
+    /// Disable a cron job
+    Disable {
+        /// Job ID
+        id: String,
+    },
+    /// Trigger immediate execution of a cron job
+    Run {
+        /// Job ID
+        id: String,
+    },
+    /// Show the last error from a cron job
+    Errors {
+        /// Job ID (optional — shows all errors if omitted)
+        id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KvAction {
+    /// Get a value by key
+    Get {
+        /// Key to look up
+        key: String,
+        /// Output raw value (unwrap JSON strings for piping to files)
+        #[arg(long)]
+        raw: bool,
+    },
+    /// List keys matching an optional prefix
+    List {
+        /// Key prefix to filter by
+        prefix: Option<String>,
+    },
+    /// Set a key-value pair
+    Set {
+        /// Key
+        key: String,
+        /// Value
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretsAction {
+    /// Get a secret's value
+    Get {
+        /// Secret name
+        name: String,
+    },
+    /// Set a secret (reads from stdin if value omitted)
+    Set {
+        /// Secret name
+        name: String,
+        /// Secret value (omit to enter interactively)
+        value: Option<String>,
+    },
+    /// List all secret names
+    List,
+    /// Delete a secret
+    Delete {
+        /// Secret name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TsAction {
+    /// Get the most recent data point for a metric
+    Latest {
+        /// Metric name
+        metric: String,
+    },
+    /// Query time-series data for a metric
+    Query {
+        /// Metric name
+        metric: String,
+        /// Time range to query (e.g. "1h", "30m", "7d"). Default: 1h
+        #[arg(long, default_value = "1h")]
+        last: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CapAction {
+    /// List available capabilities
+    List,
+    /// Enable a capability (creates a cron job)
+    Enable {
+        /// Capability ID (e.g. health, log-search, security-baseline)
+        id: String,
+        /// Fleet target tag (hosts to monitor)
+        #[arg(long)]
+        targets: Option<String>,
+        /// Override the default schedule (cron expression)
+        #[arg(long)]
+        schedule: Option<String>,
+    },
+    /// Disable a capability (removes its cron job)
+    Disable {
+        /// Capability ID
+        id: String,
+    },
+    /// Show status of enabled capabilities
+    Status,
+    /// Run a capability once (on-demand)
+    Run {
+        /// Capability ID
+        id: String,
+        /// Fleet target tag
+        #[arg(long)]
+        targets: Option<String>,
+        /// Parameters as key=value pairs
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
+    /// Deploy a capability to remote nodes
+    Deploy {
+        /// Capability ID
+        id: String,
+        /// Fleet target tag (required)
+        #[arg(long)]
+        targets: String,
+    },
+    /// Interactive setup: authenticate and enable a capability
+    Setup {
+        /// Capability ID (e.g. email-monitor)
+        id: String,
+        /// Override the default schedule (cron expression)
+        #[arg(long)]
+        schedule: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PeersAction {
+    /// Remove an authorized peer
+    Remove {
+        /// NodeId of the peer to remove
+        id: String,
+    },
+
+    /// Rename a peer or known host
+    Rename {
+        /// NodeId prefix or current alias
+        id: String,
+        /// New name
+        name: String,
+    },
+}

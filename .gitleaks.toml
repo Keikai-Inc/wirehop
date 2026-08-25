@@ -1,0 +1,28 @@
+# Gitleaks configuration for WireHop.
+#
+# Extends the default rules; the allowlist documents every intentional
+# exception. Adding an entry requires a justification comment.
+
+[extend]
+useDefault = true
+
+# Google OAuth credentials must NEVER appear in source: they are injected at
+# build time (crates/hop-cli/build.rs) from the release environment and stored
+# obfuscated in the binary. This rule makes any occurrence in the tree a
+# finding — there is deliberately no path exemption for them.
+[[rules]]
+id = "wirehop-google-oauth-in-source"
+description = "Google OAuth credential in source (must be build-time injected)"
+regex = "(GOCSPX-[A-Za-z0-9_-]{20,}|[0-9]{10,}-[a-z0-9]{20,}\\.apps\\.googleusercontent\\.com)"
+
+[allowlist]
+description = "Reviewed, intentional exceptions"
+regexes = [
+  # Synthetic fixture exercising the `claude setup-token` output parser in
+  # crates/hop-cli/src/oauth.rs. Not a live credential.
+  #
+  # Deliberately a PREFIX, not the whole token: writing the full value here
+  # would put a credential-shaped string in this file, which our own export
+  # gate correctly rejects (it caught exactly that).
+  "sk-ant-oat01-AbCdEf",
+]

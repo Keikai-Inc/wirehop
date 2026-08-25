@@ -1,0 +1,30 @@
+[Unit]
+Description=Hop - Secure P2P Remote Access
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hop host --quiet --config /etc/hop
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening (security-audit M9) -------------------------------------------
+# NOTE: `hop host` spawns remote *user sessions* (shells/exec) as children of
+# this unit. Any systemd filesystem/namespace sandbox (ProtectSystem,
+# ProtectHome, PrivateTmp, NoNewPrivileges, RestrictSUIDSGID, …) would also
+# apply to those sessions and would BREAK legitimate full-access use — e.g. an
+# admin editing /etc or installing to /usr, or dropping privileges via `su` to
+# the bound user. hop's real per-session boundary is its own SandboxPolicy
+# (role -> read-only / allowed_paths / no_network), enforced in-process per
+# peer. So we deliberately omit session-restricting options (including
+# ProtectControlGroups / RestrictNamespaces / RestrictRealtime, which would
+# break legitimate container, cgroup, and realtime administration over hop) and
+# apply only hardening that cannot constrain a legitimate session.
+LockPersonality=true
+# Identity/secrets live under /etc/hop (0600/0660); journald handles logs.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[package]
+name = "hop-tap-protocol"
+description = "Wire types for the hop-tap extension subprotocol (TapRequest / TapResponse / streaming frames)"
+version = "0.2.29"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,137 @@
+[workspace]
+members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/hop-mcp", "crates/hop-vt"]
+resolver = "2"
+
+[workspace.package]
+version = "0.9.32"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Keikai-Inc/wirehop"
+
+[workspace.dependencies]
+# Internal
+hop-core = { path = "crates/hop-core" }
+hop-mcp = { path = "crates/hop-mcp" }
+hop-vt = { path = "crates/hop-vt" }
+
+# Networking
+# iroh referenced as a crates.io version so the [patch.crates-io] below redirects
+# it AND the transitive iroh deps of iroh-docs/blobs/gossip to our fork (single
+# iroh instance). The fork is iroh 0.97.0 + our relay-cascade fix.
+# `address-lookup-mdns`: local-network (mDNS) peer discovery so same-LAN warren
+# members find each other's CURRENT address directly — fast recovery after a peer
+# restarts/roams without waiting on n0 DNS propagation or a relay hairpin.
+# default-features off drops iroh's `metrics` + `portmapper` (UPnP — pulls
+# igd-next/xml-rs) defaults hop never uses; keep mDNS discovery + the macOS fast
+# datapath. The iroh-* siblings likewise drop `rpc` (irpc) + `metrics`, keeping
+# only the local fs store / gossip net hop actually uses.
+iroh = { version = "0.97", default-features = false, features = ["address-lookup-mdns", "fast-apple-datapath"] }
+# iroh-docs CRDT + its mandatory companions (content-addressed values via blobs,
+# live replication via gossip). Stable lockstep matched to iroh 0.97.
+iroh-docs = { version = "0.97", default-features = false, features = ["fs-store"] }
+iroh-gossip = { version = "0.97", default-features = false, features = ["net"] }
+iroh-blobs = { version = "0.99", default-features = false, features = ["fs-store"] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "signal"] }
+futures-lite = "2"
+
+# CLI — default-features off drops `color` (anstream) + `suggestions` (strsim);
+# keep the help/usage/error machinery.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+toml = "0.8"
+
+# Extension IPC (typed channels with serde, fd transfer, cross-platform)
+ipc-channel = "0.20"
+
+# Terminal / PTY
+portable-pty = "0.9"
+crossterm = "0.28"
+ratatui = "0.29"
+
+# Crypto / Auth
+rand = "0.9"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Config
+directories = "5"
+
+# Error handling & logging
+anyhow = "1"
+tracing = "0.1"
+# No `env-filter`: it pulls the regex stack (regex-automata/aho-corasick, ~500KB).
+# hop only uses target=level filtering, served by the lightweight `Targets` filter
+# (still parses RUST_LOG). Defaults (fmt/ansi/std/tracing-log) are kept.
+tracing-subscriber = "0.3"
+
+# System
+libc = "0.2"
+nix = { version = "0.29", features = ["user", "net", "term", "signal", "process", "fs", "socket", "uio"] }
+uzers = "0.12"
+hostname = "0.4"
+filetime = "0.2"
+landlock = "0.4"
+
+# Compression & Hashing — hop only does bulk compress/decompress at a fixed
+# level; drop `zdict_builder` (dictionary training, unused). Keep `legacy` (decode
+# old peers' streams) + `arrays` (SIMD).
+zstd = { version = "0.13", default-features = false, features = ["legacy", "arrays"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Datastore
+redb = "2"
+cron = "0.13"
+
+# Testing
+tempfile = "3"
+
+# NOTE: iroh 0.97 switched from iroh-quinn (n0's quinn fork) to stock quinn
+# 0.11.x, so the previous `iroh-quinn` patch (a panic fix on drained connections)
+# is no longer in the dependency graph. TODO(p2p): verify whether stock
+# quinn 0.11.9 still has the `unreachable!()` panic on drained-without-error
+# connections (the fix was filed upstream at quinn-rs/quinn); if not, patch
+# `quinn` instead. Tracked as a Phase 1 robustness item.
+[patch.crates-io]
+# Redirect iroh AND its sibling workspace crates (iroh-base, iroh-relay) to our
+# fork: upstream iroh 0.97.0 + the macOS relay-connection-cascade fix. All three
+# must be patched together — iroh-docs/blobs/gossip pull iroh-base/iroh-relay
+# from crates.io, and mixing those with the fork's copies yields two iroh_base
+# versions (PublicKey type mismatch).
+iroh = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+iroh-base = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-relay-fix-0.97" }
+# noq-proto (n0's quinn fork, the QUIC engine under iroh 0.97) vendored + patched:
+# SentPacket.largest_acked was an FxHashMap<PathId,u64> allocated per sent packet
+# and retained ×concurrent-paths → a multi-GB leak under multipath. Our copy makes
+# it an inline TinyVec (no per-packet heap alloc for the common 1-2 path case), so
+# multipath can be re-enabled without the bleed. See vendor/noq-proto.
+noq-proto = { path = "vendor/noq-proto" }
+
+[profile.release]
+# opt-level "s" optimizes for size (still keeps most speed opts, unlike "z").
+# Chosen because the daemon is CPU-idle under the heaviest workload (VNC-over-VPN
+# sampled <0.1% CPU) and the hot crypto/compression is C/asm (ring, zstd-sys),
+# unaffected by Rust opt-level. Validate throughput on real hardware before fully
+# relying on it (iperf over the tunnel).
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Faster profile for Linux cross-compilation (QEMU + native arm64 Docker).
+# Thin LTO allows parallel codegen, reducing emulated build times significantly.
+# ~5% larger binaries than full LTO — acceptable tradeoff for CLI tools.
+[profile.release-cross]
+inherits = "release"
+lto = "thin"
+codegen-units = 4

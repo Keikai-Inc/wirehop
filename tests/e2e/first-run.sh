@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# First-run acceptance — proves the three core jobs each complete within a
+# step/time budget for a NO-DOCS first-timer, so "each job in ~60s" can't silently
+# regress. The tutorials ARE the tests. Gates releases (scripts/release.sh).
+#
+#   A1  reach a machine     host -> invite -> connect -> run a command over the shell
+#   A2  private network     founder -> invite -> node joins (the PAGE'S DEFAULT node
+#                           command: bare `--host`, no HOP_VPN) -> reaches founder
+#                           BY NAME over the VPN. Proves VPN-on-by-default + MagicDNS.
+#   A3  expose a device     (added in a later milestone: subnet route + `hop tunnel`)
+#   GUARD                   the default CLIENT install (no daemon, no VPN) still does
+#                           hop/exec/cp with no local daemon and no VPN.
+#
+# Deterministic Linux Docker (the macOS path is covered by the Tart harness).
+# Usage:  ./tests/e2e/first-run.sh        (REBUILD=1 to force a cross-build)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+IMG=hop-firstrun-e2e
+NET=hop-firstrun-net
+BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/hop"
+
+# Per-job budgets (seconds). A first-timer target is ~60s/job; these are the CI
+# ceilings (cold Docker, relay handshake). A regression past budget fails the gate.
+A1_BUDGET="${A1_BUDGET:-40}"
+A2_BUDGET="${A2_BUDGET:-60}"
+A3_BUDGET="${A3_BUDGET:-40}"
+FG_BUDGET="${FG_BUDGET:-60}"
+CAP_BUDGET="${CAP_BUDGET:-40}"
+LC_BUDGET="${LC_BUDGET:-120}"
+GUARD_BUDGET="${GUARD_BUDGET:-40}"
+
+PASS=0; FAIL=0; REPORT=""
+say() { echo "=== $* ==="; }
+record() { # name ok secs budget detail
+  local name="$1" ok="$2" secs="$3" budget="$4" detail="$5" status
+  if [ "$ok" = 1 ] && [ "$secs" -le "$budget" ] 2>/dev/null; then
+    status="PASS"; PASS=$((PASS+1))
+  else
+    status="FAIL"; FAIL=$((FAIL+1))
+  fi
+  printf "  %-22s %s  (%ss / %ss budget)  %s\n" "$name" "$status" "$secs" "$budget" "$detail"
+  REPORT="${REPORT}| ${name} | ${secs}s | ${budget}s | ${status} | ${detail} |\n"
+}
+
+CONTAINERS=()
+trap cleanup EXIT
+cleanup() {
+  say "cleanup"
+  for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  docker network rm "$NET" >/dev/null 2>&1 || true
+  rm -f "$SCRIPT_DIR/hop"
+}
+
+# --- build + image --------------------------------------------------------
+if [ "${REBUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; then
+  say "cross-building aarch64 linux binary"
+  AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target aarch64-unknown-linux-gnu -p hop-cli
+fi
+cp "$BIN" "$SCRIPT_DIR/hop"
+say "building image"
+docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates jq iputils-ping iproute2 dnsutils netcat-openbsd && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -s /bin/bash hop
+COPY hop /usr/local/bin/hop
+RUN chmod +x /usr/local/bin/hop
+DOCKERFILE
+docker network create "$NET" >/dev/null 2>&1 || true
+
+# A node (warren host) needs the TUN + NET_ADMIN. Deliberately NO HOP_VPN env:
+# A2 must prove the VPN comes up from the config DEFAULT (the bare `--host` the
+# web builder emits), not a forced override.
+NODE_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1
+          -e HOP_WARREN_SNAPSHOT_SECS=3
+          -e RUST_LOG="${FR_LOG:-hop=info,hop_core=warn}" --user root)
+# A pure client needs neither.
+CLIENT_ENV=(-e RUST_LOG="${FR_LOG:-hop=info,hop_core=warn}" --user root)
+
+# run_node <name> <hostname> — a warren node (TUN + NET_ADMIN, VPN from default).
+run_node()   { local n="$1" h="$2"; CONTAINERS+=("$n"); docker run -d --name "$n" --hostname "$h" --network "$NET" "${NODE_ENV[@]}"   "$IMG" sleep infinity >/dev/null; docker exec "$n" mkdir -p /cfg; }
+# run_client <name> <hostname> — a pure client (no TUN, no NET_ADMIN, no VPN).
+run_client() { local n="$1" h="$2"; CONTAINERS+=("$n"); docker run -d --name "$n" --hostname "$h" --network "$NET" "${CLIENT_ENV[@]}" "$IMG" sleep infinity >/dev/null; docker exec "$n" mkdir -p /cfg; }
+# run_session_host <name> <hostname> — a reach target WITHOUT the warren VPN
+# (HOP_VPN=0): "reach a machine" is just sessions, no private network.
+run_session_host() { local n="$1" h="$2"; CONTAINERS+=("$n"); docker run -d --name "$n" --hostname "$h" --network "$NET" -e HOP_VPN=0 "${CLIENT_ENV[@]}" "$IMG" sleep infinity >/dev/null; docker exec "$n" mkdir -p /cfg; }
+nsec() { date +%s; }
+
+#############################################################################
+say "A1 — reach a machine (host -> invite -> connect -> run a command)"
+#############################################################################
+SRV_HOST=myserver
+run_session_host fr-srv "$SRV_HOST"
+docker exec -d fr-srv bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 120); do docker exec fr-srv test -f /cfg/creator_invite && break; sleep 1; done
+A1_OK=0; A1_DETAIL="no invite"
+if docker exec fr-srv test -f /cfg/creator_invite; then
+  # Documented first-timer invite: a client-tier token (reach this host, no warren),
+  # reusable so the GUARD can redeem it too. The token is the eyJ... base64 line.
+  TOKEN=$(docker exec fr-srv hop --config /cfg invite --user hop --tier client --max-uses 5 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9_=-]+' | head -1)
+  if [ -n "$TOKEN" ]; then
+    A1_INVITE_CMD="hop invite ok"
+    run_client fr-cli client-a
+    t0=$(nsec)
+    # `hop exec <token>` redeems the invite, runs the command, and saves the host
+    # under its name — the non-interactive form of "connect and reach by name".
+    if docker exec fr-cli bash -lc "hop --config /cfg exec '$TOKEN' -- echo FIRSTRUN_OK 2>/cfg/e.log" | grep -q FIRSTRUN_OK; then
+      A1_OK=1
+    fi
+    A1_SECS=$(( $(nsec) - t0 ))
+    A1_DETAIL="$A1_INVITE_CMD"
+  else
+    A1_DETAIL="hop invite produced no token"; A1_SECS=$A1_BUDGET
+  fi
+else
+  A1_SECS=$A1_BUDGET
+fi
+record "A1 reach-a-machine" "$A1_OK" "${A1_SECS:-$A1_BUDGET}" "$A1_BUDGET" "$A1_DETAIL"
+
+#############################################################################
+say "AUDIT — the per-node audit log captured the A1 session (no central collector)"
+#############################################################################
+# A1 redeemed an invite, authorized a connection, and ran `echo` over exec on
+# fr-srv. With the default audit level (connections), the host's local audit log
+# must show those events; `hop audit --json` reads them back over the daemon socket.
+# The drain is async, so retry briefly.
+AUDIT_OK=0; AUDIT_DETAIL="no A1 events in audit log"
+if [ "$A1_OK" = 1 ]; then
+  for _ in $(seq 1 10); do
+    AJSON=$(docker exec fr-srv hop --config /cfg audit --since 1h --json 2>/dev/null)
+    if echo "$AJSON" | grep -q '"action":"exec"'; then
+      AUDIT_OK=1; AUDIT_DETAIL="exec recorded ($(echo "$AJSON" | grep -c '"ts_ms"') events)"; break
+    elif echo "$AJSON" | grep -qE '"category":"(connection|membership)"'; then
+      AUDIT_OK=1; AUDIT_DETAIL="connection/membership recorded"; break
+    fi
+    sleep 1
+  done
+  # Category filter must also work (proves the query path, not just a dump).
+  if [ "$AUDIT_OK" = 1 ]; then
+    CONNS=$(docker exec fr-srv hop --config /cfg audit --category connection --json 2>/dev/null | grep -c '"ts_ms"')
+    AUDIT_DETAIL="$AUDIT_DETAIL; --category connection -> ${CONNS:-0}"
+  fi
+else
+  AUDIT_DETAIL="A1 failed; skipped"
+fi
+record "AUDIT per-node-log" "$AUDIT_OK" 0 5 "$AUDIT_DETAIL"
+
+#############################################################################
+say "A2 — private network (node joins with bare --host -> reach founder BY NAME over VPN)"
+#############################################################################
+run_node fr-founder founder
+docker exec -d fr-founder bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+# Founder brings up the VPN from the DEFAULT (no HOP_VPN). Wait for it.
+F_VIP=""; for _ in $(seq 1 90); do
+  F_VIP=$(docker exec fr-founder sh -c "grep -aoE 'vpn: enabled, virtual IP [0-9.]+' /cfg/log | grep -oE '[0-9.]+$' | head -1" 2>/dev/null)
+  [ -n "$F_VIP" ] && break; sleep 1
+done
+F_NAME=$(docker exec fr-founder hostname | tr 'A-Z' 'a-z' | cut -d. -f1)
+INVITE=$(docker exec fr-founder cat /cfg/creator_invite 2>/dev/null)
+A2_OK=0; A2_DETAIL="founder vpn never came up (default)"
+if [ -n "$F_VIP" ] && [ -n "$INVITE" ]; then
+  A2_DETAIL="founder=${F_NAME}/${F_VIP}"
+  run_node fr-member member
+  t0=$(nsec)
+  # The page's default node command: join the warren, then `hop host` (VPN on by
+  # default — NO HOP_VPN, NO --no-vpn).
+  docker exec fr-member sh -c "hop --config /cfg connect '$INVITE' --warren >/cfg/join.log 2>&1" || true
+  docker exec -d fr-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+  M_VIP=""; for _ in $(seq 1 90); do
+    M_VIP=$(docker exec fr-member sh -c "grep -aoE 'vpn: enabled, virtual IP [0-9.]+' /cfg/log | grep -oE '[0-9.]+$' | head -1" 2>/dev/null)
+    [ -n "$M_VIP" ] && break; sleep 1
+  done
+  if [ -n "$M_VIP" ]; then
+    # Reach the founder BY NAME: resolve <founder>.hop via the member's own MagicDNS
+    # (served on its vIP), then reach that address over the tunnel.
+    for _ in $(seq 1 90); do
+      R=$(docker exec fr-member dig +short +time=2 +tries=1 "@${M_VIP}" "${F_NAME}.hop" 2>/dev/null | head -1)
+      if [ "$R" = "$F_VIP" ] && docker exec fr-member ping -c1 -W2 "$F_VIP" >/dev/null 2>&1; then
+        A2_OK=1; A2_DETAIL="${F_NAME}.hop -> ${F_VIP} reached"; break
+      fi
+      sleep 1
+    done
+    [ "$A2_OK" = 0 ] && A2_DETAIL="member=${M_VIP} but ${F_NAME}.hop never resolved+reached"
+  else
+    A2_DETAIL="member VPN never came up (default)"
+  fi
+  A2_SECS=$(( $(nsec) - t0 ))
+else
+  A2_SECS=$A2_BUDGET
+fi
+record "A2 private-network" "$A2_OK" "${A2_SECS:-$A2_BUDGET}" "$A2_BUDGET" "$A2_DETAIL"
+
+#############################################################################
+say "FLEET-GREP — federated READ-ONLY log search across the warren (no central collector)"
+#############################################################################
+# Reuse the A2 founder + member (both warren members, role admin). Write a unique
+# marker to a file on EACH, then run `hop fleet grep` from the founder across the
+# `admin` selector and assert the marker is found on a remote node — proving the
+# fan-out + reduce. The search runs under the audit (read-only) sandbox.
+FG_OK=0; FG_DETAIL="skipped (needs A2)"; FG_SECS=0
+if [ "$A2_OK" = 1 ]; then
+  MARK="FLEETGREP-MARK-$$"
+  docker exec fr-founder sh -c "echo '$MARK founder-evidence' > /tmp/applog.txt"
+  docker exec fr-member  sh -c "echo '$MARK member-evidence'  > /tmp/applog.txt"
+  t0=$(nsec)
+  # The warren snapshot (the target roster) is rebuilt periodically, so poll until a
+  # member shows up and the read-only fan-out finds the marker.
+  FG_JSON=""
+  for _ in $(seq 1 12); do
+    FG_JSON=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet grep all '$MARK' --source /tmp/applog.txt --json 2>/dev/null" || true)
+    echo "$FG_JSON" | grep -q '"total":[1-9]' && break
+    sleep 3
+  done
+  FG_SECS=$(( $(nsec) - t0 ))
+  if echo "$FG_JSON" | grep -q '"total":[1-9]' && echo "$FG_JSON" | grep -q "$MARK"; then
+    TOTAL=$(echo "$FG_JSON" | grep -oE '"total":[0-9]+' | grep -oE '[0-9]+' | head -1)
+    FG_OK=1; FG_DETAIL="marker found on ${TOTAL:-?} node(s), read-only fan-out"
+  else
+    FG_DETAIL="no marker matches"; echo "  fleet-grep json: $(printf '%s' "$FG_JSON" | head -c 400)"
+  fi
+fi
+record "FLEET-GREP federated-search" "$FG_OK" "${FG_SECS:-$FG_BUDGET}" "$FG_BUDGET" "$FG_DETAIL"
+
+#############################################################################
+say "SEARCH — fleet log search + source discovery (G24: hop fleet search/sources)"
+#############################################################################
+# Reuse the A2 founder + member. `hop fleet search` (one-shot when piped) fans a
+# read-only search across the warren with [node·source·time] provenance; `hop
+# fleet sources` makes the searchable logs discoverable per machine.
+SR_BUDGET="${SR_BUDGET:-60}"
+SR_OK=0; SR_DETAIL="skipped (needs A2)"; SR_SECS=0
+if [ "$A2_OK" = 1 ]; then
+  SMARK="FLEETSEARCH-MARK-$$"
+  docker exec fr-member sh -c "echo '$SMARK member-evidence' > /tmp/searchlog.txt"
+  t0=$(nsec)
+  # search: find the marker on a remote node with provenance (one-shot JSON).
+  SR_JSON=""
+  for _ in $(seq 1 12); do
+    SR_JSON=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet search all '$SMARK' --source /tmp/searchlog.txt --json 2>/dev/null" || true)
+    echo "$SR_JSON" | grep -q '"total":[1-9]' && break
+    sleep 3
+  done
+  FOUND=0
+  echo "$SR_JSON" | grep -q '"total":[1-9]' && echo "$SR_JSON" | grep -q "$SMARK" && echo "$SR_JSON" | grep -q '"node"' && FOUND=1
+  # sources: the discovery menu fans out and lists the audit + system sources.
+  SR_SRC=$(docker exec fr-founder sh -lc "timeout 30 hop --config /cfg fleet sources all 2>/dev/null" || true)
+  SRC_OK=0
+  echo "$SR_SRC" | grep -q "audit" && echo "$SR_SRC" | grep -q "system" && SRC_OK=1
+  SR_SECS=$(( $(nsec) - t0 ))
+  if [ "$FOUND" = 1 ] && [ "$SRC_OK" = 1 ]; then
+    SR_OK=1; SR_DETAIL="search found marker w/ provenance; sources lists audit+system per node"
+  else
+    SR_DETAIL="found=$FOUND sources=$SRC_OK"; echo "  search json: $(printf '%s' "$SR_JSON" | head -c 300)"
+  fi
+fi
+record "SEARCH fleet-search+sources" "$SR_OK" "${SR_SECS:-$SR_BUDGET}" "$SR_BUDGET" "$SR_DETAIL"
+
+#############################################################################
+say "A3 — expose a local device (hop tunnel: forward a remote port to localhost)"
+#############################################################################
+# Reuse the A2 founder + member. A trivial marker service on the founder's
+# localhost:9000; the member runs `hop tunnel <founder> 9000` and reaches the
+# service at its OWN localhost:9000 over the encrypted link.
+A3_OK=0; A3_DETAIL="needs A2 founder+member"
+if [ "$A2_OK" = 1 ]; then
+  F_ID=$(docker exec fr-founder hop --config /cfg id 2>/dev/null)
+  docker exec -d fr-founder bash -lc 'while true; do printf "TUNNEL_OK\n" | nc -l 9000 >/dev/null 2>&1; done'
+  sleep 1
+  t0=$(nsec)
+  docker exec -d fr-member bash -lc "hop --config /cfg tunnel '$F_ID' 9000 >/cfg/tunnel.log 2>&1"
+  A3_DETAIL="tunnel never delivered the marker"
+  for _ in $(seq 1 30); do
+    if docker exec fr-member bash -lc "nc -w2 127.0.0.1 9000 </dev/null 2>/dev/null" | grep -q TUNNEL_OK; then
+      A3_OK=1; A3_DETAIL="localhost:9000 -> founder:9000 (TUNNEL_OK)"; break
+    fi
+    sleep 1
+  done
+  A3_SECS=$(( $(nsec) - t0 ))
+else
+  A3_SECS=$A3_BUDGET
+fi
+record "A3 expose-tunnel" "$A3_OK" "${A3_SECS:-$A3_BUDGET}" "$A3_BUDGET" "$A3_DETAIL"
+
+#############################################################################
+say "GUARD — default client install (no daemon, no VPN) still reaches + transfers"
+#############################################################################
+# Reuse the A1 server. A pure client (no NET_ADMIN, no TUN, no daemon) must still
+# hop/exec/cp — the VPN-free tier the install page offers must survive the flip.
+GUARD_OK=0; GUARD_DETAIL="A1 server unavailable"
+if [ "$A1_OK" = 1 ]; then
+  run_client fr-guard client-guard
+  t0=$(nsec)
+  docker exec fr-guard sh -c "echo guard-payload > /cfg/g.txt"
+  # Redeem the reusable client invite (saves the alias), then exec + cp via the
+  # saved alias — exactly the default client tier with no daemon and no VPN.
+  docker exec fr-guard bash -lc "hop --config /cfg exec '$TOKEN' -- true 2>/cfg/c.log" || true
+  if docker exec fr-guard bash -lc "hop --config /cfg exec '$SRV_HOST' -- echo GUARD_EXEC 2>/dev/null" | grep -q GUARD_EXEC \
+     && docker exec fr-guard bash -lc "hop --config /cfg cp /cfg/g.txt '$SRV_HOST':/tmp/ 2>/dev/null; hop --config /cfg exec '$SRV_HOST' -- cat /tmp/g.txt 2>/dev/null" | grep -q guard-payload; then
+    # confirm this client truly has NO VPN/daemon: no TUN, no hop host process.
+    if ! docker exec fr-guard sh -c "ip link show 2>/dev/null | grep -q 'hop\\|tun'" \
+       && ! docker exec fr-guard pgrep -f 'hop .*host' >/dev/null 2>&1; then
+      GUARD_OK=1; GUARD_DETAIL="exec+cp ok, no daemon/VPN"
+    else
+      GUARD_DETAIL="client unexpectedly ran a daemon/VPN"
+    fi
+  else
+    GUARD_DETAIL="exec/cp failed on a pure client"
+  fi
+  GUARD_SECS=$(( $(nsec) - t0 ))
+else
+  GUARD_SECS=$GUARD_BUDGET
+fi
+record "GUARD client-no-vpn" "$GUARD_OK" "${GUARD_SECS:-$GUARD_BUDGET}" "$GUARD_BUDGET" "$GUARD_DETAIL"
+
+#############################################################################
+say "POSTURE — a Cedar policy gates reach on device posture (allow vs deny)"
+#############################################################################
+# Device posture (Path D): an admin authors a posture-gated policy and a node is
+# allowed/denied by its health card. `hop acl policy test` evaluates the real
+# Cedar engine offline, so this is deterministic: in-policy ALLOW, out DENY.
+run_client fr-posture posture
+P_OK=0; P_DETAIL="acl policy test failed"
+# `docker exec -i` so the heredoc reaches the container's stdin.
+docker exec -i fr-posture sh -c 'cat > /cfg/roles.json' <<'JSON'
+{"roles":[{"name":"locked","host_tags":[],"admin":false,"sudo":false,"network_only":false,"groups":[],"capabilities":{}}]}
+JSON
+docker exec -i fr-posture sh -c 'cat > /cfg/p.cedar' <<'CEDAR'
+permit ( principal, action == Action::"connect", resource ) when { resource.tags.contains("production") && principal.disk_encrypted == "true" };
+CEDAR
+docker exec fr-posture hop --config /cfg acl policy set /cfg/p.cedar >/dev/null 2>&1
+t0=$(nsec)
+ALLOW=$(docker exec fr-posture hop --config /cfg acl policy test --role locked --tag production --posture disk_encrypted=true 2>/dev/null)
+DENY=$(docker exec fr-posture hop --config /cfg acl policy test --role locked --tag production --posture disk_encrypted=false 2>/dev/null)
+P_SECS=$(( $(nsec) - t0 ))
+if printf '%s' "$ALLOW" | grep -q '^ALLOW' && printf '%s' "$DENY" | grep -q '^DENY'; then
+  P_OK=1; P_DETAIL="in-policy ALLOW, out-of-policy DENY"
+fi
+record "POSTURE acl-gate" "$P_OK" "${P_SECS:-20}" "20" "$P_DETAIL"
+
+#############################################################################
+say "CAPABILITY — host-tag-scoped exec vs read-only search (G23)"
+#############################################################################
+# A host tagged 'prod' + the 'developer' role scoped to exec 'dev' / search 'prod'.
+# A developer-role peer: a mutating EXEC on the prod host is DENIED, but a READ-ONLY
+# search is ALLOWED — proving capability scoping by host-tag (membership != full
+# access). The two requests differ ONLY in read-only-ness, so a working read-only
+# search + a blocked exec isolates the capability gate.
+CAP_OK=0; CAP_DETAIL="setup failed"; CAP_SECS=0
+run_node cap-host caphost
+docker exec cap-host sh -c 'printf "{\"tags\":[\"prod\"]}" > /cfg/host_config.json'
+docker exec -d cap-host bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 60); do docker exec cap-host test -f /cfg/creator_invite && break; sleep 1; done
+# Add a scoped role 'devscoped': exec only 'dev', read-only search 'prod'.
+docker exec cap-host sh -c 'for i in $(seq 1 30); do [ -f /cfg/roles.json ] && break; sleep 1; done; [ -f /cfg/roles.json ] || echo "{\"roles\":[]}" > /cfg/roles.json; jq ".roles += [{\"name\":\"devscoped\",\"host_tags\":[\"*\"],\"exec_tags\":[\"dev\"],\"search_tags\":[\"prod\"]}]" /cfg/roles.json > /cfg/roles.tmp && mv /cfg/roles.tmp /cfg/roles.json'
+TOKEN=$(docker exec cap-host hop --config /cfg invite --user hop --role devscoped --max-uses 5 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9_=-]+' | head -1)
+if [ -n "$TOKEN" ]; then
+  run_client cap-cli capcli
+  t0=$(nsec)
+  # Step 1 redeems + saves the host alias; the mutating exec is DENIED.
+  DENY=$(docker exec cap-cli bash -lc "hop --config /cfg exec '$TOKEN' -- echo CAPMARK 2>&1" || true)
+  # Step 2 reuses the saved alias (existing peer, no re-redeem); read-only search OK.
+  ALLOW=$(docker exec cap-cli bash -lc "hop --config /cfg exec caphost --read-only -- echo CAPMARK 2>&1" || true)
+  CAP_SECS=$(( $(nsec) - t0 ))
+  if ! printf '%s' "$DENY" | grep -q CAPMARK && printf '%s' "$ALLOW" | grep -q CAPMARK; then
+    CAP_OK=1; CAP_DETAIL="exec denied, read-only search allowed (host-tag scoped)"
+  else
+    CAP_DETAIL="deny=[$(printf '%s' "$DENY"|tr -d '\n'|head -c70)] allow=[$(printf '%s' "$ALLOW"|tr -d '\n'|head -c70)]"
+  fi
+else
+  CAP_DETAIL="no invite token"
+fi
+record "CAPABILITY tag-scoped" "$CAP_OK" "${CAP_SECS:-$CAP_BUDGET}" "$CAP_BUDGET" "$CAP_DETAIL"
+
+#############################################################################
+say "LIFECYCLE — full peer lifecycle from the admin node (G26: local self-admin)"
+#############################################################################
+# The sole admin can't mux-dial itself, so grant/rename/revoke must work via the
+# LOCAL daemon socket AND propagate. Drive the whole lifecycle from the admin node:
+# a member joins → appears in the warren snapshot → `hop admin self grant` (verify
+# role) → `hop peers rename` (verify PROPAGATED name) → `hop admin self remove-peer`
+# (verify the member LEAVES `hop fleet list` — the replicated revocation).
+LC_OK=0; LC_DETAIL="setup failed"; LC_SECS=0
+run_node lc-admin lcadmin
+docker exec -d lc-admin bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 90); do docker exec lc-admin grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+INV=$(docker exec lc-admin cat /cfg/creator_invite 2>/dev/null)
+if [ -n "$INV" ]; then
+  run_node lc-member lcmember
+  docker exec lc-member sh -c "hop --config /cfg connect '$INV' --warren >/cfg/join.log 2>&1" || true
+  docker exec -d lc-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+  for _ in $(seq 1 90); do docker exec lc-member grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+  MID=$(docker exec lc-member hop --config /cfg id 2>/dev/null | cut -c1-10)
+  AID=$(docker exec lc-admin hop --config /cfg id 2>/dev/null | cut -c1-10)
+  t0=$(nsec)
+  fleet_has() { docker exec lc-admin hop --config /cfg fleet list 2>/dev/null | grep -q "$1"; }
+  APPEAR=0; for _ in $(seq 1 25); do fleet_has "$MID" && { APPEAR=1; break; }; sleep 2; done
+  # grant a role via LOCAL self-admin, then verify it shows in the snapshot.
+  docker exec lc-admin hop --config /cfg admin self grant "$MID" ops >/dev/null 2>&1 || true
+  GRANTED=0; for _ in $(seq 1 15); do docker exec lc-admin hop --config /cfg fleet list 2>/dev/null | grep "$MID" | grep -q "ops" && { GRANTED=1; break; }; sleep 2; done
+  # rename via `hop peers rename` — must PROPAGATE to the snapshot.
+  docker exec lc-admin hop --config /cfg peers rename "$MID" renamed-lc >/dev/null 2>&1 || true
+  RENAMED=0; for _ in $(seq 1 15); do fleet_has "renamed-lc" && { RENAMED=1; break; }; sleep 2; done
+  # revoke via LOCAL self-admin — the member must LEAVE the snapshot (tombstone).
+  docker exec lc-admin hop --config /cfg admin self remove-peer "$MID" >/dev/null 2>&1 || true
+  GONE=0; for _ in $(seq 1 25); do fleet_has "$MID" || { GONE=1; break; }; sleep 2; done
+  # The admin (founder) must REMAIN in its own roster after the mutation — a
+  # non-federated reconcile must never revoke the founder's own self-entry.
+  SELFKEPT=0; fleet_has "$AID" && SELFKEPT=1
+  LC_SECS=$(( $(nsec) - t0 ))
+  if [ "$APPEAR" = 1 ] && [ "$GRANTED" = 1 ] && [ "$RENAMED" = 1 ] && [ "$GONE" = 1 ] && [ "$SELFKEPT" = 1 ]; then
+    LC_OK=1; LC_DETAIL="join→appear, grant→ops, rename→propagated, revoke→gone, founder-self-kept (all local self-admin)"
+  else
+    LC_DETAIL="appear=$APPEAR granted=$GRANTED renamed=$RENAMED gone=$GONE selfkept=$SELFKEPT"
+  fi
+fi
+record "LIFECYCLE peer-admin" "$LC_OK" "${LC_SECS:-$LC_BUDGET}" "$LC_BUDGET" "$LC_DETAIL"
+
+#############################################################################
+say "ROSTER — liveness, name backfill, offline-skip, prune (G25)"
+#############################################################################
+# A member joins via the creator invite, so it admits with an OPAQUE generated name
+# (`creator-XXXX` — no bound hostname), comes up on the VPN, and self-registers its
+# hostname. The founder should: (1) BACKFILL the opaque name → the member's real
+# hostname; then once the member is stopped (genuinely offline): (2) show it
+# `offline` in `fleet list`, (3) SKIP it in fan-out (`fleet grep`) by default, and
+# (4) PRUNE it (replicated revocation) so it leaves the roster.
+RH_BUDGET="${RH_BUDGET:-160}"
+RH_OK=0; RH_DETAIL="setup failed"; RH_SECS=0
+run_node rh-admin rhadmin
+docker exec -d rh-admin bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+for _ in $(seq 1 90); do docker exec rh-admin grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+RINV=$(docker exec rh-admin cat /cfg/creator_invite 2>/dev/null)
+if [ -n "$RINV" ]; then
+  run_node rh-member rhmember
+  docker exec rh-member sh -c "hop --config /cfg connect '$RINV' --warren >/cfg/join.log 2>&1" || true
+  docker exec -d rh-member bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'
+  for _ in $(seq 1 90); do docker exec rh-member grep -q "vpn: enabled" /cfg/log 2>/dev/null && break; sleep 1; done
+  MID=$(docker exec rh-member hop --config /cfg id 2>/dev/null | cut -c1-10)
+  t0=$(nsec)
+  member_row() { docker exec rh-admin hop --config /cfg fleet list "$@" 2>/dev/null | grep "$MID"; }
+  # Wait for the member to appear in the roster.
+  for _ in $(seq 1 25); do member_row >/dev/null && break; sleep 2; done
+  # NAMED: simulate an UNNAMED member by forcing an opaque `peer-` roster name, then
+  # the founder must BACKFILL it to the member's real hostname (`rhmember`), resolved
+  # from the member's self-registered `name/` (self-doc imported by the founder).
+  docker exec rh-admin hop --config /cfg peers rename "$MID" peer-unnamed >/dev/null 2>&1 || true
+  NAMED=0
+  for _ in $(seq 1 40); do
+    if member_row | grep -q "rhmember"; then NAMED=1; break; fi
+    sleep 2
+  done
+  # Fresh member must NOT be pruned by a 30d threshold.
+  FRESH_NOOP=0
+  docker exec rh-admin hop --config /cfg fleet prune --older-than 30d --dry-run 2>/dev/null | grep -q "$MID" || FRESH_NOOP=1
+  # Now make the member genuinely offline: stop its process (no VPN keepalive, no
+  # control-plane), then let last_seen age past a small window.
+  docker stop rh-member >/dev/null 2>&1
+  sleep 9
+  # OFFLINE: fleet list with a tight window labels it offline.
+  OFFLINE=0; member_row --stale-after 5s | grep -q "offline" && OFFLINE=1
+  # SKIP: default fan-out skips the offline member ("offline skipped" note).
+  SKIP=0
+  docker exec rh-admin hop --config /cfg fleet grep all rosterprobe --since 1h --stale-after 5s 2>/dev/null | grep -qi "offline skipped" && SKIP=1
+  # PRUNE: remove members idle > 5s; the member must leave the roster.
+  docker exec rh-admin hop --config /cfg fleet prune --older-than 5s --yes >/dev/null 2>&1 || true
+  PRUNED=0; for _ in $(seq 1 15); do member_row >/dev/null || { PRUNED=1; break; }; sleep 2; done
+  RH_SECS=$(( $(nsec) - t0 ))
+  if [ "$NAMED" = 1 ] && [ "$FRESH_NOOP" = 1 ] && [ "$OFFLINE" = 1 ] && [ "$SKIP" = 1 ] && [ "$PRUNED" = 1 ]; then
+    RH_OK=1; RH_DETAIL="peer-XXXX→hostname backfill, offline labeled, fan-out skipped offline, stale pruned (replicated)"
+  else
+    RH_DETAIL="named=$NAMED fresh_noop=$FRESH_NOOP offline=$OFFLINE skip=$SKIP pruned=$PRUNED"
+  fi
+fi
+record "ROSTER hygiene" "$RH_OK" "${RH_SECS:-$RH_BUDGET}" "$RH_BUDGET" "$RH_DETAIL"
+
+# --- report ---------------------------------------------------------------
+ART="${HOP_FIRSTRUN_ARTIFACT:-$SCRIPT_DIR/first-run-results.md}"
+STAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+{
+  echo "# First-run acceptance results"
+  echo
+  echo "Generated by \`tests/e2e/first-run.sh\` on ${STAMP} (Linux Docker). Each core"
+  echo "job is run COLD end-to-end and must finish within its step/time budget."
+  echo
+  echo "| job | time | budget | result | detail |"
+  echo "|---|---|---|---|---|"
+  printf '%b' "$REPORT"
+} > "$ART"
+echo "artifact: $ART"
+echo
+if [ "$FAIL" -eq 0 ]; then echo "FIRST-RUN PASSED (${PASS} jobs within budget)"; exit 0
+else echo "FIRST-RUN FAILED (${FAIL} job(s) over budget or broken)"; exit 1; fi

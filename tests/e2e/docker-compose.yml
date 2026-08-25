@@ -1,0 +1,53 @@
+services:
+  hop-host-a:
+    build: .
+    container_name: hop-host-a
+    hostname: host-a
+    volumes:
+      - shared:/shared
+      - ./scripts/host-entrypoint.sh:/scripts/host-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/scripts/host-entrypoint.sh"]
+    environment:
+      - HOP_HOST_NAME=host-a
+      - HOP_CONFIG_DIR=/home/hop/config-a
+      - HOP_INVITE_FILE=/shared/invite-a
+      - HOP_READY_FILE=/shared/ready-a
+      # Privsep passthrough (bare = inherit from the run.sh shell only if set, so
+      # the default e2e is unaffected). Set both to exercise the monitor/worker
+      # split + setuid-via-monitor session/exec/transfer under HOP_PRIVSEP_DROP.
+      - HOP_PRIVSEP
+      - HOP_PRIVSEP_DROP
+
+  hop-host-b:
+    build: .
+    container_name: hop-host-b
+    hostname: host-b
+    volumes:
+      - shared:/shared
+      - ./scripts/host-entrypoint.sh:/scripts/host-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/scripts/host-entrypoint.sh"]
+    environment:
+      - HOP_HOST_NAME=host-b
+      - HOP_CONFIG_DIR=/home/hop/config-b
+      - HOP_INVITE_FILE=/shared/invite-b
+      - HOP_READY_FILE=/shared/ready-b
+      - HOP_PRIVSEP
+      - HOP_PRIVSEP_DROP
+
+  hop-test:
+    build: .
+    container_name: hop-test
+    hostname: test-runner
+    volumes:
+      - shared:/shared
+      - ./scripts/test-entrypoint.sh:/scripts/test-entrypoint.sh:ro
+      - ./scripts/test-functions.sh:/scripts/test-functions.sh:ro
+    entrypoint: ["/bin/bash", "/scripts/test-entrypoint.sh"]
+    environment:
+      - HOP_CONFIG_DIR=/home/hop/config-test
+    depends_on:
+      - hop-host-a
+      - hop-host-b
+
+volumes:
+  shared:

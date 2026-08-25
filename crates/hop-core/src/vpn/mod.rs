@@ -1,0 +1,1067 @@
+//! VPN data plane (Phase 3 — see `docs/technical/p2p-network.md`).
+//!
+//! **Status: experimental, opt-in, off by default.** Nothing in this module
+//! runs unless the VPN is explicitly enabled. The pieces here are the routing
+//! core (IPv4 destination parsing + virtual-IP → peer lookup against the network
+//! document) and the `hop/vpn/v1` ALPN. The TUN device + forwarding loop wire
+//! these together and are gated behind an explicit enable so a release can never
+//! change the daemon's default networking behavior.
+
+use std::net::Ipv4Addr;
+
+/// ALPN for the VPN packet plane (QUIC datagrams carrying L3 IP packets).
+pub const VPN_ALPN: &[u8] = b"hop/vpn/1";
+
+/// Keepalive heartbeat datagram. Sent periodically to every peer connection to
+/// keep the QUIC path validated/warm and the remote's `last_rx` fresh, so a
+/// live-but-idle connection is never mistaken for silently-dead and redialed.
+/// The leading `0xFF` is not a valid IP version (4/6), so even if the marker
+/// check is bypassed the ingress IP-parse rejects it safely (never injected to
+/// the TUN).
+pub const VPN_KEEPALIVE: &[u8] = b"\xffhKA1";
+
+/// TUN MTU. QUIC's effective datagram payload (~1232B after framing) bounds
+/// this; 1280 leaves headroom and matches the IPv6 minimum-MTU convention.
+pub const VPN_MTU: u16 = 1280;
+
+/// Parse the destination IPv4 address from a raw L3 packet read off a TUN
+/// device. Returns `None` for non-IPv4 (e.g. IPv6) or truncated packets.
+///
+/// A TUN device in this configuration hands us bare IP packets (no Ethernet
+/// header). The IPv4 header's destination address is bytes 16..20, valid only
+/// when the version nibble is 4 and the packet is at least 20 bytes.
+pub fn parse_dest_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    Some(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]))
+}
+
+pub mod acl;
+pub mod cedar;
+pub mod discovery;
+pub mod dns;
+pub mod gateway;
+pub mod resolver;
+pub mod siit;
+pub mod tailscale_import;
+
+/// Parse the destination transport port (TCP/UDP) from a raw L3 packet, if the
+/// protocol carries ports and the packet is long enough. ICMP etc. → `None`.
+pub fn parse_dest_port(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 24 || (packet[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    let proto = packet[9];
+    // TCP (6) / UDP (17): destination port is bytes 2..4 of the transport header.
+    if !(proto == 6 || proto == 17) || packet.len() < ihl + 4 {
+        return None;
+    }
+    Some(u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+}
+
+/// Parse the source IPv4 address from a raw L3 packet (bytes 12..16).
+pub fn parse_src_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.len() < 20 || (packet[0] >> 4) != 4 {
+        return None;
+    }
+    Some(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]))
+}
+
+/// Parse the destination IPv6 address from a raw L3 packet (bytes 24..40), or
+/// `None` for non-IPv6/truncated. (4via6, Tier 3a.)
+pub fn parse_dest_ipv6(packet: &[u8]) -> Option<std::net::Ipv6Addr> {
+    if packet.len() < 40 || (packet[0] >> 4) != 6 {
+        return None;
+    }
+    Some(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?))
+}
+
+/// Whether an address falls in hop's virtual range `100.64.0.0/10`.
+pub fn is_virtual_addr(addr: Ipv4Addr) -> bool {
+    let o = addr.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+/// The 4via6 SIIT source pool: the top `/16` of the warren `/10`
+/// (`100.127.0.0/16`). A gateway maps each via6 client to a stable v4 in this
+/// range as the source of the translated (v6→v4) packet; the kernel then
+/// masquerades it onto the LAN exactly like any warren source (it's inside the
+/// `100.64/10` the gateway already NATs), and a reply routed back to it on the
+/// TUN is recognized for reverse translation. Reserved from vIP allocation so a
+/// pooled address can never collide with a real member's vIP.
+pub const SIIT_POOL_BASE: Ipv4Addr = Ipv4Addr::new(100, 127, 0, 0);
+
+/// Whether `addr` is in the 4via6 SIIT source pool (`100.127.0.0/16`).
+pub fn is_siit_pool_addr(addr: Ipv4Addr) -> bool {
+    let o = addr.octets();
+    o[0] == 100 && o[1] == 127
+}
+
+/// Parse an IPv4 CIDR `"a.b.c.d/n"` into `(network, prefix_len)` with the host
+/// bits masked off. `None` if malformed or `n > 32`. (Tier 1 LAN bridging.)
+pub fn parse_cidr_v4(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, len) = s.split_once('/')?;
+    let ip: Ipv4Addr = ip.trim().parse().ok()?;
+    let len: u8 = len.trim().parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    Some((Ipv4Addr::from(u32::from(ip) & mask), len))
+}
+
+/// hop's 4via6-style ULA prefix (first 64 bits) for overlapping-subnet routing
+/// (P3). A device's real IPv4 at a given site is reached via a unique IPv6 that
+/// embeds `(site_id, ipv4)`; the gateway translates it back to the real v4 on the
+/// far LAN. This lets two sites that both use e.g. `192.168.1.0/24` coexist —
+/// the address that would collide in v4 is unambiguous in v6. Address layout:
+/// `<64-bit hop prefix> : <32-bit site id> : <32-bit embedded IPv4>`. The prefix
+/// bytes spell `fd 'hopvia6'` (`0xfd` makes it a ULA, `fc00::/7`).
+const VIA6_PREFIX: [u8; 8] = [0xfd, 0x68, 0x6f, 0x70, 0x76, 0x69, 0x61, 0x36];
+
+/// The via6 **destination** prefix as a routable CIDR. A client routes this `/64`
+/// into the warren TUN so packets to any `via6(site, ipv4)` are forwarded over
+/// the tunnel to the owning gateway. (The prefix is 64 bits; the low 64 carry the
+/// `site_id`+`ipv4` payload.)
+pub const VIA6_ROUTE_CIDR: &str = "fd68:6f70:7669:6136::/64";
+
+/// hop's via6 **client-source** prefix (first 64 bits) — a sibling ULA of the
+/// destination prefix, used for a client's own TUN IPv6 source address so it never
+/// overlaps a via6 destination. The bytes spell `fd 'hopvia5'`.
+const CLIENT_V6_PREFIX: [u8; 8] = [0xfd, 0x68, 0x6f, 0x70, 0x76, 0x69, 0x61, 0x35];
+
+/// The client's own TUN IPv6 source address (4via6, Tier 3a), derived from its
+/// warren vIP so it is stable and unique per node: `<client prefix>::<vip>`. This
+/// is the address a client sends via6 traffic *from* and the gateway maps replies
+/// back *to*; assigning it to the TUN makes the kernel accept the translated
+/// reply packets.
+pub fn client_v6(vip: Ipv4Addr) -> std::net::Ipv6Addr {
+    let mut o = [0u8; 16];
+    o[0..8].copy_from_slice(&CLIENT_V6_PREFIX);
+    o[12..16].copy_from_slice(&vip.octets());
+    std::net::Ipv6Addr::from(o)
+}
+
+/// Whether `addr` falls in the via6 client-source prefix (defensive validation at
+/// the privsep boundary — the monitor only assigns a TUN v6 address in this range).
+pub fn is_client_v6(addr: std::net::Ipv6Addr) -> bool {
+    addr.octets()[0..8] == CLIENT_V6_PREFIX
+}
+
+/// Build the 4via6 IPv6 address for `ipv4` at site `site_id` (overlap routing).
+pub fn via6_encode(site_id: u32, ipv4: Ipv4Addr) -> std::net::Ipv6Addr {
+    let mut o = [0u8; 16];
+    o[0..8].copy_from_slice(&VIA6_PREFIX);
+    o[8..12].copy_from_slice(&site_id.to_be_bytes());
+    o[12..16].copy_from_slice(&ipv4.octets());
+    std::net::Ipv6Addr::from(o)
+}
+
+/// Decode a 4via6 address back to `(site_id, ipv4)`, or `None` if it doesn't carry
+/// hop's via6 prefix (an ordinary IPv6 destination).
+pub fn via6_decode(addr: std::net::Ipv6Addr) -> Option<(u32, Ipv4Addr)> {
+    let o = addr.octets();
+    if o[0..8] != VIA6_PREFIX {
+        return None;
+    }
+    let site_id = u32::from_be_bytes([o[8], o[9], o[10], o[11]]);
+    Some((site_id, Ipv4Addr::new(o[12], o[13], o[14], o[15])))
+}
+
+/// MagicDNS label for a via6 device, Tailscale's `-via-` convention:
+/// `via6(7, 192.168.1.50)` → `192-168-1-50-via-7` (the host part; the warren
+/// domain is appended by the resolver). Lets users/apps name an overlapping-subnet
+/// device without typing the IPv6.
+pub fn via_name(site_id: u32, ipv4: Ipv4Addr) -> String {
+    let o = ipv4.octets();
+    format!("{}-{}-{}-{}-via-{}", o[0], o[1], o[2], o[3], site_id)
+}
+
+/// Parse a `<a>-<b>-<c>-<d>-via-<site>` MagicDNS label back to `(site_id, ipv4)`.
+/// `None` if it isn't a via name or the octets/site don't parse. Case/strictness:
+/// the four octets must each be `0..=255` and the site id a valid `u32`.
+pub fn parse_via_name(host: &str) -> Option<(u32, Ipv4Addr)> {
+    let (ip_part, site_part) = host.rsplit_once("-via-")?;
+    let site_id: u32 = site_part.parse().ok()?;
+    let mut it = ip_part.split('-');
+    let a = it.next()?.parse::<u8>().ok()?;
+    let b = it.next()?.parse::<u8>().ok()?;
+    let c = it.next()?.parse::<u8>().ok()?;
+    let d = it.next()?.parse::<u8>().ok()?;
+    if it.next().is_some() {
+        return None; // trailing junk after the four octets
+    }
+    Some((site_id, Ipv4Addr::new(a, b, c, d)))
+}
+
+/// HA gateway failover rule: from same-route `candidates`, return the index of the
+/// first one for which `is_live` holds (a gateway we've heard from recently); if
+/// none is live (cold start, or all silent), index 0. So traffic prefers a live
+/// gateway and falls over to a backup when the primary goes silent, deterministic
+/// on a cold start.
+pub fn select_live<T>(candidates: &[T], is_live: impl Fn(&T) -> bool) -> usize {
+    candidates.iter().position(is_live).unwrap_or(0)
+}
+
+/// Whether `cidr` (an IPv4 CIDR string) contains `ip`. Malformed CIDR → false.
+pub fn cidr_contains_v4(cidr: &str, ip: Ipv4Addr) -> bool {
+    let Some((net, len)) = parse_cidr_v4(cidr) else {
+        return false;
+    };
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(ip) & mask) == u32::from(net)
+}
+
+/// From an iterator of `(cidr, value)`, return the value whose CIDR contains
+/// `ip` with the **longest** prefix (most specific). Ties broken by iteration
+/// order. `None` if nothing matches. Used to resolve which gateway routes a
+/// given destination (a `/32` device route wins over a `/24` subnet route).
+pub fn longest_prefix_match<'a, T>(
+    routes: impl IntoIterator<Item = (&'a str, T)>,
+    ip: Ipv4Addr,
+) -> Option<T> {
+    let mut best: Option<(u8, T)> = None;
+    for (cidr, value) in routes {
+        if let Some((_, len)) = parse_cidr_v4(cidr)
+            && cidr_contains_v4(cidr, ip)
+            && best.as_ref().is_none_or(|(blen, _)| len > *blen)
+        {
+            best = Some((len, value));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+/// If another network interface already holds an address in `100.64.0.0/10`,
+/// return it. hop's virtual network shares the CGNAT range with Tailscale and
+/// some carrier-grade NATs, so when the VPN is left at its default (auto) we
+/// refuse to bring up our TUN in that case rather than clobber the existing
+/// overlay's route. An explicit `HOP_VPN=1` overrides this guard.
+///
+/// This runs *before* hop's own TUN exists, so it never matches our own address.
+#[cfg(unix)]
+pub fn cgnat_range_in_use() -> Option<Ipv4Addr> {
+    crate::net::netmon::current_interface_addrs()
+        .into_iter()
+        .find_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) if is_virtual_addr(v4) => Some(v4),
+            _ => None,
+        })
+}
+
+// ── Data plane (unix only; opt-in) ───────────────────────────────────────
+
+/// Netmask for `100.64.0.0/10` (a /10 = `255.192.0.0`).
+#[cfg(unix)]
+const CGNAT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
+
+/// Shared slot holding the active TUN device when the VPN is enabled.
+/// `None` means the VPN is off — the inbound handler drops datagrams and the
+/// daemon's default behavior is entirely unaffected.
+#[cfg(unix)]
+pub type TunSlot = std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<tun::AsyncDevice>>>>;
+
+/// Create a TUN device bound to `addr` within `100.64.0.0/10` and bring it up.
+/// On Linux the kernel installs the /10 route from the netmask; on macOS a
+/// point-to-point utun does NOT, so we install it explicitly (`ensure_warren_route`).
+#[cfg(unix)]
+pub async fn create_tun(addr: Ipv4Addr) -> anyhow::Result<tun::AsyncDevice> {
+    use tun::AbstractDevice;
+    let mut config = tun::configure();
+    config
+        .address(addr)
+        .netmask(CGNAT_NETMASK)
+        .mtu(VPN_MTU)
+        .up();
+    let dev =
+        tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("create TUN device: {e}"))?;
+    if let Ok(name) = dev.tun_name()
+        && let Err(e) = ensure_warren_route(&name)
+    {
+        tracing::warn!("vpn: warren route setup on {name} failed: {e:#}");
+    }
+    // Keep the route asserted across sleep/wake + network changes (non-privsep
+    // daemon is root here; under privsep the monitor runs the enforcer).
+    spawn_route_enforcer();
+    Ok(dev)
+}
+
+/// Ensure the warren `100.64.0.0/10` route is pinned to `iface`. macOS p2p utuns
+/// don't auto-install the range route from their netmask (Linux does), so without
+/// this warren traffic falls through to the default route. Idempotent: a re-add
+/// of an existing route is success. macOS-only; a no-op elsewhere. Must run as
+/// root (privsep monitor / non-privsep daemon both qualify).
+#[cfg(target_os = "macos")]
+pub fn ensure_warren_route(iface: &str) -> anyhow::Result<()> {
+    // If the /10 route already points at THIS interface, do nothing — the 30s
+    // enforcer calls this repeatedly, and tearing a correct route down even
+    // briefly would drop in-flight packets.
+    if warren_route_iface().as_deref() == Some(iface) {
+        return Ok(());
+    }
+    // Otherwise it's missing OR points at a STALE interface — e.g. a utun from a
+    // SIGKILL'd daemon, whose dead route macOS leaves in the table. A plain
+    // `route add` would fail "route already exists" and leave the stale route in
+    // place (the bug that black-holed traffic after `killall -9`), so delete
+    // whatever's there first, then add it fresh to the current interface.
+    let _ = std::process::Command::new("/sbin/route")
+        .args(["-n", "delete", "-net", "100.64.0.0/10"])
+        .output();
+    let out = std::process::Command::new("/sbin/route")
+        .args(["-n", "add", "-net", "100.64.0.0/10", "-interface", iface])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawning route add: {e}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "route add 100.64.0.0/10 -> {iface} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    tracing::info!("vpn: installed warren route 100.64.0.0/10 -> {iface}");
+    Ok(())
+}
+
+/// The interface the routing table currently uses for the warren range, if any
+/// (`route -n get` → the `interface:` line). Distinguishes a correct route from
+/// a stale one pointing at a dead utun, and lets the enforcer avoid churn.
+#[cfg(target_os = "macos")]
+fn warren_route_iface() -> Option<String> {
+    let out = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", "100.64.0.1"]) // representative host in 100.64.0.0/10
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn ensure_warren_route(_iface: &str) -> anyhow::Result<()> {
+    Ok(()) // Linux: kernel installs the /10 route from the address/netmask.
+}
+
+/// The hop TUN interface name (a `utun*`/`tun*` carrying a `100.64.0.0/10`
+/// address), if up. Used by the route enforcer to re-find the device across
+/// utun renumbering. macOS-relevant; returns `None` if not found.
+#[cfg(target_os = "macos")]
+pub fn warren_tun_iface() -> Option<String> {
+    let addrs = nix::ifaddrs::getifaddrs().ok()?;
+    for ifa in addrs {
+        if let Some(v4) = ifa.address.and_then(|a| a.as_sockaddr_in().map(|s| s.ip()))
+            && is_virtual_addr(v4)
+        {
+            return Some(ifa.interface_name);
+        }
+    }
+    None
+}
+
+/// Robustly enforce the warren route: every 30s re-find the hop TUN and re-assert
+/// its `/10` route, so a route flushed by sleep/wake or a network change is
+/// restored without waiting for a daemon restart. macOS-only (Linux's kernel
+/// keeps the interface route); must be spawned as root. Never returns.
+#[cfg(target_os = "macos")]
+pub fn spawn_route_enforcer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return; // one enforcer per process
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Some(iface) = warren_tun_iface()
+                && let Err(e) = ensure_warren_route(&iface)
+            {
+                tracing::debug!("vpn: route re-assert on {iface} failed: {e:#}");
+            }
+        }
+    });
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn spawn_route_enforcer() {}
+
+/// Address MagicDNS binds on and the OS resolver is pointed at. On Linux the
+/// node's own vIP works (the kernel delivers packets addressed to a local
+/// interface). On macOS a point-to-point utun routes a query to the node's OWN
+/// vIP back *out* the tunnel instead of to the bound socket, so MagicDNS is
+/// unreachable on the vIP from the same host — serve on loopback instead, which
+/// is always locally deliverable.
+pub fn magicdns_bind_addr(vip: Ipv4Addr) -> Ipv4Addr {
+    if cfg!(target_os = "macos") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        vip
+    }
+}
+
+/// `endpoint-id-hex → virtual IP` for every registered VPN node, shared with the
+/// `NetDoc` which refreshes it. Used by `VpnInbound` to authenticate ingress.
+#[cfg(unix)]
+pub type VpnPeerIps = std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Ipv4Addr>>>;
+/// This host's own virtual IP (the only legitimate destination for ingress).
+#[cfg(unix)]
+pub type VpnLocalIp = std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>;
+
+/// Shared notifier that asks the `NetDoc` to refresh `peer_ips` from the
+/// document. `VpnInbound` fires it when a datagram arrives from a peer whose
+/// registered vIP it doesn't yet know (e.g. just after that peer rebooted), so
+/// reconvergence doesn't have to wait for the periodic refresh tick.
+#[cfg(unix)]
+pub type VpnRefresh = std::sync::Arc<tokio::sync::Notify>;
+
+/// Per-peer timestamp of the last inbound VPN datagram, keyed by remote node-id
+/// string. The outbound forwarder reads it to detect a silently-dead pooled
+/// connection (we keep sending but hear nothing back) and force a re-dial —
+/// QUIC datagram sends return `Ok` on a dead path, so `close_reason()` alone
+/// never triggers recovery. Updated by `pump_vpn_datagrams` on every datagram.
+pub type VpnLastRx =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>;
+
+/// `remote endpoint id hex → live inbound hop/vpn/1 connection`. Registered by
+/// `VpnInbound` on accept (newest wins) and shared with the outbound forwarder,
+/// which PREFERS it over its own dial cache: after a peer reboots and redials,
+/// replies immediately ride the fresh inbound connection instead of a
+/// silently-dead cached one (no CLOSE frame is ever received from a rebooted
+/// peer, so `close_reason()` can't detect it until the QUIC idle timeout).
+#[cfg(unix)]
+pub type VpnConns =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>>;
+
+/// Egress forwarding cache: member vIP → resolved `(endpoint pubkey, relay url)`.
+/// Built by `NetDoc::refresh_vpn_peer_ips` on the 5s tick (and on the refresh
+/// notify), so `vpn_outbound_loop` resolves a destination with one map lookup
+/// instead of `lookup_vpn_endpoint`'s iroh-docs scans per packet. Those per-packet
+/// scans pinned redb's MVCC read version, blocking page reclamation while
+/// background sync writes churned — the data-plane memory leak. Mirrors the
+/// ingress `VpnPeerIps` cache; the doc path stays as the cold/miss fallback.
+#[cfg(unix)]
+pub type VpnFwd = std::sync::Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<Ipv4Addr, (iroh::PublicKey, Option<iroh::RelayUrl>)>,
+    >,
+>;
+
+/// Egress reach cache: member vIP → owning node-id. Built on the same refresh
+/// tick so the per-packet reach ACL (`vpn_reach_allowed`) does a map lookup
+/// instead of `list_virtual_ips()` (a full `ip/` doc scan + blob reads) per packet.
+#[cfg(unix)]
+pub type VpnVipOwner =
+    std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<Ipv4Addr, String>>>;
+
+/// iroh `ProtocolHandler` for `hop/vpn/1`: writes received QUIC datagrams (L3 IP
+/// packets) to the TUN device — **after authenticating ingress** (security-audit
+/// C2). A datagram is delivered only if (a) the connecting node is a registered
+/// VPN peer, (b) the packet's source virtual IP matches that node's registered
+/// IP (anti-spoofing), and (c) the destination is this host's own virtual IP.
+/// Dropped silently when the VPN is off.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct VpnInbound {
+    tun: TunSlot,
+    peer_ips: VpnPeerIps,
+    local_ip: VpnLocalIp,
+    refresh: VpnRefresh,
+    conns: VpnConns,
+    last_rx: VpnLastRx,
+    /// CIDRs this node advertises as a gateway (Tier 1 LAN bridging). An inbound
+    /// datagram destined into one of these is written to the TUN so the kernel
+    /// forwards + NATs it onto the physical LAN, instead of being dropped as "not
+    /// for our vIP". Settable (filled after the daemon reads `routes.json`);
+    /// empty for a non-gateway node.
+    gateway_cidrs: GatewayCidrs,
+    /// 4via6 SIIT state (Tier 3a). Inbound via6 datagrams destined to this
+    /// gateway's site are translated to IPv4 here before the TUN write; empty +
+    /// inert on a node with no site / no via6 traffic.
+    siit: SiitSlot,
+}
+
+/// A gateway-advertised route plus its per-role reach gate (Tier 1 LAN bridging).
+#[derive(Clone, Debug, Default)]
+pub struct GatewayRouteEntry {
+    /// The advertised CIDR this gateway forwards onto its LAN.
+    pub cidr: String,
+    /// Cedar reach tags gating the route. **Empty = reachable by any warren
+    /// member** (the permissive default); non-empty = only members whose role
+    /// reaches these tags.
+    pub tags: Vec<String>,
+    /// Member vIPs allowed to reach this route, recomputed on the peer-IP refresh
+    /// from the reach engine. Consulted only when `tags` is non-empty.
+    pub allowed_vips: std::collections::HashSet<Ipv4Addr>,
+}
+
+/// Shared, settable gateway routing table (see `VpnInbound`).
+pub type GatewayCidrs = std::sync::Arc<std::sync::RwLock<Vec<GatewayRouteEntry>>>;
+
+/// Gateway-side 4via6 SIIT translation state (Tier 3a — overlapping-subnet
+/// routing). Holds this gateway's own `site_id` and a coarse, stable per-client
+/// source mapping: each via6 **client** (its `client_v6` source) is assigned one
+/// IPv4 from the SIIT pool (`100.127.0.0/16`). The kernel's conntrack handles the
+/// *connection* state; this map only needs one entry per client, so the reverse
+/// (v4→v6) translation can recover which client a reply belongs to. Empty + inert
+/// on a node that owns no site / receives no via6 traffic.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct SiitState {
+    /// This gateway's allocated site id (from its admin-owned `peer.site_id`).
+    /// `None` until known — inbound via6 is dropped until then.
+    pub my_site: Option<u32>,
+    /// Next pool index to hand out (1.. within `100.127.0.0/16`; 0 skipped).
+    next: u32,
+    /// `client_v6 → pooled_v4` (allocate-on-first-use, forward path).
+    by_client: std::collections::HashMap<std::net::Ipv6Addr, Ipv4Addr>,
+    /// `pooled_v4 → client_v6` (reverse path: a reply routed to the pool address).
+    by_pool: std::collections::HashMap<Ipv4Addr, std::net::Ipv6Addr>,
+}
+
+#[cfg(unix)]
+impl SiitState {
+    /// Map a via6 client's source address to its stable pooled IPv4, allocating
+    /// the next free pool address on first use. `None` if the pool is exhausted
+    /// (65 534 distinct clients per gateway).
+    pub fn map_client(&mut self, client_v6: std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+        if let Some(v4) = self.by_client.get(&client_v6) {
+            return Some(*v4);
+        }
+        // Probe forward for a free pool slot (skip .0 network + .255.255 edges).
+        let base = u32::from(SIIT_POOL_BASE);
+        for _ in 0..0xffff {
+            self.next = self.next.wrapping_add(1) & 0xffff;
+            if self.next == 0 {
+                continue;
+            }
+            let cand = Ipv4Addr::from(base + self.next);
+            if !self.by_pool.contains_key(&cand) {
+                self.by_client.insert(client_v6, cand);
+                self.by_pool.insert(cand, client_v6);
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// The via6 client a reply destined to `pooled_v4` belongs to (reverse path).
+    pub fn client_for_pool(&self, pooled_v4: Ipv4Addr) -> Option<std::net::Ipv6Addr> {
+        self.by_pool.get(&pooled_v4).copied()
+    }
+}
+
+/// Shared, settable gateway SIIT state (Tier 3a). Shared between the ingress pump
+/// (allocates a client mapping + translates v6→v4) and the outbound forwarder
+/// (recognizes a pooled-address reply + translates v4→v6).
+#[cfg(unix)]
+pub type SiitSlot = std::sync::Arc<std::sync::RwLock<SiitState>>;
+
+/// Whether this gateway should forward a datagram from `src_vip` to `dst`: there
+/// is an advertised route covering `dst`, AND either it's untagged (any member) or
+/// `src_vip` is in its reach-gated allow-set. (Tier 1 LAN bridging.)
+pub fn gateway_forwards(routes: &[GatewayRouteEntry], src_vip: Ipv4Addr, dst: Ipv4Addr) -> bool {
+    routes.iter().any(|r| {
+        cidr_contains_v4(&r.cidr, dst)
+            && (r.tags.is_empty() || r.allowed_vips.contains(&src_vip))
+    })
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for VpnInbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VpnInbound").finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl VpnInbound {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tun: TunSlot,
+        peer_ips: VpnPeerIps,
+        local_ip: VpnLocalIp,
+        refresh: VpnRefresh,
+        conns: VpnConns,
+        last_rx: VpnLastRx,
+        gateway_cidrs: GatewayCidrs,
+        siit: SiitSlot,
+    ) -> Self {
+        Self { tun, peer_ips, local_ip, refresh, conns, last_rx, gateway_cidrs, siit }
+    }
+}
+
+/// Read datagrams off a hop/vpn/1 connection (inbound OR dialed — QUIC
+/// datagrams are bidirectional) and deliver each to the TUN after
+/// authenticating ingress (security-audit C2). Returns when the connection
+/// dies. Shared by `VpnInbound::accept` and the outbound forwarder's dialed
+/// connections, so replies sent back over the *same* connection a peer dialed
+/// are actually read — the old accept-only pump silently discarded them.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub async fn pump_vpn_datagrams(
+    conn: &iroh::endpoint::Connection,
+    tun: &TunSlot,
+    peer_ips: &VpnPeerIps,
+    local_ip: &VpnLocalIp,
+    refresh: &VpnRefresh,
+    last_rx: &VpnLastRx,
+    gateway_cidrs: &std::sync::RwLock<Vec<GatewayRouteEntry>>,
+    siit: &SiitSlot,
+) {
+    use crate::netstats::NET_STATS;
+    use std::sync::atomic::Ordering::Relaxed;
+    // The authenticated identity of the remote node (QUIC/TLS-verified).
+    let remote = conn.remote_id().to_string();
+    while let Ok(dg) = conn.read_datagram().await {
+        // Per-datagram handling timer (recorded on the path that reaches the TUN).
+        let t0 = std::time::Instant::now();
+        // Liveness signal: a datagram arrived from this peer, so the path is
+        // alive right now. The outbound forwarder uses this to tell a working
+        // pooled connection from a silently-dead one and recover from the latter.
+        last_rx.write().await.insert(remote.clone(), std::time::Instant::now());
+        // Keepalive heartbeat: it already served its purpose (the `last_rx`
+        // update above proves the path is live). Don't try to parse it as an IP
+        // packet — skip cleanly so it never triggers a spurious refresh or TUN
+        // write.
+        if dg.as_ref() == VPN_KEEPALIVE {
+            NET_STATS.in_keepalive.fetch_add(1, Relaxed);
+            continue;
+        }
+        // Real user datagram (past the keepalive fast-path).
+        NET_STATS.in_dg.fetch_add(1, Relaxed);
+        NET_STATS.in_bytes.fetch_add(dg.len() as u64, Relaxed);
+        // 4via6 (Tier 3a): an IPv6 datagram is either a via6 request to translate
+        // (we're the destination gateway) or a translated reply to deliver (we're
+        // the client). Handled before the v4 anti-spoof path (which would drop it).
+        if (dg.first().copied().unwrap_or(0) >> 4) == 6 {
+            if dg.len() < 40 {
+                continue;
+            }
+            let dst_v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&dg[24..40]).unwrap());
+            let src_v6 = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&dg[8..24]).unwrap());
+            // Gateway path: dst is a via6 address for OUR site → SIIT v6→v4 → TUN,
+            // then the kernel forwards + masquerades onto the LAN (the P1 path).
+            if let Some((site, real_v4)) = via6_decode(dst_v6) {
+                let mine = siit.read().map(|s| s.my_site) .unwrap_or(None) == Some(site);
+                if mine {
+                    // Reach authorization (parity with the v4 gateway path): the
+                    // sending client (its vIP is embedded in client_v6) must be
+                    // permitted to reach `real_v4` via an advertised route.
+                    if !is_client_v6(src_v6) {
+                        NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    let client_vip = Ipv4Addr::new(
+                        src_v6.octets()[12], src_v6.octets()[13], src_v6.octets()[14], src_v6.octets()[15],
+                    );
+                    let authorized = gateway_cidrs
+                        .read()
+                        .is_ok_and(|rs| gateway_forwards(&rs, client_vip, real_v4));
+                    if !authorized {
+                        NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
+                        tracing::debug!("via6 ingress: DROP — {client_vip} not authorized for {real_v4}");
+                        continue;
+                    }
+                    let pooled = match siit.write().ok().and_then(|mut s| s.map_client(src_v6)) {
+                        Some(p) => p,
+                        None => {
+                            NET_STATS.in_drop_via6.fetch_add(1, Relaxed);
+                            continue; // pool exhausted
+                        }
+                    };
+                    if let Some(v4pkt) = siit::translate_v6_to_v4(&dg, pooled, real_v4)
+                        && let Some(tun) = tun.read().await.clone()
+                    {
+                        match tun.send(&v4pkt).await {
+                            Ok(_) => {
+                                NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                                NET_STATS.in_tun_bytes.fetch_add(v4pkt.len() as u64, Relaxed);
+                                NET_STATS.record_ingress_latency(t0.elapsed());
+                            }
+                            Err(_) => {
+                                NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Client path: dst is OUR own via6 client address → it's a translated
+            // reply; write the v6 packet to the TUN so the local app receives it.
+            let my_client_v6 = local_ip.read().await.map(client_v6);
+            if my_client_v6 == Some(dst_v6)
+                && let Some(tun) = tun.read().await.clone()
+            {
+                match tun.send(&dg).await {
+                    Ok(_) => {
+                        NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                        NET_STATS.in_tun_bytes.fetch_add(dg.len() as u64, Relaxed);
+                        NET_STATS.record_ingress_latency(t0.elapsed());
+                    }
+                    Err(_) => {
+                        NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            continue;
+        }
+        // Look up the peer's authorized vIP *per datagram* (not once up front)
+        // so a refresh mid-connection — e.g. after the peer reboots and
+        // re-registers — takes effect without dropping the connection.
+        let expected_src = peer_ips.read().await.get(&remote).copied();
+        let Some(expected) = expected_src else {
+            NET_STATS.in_drop_unknown_peer.fetch_add(1, Relaxed);
+            // Unknown peer: ask the NetDoc to refresh from the document. The
+            // notify coalesces and the consumer is rate-limited, so a packet
+            // flood can't amplify into excessive doc reads.
+            tracing::debug!(
+                "vpn ingress: DROP datagram from {} — no endpoint→vIP mapping (map has {} entries); refresh requested",
+                &remote[..10.min(remote.len())],
+                peer_ips.read().await.len()
+            );
+            refresh.notify_one();
+            continue;
+        };
+        // Anti-spoofing: the packet's source vIP must be this node's vIP. A
+        // mismatch can mean the peer changed vIP — refresh and re-check next
+        // datagram rather than blackholing it indefinitely.
+        match parse_src_ipv4(&dg) {
+            Some(src) if src == expected => {}
+            // Return traffic from a LAN subnet a gateway peer forwards for us has
+            // a non-virtual source (the real LAN device), which legitimately won't
+            // match the peer's vIP. Accept it: a non-virtual address can't
+            // impersonate a warren member (members are all in 100.64/10), and the
+            // destination check below still confines it to our vIP / our own
+            // gatewayed routes. (P1 follow-up: tighten to "only from a peer whose
+            // route we accepted", alongside per-role route gating.)
+            Some(src) if !is_virtual_addr(src) => {}
+            _ => {
+                NET_STATS.in_drop_spoof.fetch_add(1, Relaxed);
+                refresh.notify_one();
+                continue;
+            }
+        }
+        // The datagram must be destined for *us* (our virtual IP) — OR, if we're
+        // a gateway, for one of our advertised LAN subnets, in which case we hand
+        // it to the TUN and the kernel forwards + NATs it onto the physical LAN.
+        // NOTE (plan P1 slice 4): forwarding here is gated only to advertised
+        // CIDRs + the anti-spoof'd sender vIP above; per-role authorization of
+        // *which* members may reach a route (the gateway-side Cedar check) is the
+        // security follow-up before this leaves the branch.
+        if let Some(local) = *local_ip.read().await {
+            let dst = parse_dest_ipv4(&dg);
+            let for_us = dst == Some(local);
+            // Forward only if an advertised route covers `dst` AND the sending
+            // member (`expected`, its anti-spoof'd vIP) is permitted to reach it
+            // (untagged routes = any member; tagged = role-gated). This is the
+            // gateway-side authorization — egress trust alone is insufficient for a
+            // non-member destination.
+            let for_gateway = dst
+                .is_some_and(|d| gateway_cidrs.read().is_ok_and(|rs| gateway_forwards(&rs, expected, d)));
+            if !for_us && !for_gateway {
+                NET_STATS.in_drop_dest.fetch_add(1, Relaxed);
+                continue;
+            }
+            if for_gateway && !for_us {
+                tracing::debug!(
+                    "vpn ingress: forwarding {:?} → LAN (gateway route); kernel will NAT",
+                    dst
+                );
+            }
+        }
+        if let Some(tun) = tun.read().await.clone() {
+            match tun.send(&dg).await {
+                Ok(_) => {
+                    NET_STATS.in_tun_written.fetch_add(1, Relaxed);
+                    NET_STATS.in_tun_bytes.fetch_add(dg.len() as u64, Relaxed);
+                    NET_STATS.record_ingress_latency(t0.elapsed());
+                }
+                Err(_) => {
+                    NET_STATS.in_drop_tun.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl iroh::protocol::ProtocolHandler for VpnInbound {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let remote = conn.remote_id().to_string();
+        // Register this connection for the outbound forwarder (newest wins): a
+        // peer that just rebooted redials us, and replies must ride THIS fresh
+        // connection, not a silently-dead cached dial.
+        let my_id = conn.stable_id();
+        self.conns.write().await.insert(remote.clone(), conn.clone());
+        // Seed last_rx NOW, at accept time — not on the first datagram. A peer
+        // establishing a connection TO us is the freshest possible liveness signal:
+        // it just completed a QUIC handshake from its CURRENT address. Without this
+        // seed there's a race on peer reboot — the rebooted founder redials us and
+        // this fresh conn is registered, but until its first datagram lands the
+        // outbound forwarder still sees the peer as rx-stale, so it tears THIS
+        // connection down (close + reset_node) and redials, thrashing the founder's
+        // recovery handshake (the ~31s tail, and a >120s livelock under a short
+        // reset cooldown). Seeding makes the forwarder latch onto the inbound
+        // immediately; it ages out normally after STALE_AFTER if no real datagrams
+        // follow.
+        self.last_rx
+            .write()
+            .await
+            .insert(remote.clone(), std::time::Instant::now());
+        pump_vpn_datagrams(
+            &conn,
+            &self.tun,
+            &self.peer_ips,
+            &self.local_ip,
+            &self.refresh,
+            &self.last_rx,
+            &self.gateway_cidrs,
+            &self.siit,
+        )
+        .await;
+        // Connection ended — unregister, unless a newer one already replaced it.
+        {
+            let mut conns = self.conns.write().await;
+            if conns.get(&remote).map(|c| c.stable_id()) == Some(my_id) {
+                conns.remove(&remote);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal IPv4 packet header with the given src/dst.
+    fn ipv4(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45; // version 4, IHL 5
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    #[test]
+    fn parses_ipv4_src_and_dest() {
+        let p = ipv4([100, 64, 0, 1], [100, 64, 7, 42]);
+        assert_eq!(parse_dest_ipv4(&p), Some(Ipv4Addr::new(100, 64, 7, 42)));
+        assert_eq!(parse_src_ipv4(&p), Some(Ipv4Addr::new(100, 64, 0, 1)));
+    }
+
+    #[test]
+    fn keepalive_marker_is_not_a_valid_ip_packet() {
+        // Defense in depth: even if the explicit marker check in
+        // `pump_vpn_datagrams` were bypassed, the heartbeat must never parse as
+        // an IP packet — so it can't be injected into the TUN or pass the
+        // source-vIP anti-spoof check. Its leading byte is not IPv4 (0x4_) or
+        // IPv6 (0x6_).
+        assert_eq!(parse_src_ipv4(VPN_KEEPALIVE), None);
+        assert_eq!(parse_dest_ipv4(VPN_KEEPALIVE), None);
+        assert_ne!(VPN_KEEPALIVE[0] >> 4, 4);
+        assert_ne!(VPN_KEEPALIVE[0] >> 4, 6);
+    }
+
+    #[test]
+    fn rejects_non_ipv4_and_truncated() {
+        let mut v6 = vec![0u8; 20];
+        v6[0] = 0x60; // version 6
+        assert_eq!(parse_dest_ipv4(&v6), None);
+        assert_eq!(parse_dest_ipv4(&[0x45, 0, 0]), None); // truncated
+    }
+
+    #[test]
+    fn virtual_range_check() {
+        assert!(is_virtual_addr(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_virtual_addr(Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(!is_virtual_addr(Ipv4Addr::new(100, 63, 0, 1)));
+        assert!(!is_virtual_addr(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!is_virtual_addr(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn cidr_parse_and_contains() {
+        assert_eq!(
+            parse_cidr_v4("192.168.1.0/24"),
+            Some((Ipv4Addr::new(192, 168, 1, 0), 24))
+        );
+        // host bits are masked off in the returned network
+        assert_eq!(
+            parse_cidr_v4("192.168.1.128/24"),
+            Some((Ipv4Addr::new(192, 168, 1, 0), 24))
+        );
+        assert_eq!(parse_cidr_v4("0.0.0.0/0"), Some((Ipv4Addr::new(0, 0, 0, 0), 0)));
+        assert_eq!(parse_cidr_v4("10.0.0.5/32"), Some((Ipv4Addr::new(10, 0, 0, 5), 32)));
+        assert_eq!(parse_cidr_v4("nonsense"), None);
+        assert_eq!(parse_cidr_v4("1.2.3.4/33"), None);
+
+        assert!(cidr_contains_v4("192.168.1.0/24", Ipv4Addr::new(192, 168, 1, 128)));
+        assert!(!cidr_contains_v4("192.168.1.0/24", Ipv4Addr::new(192, 168, 2, 1)));
+        assert!(cidr_contains_v4("0.0.0.0/0", Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(cidr_contains_v4("10.0.0.5/32", Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(!cidr_contains_v4("10.0.0.5/32", Ipv4Addr::new(10, 0, 0, 6)));
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        // a /32 device route must win over a covering /24 and the default route
+        let routes = [
+            ("0.0.0.0/0", "exit"),
+            ("192.168.1.0/24", "subnet"),
+            ("192.168.1.128/32", "device"),
+        ];
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(192, 168, 1, 128));
+        assert_eq!(hit, Some("device"));
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(hit, Some("subnet"));
+        let hit = longest_prefix_match(routes.iter().map(|(c, v)| (*c, *v)), Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(hit, Some("exit"));
+    }
+
+    #[test]
+    fn gateway_gate_enforces_route_tags() {
+        use std::collections::HashSet;
+        let alice = Ipv4Addr::new(100, 64, 0, 1);
+        let bob = Ipv4Addr::new(100, 64, 0, 2);
+        let dst = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Untagged route → reachable by any member.
+        let open = vec![GatewayRouteEntry {
+            cidr: "192.168.1.0/24".into(),
+            tags: vec![],
+            allowed_vips: HashSet::new(),
+        }];
+        assert!(gateway_forwards(&open, alice, dst));
+        assert!(gateway_forwards(&open, bob, dst));
+        // …but only for destinations inside an advertised route.
+        assert!(!gateway_forwards(&open, alice, Ipv4Addr::new(10, 0, 0, 1)));
+
+        // Tagged route → only members in the role-derived allow-set (alice, not bob).
+        let gated = vec![GatewayRouteEntry {
+            cidr: "192.168.1.0/24".into(),
+            tags: vec!["media".into()],
+            allowed_vips: HashSet::from([alice]),
+        }];
+        assert!(gateway_forwards(&gated, alice, dst));
+        assert!(!gateway_forwards(&gated, bob, dst));
+    }
+
+    #[test]
+    fn ha_failover_prefers_live_gateway() {
+        let gws = ["primary", "backup"];
+        // Cold start (none live) → the first (deterministic).
+        assert_eq!(select_live(&gws, |_| false), 0);
+        // Primary live → primary.
+        assert_eq!(select_live(&gws, |g| *g == "primary"), 0);
+        // Primary silent, backup live → fail over to the backup.
+        assert_eq!(select_live(&gws, |g| *g == "backup"), 1);
+        // Both live → prefer the first (stable; no needless flapping).
+        assert_eq!(select_live(&gws, |_| true), 0);
+    }
+
+    #[test]
+    fn via6_roundtrips_and_disambiguates_overlap() {
+        // The SAME real v4 at two different sites encodes to DIFFERENT v6 — the
+        // whole point of 4via6 for overlapping subnets.
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        let a = via6_encode(1, ip);
+        let b = via6_encode(2, ip);
+        assert_ne!(a, b);
+        assert_eq!(via6_decode(a), Some((1, ip)));
+        assert_eq!(via6_decode(b), Some((2, ip)));
+        // Round-trip a few values.
+        for (site, ip) in [
+            (0u32, Ipv4Addr::new(10, 0, 0, 1)),
+            (65535, Ipv4Addr::new(192, 168, 1, 127)),
+            (0xDEAD_BEEF, Ipv4Addr::new(255, 255, 255, 255)),
+        ] {
+            assert_eq!(via6_decode(via6_encode(site, ip)), Some((site, ip)));
+        }
+        // A non-via6 IPv6 address (e.g. localhost) is not decoded.
+        assert_eq!(via6_decode(std::net::Ipv6Addr::LOCALHOST), None);
+    }
+
+    #[test]
+    fn via_name_roundtrips() {
+        let ip = Ipv4Addr::new(192, 168, 1, 50);
+        assert_eq!(via_name(7, ip), "192-168-1-50-via-7");
+        assert_eq!(parse_via_name("192-168-1-50-via-7"), Some((7, ip)));
+        // Round-trip across sites/ips.
+        for (site, ip) in [
+            (1u32, Ipv4Addr::new(10, 0, 0, 1)),
+            (4_000_000_000, Ipv4Addr::new(255, 254, 253, 252)),
+        ] {
+            assert_eq!(parse_via_name(&via_name(site, ip)), Some((site, ip)));
+        }
+    }
+
+    #[test]
+    fn parse_via_name_rejects_malformed() {
+        assert_eq!(parse_via_name("laptop"), None); // ordinary host
+        assert_eq!(parse_via_name("192-168-1-via-7"), None); // only 3 octets
+        assert_eq!(parse_via_name("192-168-1-50-1-via-7"), None); // 5 octets
+        assert_eq!(parse_via_name("192-168-1-256-via-7"), None); // octet > 255
+        assert_eq!(parse_via_name("192-168-1-50-via-"), None); // empty site
+        assert_eq!(parse_via_name("192-168-1-50-via-abc"), None); // non-numeric site
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn siit_pool_maps_clients_stably_and_reverses() {
+        let mut s = SiitState::default();
+        let c1 = client_v6(Ipv4Addr::new(100, 64, 0, 9));
+        let c2 = client_v6(Ipv4Addr::new(100, 64, 0, 10));
+        let p1 = s.map_client(c1).unwrap();
+        // Stable: the same client always maps to the same pool address.
+        assert_eq!(s.map_client(c1).unwrap(), p1);
+        // Pooled addresses are in the reserved /16 and distinct per client.
+        assert!(is_siit_pool_addr(p1));
+        let p2 = s.map_client(c2).unwrap();
+        assert_ne!(p1, p2);
+        // Reverse lookup recovers the client for a reply routed to the pool addr.
+        assert_eq!(s.client_for_pool(p1), Some(c1));
+        assert_eq!(s.client_for_pool(p2), Some(c2));
+        assert_eq!(s.client_for_pool(Ipv4Addr::new(100, 127, 9, 9)), None);
+    }
+
+    #[test]
+    fn siit_pool_addrs_excluded_from_virtual_membership_check() {
+        // A pool address is still inside the warren /10 (so the gateway's existing
+        // masquerade covers it) but is recognized as pool, not a member vIP.
+        let p = Ipv4Addr::new(100, 127, 0, 5);
+        assert!(is_virtual_addr(p));
+        assert!(is_siit_pool_addr(p));
+        assert!(!is_siit_pool_addr(Ipv4Addr::new(100, 64, 0, 9)));
+    }
+
+    #[test]
+    fn client_v6_is_stable_unique_and_recognized() {
+        let a = client_v6(Ipv4Addr::new(100, 64, 0, 9));
+        // Stable + embeds the vIP in the low bytes.
+        assert_eq!(a, client_v6(Ipv4Addr::new(100, 64, 0, 9)));
+        assert_eq!(&a.octets()[12..16], &[100, 64, 0, 9]);
+        // Different vIP → different client address.
+        assert_ne!(a, client_v6(Ipv4Addr::new(100, 64, 0, 10)));
+        // Recognized as a client-prefix address, and distinct from a via6 dest.
+        assert!(is_client_v6(a));
+        assert!(!is_client_v6(via6_encode(7, Ipv4Addr::new(192, 168, 1, 50))));
+    }
+
+    #[test]
+    fn deterministic_site_id_is_stable_nonzero_and_distinct() {
+        use crate::netdoc::deterministic_site_id;
+        let a = deterministic_site_id("node-aaaa");
+        // Stable for the same node id.
+        assert_eq!(a, deterministic_site_id("node-aaaa"));
+        // Never the reserved 0.
+        assert_ne!(a, 0);
+        // Different nodes get different candidates (overwhelmingly likely).
+        assert_ne!(a, deterministic_site_id("node-bbbb"));
+    }
+}

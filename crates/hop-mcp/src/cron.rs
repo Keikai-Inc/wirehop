@@ -1,0 +1,532 @@
+//! Cron scheduler: polls for due jobs and executes their JS scripts.
+//!
+//! Design follows the Kubernetes CronJob `Forbid` / APScheduler `max_instances=1`
+//! pattern: only one instance of a given job runs at a time. If a job is still
+//! running when its next fire time arrives, that tick is skipped. Missed runs
+//! (e.g. daemon was down) are coalesced into a single execution on startup.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use hop_core::datastore::Datastore;
+use tokio::task::JoinHandle;
+
+use crate::backend::OrchestratorBackend;
+use crate::js::JsRuntime;
+
+/// Compute the next occurrence (in epoch milliseconds) of a cron schedule
+/// after the given timestamp.
+pub fn next_occurrence_ms(schedule: &cron::Schedule, after_ms: u64) -> u64 {
+    use chrono::{TimeZone, Utc};
+    let dt = Utc.timestamp_millis_opt(after_ms as i64).single();
+    match dt {
+        Some(dt) => schedule
+            .after(&dt)
+            .next()
+            .map(|next| next.timestamp_millis() as u64)
+            .unwrap_or(after_ms + 60_000),
+        None => after_ms + 60_000,
+    }
+}
+
+/// Spawn the cron scheduler loop. Polls for due jobs at `poll_interval`.
+///
+/// When `backend` is provided, cron jobs can use `hop.exec()` / `hop.fleet.exec()`
+/// and jobs with `targets` will have `hop.targets` injected.
+pub fn spawn_cron_scheduler(
+    datastore: Datastore,
+    poll_interval: Duration,
+    backend: Option<Arc<dyn OrchestratorBackend>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Track which jobs are currently executing. Checked synchronously on
+        // each tick before spawning — prevents duplicate runs entirely.
+        let running: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let mut interval = tokio::time::interval(poll_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) =
+                run_due_jobs(&datastore, backend.as_ref(), &running).await
+            {
+                tracing::error!("Cron scheduler error: {e:#}");
+            }
+        }
+    })
+}
+
+/// Query for due jobs and spawn a task for each one (skipping in-flight jobs).
+async fn run_due_jobs(
+    datastore: &Datastore,
+    backend: Option<&Arc<dyn OrchestratorBackend>>,
+    running: &Arc<std::sync::Mutex<HashSet<String>>>,
+) -> Result<()> {
+    let now = now_ms();
+    let due_jobs = datastore.cron_get_due(now)?;
+
+    for job in due_jobs {
+        // --- Concurrency guard: skip if already running ---
+        {
+            let set = running.lock().unwrap();
+            if set.contains(&job.id) {
+                tracing::debug!(
+                    "Cron: skipping '{}' ({}) — already running",
+                    job.name,
+                    job.id
+                );
+                continue;
+            }
+        }
+
+        // Advance next_run before spawning so cron_get_due won't return this
+        // job again even if the running set check somehow races.
+        let next_run = job
+            .schedule
+            .parse::<cron::Schedule>()
+            .map(|s| next_occurrence_ms(&s, now))
+            .unwrap_or(now + 60_000);
+        datastore.cron_update_last_run(&job.id, now, next_run)?;
+
+        // Mark as running before spawning the task.
+        {
+            let mut set = running.lock().unwrap();
+            set.insert(job.id.clone());
+        }
+
+        let ds = datastore.clone();
+        let be = backend.cloned();
+        let running = Arc::clone(running);
+        let job_id = job.id.clone();
+
+        tokio::spawn(async move {
+            // RAII guard: clears the running flag on drop, even if the task
+            // panics (e.g. from iroh-quinn connection bugs). Without this,
+            // a panicked task would leave the job permanently stuck.
+            let _guard = RunningGuard {
+                set: Arc::clone(&running),
+                id: job_id,
+            };
+            if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
+                let msg = format!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
+                tracing::error!("{msg}");
+                eprintln!("[hop.cron] ERROR: {msg}");
+                store_cron_error(&ds, &job.id, &msg);
+                notify_cron_failure(&ds, &job, &msg).await;
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Execute a single cron job's JS script.
+async fn execute_cron_job(
+    datastore: &Datastore,
+    job: &hop_core::datastore::types::CronJob,
+    backend: Option<&Arc<dyn OrchestratorBackend>>,
+) -> Result<()> {
+    tracing::info!("Cron: executing job '{}' ({})", job.name, job.id);
+
+    let mut runtime = JsRuntime::new();
+    runtime.set_datastore(datastore.clone());
+
+    // Apply sandbox policy if the job specifies one
+    if let Some(ref sandbox) = job.sandbox {
+        runtime.set_sandbox(sandbox.clone());
+    }
+
+    // Set user for privilege dropping in hop.local()
+    if let Some(ref user) = job.run_as_user {
+        runtime.set_run_as_user(user.clone());
+    }
+
+    // Build the script, optionally prepending hop.targets injection
+    let script = if let (Some(tag), Some(be)) = (&job.targets, backend) {
+        let hosts = be.list_hosts(Some(tag)).await.unwrap_or_default();
+        let hosts_json = serde_json::to_string(&hosts).unwrap_or_else(|_| "[]".to_string());
+        format!("hop.targets = {};\n{}", hosts_json, job.script)
+    } else {
+        job.script.clone()
+    };
+
+    // Timeout must exceed the 60s exec timeout in LocalBackend so that
+    // hop.exec() can fire its own timeout error instead of the JS runtime
+    // killing the script silently. Set to 5 minutes for AI-powered jobs
+    // that may invoke hop.claude() (each Claude call can take 30-60s).
+    let js_timeout = Duration::from_secs(300);
+
+    let result = if let Some(be) = backend {
+        runtime.execute(&script, be, Some(js_timeout)).await
+    } else {
+        runtime.execute_script(&script, Some(js_timeout)).await
+    };
+
+    match &result {
+        Ok(output) => {
+            let msg = truncate(output, 200);
+            tracing::info!("Cron job '{}' completed: {msg}", job.name);
+            eprintln!("[hop.cron] {} completed: {msg}", job.name);
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!("Cron job '{}' script error: {msg}", job.name);
+            eprintln!("[hop.cron] ERROR: {} script error: {msg}", job.name);
+            store_cron_error(datastore, &job.id, &msg);
+        }
+    }
+
+    Ok(())
+}
+
+/// RAII guard that removes a job ID from the running set on drop.
+/// Ensures cleanup even if the spawned task panics (e.g. from iroh-quinn bugs).
+struct RunningGuard {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.id);
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    // Find the largest char boundary at or before `max`
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Store a cron error with timestamp, keeping at most 10 entries per job.
+fn store_cron_error(ds: &Datastore, job_id: &str, msg: &str) {
+    const MAX_ERRORS_PER_JOB: usize = 10;
+
+    let ts = now_ms();
+    let key = format!("{job_id}:{ts:016}");
+    let _ = ds.kv_set(
+        "cron_errors",
+        &key,
+        &hop_core::datastore::types::KvEntry {
+            value: msg.as_bytes().to_vec(),
+            content_type: "text/plain".to_string(),
+            updated_at: ts,
+        },
+    );
+
+    // Prune oldest entries if over the limit
+    if let Ok(entries) = ds.kv_list("cron_errors", &format!("{job_id}:"))
+        && entries.len() > MAX_ERRORS_PER_JOB
+    {
+        for (old_key, _) in entries.iter().take(entries.len() - MAX_ERRORS_PER_JOB) {
+            let _ = ds.kv_delete("cron_errors", old_key);
+        }
+    }
+}
+
+/// Best-effort SMS notification on cron failure.
+///
+/// Sends an SMS via the Gmail API / carrier email gateway, reusing secrets
+/// already configured for the email-monitor capability. Rate-limited to
+/// one SMS per job per hour to prevent spam on recurring failures.
+async fn notify_cron_failure(
+    ds: &Datastore,
+    job: &hop_core::datastore::types::CronJob,
+    msg: &str,
+) {
+    // Check cooldown: at most one SMS per job per hour
+    let cooldown_key = format!("sms_cooldown:{}", job.id);
+    let now = now_ms();
+    if let Ok(Some(entry)) = ds.kv_get("cron_notify", &cooldown_key)
+        && now.saturating_sub(entry.updated_at) < 3_600_000
+    {
+        tracing::debug!("Cron failure SMS skipped (cooldown): {}", job.name);
+        return;
+    }
+
+    // Truncate message for SMS (max ~300 chars)
+    let sms_body = if msg.len() > 280 {
+        format!("[hop] {} failed: {}...", job.name, &msg[..250])
+    } else {
+        format!("[hop] {msg}")
+    };
+
+    let sms_msg_json = serde_json::to_string(&sms_body).unwrap_or_else(|_| "\"cron job failed\"".into());
+    let script = format!(
+        "var __sms_message = {sms_msg_json};\n{SMS_NOTIFY_JS}",
+    );
+
+    let mut runtime = crate::js::JsRuntime::new();
+    runtime.set_datastore(ds.clone());
+    if let Some(ref user) = job.run_as_user {
+        runtime.set_run_as_user(user.clone());
+    }
+
+    match runtime
+        .execute_script(&script, Some(Duration::from_secs(30)))
+        .await
+    {
+        Ok(result) => tracing::info!("Cron failure SMS for '{}': {result}", job.name),
+        Err(e) => tracing::warn!("Cron failure SMS for '{}' failed: {e:#}", job.name),
+    }
+
+    // Update cooldown timestamp
+    let _ = ds.kv_set(
+        "cron_notify",
+        &cooldown_key,
+        &hop_core::datastore::types::KvEntry {
+            value: b"1".to_vec(),
+            content_type: "text/plain".to_string(),
+            updated_at: now,
+        },
+    );
+}
+
+/// Minimal JS to send an SMS via Gmail API + carrier email gateway.
+/// Expects `__sms_message` global to be set before evaluation.
+const SMS_NOTIFY_JS: &str = r#"
+(function() {
+    var GATEWAYS = {
+        "tmobile": "@tmomail.net", "att": "@txt.att.net",
+        "verizon": "@vtext.com", "sprint": "@messaging.sprintpcs.com",
+        "googlefi": "@msg.fi.google.com", "mint": "@tmomail.net",
+        "visible": "@vtext.com", "uscellular": "@email.uscc.net"
+    };
+    var phone = hop.secrets.get("sms_phone");
+    var carrier = hop.secrets.get("sms_carrier");
+    if (!phone || !carrier) return "no sms config";
+    var gateway = GATEWAYS[carrier.toLowerCase()];
+    if (!gateway) gateway = carrier.indexOf("@") === 0 ? carrier : "@" + carrier;
+    var addr = phone + gateway;
+    var msg = __sms_message;
+    if (msg.length > 300) msg = msg.substring(0, 297) + "...";
+
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    function base64url(str) {
+        var bytes = [];
+        for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            if (c < 128) bytes.push(c);
+            else if (c < 2048) { bytes.push(192 | (c >> 6)); bytes.push(128 | (c & 63)); }
+            else if (c < 65536) { bytes.push(224 | (c >> 12)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+            else { bytes.push(240 | (c >> 18)); bytes.push(128 | ((c >> 12) & 63)); bytes.push(128 | ((c >> 6) & 63)); bytes.push(128 | (c & 63)); }
+        }
+        var b64 = "";
+        for (var i = 0; i < bytes.length; i += 3) {
+            var b0 = bytes[i], b1 = bytes[i + 1] || 0, b2 = bytes[i + 2] || 0;
+            var n = (b0 << 16) | (b1 << 8) | b2;
+            b64 += chars[(n >> 18) & 63];
+            b64 += chars[(n >> 12) & 63];
+            b64 += (i + 1 < bytes.length) ? chars[(n >> 6) & 63] : "";
+            b64 += (i + 2 < bytes.length) ? chars[n & 63] : "";
+        }
+        return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    var content = "To: " + addr + "\r\nSubject: hop alert\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + msg;
+    var token = hop.secrets.get("gmail_access_token");
+    if (!token) return "no gmail token for SMS";
+    try {
+        hop.http.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            { bearer: token, json: { raw: base64url(content) } });
+        return "sms sent to " + addr;
+    } catch(e) {
+        return "sms failed: " + e.message;
+    }
+})();
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hop_core::datastore::types::CronJob;
+
+    fn make_job(id: &str, schedule: &str, script: &str, enabled: bool, next_run: u64) -> CronJob {
+        CronJob {
+            id: id.to_string(),
+            name: format!("Job {id}"),
+            schedule: schedule.to_string(),
+            script: script.to_string(),
+            enabled,
+            last_run: None,
+            next_run,
+            created_at: 1000,
+            tags: vec![],
+            targets: None,
+            catalog_id: None,
+            sandbox: None,
+            run_as_user: None,
+        }
+    }
+
+    #[test]
+    fn next_occurrence_computes_future_timestamp() {
+        let schedule: cron::Schedule = "0 * * * * *".parse().unwrap();
+        let now = now_ms();
+        let next = next_occurrence_ms(&schedule, now);
+        assert!(next > now, "next_occurrence should be in the future");
+    }
+
+    #[tokio::test]
+    async fn run_due_jobs_executes_script_writes_kv() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let job = make_job(
+            "j1",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'proof', 'it_ran')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let entry = ds.kv_get("cron_test", "proof").unwrap();
+        assert!(entry.is_some(), "KV entry should exist after cron execution");
+        assert_eq!(entry.unwrap().value, b"\"it_ran\"");
+    }
+
+    #[tokio::test]
+    async fn run_due_jobs_handles_failing_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let job = make_job("j_fail", "0 * * * * *", "throw new Error('boom')", true, 0);
+        ds.cron_add(&job).unwrap();
+
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let updated = ds.cron_get("j_fail").unwrap().unwrap();
+        assert!(
+            updated.last_run.is_some(),
+            "last_run should be set even on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_jobs_are_not_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let job = make_job(
+            "j_disabled",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'disabled', 'should_not_run')",
+            false,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let entry = ds.kv_get("cron_test", "disabled").unwrap();
+        assert!(entry.is_none(), "Disabled job should not execute");
+    }
+
+    #[tokio::test]
+    async fn skips_already_running_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        // Simulate a long-running job by pre-inserting its ID in the running set
+        let job = make_job(
+            "j_slow",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'slow', 'should_not_run_twice')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        // Mark as already running
+        running.lock().unwrap().insert("j_slow".to_string());
+
+        // This tick should skip it
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let entry = ds.kv_get("cron_test", "slow").unwrap();
+        assert!(entry.is_none(), "Already-running job should be skipped");
+    }
+
+    #[tokio::test]
+    async fn running_flag_cleared_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let job = make_job(
+            "j_clear",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'clear', 'done')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // After completion, the running set should be empty
+        assert!(
+            !running.lock().unwrap().contains("j_clear"),
+            "Running flag should be cleared after job completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_scheduler_executes_due_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+
+        let job = make_job(
+            "j_sched",
+            "0 * * * * *",
+            "hop.kv.set('cron_test', 'sched', 'scheduler_ran')",
+            true,
+            0,
+        );
+        ds.cron_add(&job).unwrap();
+
+        let handle = spawn_cron_scheduler(ds.clone(), Duration::from_millis(100), None);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        handle.abort();
+
+        let entry = ds.kv_get("cron_test", "sched").unwrap();
+        assert!(
+            entry.is_some(),
+            "Scheduler should have executed the due job"
+        );
+
+        let updated = ds.cron_get("j_sched").unwrap().unwrap();
+        assert!(updated.next_run > 0, "next_run should be advanced");
+        assert!(
+            updated.last_run.is_some(),
+            "last_run should be set after execution"
+        );
+    }
+}

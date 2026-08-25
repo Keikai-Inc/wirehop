@@ -1,0 +1,19 @@
+[package]
+name = "hop-ext-echo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hop-ext-echo"
+path = "src/main.rs"
+
+[dependencies]
+hop-core.workspace = true
+ipc-channel.workspace = true
+toml.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true

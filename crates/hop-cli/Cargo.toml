@@ -1,0 +1,65 @@
+[package]
+name = "hop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hop"
+path = "src/main.rs"
+
+[dependencies]
+hop-core.workspace = true
+hop-mcp.workspace = true
+# Wire types for the `hop <host> tap` verb. Tiny crate (just serde
+# derives), zero transitive cost. The verb is purely additive: if the
+# user doesn't have hop-tap installed on the target, they just get an
+# "extension not available" error from the hop daemon.
+hop-tap-protocol = { path = "../../vendor/hop-tap-protocol" }
+iroh.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+hex.workspace = true
+libc.workspace = true
+uzers.workspace = true
+cron.workspace = true
+rand.workspace = true
+sha2.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+base64.workspace = true
+dhat = { version = "0.3", optional = true }
+# Function-level flame graphs for `hop debug cpu-profile`: pure-Rust FlameGraph.
+# Folds the native sampler output (macOS `sample`, Linux `perf script`) and
+# renders an interactive SVG — no external perl scripts. Cross-platform.
+inferno = { version = "0.12", default-features = false }
+
+# Linux heap profiling for `hop debug mem-profile`: jemalloc compiled WITH prof
+# support but inactive by default (negligible overhead) — `mem-profile on`
+# re-execs with MALLOC_CONF=prof:true and `snapshot`/SIGUSR2 triggers prof.dump,
+# analyzed with jeprof. macOS uses the native MallocStackLogging + malloc_history
+# path instead, so jemalloc is Linux-only. Restricted to 64-bit: jemalloc's
+# pow2_ceil_u64 pulls in __ffsdi2, which doesn't resolve in the 32-bit armv7
+# static-musl link (armv7 keeps the system allocator; heap profiling there is a
+# non-need). The `#[global_allocator]` in main.rs is additionally gated
+# `not(feature = "dhat-heap")` so the two profilers never collide.
+[target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["profiling"] }
+
+[features]
+# Heap-profile the daemon: build with `--features dhat-heap`, run the daemon,
+# generate traffic, then SIGTERM it — writes dhat-heap.json (live bytes by
+# allocation call-site). For pinning the multipath/forwarding leak.
+dhat-heap = ["dep:dhat"]
+
+[dev-dependencies]
+tempfile.workspace = true
+sha2 = "0.10"

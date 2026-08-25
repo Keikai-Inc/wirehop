@@ -1,0 +1,29 @@
+# Example hop extension manifest for hop-ext-echo.
+#
+# Install this file at one of:
+#   ~/.config/hop/extensions/echo.toml      (per-user)
+#   /etc/hop/extensions/echo.toml           (system-wide; not yet read at v0)
+#
+# Then run hop-ext-echo with the same bootstrap path:
+#
+#   hop-ext-echo --bootstrap /tmp/hop-echo/bootstrap
+#
+# Restart `hop host`. From a peer:
+#
+#   hop <host> ext list
+#   hop <host> ext call echo --text "hello"
+
+ext_id         = "echo"
+description    = "Echo extension (returns request payload unchanged)"
+bootstrap_path = "/tmp/hop-echo/bootstrap"
+
+# Set this to the UID `hop-ext-echo` runs as. The hop daemon refuses to
+# trust the bootstrap file unless its file owner matches.
+expected_uid   = 1000
+
+# Must match --protocol-version on hop-ext-echo (default "0.1.0").
+version        = "0.1.0"
+
+# Minimum role required to call this extension. "peer" is the most
+# permissive (any authenticated peer); "creator" restricts to admins.
+required_role  = "peer"

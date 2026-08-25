@@ -1,0 +1,29 @@
+[package]
+name = "hop-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hop-core.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+rquickjs = { version = "0.8", features = ["bindgen", "classes", "properties", "parallel", "rust-alloc"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+async-trait = "0.1"
+# default-features off drops `oldtime` (legacy Duration) + `wasmbind`; keep
+# `clock` (system time) + `std` + serde.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+cron = { workspace = true }
+# Secure scratch dir for the claude CLI: euid (nix) + mkdtemp fallback (tempfile).
+nix.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

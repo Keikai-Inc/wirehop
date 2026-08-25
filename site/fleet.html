@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hop, Fleet Management</title>
+  <meta name="description" content="A fleet in hop is your warren, managed at scale: role-based access, host tags, and one-command invites, replicated to every machine, no master server. From a 5-person team to thousands of hosts.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    /* --- Fleet page overrides ------------------------------------------------ */
+
+    .steps-2 { grid-template-columns: repeat(2, 1fr); }
+
+    /* --- Concept diagram ----------------------------------------------------- */
+
+    .concept-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+
+    .concept-grid > * { min-width: 0; }
+
+    .concept-info h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .concept-info p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+      margin-bottom: 1.5rem;
+    }
+
+    .concept-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .concept-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .concept-list li::before {
+      content: "\2713";
+      color: var(--color-accent-green);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 0.1rem;
+    }
+
+    /* --- Roles table --------------------------------------------------------- */
+
+    .roles-table {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 1rem;
+      overflow: hidden;
+      width: 100%;
+    }
+
+    .roles-row {
+      display: grid;
+      grid-template-columns: 1fr 2fr 1fr 1fr 1fr;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .roles-row > * { min-width: 0; }
+
+    .roles-row:last-child { border-bottom: none; }
+
+    .roles-cell {
+      padding: 1rem 1.5rem;
+      font-size: 0.875rem;
+      border-right: 1px solid var(--color-border);
+    }
+
+    .roles-cell:last-child { border-right: none; }
+
+    .roles-header {
+      font-weight: 600;
+      font-family: var(--font-display);
+      color: var(--color-text);
+      background: var(--color-surface-elevated);
+    }
+
+    .roles-cell.role-name {
+      color: var(--color-accent-teal);
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+
+    .roles-cell.role-detail {
+      color: var(--color-text-secondary);
+    }
+
+    /* --- Fleet responsive ---------------------------------------------------- */
+
+    @media (max-width: 768px) {
+      .steps-2 { grid-template-columns: 1fr; }
+      .concept-grid { grid-template-columns: 1fr; }
+
+      /* Roles table, stacked card layout */
+      .roles-row.roles-header-row { display: none; }
+      .roles-row {
+        grid-template-columns: 1fr;
+        padding: 1rem;
+        gap: 0.5rem;
+        border-bottom: 1px solid var(--color-border);
+      }
+      .roles-cell {
+        border-right: none;
+        padding: 0.25rem 0;
+      }
+      .roles-cell[data-label]::before {
+        content: attr(data-label) ": ";
+        color: var(--color-text-tertiary);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Fleet Management</div>
+    <h1>One tool,<br><span class="gradient">every machine</span></h1>
+    <p>A fleet in hop is just your private network of machines (a <strong>warren</strong>), managed at scale: roles and tags across every machine, replicated to all of them, with no master server. Same hop simplicity, from 5 machines to 5,000.</p>
+    <div class="hero-actions">
+      <a href="#how-fleet-works" class="btn btn-primary">How It Works</a>
+      <a href="index.html" class="btn btn-ghost">&larr; Back to hop</a>
+    </div>
+  </div>
+
+  <!-- Key concepts -->
+  <section id="concepts">
+    <div class="container">
+      <div class="section-header">
+        <h2>Three concepts, that's it</h2>
+        <p>Managing a fleet comes down to your warren, tags, and roles.</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card card-red">
+          <div class="card-icon card-icon-red">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
+          </div>
+          <h3>Your warren</h3>
+          <p>Your machines, as one shared list. Every node sees the same membership; there's no master server to run or lose. Add a machine and it's in the warren; its roles and tags travel with it.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+          </div>
+          <h3>Tags</h3>
+          <p>Label your hosts with tags like <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">developer</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">production</code>, or <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">web</code>. Tags describe what a machine is.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </div>
+          <h3>Roles</h3>
+          <p>Define what people can reach. A role maps to host tags ("developers reach developer + staging machines") and gates warren VPN reach too. Each person gets their own account.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How fleet works -->
+  <section id="how-fleet-works">
+    <div class="container">
+      <div class="section-header">
+        <h2>How it works</h2>
+        <p>Set up fleet management in four steps.</p>
+      </div>
+
+      <div class="steps steps-2">
+        <div class="step">
+          <h3>Start your warren</h3>
+          <p>Install hop on any machine. It starts your warren and prints a <strong>creator invite</strong>. Redeem it from your laptop with <code>hop connect</code> and it's saved as a known host (here, <code>myserver</code>).</p>
+        </div>
+        <div class="step">
+          <h3>Define roles</h3>
+          <p>Roles map host tags to access, and to warren VPN reach. Manage any host remotely with <code>hop admin &lt;host&gt;</code>, e.g. <code>hop admin rex role create developer</code>.</p>
+        </div>
+        <div class="step">
+          <h3>Add machines</h3>
+          <p>One invite registers any number of machines into the warren, with their tags. Membership replicates to every node, no master list to keep in sync.</p>
+        </div>
+        <div class="step">
+          <h3>Invite your team</h3>
+          <p>Invite people by role. They reach every matching machine (by name, over the warren) each with their own account.</p>
+        </div>
+      </div>
+
+      <div style="margin-top: 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal, Setting up your warren</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># 1. Install hop on a host, it starts your warren</span>
+<span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span>
+<span class="output">Creator invite: eyJ0eX...   (valid for 1 hour)</span>
+
+<span class="comment"># 2. Redeem it from your laptop, saved as a known host, "rex"</span>
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
+<span class="output">Saved as known host: rex</span>
+
+<span class="comment"># 3. Define roles, they map tags to access AND warren reach</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">developer</span> --tags developer,staging
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> role create <span class="flag">ops</span> --tags '*' --sudo
+
+<span class="comment"># 4. One invite adds any number of machines to the warren</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> fleet-invite --tags developer,web
+<span class="output">Warren invite: abCdEf...   (100 uses, 24h expiry)</span>
+
+<span class="comment"># 5. On each machine, joins the warren with its tags</span>
+<span class="prompt">$</span> <span class="cmd">curl -fsSL</span> https://hop.keikai.ai/install-daemon.sh <span class="cmd">| bash</span> -s -- --invite <span class="flag">abCdEf...</span>
+
+<span class="comment"># 6. Invite a teammate by role</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> invite --role developer --name alice
+<span class="output">Invite: xYz123...   (reaches every developer+staging machine)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Roles -->
+  <section id="roles">
+    <div class="container">
+      <div class="section-header">
+        <h2>Role-based access</h2>
+        <p>Define who can access what. Each role maps to host tags and access settings.</p>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-info">
+          <h3>Sensible defaults, full control</h3>
+          <p>Roles default to individual accounts with no sudo. Override as needed, give ops sudo, create shared service accounts for CI, or add users to specific Unix groups.</p>
+          <ul class="concept-list">
+            <li><strong>Individual accounts</strong>: each person gets their own Unix user</li>
+            <li><strong>No sudo by default</strong>: principle of least privilege</li>
+            <li><strong>No passwords</strong>: access only via hop's key-based auth</li>
+            <li><strong>Auto-created</strong>: user accounts created on first connection</li>
+            <li><strong>Git-committable</strong>: roles live in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code>, version-control your access policy</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="roles-table">
+            <div class="roles-row roles-header-row">
+              <div class="roles-cell roles-header">Role</div>
+              <div class="roles-cell roles-header">Host Tags</div>
+              <div class="roles-cell roles-header">Sudo</div>
+              <div class="roles-cell roles-header">User Mode</div>
+              <div class="roles-cell roles-header">Sandbox</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name" data-label="Role">developer</div>
+              <div class="roles-cell role-detail" data-label="Host Tags">developer, staging</div>
+              <div class="roles-cell role-detail" data-label="Sudo">No</div>
+              <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">, </div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name" data-label="Role">ops</div>
+              <div class="roles-cell role-detail" data-label="Host Tags">* (all hosts)</div>
+              <div class="roles-cell role-detail" data-label="Sudo">Yes</div>
+              <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox">, </div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name" data-label="Role">security</div>
+              <div class="roles-cell role-detail" data-label="Host Tags">production, staging</div>
+              <div class="roles-cell role-detail" data-label="Sudo">No</div>
+              <div class="roles-cell role-detail" data-label="User Mode">Individual</div>
+              <div class="roles-cell role-detail" data-label="Sandbox" style="color: var(--color-accent-teal);">audit</div>
+            </div>
+            <div class="roles-row">
+              <div class="roles-cell role-name" data-label="Role">ci</div>
+              <div class="roles-cell role-detail" data-label="Host Tags">build</div>
+              <div class="roles-cell role-detail" data-label="Sudo">No</div>
+              <div class="roles-cell role-detail" data-label="User Mode">Shared</div>
+              <div class="roles-cell role-detail" data-label="Sandbox" style="color: var(--color-accent-teal);">deploy</div>
+            </div>
+          </div>
+
+          <div class="code-block" style="margin-top: 1.5rem;">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">roles.json</span>
+            </div>
+            <div class="code-body" style="font-size: 0.8rem;">
+<span class="output">{</span>
+  <span class="cmd">"roles"</span>: [
+    {
+      <span class="cmd">"name"</span>: <span class="flag">"developer"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"developer"</span>, <span class="flag">"staging"</span>],
+      <span class="cmd">"user_mode"</span>: <span class="flag">"individual"</span>,
+      <span class="cmd">"sudo"</span>: <span class="url">false</span>
+    },
+    {
+      <span class="cmd">"name"</span>: <span class="flag">"security"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"production"</span>, <span class="flag">"staging"</span>],
+      <span class="cmd">"sandbox"</span>: { <span class="cmd">"read_only"</span>: <span class="url">true</span>, <span class="cmd">"no_network"</span>: <span class="url">true</span> }
+    },
+    {
+      <span class="cmd">"name"</span>: <span class="flag">"ops"</span>,
+      <span class="cmd">"host_tags"</span>: [<span class="flag">"*"</span>],
+      <span class="cmd">"user_mode"</span>: <span class="flag">"individual"</span>,
+      <span class="cmd">"sudo"</span>: <span class="url">true</span>,
+      <span class="cmd">"groups"</span>: [<span class="flag">"docker"</span>]
+    }
+  ]
+<span class="output">}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Sandbox Policies -->
+  <section id="sandbox">
+    <div class="container">
+      <div class="section-header">
+        <h2>Sandbox Policies</h2>
+        <p>Restrict what peers can do at the OS level. Policies are enforced via macOS Seatbelt and Linux Landlock.</p>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-info">
+          <h3>Three layers of enforcement</h3>
+          <p>Sandbox policies flow through three layers: role definition (the role sets the baseline), invite creation (the host can further restrict), and client connection (the client can self-restrict). The result is always the strictest combination.</p>
+          <ul class="concept-list">
+            <li><strong>Presets</strong>: <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">monitor</code> (read-only, no network, scoped paths), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">audit</code> (read-only, no network), <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">deploy</code> (scoped write, dangerous commands blocked)</li>
+            <li><strong>Custom policies</strong>: combine <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--read-only</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--no-network</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--scope</code>, <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">--allow-command</code></li>
+            <li><strong>Role-based</strong>: assign sandbox policies per role in <code style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-accent-teal);">roles.json</code></li>
+            <li><strong>Client self-restriction</strong>: peers can request stricter sandbox at connect time</li>
+            <li><strong>Merge logic</strong>: restrictions only tighten, never loosen</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">Terminal, Sandbox examples</span>
+            </div>
+            <div class="code-body">
+<span class="comment"># Create a monitor-only invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--preset monitor</span>
+
+<span class="comment"># Create a custom sandboxed invite</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--read-only --no-network --scope /var/log</span>
+
+<span class="comment"># Connect with self-imposed restrictions</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1 --preset audit</span>
+
+<span class="comment"># Execute a command in read-only mode</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1 --read-only</span> -- cat /etc/hosts
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Using the fleet -->
+  <section id="using-fleet">
+    <div class="container">
+      <div class="section-header">
+        <h2>Using the fleet</h2>
+        <p>Once set up, your team works with the warren using familiar commands.</p>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal, Connecting</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Alice redeems her invite</span>
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">xYz123...</span>
+<span class="output">Added 12 hosts (role: developer)</span>
+
+<span class="comment"># List available hosts</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet list</span> <span class="flag">developer</span>
+<span class="output">  web-1       online   developer,web</span>
+<span class="output">  web-2       online   developer,web</span>
+<span class="output">  staging-1   online   staging</span>
+
+<span class="comment"># Connect to a specific host</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1</span>
+<span class="prompt">web-1 $</span> <span class="cmd">_</span>
+
+<span class="comment"># Quick command on a single host</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">web-1</span> -- uptime
+<span class="output"> 14:32:01 up 42 days</span>
+          </div>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal, Fleet operations</span>
+          </div>
+          <div class="code-body">
+<span class="comment"># Run a command across all developer hosts</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet exec</span> <span class="flag">developer</span> -- uname -a
+<span class="output">[web-1]     Linux 6.1 x86_64</span>
+<span class="output">[web-2]     Linux 6.1 x86_64</span>
+<span class="output">[staging-1] Linux 6.1 x86_64</span>
+
+<span class="comment"># Check warren status</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet status</span>
+<span class="output">Warren: 3a8f...   (replicated to every node)</span>
+<span class="output">  3 machines, 3 online</span>
+
+<span class="comment"># Admin: see the members</span>
+<span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> peers
+<span class="output">  alice   developer   online</span>
+<span class="output">  bob     ops         online</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scaling -->
+  <section id="scaling" style="padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Scales with you</h2>
+        <p>No infrastructure to manage. The same tool works at every size.</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </div>
+          <h3>Small Team (5-50)</h3>
+          <p>Your warren plus JSON config, zero infrastructure beyond hop itself. Set up in minutes.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </div>
+          <h3>Growing (50-500)</h3>
+          <p>Same warren. Roles keep access organized, and membership replicates to every node automatically, nothing to keep in sync by hand.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="9" height="9" rx="1"/><rect x="13" y="2" width="9" height="9" rx="1"/><rect x="2" y="13" width="9" height="9" rx="1"/><rect x="13" y="13" width="9" height="9" rx="1"/></svg>
+          </div>
+          <h3>Large (500+)</h3>
+          <p>No central server to bottleneck or shard: the warren replicates peer-to-peer, and data flows directly between machines.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to get started?</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Fleet features are built into hop: it's just your warren at scale. Install the daemon, redeem the creator invite, and you're managing every machine.</p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="index.html#install" class="btn btn-primary">Install hop</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer id="site-footer"></footer>
+
+  <script src="shared.js"></script>
+
+</body>
+</html>

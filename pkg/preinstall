@@ -1,0 +1,31 @@
+#!/bin/bash
+# preinstall — Stop the existing hop daemon before upgrading.
+# Runs as root during .pkg installation.
+
+set -e
+
+# Stop the new-style LaunchDaemon if loaded
+DAEMON_LABEL="com.hop.daemon"
+if launchctl print "system/$DAEMON_LABEL" &>/dev/null; then
+    echo "Stopping hop daemon..."
+    launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+fi
+
+# Stop the client-side multiplexer agent for the console user
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+    # Stop the mux agent so it restarts with the new binary on next use
+    su - "$CONSOLE_USER" -c '/usr/local/bin/hop agent stop 2>/dev/null' || true
+
+    # Also stop the legacy LaunchAgent if still present
+    AGENT_LABEL="com.hop.agent"
+    CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
+    if [ -n "$CONSOLE_UID" ]; then
+        launchctl bootout "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
+    fi
+fi
+
+# Remove the legacy LaunchAgent plist if it exists
+rm -f "/Library/LaunchAgents/com.hop.agent.plist"
+
+exit 0

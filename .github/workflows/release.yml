@@ -1,0 +1,280 @@
+# Build, sign, notarize and publish a WireHop release from GitHub-hosted
+# runners. Free for public repositories (macOS runners included).
+#
+# Triggered by pushing a tag:  git tag v0.9.33 && git push --tags
+# Or manually via the Actions tab (workflow_dispatch).
+#
+# WHY THIS EXISTS: macOS scopes keychain unlocks per security session, so
+# signing cannot run from a detached SSH/automation context on a workstation —
+# it needed a human at a local console. A CI runner is a fresh machine with its
+# own session, so it creates a throwaway keychain, imports the certs from
+# secrets, and signs unattended. That is the whole reason releases were manual.
+#
+# ── Required repository secrets ──────────────────────────────────────────────
+#   APPLE_CERT_APPLICATION_P12   base64 of the Developer ID *Application* .p12
+#   APPLE_CERT_INSTALLER_P12     base64 of the Developer ID *Installer* .p12
+#   APPLE_CERT_PASSWORD          password set when exporting those .p12 files
+#   APPLE_TEAM_ID                e.g. S7U8BMQ98Y
+#   APPLE_SIGN_IDENTITY          "Developer ID Application: NAME (TEAMID)"
+#   APPLE_INSTALLER_IDENTITY     "Developer ID Installer: NAME (TEAMID)"
+#   APPLE_API_KEY_P8             base64 of the App Store Connect .p8 key
+#   APPLE_API_KEY_ID             the .p8 key id
+#   APPLE_API_ISSUER_ID          App Store Connect issuer uuid
+#   HOP_SIGNING_KEY_PEM          the RSA release-signing private key (PEM text)
+#   HOP_GOOGLE_CLIENT_ID         Google Desktop-app OAuth client id
+#   HOP_GOOGLE_CLIENT_SECRET     …and its secret (baked in obfuscated by
+#                                crates/hop-cli/build.rs; NOT in the source)
+#   AWS_ROLE_ARN                 IAM role for OIDC (no long-lived AWS keys)
+#   CF_DISTRIBUTION_ID           CloudFront distribution id
+#
+# Export the .p12 files on the Mac that holds the certs:
+#   security find-identity -v            # confirm both are present
+#   # Keychain Access → My Certificates → right-click each → Export → .p12
+#   base64 -i Application.p12 | pbcopy   # paste into the secret
+#
+# The App Store Connect API key (.p8) replaces the app-specific password used
+# interactively: it is revocable on its own, scoped, and does not carry an
+# Apple ID. Create at appstoreconnect.apple.com → Users and Access → Keys.
+#
+# ── Threat model for an open repo ────────────────────────────────────────────
+# Fork pull requests CANNOT read these secrets: GitHub withholds secrets from
+# `pull_request` runs from forks, and this workflow only triggers on tag pushes
+# and manual dispatch — neither is available to an outside contributor.
+#
+# The residual risk is code that gets MERGED and then executes here during a
+# release: a build.rs, a proc-macro, a new dependency, or an edit to
+# pkg/build-pkg.sh runs on this runner with the signing key and AWS role
+# present. Mitigations in force:
+#   1. `environment: release` with a required reviewer — secrets are not issued
+#      until a human approves the run (configure in Settings → Environments).
+#   2. Third-party actions pinned to commit SHAs, not moving tags, so a
+#      compromised upstream action cannot silently change what runs here.
+#   3. NEVER add a `pull_request_target` workflow that checks out PR code —
+#      that combination hands untrusted code a token with write access.
+#   4. Review dependency and build-script changes in PRs with release
+#      execution in mind, not just runtime behaviour.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 0.9.33)"
+        required: true
+
+permissions:
+  contents: write   # create the GitHub release
+  id-token: write   # AWS OIDC
+
+jobs:
+  # ── Linux binaries (x86_64 + arm64 + armv7) ────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Build
+        env:
+          AWS_LC_SYS_CMAKE_BUILDER: "1"
+          HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
+          HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
+        run: cross build --release --target ${{ matrix.target }} -p hop-cli
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-*)  NAME=hop-linux-x86_64 ;;
+            aarch64-*) NAME=hop-linux-arm64 ;;
+            armv7-*)   NAME=hop-linux-armv7 ;;
+          esac
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/hop" "dist/$NAME"
+          strip "dist/$NAME" 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/
+
+  # ── macOS binaries + signed, notarized .pkg installers ─────────────────────
+  macos:
+    # macos-14 is Apple Silicon; both slices cross-compile from it.
+    runs-on: macos-14
+    # Secrets are scoped to this environment. Configure it in repo Settings →
+    # Environments → "release" with a REQUIRED REVIEWER (you): the job then
+    # pauses for explicit approval before any signing credential is exposed.
+    # This is the backstop against merged-then-released supply-chain code —
+    # a tag push alone cannot reach the certs.
+    environment: release
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Build binary
+        env:
+          HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
+          HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            arm64)  TARGET=aarch64-apple-darwin; NAME=hop-darwin-arm64 ;;
+            x86_64) TARGET=x86_64-apple-darwin;  NAME=hop-darwin-x86_64 ;;
+          esac
+          cargo build --release --target "$TARGET" -p hop-cli
+          mkdir -p dist
+          cp "target/$TARGET/release/hop" "dist/$NAME"
+          strip "dist/$NAME" 2>/dev/null || true
+
+      # A throwaway keychain: created, unlocked, and used within this job, then
+      # discarded with the runner. set-key-partition-list is what stops codesign
+      # from blocking on a GUI prompt — the step that makes this unattended.
+      - name: Import signing certificates
+        env:
+          CERT_APP: ${{ secrets.APPLE_CERT_APPLICATION_P12 }}
+          CERT_INST: ${{ secrets.APPLE_CERT_INSTALLER_P12 }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo "$CERT_APP"  | base64 --decode > "$RUNNER_TEMP/app.p12"
+          echo "$CERT_INST" | base64 --decode > "$RUNNER_TEMP/inst.p12"
+          for f in app inst; do
+            security import "$RUNNER_TEMP/$f.p12" -k "$KEYCHAIN" -P "$CERT_PASS" \
+              -T /usr/bin/codesign -T /usr/bin/productbuild -T /usr/bin/security
+          done
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          # Prepend to the search list so codesign/productbuild find the identities.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Store notarization credentials
+        env:
+          KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          echo "$KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          xcrun notarytool store-credentials wirehop-notary \
+            --key "$RUNNER_TEMP/asc.p8" --key-id "$KEY_ID" --issuer "$ISSUER"
+          rm -f "$RUNNER_TEMP/asc.p8"
+
+      - name: Build signed + notarized .pkg
+        env:
+          HOP_CODESIGN_ID: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          HOP_INSTALLER_ID: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+          HOP_NOTARY_PROFILE: wirehop-notary
+        run: ./pkg/build-pkg.sh --arch ${{ matrix.arch }} --binary-dir dist
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          set -euo pipefail
+          PKG=$(ls target/pkg-staging/output/*.pkg)
+          spctl --assess --type install -vv "$PKG"
+          spctl --assess --type install "$PKG" 2>&1 | grep -q accepted
+          cp "$PKG" dist/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/
+
+  # ── Sign artifacts, publish to S3 + GitHub Releases ────────────────────────
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    # Same gate: holds the RSA release key and the AWS role.
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: staged
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staged -type f -exec cp {} dist/ \;
+          ls -la dist/
+
+      # Detached RSA signatures over every binary — install.sh verifies these
+      # against the public key embedded in it, and FAILS CLOSED without them.
+      - name: Sign binaries + checksums
+        env:
+          SIGNING_KEY: ${{ secrets.HOP_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          echo "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          cd dist
+          for f in hop-linux-* hop-darwin-*; do
+            case "$f" in *.sha256|*.sig|*.pkg) continue ;; esac
+            shasum -a 256 "$f" | awk '{print $1}' > "$f.sha256"
+            openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out "$f.sig" "$f"
+            openssl dgst -sha256 -verify <(openssl rsa -in "$RUNNER_TEMP/key.pem" -pubout 2>/dev/null) \
+              -signature "$f.sig" "$f"
+          done
+          rm -f "$RUNNER_TEMP/key.pem"
+
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Publish to S3 + invalidate CDN
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "${{ inputs.version }}" ] && VERSION="${{ inputs.version }}"
+          aws s3 cp dist/ "s3://hop-releases/v${VERSION}/" --recursive --no-progress
+          printf '%s' "$VERSION" > latest
+          aws s3 cp latest s3://hop-releases/latest --no-progress
+          aws s3 cp install.sh s3://hop-releases/install.sh --no-progress
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CF_DISTRIBUTION_ID }}" --paths "/*"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "${{ inputs.version }}" ] && VERSION="${{ inputs.version }}"
+          {
+            printf 'WireHop v%s — single binary `hop`.\n\n' "$VERSION"
+            printf '```bash\n'
+            printf 'curl -fsSL https://hop.keikai.ai/install.sh | bash\n'
+            printf '```\n\n'
+            printf 'Installers are **signed and notarized**; binaries carry '
+            printf '`.sha256` and `.sig` sidecars verified by `install.sh`.\n'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "v${VERSION}" dist/* \
+            --title "WireHop v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            || gh release upload "v${VERSION}" dist/* --clobber

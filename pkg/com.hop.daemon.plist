@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hop.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/hop</string>
+        <string>host</string>
+        <string>--quiet</string>
+        <string>--config</string>
+        <string>/Library/Application Support/hop</string>
+    </array>
+
+    <!-- Privilege separation (privsep-node.md). The §8.1 utun gate passed on
+         macOS (B-full), so the daemon runs as a root monitor that owns the TUN /
+         :53 and spawns an unprivileged `_hop` worker for the network-facing
+         daemon. HOP_PRIVSEP = monitor/worker split; HOP_PRIVSEP_DROP = drop the
+         worker to `_hop`. The `_hop` account is created by postinstall; the
+         monitor re-owns the config to `_hop` at startup. If the worker can't
+         stay up, the monitor falls back to a plain root daemon (anti-lockout).
+         Off-by-default in the binary — this plist opts in. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOP_PRIVSEP</key>
+        <string>1</string>
+        <key>HOP_PRIVSEP_DROP</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Raise the file-descriptor ceiling. launchd's default soft NOFILE is
+         256, which a long-running multi-session daemon (each shell holds PTY
+         fds) exhausts; once hit, every new session fails to spawn a shell with
+         EMFILE. 65536 gives ample headroom. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/hop-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/hop-stderr.log</string>
+</dict>
+</plist>

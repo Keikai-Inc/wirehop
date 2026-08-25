@@ -1,0 +1,1345 @@
+//! Connection multiplexer agent process.
+//!
+//! Owns a single iroh Endpoint and multiplexes all sessions over QUIC bi-streams.
+//! Listens on a Unix socket for IPC clients, each of which gets a transparent
+//! byte pipe to a host via a dedicated QUIC bi-stream.
+//!
+//! Uses the actor pattern (like session_registry): all mutable connection state
+//! is owned by a single actor task, accessed via `AgentHandle` + `AgentCommand`.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use iroh::endpoint::Connection;
+use iroh::{Endpoint, PublicKey};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+
+use tracing_subscriber::filter::Targets;
+
+use hop_core::config;
+use hop_core::net;
+
+use crate::mux::{self, MuxConnect, MuxResult};
+
+/// Type alias for the reload handle used by the SIGUSR1 debug toggle.
+type ReloadHandle = tracing_subscriber::reload::Handle<Targets, tracing_subscriber::Registry>;
+
+/// Idle timeout: shut down the agent after 10 minutes with no active sessions.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Run the agent in foreground mode.
+pub async fn run_foreground(config_dir: &Path, reload_handle: ReloadHandle) -> Result<()> {
+    run_agent(config_dir, false, reload_handle).await
+}
+
+/// Run the agent in daemon mode (detached, writes PID file).
+pub async fn run_daemon(config_dir: &Path, reload_handle: ReloadHandle) -> Result<()> {
+    run_agent(config_dir, true, reload_handle).await
+}
+
+/// Stop a running agent by sending it a signal via PID file.
+pub fn stop_agent(config_dir: &Path) -> Result<()> {
+    let pid_path = mux::agent_pid_path(config_dir);
+    if !pid_path.exists() {
+        anyhow::bail!("No agent PID file found — agent may not be running");
+    }
+    let pid_str = std::fs::read_to_string(&pid_path).context("read PID file")?;
+    let pid: i32 = pid_str.trim().parse().context("invalid PID")?;
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+
+    // Clean up PID file and socket
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(mux::agent_sock_path(config_dir));
+    println!("Agent (PID {pid}) stopped.");
+    Ok(())
+}
+
+/// Print agent status.
+pub fn agent_status(config_dir: &Path) -> Result<()> {
+    let pid_path = mux::agent_pid_path(config_dir);
+    let sock_path = mux::agent_sock_path(config_dir);
+
+    if !pid_path.exists() {
+        println!("Agent is not running.");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path).context("read PID file")?;
+    let pid: i32 = pid_str.trim().parse().context("invalid PID")?;
+
+    // Check if process is actually alive
+    #[cfg(unix)]
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    #[cfg(not(unix))]
+    let alive = false;
+
+    if alive {
+        println!("Agent is running (PID {pid}).");
+        if sock_path.exists() {
+            println!("  Socket: {}", sock_path.display());
+        }
+    } else {
+        println!("Agent PID file exists but process {pid} is not running.");
+        // Clean up stale files
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&sock_path);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Actor pattern: AgentCommand + AgentHandle + AgentState + actor loop
+// ---------------------------------------------------------------------------
+
+/// Commands processed by the agent actor.
+enum AgentCommand {
+    /// Request a connection + semaphore for a host. If no connection exists,
+    /// one is created (or an in-flight connect is joined).
+    GetConnection {
+        host_id: PublicKey,
+        relay_url: Option<String>,
+        reply: oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>,
+    },
+    /// Self-message from a spawned connect task when the QUIC handshake completes.
+    ConnectDone {
+        host_id: PublicKey,
+        result: Result<Connection>,
+    },
+    /// Evict a stale connection after an open_bi failure or reconnect.
+    /// Skipped if the host still has live sessions (the conn is in use).
+    RemoveConnection {
+        host_id: PublicKey,
+    },
+    /// A multiplexed proxy session for `host_id` started.
+    SessionStarted {
+        host_id: PublicKey,
+    },
+    /// A multiplexed proxy session for `host_id` ended.
+    SessionEnded {
+        host_id: PublicKey,
+    },
+    /// Flush all pooled connections (sleep/wake recovery).
+    FlushAll,
+    /// Bump last_activity timestamp (session start/end).
+    TouchActivity,
+    /// Query whether the agent is idle (no sessions, past timeout).
+    CheckIdle {
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+/// Cloneable handle to the agent actor.
+#[derive(Clone)]
+struct AgentHandle {
+    tx: mpsc::Sender<AgentCommand>,
+}
+
+impl AgentHandle {
+    /// Request a connection and per-host semaphore for the given host.
+    async fn get_connection(
+        &self,
+        host_id: PublicKey,
+        relay_url: Option<String>,
+    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::GetConnection {
+                host_id,
+                relay_url,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("agent actor stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("agent actor stopped"))?
+    }
+
+    /// Evict a stale connection (fire-and-forget).
+    async fn remove_connection(&self, host_id: PublicKey) {
+        let _ = self
+            .tx
+            .send(AgentCommand::RemoveConnection { host_id })
+            .await;
+    }
+
+    /// Register a started proxy session for `host_id` (fire-and-forget).
+    async fn session_started(&self, host_id: PublicKey) {
+        let _ = self
+            .tx
+            .send(AgentCommand::SessionStarted { host_id })
+            .await;
+    }
+
+    /// Register an ended proxy session for `host_id` (fire-and-forget).
+    async fn session_ended(&self, host_id: PublicKey) {
+        let _ = self.tx.send(AgentCommand::SessionEnded { host_id }).await;
+    }
+
+    /// Flush all pooled connections (fire-and-forget).
+    async fn flush_all(&self) {
+        let _ = self.tx.send(AgentCommand::FlushAll).await;
+    }
+
+    /// Bump last_activity timestamp (fire-and-forget).
+    async fn touch_activity(&self) {
+        let _ = self.tx.send(AgentCommand::TouchActivity).await;
+    }
+
+    /// Check whether the agent is idle past the timeout.
+    async fn check_idle(&self) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(AgentCommand::CheckIdle { reply }).await;
+        rx.await.unwrap_or(true)
+    }
+}
+
+/// Reply type for GetConnection: a live connection + per-host semaphore.
+type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>;
+
+/// Mutable state owned exclusively by the actor task.
+struct AgentState {
+    endpoint: Endpoint,
+    connections: HashMap<PublicKey, Connection>,
+    semaphores: HashMap<PublicKey, Arc<tokio::sync::Semaphore>>,
+    /// Live multiplexed sessions per host. The pooled connection is shared across
+    /// all sessions to a host, so eviction must never close a connection that
+    /// still has a live session on it (see `RemoveConnection`).
+    active: HashMap<PublicKey, usize>,
+    /// In-flight connect waiters: queued reply channels for hosts being connected.
+    pending: HashMap<PublicKey, Vec<ConnectReply>>,
+    /// Self-sender for spawned connect tasks to send ConnectDone back.
+    tx: mpsc::Sender<AgentCommand>,
+    last_activity: Instant,
+}
+
+/// Whether a host's pooled connection may be evicted. Eviction closes the
+/// shared per-host connection's streams, so it is only safe when no live session
+/// is using it — otherwise a concurrent session's reconnect would tear down the
+/// streams in use (the mutual-eviction loop). See `AgentCommand::RemoveConnection`.
+fn may_evict(active: &HashMap<PublicKey, usize>, host_id: &PublicKey) -> bool {
+    active.get(host_id).copied().unwrap_or(0) == 0
+}
+
+/// Record that a proxy session for `host_id` started.
+fn session_inc(active: &mut HashMap<PublicKey, usize>, host_id: PublicKey) {
+    *active.entry(host_id).or_insert(0) += 1;
+}
+
+/// Record that a proxy session for `host_id` ended (drops the entry at zero).
+fn session_dec(active: &mut HashMap<PublicKey, usize>, host_id: &PublicKey) {
+    if let Some(n) = active.get_mut(host_id) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            active.remove(host_id);
+        }
+    }
+}
+
+/// Spawn the agent actor and return a handle.
+fn spawn_agent_actor(endpoint: Endpoint) -> AgentHandle {
+    let (tx, rx) = mpsc::channel(64);
+    let state = AgentState {
+        endpoint,
+        connections: HashMap::new(),
+        semaphores: HashMap::new(),
+        active: HashMap::new(),
+        pending: HashMap::new(),
+        tx: tx.clone(),
+        last_activity: Instant::now(),
+    };
+    tokio::spawn(run_agent_actor(rx, state));
+    AgentHandle { tx }
+}
+
+/// The actor loop: owns all mutable connection state, processes commands sequentially.
+async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentState) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            AgentCommand::GetConnection {
+                host_id,
+                relay_url,
+                reply,
+            } => {
+                // 1. Check cache for a live connection
+                if let Some(conn) = state.connections.get(&host_id) {
+                    if conn.close_reason().is_none() {
+                        tracing::debug!("actor: cache HIT for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
+                        let sem = state
+                            .semaphores
+                            .entry(host_id)
+                            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                            .clone();
+                        let _ = reply.send(Ok((conn.clone(), sem)));
+                        continue;
+                    }
+                    // Dead connection — remove it
+                    tracing::debug!("actor: evicting dead connection for {}", host_id.fmt_short());
+                    state.connections.remove(&host_id);
+                }
+
+                // 2. If a connect is already in-flight, queue this waiter
+                if let Some(waiters) = state.pending.get_mut(&host_id) {
+                    tracing::debug!("actor: joining in-flight connect for {} ({} waiters)", host_id.fmt_short(), waiters.len() + 1);
+                    waiters.push(reply);
+                    continue;
+                }
+
+                // 3. No connection, no in-flight connect — spawn one
+                tracing::debug!("actor: spawning new connect for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
+                state.pending.insert(host_id, vec![reply]);
+                let endpoint = state.endpoint.clone();
+                let tx = state.tx.clone();
+                tokio::spawn(async move {
+                    let result = do_connect(&endpoint, host_id, relay_url).await;
+                    let _ = tx
+                        .send(AgentCommand::ConnectDone {
+                            host_id,
+                            result,
+                        })
+                        .await;
+                });
+            }
+
+            AgentCommand::ConnectDone { host_id, result } => {
+                let waiters = state.pending.remove(&host_id).unwrap_or_default();
+
+                match result {
+                    Ok(conn) => {
+                        state.connections.insert(host_id, conn.clone());
+                        tracing::debug!("actor: connect succeeded for {} (alpn: {}, pool size: {}, notifying {} waiters)",
+                            host_id.fmt_short(),
+                            std::str::from_utf8(conn.alpn()).unwrap_or("?"),
+                            state.connections.len(),
+                            waiters.len());
+                        let sem = state
+                            .semaphores
+                            .entry(host_id)
+                            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                            .clone();
+                        for reply in waiters {
+                            let _ = reply.send(Ok((conn.clone(), sem.clone())));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("actor: connect failed for {}: {:#}, notifying {} waiters", host_id.fmt_short(), e, waiters.len());
+                        // Fan out the error to all waiters
+                        let msg = format!("{e:#}");
+                        for reply in waiters {
+                            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+                        }
+                    }
+                }
+            }
+
+            AgentCommand::RemoveConnection { host_id } => {
+                // Never close a connection that still has live multiplexed
+                // sessions. The pooled connection is shared per-host, so evicting
+                // it — e.g. a concurrent session's reconnect dialing with
+                // evict_first — would tear down the streams the other sessions are
+                // actively using. That is a mutual-eviction reconnect loop between
+                // two `hop connect` sessions to the same host: each one's reconnect
+                // kills the other's connection, forever. A connection with a live
+                // session is provably not half-open, so keep it; only evict an
+                // idle (genuinely stale) pooled connection.
+                if may_evict(&state.active, &host_id) {
+                    if let Some(conn) = state.connections.remove(&host_id) {
+                        tracing::debug!("actor: evicting idle connection for {} (pool size: {})", host_id.fmt_short(), state.connections.len());
+                        conn.close(0u32.into(), b"evicted-idle");
+                    }
+                } else {
+                    tracing::debug!("actor: skip evicting connection for {} — {} active session(s) still using it", host_id.fmt_short(), state.active.get(&host_id).copied().unwrap_or(0));
+                }
+            }
+
+            AgentCommand::SessionStarted { host_id } => {
+                session_inc(&mut state.active, host_id);
+            }
+
+            AgentCommand::SessionEnded { host_id } => {
+                session_dec(&mut state.active, &host_id);
+            }
+
+            AgentCommand::FlushAll => {
+                tracing::debug!("actor: flushing all connections ({} pooled)", state.connections.len());
+                for (_, conn) in state.connections.drain() {
+                    conn.close(0u32.into(), b"flush");
+                }
+            }
+
+            AgentCommand::TouchActivity => {
+                state.last_activity = Instant::now();
+            }
+
+            AgentCommand::CheckIdle { reply } => {
+                let idle = state.last_activity.elapsed() >= IDLE_TIMEOUT;
+                let _ = reply.send(idle);
+            }
+        }
+    }
+}
+
+/// Dial timeout for mux connects. Deliberately short (session-recovery-parity
+/// Phase 2): a dead path must FAIL FAST so the reconnect loop can retry — and
+/// because concurrent retry attempts JOIN the in-flight dial as waiters, one
+/// slow dial pins every "retry now" the user presses behind it. The old
+/// 30s-hop/3 + 30s-hop/2 sequence meant a dead path blocked all reconnect
+/// attempts for a full minute. The VPN data plane uses the same fail-fast
+/// rationale for its short dial timeout.
+const MUX_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After this long with zero received datagrams, a connection is a zombie.
+/// Both ends run hop's transport config (5s keepalives), so a healthy
+/// connection receives SOMETHING at least every ~5s even when idle; 15s of
+/// silence = 3 missed keepalives. QUIC's own idle timeout is 60s — waiting for
+/// it is what made dead sessions sit frozen for a minute before the reconnect
+/// machinery even started.
+const ZOMBIE_STALL: Duration = Duration::from_secs(15);
+const ZOMBIE_POLL: Duration = Duration::from_secs(3);
+
+/// Watch a pooled connection for rx-stall and close it as a zombie. Closing
+/// errors the proxied session streams immediately → the client sees EOF →
+/// its quick-reconnect tier engages within seconds instead of waiting out
+/// QUIC's 60s idle timeout (session-recovery-parity Phase 1).
+fn spawn_zombie_watchdog(conn: Connection, host_id: PublicKey) {
+    tokio::spawn(async move {
+        let mut last_rx = conn.stats().udp_rx.datagrams;
+        let mut last_progress = Instant::now();
+        loop {
+            tokio::time::sleep(ZOMBIE_POLL).await;
+            if conn.close_reason().is_some() {
+                return; // closed normally — watchdog done
+            }
+            let rx = conn.stats().udp_rx.datagrams;
+            if rx != last_rx {
+                last_rx = rx;
+                last_progress = Instant::now();
+                continue;
+            }
+            if last_progress.elapsed() >= ZOMBIE_STALL {
+                tracing::info!(
+                    "mux: connection to {} stalled ({}s without a datagram despite 5s keepalives) — closing zombie",
+                    host_id.fmt_short(),
+                    last_progress.elapsed().as_secs()
+                );
+                conn.close(0u32.into(), b"zombie-stall");
+                return;
+            }
+        }
+    });
+}
+
+/// True if the dial error was a timeout (dead/stale path) rather than a
+/// rejection. Matches the message produced by `connect_to_host_with_alpn_timeout`.
+fn is_dial_timeout(e: &anyhow::Error) -> bool {
+    format!("{e:#}").to_lowercase().contains("timed out")
+}
+
+/// Connect to a host via QUIC. Tries hop/3 (compressed) first; falls back to
+/// hop/2 ONLY when hop/3 was REJECTED (a pre-0.9.28 host refusing the ALPN) —
+/// a TIMEOUT means the path is dead and hop/2 would hang identically, doubling
+/// the stall for nothing. Runs in a spawned task — never blocks the actor loop.
+async fn do_connect(
+    endpoint: &Endpoint,
+    host_id: PublicKey,
+    relay_url: Option<String>,
+) -> Result<Connection> {
+    let relay: Option<iroh::RelayUrl> = relay_url
+        .as_deref()
+        .map(|u| u.parse())
+        .transpose()
+        .ok()
+        .flatten();
+
+    tracing::debug!("do_connect: {} relay_hint={:?}", host_id.fmt_short(), relay.as_ref().map(|u| u.to_string()));
+
+    match net::connect_to_host_with_alpn_timeout(
+        endpoint,
+        host_id,
+        relay.as_ref(),
+        hop_core::proto::ALPN_V3,
+        MUX_DIAL_TIMEOUT,
+    )
+    .await
+    {
+        Ok((conn, _)) => {
+            tracing::debug!("do_connect: hop/3 connected to {}", host_id.fmt_short());
+            spawn_zombie_watchdog(conn.clone(), host_id);
+            Ok(conn)
+        }
+        Err(e) if is_dial_timeout(&e) => {
+            tracing::debug!("do_connect: hop/3 dial to {} timed out — dead path, NOT falling back to hop/2", host_id.fmt_short());
+            Err(e)
+        }
+        Err(_) => {
+            tracing::debug!(
+                "hop/3 not supported by {}, falling back to hop/2",
+                host_id.fmt_short()
+            );
+            let (conn, _) = net::connect_to_host_with_alpn_timeout(
+                endpoint,
+                host_id,
+                relay.as_ref(),
+                hop_core::proto::ALPN_V2,
+                MUX_DIAL_TIMEOUT,
+            )
+            .await?;
+            tracing::debug!("do_connect: hop/2 fallback connected to {}", host_id.fmt_short());
+            spawn_zombie_watchdog(conn.clone(), host_id);
+            Ok(conn)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC client handler (free function, takes AgentHandle)
+// ---------------------------------------------------------------------------
+
+/// Handle a single IPC client connection.
+///
+/// Uses a per-host semaphore to serialize the connect+open_bi phase,
+/// preventing reconnect stampedes when multiple IPC clients queue up
+/// during slow QUIC handshakes. Also monitors IPC liveness so that
+/// timed-out clients don't leave orphaned bi-streams.
+async fn handle_client(
+    mut ipc: UnixStream,
+    handle: AgentHandle,
+    active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<()> {
+    // 1. Read MuxConnect
+    let req: MuxConnect = mux::read_ipc_message(&mut ipc).await?;
+    let host_id =
+        PublicKey::from_bytes(&req.host_id).context("invalid host_id in MuxConnect")?;
+
+    tracing::debug!("handle_client: MuxConnect for {} relay={:?} evict_first={}", host_id.fmt_short(), req.relay_url, req.evict_first);
+
+    // Reconnect requested a fresh dial: drop any pooled (possibly half-open)
+    // connection so get_connection re-dials rather than handing back a dead path.
+    if req.evict_first {
+        handle.remove_connection(host_id).await;
+    }
+
+    // 2. Split IPC early so we can monitor liveness during setup
+    let (mut ipc_read, mut ipc_write) = ipc.into_split();
+
+    // 3. Get connection + per-host semaphore, abort if IPC client disconnects
+    tracing::debug!("handle_client: getting connection for {}", host_id.fmt_short());
+    let (conn, sem) = tokio::select! {
+        result = handle.get_connection(host_id, req.relay_url) => {
+            match result {
+                Ok(pair) => {
+                    tracing::debug!("handle_client: connection obtained for {}", host_id.fmt_short());
+                    pair
+                }
+                Err(e) => {
+                    let _ = mux::write_ipc_message(
+                        &mut ipc_write,
+                        &MuxResult::Error(format!("{e:#}")),
+                    ).await;
+                    return Err(e);
+                }
+            }
+        }
+        _ = wait_for_ipc_close(&mut ipc_read) => {
+            tracing::debug!("IPC client disconnected during connect ({})", host_id.fmt_short());
+            return Ok(());
+        }
+    };
+
+    // 4. Acquire semaphore, abort if IPC client disconnects while waiting
+    tracing::debug!("handle_client: waiting for host semaphore for {}", host_id.fmt_short());
+    let permit = tokio::select! {
+        permit = sem.acquire_owned() => {
+            tracing::debug!("handle_client: semaphore acquired for {}", host_id.fmt_short());
+            permit.map_err(|_| anyhow::anyhow!("host semaphore closed"))?
+        }
+        _ = wait_for_ipc_close(&mut ipc_read) => {
+            tracing::debug!("IPC client disconnected while waiting for host lock ({})", host_id.fmt_short());
+            return Ok(());
+        }
+    };
+
+    // 5. Open bi-stream (fast on live connection)
+    let (quic_send, quic_recv) = match conn.open_bi().await {
+        Ok(pair) => {
+            tracing::debug!("handle_client: open_bi succeeded for {}", host_id.fmt_short());
+            pair
+        }
+        Err(e) => {
+            // Connection may have died; evict from pool
+            handle.remove_connection(host_id).await;
+            let _ = mux::write_ipc_message(
+                &mut ipc_write,
+                &MuxResult::Error(format!("open_bi failed: {e:#}")),
+            )
+            .await;
+            anyhow::bail!("open_bi failed: {e:#}");
+        }
+    };
+
+    // 6. Signal ready
+    mux::write_ipc_message(&mut ipc_write, &MuxResult::Ready).await?;
+
+    // 7. Drop semaphore permit — unblocks next waiter, doesn't block proxy
+    drop(permit);
+
+    // 8. Track active session. The per-host count guards the shared pooled
+    // connection from being evicted out from under this session (see
+    // RemoveConnection); the global counter drives idle shutdown.
+    let session_start = Instant::now();
+    active_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    handle.session_started(host_id).await;
+    handle.touch_activity().await;
+    tracing::debug!("handle_client: session started for {}", host_id.fmt_short());
+
+    // 9. Transparent bidirectional proxy
+    let result = proxy_quic(ipc_read, ipc_write, quic_send, quic_recv).await;
+
+    // 10. Session done
+    active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    handle.session_ended(host_id).await;
+    handle.touch_activity().await;
+    tracing::debug!("handle_client: session ended for {} (duration: {:?})", host_id.fmt_short(), session_start.elapsed());
+
+    if let Err(e) = result {
+        tracing::debug!("Proxy session ended: {e:#}");
+    }
+    Ok(())
+}
+
+/// Detect when an IPC client has disconnected by reading from the socket.
+///
+/// Cancel-safe: `OwnedReadHalf::read` is cancel-safe per tokio docs.
+/// Safe to call during the setup phase — the client sends no data between
+/// MuxConnect and MuxResult::Ready, so any read returning 0 or error
+/// means the client is gone.
+async fn wait_for_ipc_close(ipc_read: &mut tokio::net::unix::OwnedReadHalf) {
+    let mut buf = [0u8; 1];
+    loop {
+        match ipc_read.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Bidirectional proxy between IPC socket and QUIC bi-stream.
+///
+/// Both directions run as independent tasks. When one completes, it drops its
+/// owned resources, which propagates EOF to the other side, causing it to
+/// complete naturally. This avoids the old `select!` approach which would
+/// immediately cancel the reverse direction, potentially dropping unread data.
+async fn proxy_quic(
+    mut ipc_read: tokio::net::unix::OwnedReadHalf,
+    mut ipc_write: tokio::net::unix::OwnedWriteHalf,
+    mut quic_send: iroh::endpoint::SendStream,
+    mut quic_recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    // Host→Client: copy QUIC data to IPC, flushing after each chunk
+    // to avoid buffering delays on high-latency links.
+    // When this finishes, dropping ipc_write signals EOF to the client.
+    let h2c = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match quic_recv.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => {
+                    if ipc_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if ipc_write.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("QUIC→IPC ended: {e:#}");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Client→Host: copy IPC data to QUIC, flushing after each chunk.
+    // When this finishes, quic_send.finish() signals FIN to the host.
+    let c2h = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match ipc_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if quic_send.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("IPC→QUIC ended: {e:#}");
+                    break;
+                }
+            }
+        }
+        let _ = quic_send.finish();
+    });
+
+    // Both tasks complete naturally via EOF propagation:
+    //   Pull: host finishes → h2c drops ipc_write → client sees EOF → client
+    //         drops socket → c2h's ipc_read sees EOF → c2h finishes
+    //   Push: client finishes → c2h calls finish() → host sees FIN → host
+    //         sends response + finishes → h2c's quic_recv sees EOF → h2c finishes
+    let _ = tokio::join!(h2c, c2h);
+
+    Ok(())
+}
+
+/// Generic bidirectional byte proxy between two async stream pairs.
+///
+/// Used for testing with mock streams (tokio::io::duplex).
+#[cfg(test)]
+async fn proxy_streams(
+    mut side_a_read: impl tokio::io::AsyncRead + Unpin,
+    mut side_a_write: impl tokio::io::AsyncWrite + Unpin,
+    mut side_b_read: impl tokio::io::AsyncRead + Unpin,
+    mut side_b_write: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    tokio::select! {
+        r = tokio::io::copy(&mut side_a_read, &mut side_b_write) => {
+            r.context("A->B copy")?;
+        }
+        r = tokio::io::copy(&mut side_b_read, &mut side_a_write) => {
+            r.context("B->A copy")?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Idle check (actor-based)
+// ---------------------------------------------------------------------------
+
+/// Poll the actor for idle status. Returns when the agent is idle.
+async fn check_idle_actor(
+    active_sessions: &std::sync::atomic::AtomicUsize,
+    handle: &AgentHandle,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let active = active_sessions.load(std::sync::atomic::Ordering::Relaxed);
+        if active > 0 {
+            continue;
+        }
+
+        if handle.check_idle().await {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main agent entry point
+// ---------------------------------------------------------------------------
+
+/// Wire the "network changed → flush the connection pool" machinery for a mux
+/// service and hand back the flush channel to give the netmon watchers.
+///
+/// Every mux host MUST install this — both the standalone agent and the host
+/// daemon. A pool that is never flushed hands the next `hop connect` a pooled
+/// connection whose path died with the old network; `open_bi` on it then stalls
+/// until the QUIC idle timeout instead of re-dialing. That is not hypothetical:
+/// the daemon's mux service originally shipped without this wiring, so once
+/// client connects moved onto the daemon every dial after a laptop changed
+/// networks stalled ~30s. Keeping it in ONE function is the point — the bug was
+/// two copies of this setup drifting apart.
+fn spawn_pool_flush_watchers(
+    endpoint: Endpoint,
+    handle: AgentHandle,
+) -> tokio::sync::mpsc::Sender<()> {
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Sleep/wake: carrying the laptop to a new network is the #1 cause of a
+    // stale path. A wake almost always means the old path is dead, so force
+    // re-discovery AND flush — flushing alone leaves iroh's endpoint pointed at
+    // the old network until its own netwatch catches up.
+    let wake_handle = handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let before = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if before.elapsed() > Duration::from_secs(10) {
+                tracing::info!("Detected sleep/wake, forcing re-discovery + flushing pool");
+                endpoint.network_change().await;
+                wake_handle.flush_all().await;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while flush_rx.recv().await.is_some() {
+            tracing::info!("Flushing mux connection pool after network change");
+            handle.flush_all().await;
+        }
+    });
+
+    flush_tx
+}
+
+/// Bind a mux IPC socket on `sock_path` and serve `MuxConnect` requests using
+/// `endpoint`. Used by the host daemon: a machine running `hop host` serves
+/// client connects (`hop connect`) through ITS single endpoint instead of
+/// letting the client spawn a *second* endpoint under the same node-id, which
+/// the relay prunes against the daemon every few seconds (the identity
+/// collision). Additive + defensive: a bind failure is returned to the caller
+/// (the daemon logs and continues — the mux is a convenience, never
+/// load-bearing for the daemon's own VPN/inbound roles).
+///
+/// Returns the pool-flush channel: the caller MUST hand it to the netmon
+/// watchers, or the pool it serves is never flushed on a network change.
+pub fn spawn_mux_listener(
+    endpoint: Endpoint,
+    sock_path: std::path::PathBuf,
+) -> Result<tokio::sync::mpsc::Sender<()>> {
+    if sock_path.exists() {
+        let _ = std::fs::remove_file(&sock_path);
+    }
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format!("bind mux socket {}", sock_path.display()))?;
+    // Local-trust: let the logged-in user's `hop connect` reach the daemon's
+    // socket (the daemon may run as _hop/root). Single-user posture; multi-user
+    // hosts should group-scope this rather than world-rw (tracked follow-up).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
+    }
+    let handle = spawn_agent_actor(endpoint.clone());
+    let flush_tx = spawn_pool_flush_watchers(endpoint, handle.clone());
+    let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let h = handle.clone();
+                    let sessions = active_sessions.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(stream, h, sessions).await {
+                            tracing::debug!("daemon mux client error: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("daemon mux accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    tracing::info!("daemon mux service listening on {}", sock_path.display());
+    Ok(flush_tx)
+}
+
+async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle) -> Result<()> {
+    let sock_path = mux::agent_sock_path(config_dir);
+    let pid_path = mux::agent_pid_path(config_dir);
+
+    // Remove stale socket if present
+    if sock_path.exists() {
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    let listener = UnixListener::bind(&sock_path).context("failed to bind agent socket")?;
+
+    // Write PID file
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .context("failed to write PID file")?;
+
+    if !daemon {
+        eprintln!("Agent listening on {}", sock_path.display());
+        eprintln!("PID: {}", std::process::id());
+    }
+
+    // Set up signal handlers: graceful shutdown + SIGUSR1 debug toggle
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT handler")?;
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .context("failed to register SIGUSR1 handler")?;
+    let mut debug_enabled = false;
+
+    let secret_key = config::load_or_generate_identity(config_dir)?;
+    let endpoint = net::create_client_endpoint(secret_key).await?;
+    let handle = spawn_agent_actor(endpoint.clone());
+    let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tracing::info!("Agent started (PID {})", std::process::id());
+
+    // Network-change → pool-flush wiring. Shared with the daemon's mux service
+    // (`spawn_mux_listener`) so the two can never drift apart again.
+    let flush_tx = spawn_pool_flush_watchers(endpoint.clone(), handle.clone());
+
+    // Interface-address watcher (calls network_change internally on change).
+    let _netmon = net::netmon::spawn_interface_watcher(endpoint.clone(), Some(flush_tx.clone()));
+    // Relay-health watcher: catches a dead path when the local interface address
+    // looks unchanged — same DHCP range or carried while asleep — which the
+    // interface watcher cannot see. This is the gap that made a network move
+    // strand the agent on a dead pooled connection.
+    let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), Some(flush_tx));
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _)) => {
+                        let h = handle.clone();
+                        let sessions = active_sessions.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(stream, h, sessions).await {
+                                tracing::debug!("Agent client error: {e:#}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Agent accept error: {e}");
+                    }
+                }
+            }
+            _ = sigusr1.recv() => {
+                debug_enabled = !debug_enabled;
+                let new_filter = if debug_enabled {
+                    tracing::info!("Agent debug logging ENABLED (send SIGUSR1 again to disable)");
+                    "hop=debug,hop_core=debug,iroh=debug,iroh_relay=debug"
+                        .parse::<Targets>().expect("valid directives")
+                } else {
+                    tracing::info!("Agent debug logging DISABLED (back to info level)");
+                    "hop=info,hop_core=info".parse::<Targets>().expect("valid directives")
+                };
+                if let Err(e) = reload_handle.reload(new_filter) {
+                    tracing::error!("Failed to reload log filter: {e}");
+                }
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Agent received SIGTERM, shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Agent received SIGINT, shutting down");
+                break;
+            }
+            _ = check_idle_actor(&active_sessions, &handle) => {
+                tracing::info!("Agent idle timeout reached, shutting down");
+                break;
+            }
+        }
+    }
+
+    // Cleanup: flush all pooled connections, then close the endpoint
+    handle.flush_all().await;
+    drop(handle);
+    endpoint.close().await;
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ── Proxy Layer ──
+
+    #[tokio::test]
+    async fn proxy_bidirectional_data() {
+        let (a1, a2) = tokio::io::duplex(8192);
+        let (b1, b2) = tokio::io::duplex(8192);
+
+        let (a1_read, a1_write) = tokio::io::split(a1);
+        let (b1_read, b1_write) = tokio::io::split(b1);
+
+        let proxy = tokio::spawn(async move {
+            proxy_streams(a1_read, a1_write, b1_read, b1_write).await
+        });
+
+        let (mut a2_read, mut a2_write) = tokio::io::split(a2);
+        let (mut b2_read, mut b2_write) = tokio::io::split(b2);
+
+        // A -> B (use read_exact so we don't wait for stream close)
+        a2_write.write_all(b"hello from A").await.unwrap();
+        let mut buf = [0u8; 12];
+        b2_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello from A");
+
+        // B -> A
+        b2_write.write_all(b"hello from B").await.unwrap();
+        let mut buf2 = [0u8; 12];
+        a2_read.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"hello from B");
+
+        // Clean up — dropping all ends causes the proxy to exit
+        drop(a2_write);
+        drop(b2_write);
+        drop(a2_read);
+        drop(b2_read);
+        let _ = proxy.await;
+    }
+
+    #[tokio::test]
+    async fn proxy_large_transfer() {
+        let data: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+        let expected_hash = Sha256::digest(&data);
+
+        let (a1, a2) = tokio::io::duplex(65536);
+        let (b1, b2) = tokio::io::duplex(65536);
+
+        let (a1_read, a1_write) = tokio::io::split(a1);
+        let (b1_read, b1_write) = tokio::io::split(b1);
+
+        let proxy = tokio::spawn(async move {
+            proxy_streams(a1_read, a1_write, b1_read, b1_write).await
+        });
+
+        let (_, mut a2_write) = tokio::io::split(a2);
+        let (mut b2_read, _) = tokio::io::split(b2);
+
+        let send_data = data.clone();
+        let sender = tokio::spawn(async move {
+            a2_write.write_all(&send_data).await.unwrap();
+            a2_write.shutdown().await.unwrap();
+        });
+
+        let mut received = Vec::new();
+        b2_read.read_to_end(&mut received).await.unwrap();
+
+        assert_eq!(received.len(), 1_048_576);
+        let actual_hash = Sha256::digest(&received);
+        assert_eq!(expected_hash, actual_hash);
+
+        sender.await.unwrap();
+        let _ = proxy.await;
+    }
+
+    #[tokio::test]
+    async fn proxy_half_close() {
+        // Verify that closing one side's write causes the proxy to exit
+        // (proxy uses select!, so when one direction's copy completes, the other
+        // is cancelled and the proxy returns).
+        let (a1, a2) = tokio::io::duplex(8192);
+        let (b1, b2) = tokio::io::duplex(8192);
+
+        let (a1_read, a1_write) = tokio::io::split(a1);
+        let (b1_read, b1_write) = tokio::io::split(b1);
+
+        let proxy = tokio::spawn(async move {
+            proxy_streams(a1_read, a1_write, b1_read, b1_write).await
+        });
+
+        let (_a2_read, mut a2_write) = tokio::io::split(a2);
+        let (mut b2_read, _b2_write) = tokio::io::split(b2);
+
+        // Send data then close A's write half via shutdown (not drop —
+        // drop of a split WriteHalf doesn't propagate EOF to the peer).
+        a2_write.write_all(b"from A").await.unwrap();
+        let mut buf = [0u8; 6];
+        b2_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"from A");
+
+        // shutdown() calls poll_shutdown on the DuplexStream, signaling EOF
+        a2_write.shutdown().await.unwrap();
+
+        // B should see EOF
+        let mut tail = Vec::new();
+        b2_read.read_to_end(&mut tail).await.unwrap();
+        assert!(tail.is_empty());
+
+        // The proxy task should complete without deadlock
+        let result = tokio::time::timeout(Duration::from_secs(1), proxy).await;
+        assert!(result.is_ok(), "proxy should exit after half-close");
+    }
+
+    #[tokio::test]
+    async fn proxy_concurrent_sessions() {
+        let timeout = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut handles = Vec::new();
+
+            for i in 0..100u32 {
+                handles.push(tokio::spawn(async move {
+                    let (a1, a2) = tokio::io::duplex(8192);
+                    let (b1, b2) = tokio::io::duplex(8192);
+
+                    let (a1_read, a1_write) = tokio::io::split(a1);
+                    let (b1_read, b1_write) = tokio::io::split(b1);
+
+                    let proxy = tokio::spawn(async move {
+                        proxy_streams(a1_read, a1_write, b1_read, b1_write).await
+                    });
+
+                    let (_, mut a2_write) = tokio::io::split(a2);
+                    let (mut b2_read, _) = tokio::io::split(b2);
+
+                    let unique = format!("session-{i}-payload");
+                    a2_write.write_all(unique.as_bytes()).await.unwrap();
+                    a2_write.shutdown().await.unwrap();
+
+                    let mut received = Vec::new();
+                    b2_read.read_to_end(&mut received).await.unwrap();
+                    assert_eq!(received, unique.as_bytes());
+
+                    let _ = proxy.await;
+                }));
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        timeout.await.expect("proxy_concurrent_sessions timed out after 2s");
+    }
+
+    // ── Session Tracking ──
+
+    #[tokio::test]
+    async fn session_counter_increment_decrement() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..50 {
+            let c = counter.clone();
+            handles.push(tokio::spawn(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                c.fetch_sub(1, Ordering::Relaxed);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // Regression: two concurrent `hop connect` sessions to one host share a single
+    // pooled connection. A reconnect's evict_first must NOT close that connection
+    // while another session is live, or the two sessions mutually evict each other
+    // in an endless reconnect loop. Eviction is allowed only once the host is idle.
+    #[test]
+    fn eviction_gated_by_live_sessions() {
+        let host = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let other = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut active = HashMap::new();
+
+        // No sessions yet: an idle/stale pooled connection may be evicted.
+        assert!(may_evict(&active, &host));
+
+        // Two sessions to `host` come up (they multiplex over one connection).
+        session_inc(&mut active, host);
+        session_inc(&mut active, host);
+        assert_eq!(active.get(&host).copied(), Some(2));
+        // A reconnect on either session must not evict the in-use connection.
+        assert!(!may_evict(&active, &host));
+
+        // A different host is unaffected — its idle connection can still be evicted.
+        assert!(may_evict(&active, &other));
+
+        // One session ends; the other is still live, so eviction stays blocked.
+        session_dec(&mut active, &host);
+        assert_eq!(active.get(&host).copied(), Some(1));
+        assert!(!may_evict(&active, &host));
+
+        // Last session ends: the host is idle and the entry is cleared, so a
+        // genuinely stale pooled connection may now be evicted on reconnect.
+        session_dec(&mut active, &host);
+        assert!(!active.contains_key(&host));
+        assert!(may_evict(&active, &host));
+
+        // Decrementing an already-absent host is a no-op (no underflow panic).
+        session_dec(&mut active, &host);
+        assert!(may_evict(&active, &host));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_fires_when_no_sessions() {
+        let active = Arc::new(AtomicUsize::new(0));
+
+        // Spawn a minimal actor with last_activity already past the timeout
+        let (tx, mut rx) = mpsc::channel::<AgentCommand>(16);
+        let handle = AgentHandle { tx };
+
+        // Actor that only handles CheckIdle, with last_activity in the past
+        tokio::spawn(async move {
+            let past = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+            while let Some(cmd) = rx.recv().await {
+                if let AgentCommand::CheckIdle { reply } = cmd {
+                    let _ = reply.send(past.elapsed() >= IDLE_TIMEOUT);
+                }
+            }
+        });
+
+        // check_idle_actor polls every 30s, so we use tokio::time::pause to advance
+        // the clock instantly.
+        tokio::time::pause();
+
+        let result = tokio::time::timeout(Duration::from_secs(60), async {
+            check_idle_actor(&active, &handle).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "check_idle_actor should have returned promptly");
+    }
+
+    #[tokio::test]
+    async fn handle_returns_error_when_actor_dropped() {
+        let (tx, rx) = mpsc::channel::<AgentCommand>(1);
+        let handle = AgentHandle { tx };
+
+        // Drop the receiver immediately — actor is "stopped"
+        drop(rx);
+
+        let host_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let result = handle.get_connection(host_id, None).await;
+        assert!(result.is_err(), "should return error when actor is stopped");
+    }
+
+    // ── Agent IPC Integration ──
+
+    #[tokio::test]
+    async fn agent_ipc_handshake_then_proxy() {
+        // Simulate: client <-> (IPC) <-> agent <-> (QUIC mock) <-> "host"
+        let (client_ipc, agent_ipc) = tokio::net::UnixStream::pair().unwrap();
+        let (mock_quic_agent, mock_quic_host) = tokio::io::duplex(8192);
+
+        // Agent side: read MuxConnect, send MuxResult::Ready, then proxy
+        let agent = tokio::spawn(async move {
+            let (mut agent_read, mut agent_write) = agent_ipc.into_split();
+
+            let req: MuxConnect = mux::read_ipc_message(&mut agent_read).await.unwrap();
+            assert_eq!(req.host_id[0], 42);
+
+            mux::write_ipc_message(&mut agent_write, &MuxResult::Ready)
+                .await
+                .unwrap();
+
+            let (quic_read, quic_write) = tokio::io::split(mock_quic_agent);
+            proxy_streams(agent_read, agent_write, quic_read, quic_write)
+                .await
+                .ok();
+        });
+
+        let (mut client_read, mut client_write) = client_ipc.into_split();
+
+        let connect = MuxConnect {
+            host_id: {
+                let mut id = [0u8; 32];
+                id[0] = 42;
+                id
+            },
+            relay_url: None,
+            evict_first: false,
+        };
+        mux::write_ipc_message(&mut client_write, &connect)
+            .await
+            .unwrap();
+
+        let result: MuxResult = mux::read_ipc_message(&mut client_read).await.unwrap();
+        assert!(matches!(result, MuxResult::Ready));
+
+        let (mut host_read, mut host_write) = tokio::io::split(mock_quic_host);
+
+        // Client sends "ping", host reads it (use read_exact to avoid waiting for EOF)
+        client_write.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        host_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Host sends "pong", client reads it
+        host_write.write_all(b"pong").await.unwrap();
+        let mut buf2 = [0u8; 4];
+        client_read.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"pong");
+
+        // Cleanup
+        drop(client_write);
+        drop(client_read);
+        drop(host_write);
+        drop(host_read);
+        let _ = agent.await;
+    }
+
+    #[tokio::test]
+    async fn agent_concurrent_clients() {
+        let timeout = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut handles = Vec::new();
+
+            for i in 0..20u32 {
+                handles.push(tokio::spawn(async move {
+                    let (client_ipc, agent_ipc) = tokio::net::UnixStream::pair().unwrap();
+                    let (mock_quic_agent, mock_quic_host) = tokio::io::duplex(8192);
+
+                    let unique_payload = format!("client-{i}-data");
+                    let payload_len = unique_payload.len();
+
+                    // Agent side
+                    let agent_handle = tokio::spawn(async move {
+                        let (mut ar, mut aw) = agent_ipc.into_split();
+                        let _req: MuxConnect = mux::read_ipc_message(&mut ar).await.unwrap();
+                        mux::write_ipc_message(&mut aw, &MuxResult::Ready).await.unwrap();
+                        let (qr, qw) = tokio::io::split(mock_quic_agent);
+                        proxy_streams(ar, aw, qr, qw).await.ok();
+                    });
+
+                    // Host side: read exact bytes and echo back immediately
+                    let host_handle = tokio::spawn(async move {
+                        let (mut hr, mut hw) = tokio::io::split(mock_quic_host);
+                        let mut buf = vec![0u8; payload_len];
+                        hr.read_exact(&mut buf).await.unwrap();
+                        hw.write_all(&buf).await.unwrap();
+                    });
+
+                    // Client side
+                    let (mut cr, mut cw) = client_ipc.into_split();
+                    let connect = MuxConnect {
+                        host_id: [i as u8; 32],
+                        relay_url: None,
+                        evict_first: false,
+                    };
+                    mux::write_ipc_message(&mut cw, &connect).await.unwrap();
+                    let result: MuxResult = mux::read_ipc_message(&mut cr).await.unwrap();
+                    assert!(matches!(result, MuxResult::Ready));
+
+                    cw.write_all(unique_payload.as_bytes()).await.unwrap();
+
+                    let mut echoed = vec![0u8; payload_len];
+                    cr.read_exact(&mut echoed).await.unwrap();
+                    assert_eq!(String::from_utf8(echoed).unwrap(), unique_payload);
+
+                    // Cleanup
+                    drop(cw);
+                    drop(cr);
+                    let _ = host_handle.await;
+                    let _ = agent_handle.await;
+                }));
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        timeout.await.expect("agent_concurrent_clients timed out");
+    }
+}
