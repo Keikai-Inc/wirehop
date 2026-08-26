@@ -1,4 +1,6 @@
 (function () {
+  var REPO = 'https://github.com/Keikai-Inc/wirehop';
+
   var NAV_LINKS = [
     { label: 'Features',     href: '#features',     cross: 'index.html#features' },
     { label: 'Install',      href: '#install',      cross: 'index.html#install' },
@@ -8,6 +10,7 @@
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
     { label: 'Security',     href: 'security.html', cross: 'security.html' },
+    { label: 'Source',       href: REPO,             cross: REPO },
   ];
 
   // Pages that get an "active" nav highlight, matched on a path substring.

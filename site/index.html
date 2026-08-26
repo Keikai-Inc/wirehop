@@ -225,34 +225,6 @@
       margin-bottom: 1.5rem;
     }
 
-    .daemon-features {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }
-
-    .daemon-features li {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-      color: var(--color-text-secondary);
-      font-size: 0.9rem;
-      overflow-wrap: anywhere;
-    }
-
-    .daemon-features li code {
-      word-break: break-all;
-    }
-
-    .daemon-features li::before {
-      content: "\2713";
-      color: var(--color-accent-green);
-      font-weight: 700;
-      flex-shrink: 0;
-      margin-top: 0.1rem;
-    }
-
     /* --- Index responsive ---------------------------------------------------- */
 
     @media (max-width: 768px) {
@@ -284,7 +256,7 @@
   <div class="hero">
     <div class="badge"><span class="dot"></span> Secure private networking and remote access</div>
     <h1>VPNs should be<br><span class="gradient">as simple as SSH</span></h1>
-    <p>For Agents and users alike. One binary turns your machines (laptop, server, cloud, or a Pi) into a private network you <strong>and your Agents</strong> can reach, run commands on, and search from anywhere. It is a tool you run, not a service you buy: <strong>nobody sits in the middle, including us</strong>. Just install, invite, connect.</p>
+    <p>For Agents and users alike. One binary turns your machines (laptop, server, cloud, or a Pi) into a private network you <strong>and your Agents</strong> can reach, run commands on, and search from anywhere. Just install, invite, connect.</p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Get Started</a>
       <a href="#how-it-works" class="btn btn-ghost">How It Works</a>
@@ -305,7 +277,7 @@
   <div style="border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border); background: var(--color-surface);">
     <div class="container" style="padding-top: 1.25rem; padding-bottom: 1.25rem; text-align: center;">
       <p style="margin: 0; color: var(--color-text-secondary); font-size: 1rem;">
-        <strong style="color: var(--color-text);">WireHop is a tool, not a service.</strong> There is no company between you and your machines, and that includes us. Nothing to sign up for, nothing to log in to, nothing that can be shut off.
+        <strong style="color: var(--color-text);">WireHop is a tool, not a service.</strong> There is no company between you and your machines, and that includes us: nothing to sign up for, nothing that can be shut off. It is <strong style="color: var(--color-text);">fully open source</strong> under MIT or Apache-2.0, so you can read every line, fork it, or ship it inside your own product.
       </p>
     </div>
   </div>
@@ -315,7 +287,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Why WireHop?</h2>
-        <p>One binary. No accounts. No company in the middle, for you and the agents you run.</p>
+        <p>Reach your machines, keep your keys, and let your Agents do the work.</p>
       </div>
 
       <div class="grid grid-3">
@@ -324,7 +296,7 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           </div>
           <h3>No third party, ever</h3>
-          <p>Your machines connect directly and privately, end-to-end encrypted. Unlike Tailscale, there's no coordination server to phone home to, no account, no third party in your trust path. Your keys stay on your machines.</p>
+          <p>Your machines connect directly and privately, end-to-end encrypted. There is no coordination server to phone home to and no third party in your trust path. Your keys are generated on your machines and never leave them.</p>
         </div>
 
         <div class="card card-amber">
@@ -464,8 +436,8 @@
   <section id="ai-agents">
     <div class="container">
       <div class="section-header">
-        <h2>Give your AI agents safe hands, today</h2>
-        <p>Agents can reason and call tools, but they still can't safely reach the machines you actually run. Add the WireHop skill and yours can, immediately, with no integration to build.</p>
+        <h2>Let your Agents work on real machines</h2>
+        <p>Your Agents can already reason and call tools. What they can't do is reach the machines you actually run. Add the WireHop skill and they can, within limits you set.</p>
       </div>
 
       <div class="grid grid-2" style="align-items: center; gap: 3rem;">

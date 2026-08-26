@@ -495,3 +495,31 @@ footer {
   .step { padding: 1.5rem 1rem; }
   .footer-bottom { flex-direction: column; text-align: center; }
 }
+
+/* --- Feature checklists (used by index, fleet, orchestration) ------------- */
+
+.daemon-features {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.daemon-features li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.daemon-features li code { word-break: break-all; }
+
+.daemon-features li::before {
+  content: "\2713";
+  color: var(--color-accent-green);
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
