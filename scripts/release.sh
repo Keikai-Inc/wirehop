@@ -137,18 +137,27 @@ echo "  Releasing hop v${VERSION}"
 echo "============================================"
 echo ""
 
+# Build the invalidation path list from what actually exists in site/, so a new
+# page is never served stale from the edge just because nobody updated a list.
+site_paths() {
+  local p
+  for p in "${PROJECT_ROOT}"/site/*.html; do
+    printf '/%s\n' "$(basename "${p}")"
+  done
+}
+
 # --- Site-only mode ----------------------------------------------------------
 
 if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Site-only mode — skipping builds"
 
   echo "==> Uploading site"
-  aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
-    --content-type "text/html"
-  aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
-    --content-type "text/html"
-  aws s3 cp "${PROJECT_ROOT}/site/orchestration.html" "s3://${BUCKET}/orchestration.html" \
-    --content-type "text/html"
+  # Every page in site/, not a hardcoded list: a new page that silently fails to
+  # deploy looks exactly like a page that deployed fine.
+  for page in "${PROJECT_ROOT}"/site/*.html; do
+    aws s3 cp "${page}" "s3://${BUCKET}/$(basename "${page}")" \
+      --content-type "text/html"
+  done
   aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
     --content-type "text/css"
   aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
@@ -175,7 +184,7 @@ if [[ "${SITE_ONLY}" == true ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
-    --paths "/" "/index.html" "/fleet.html" "/orchestration.html" "/shared.css" "/shared.js" \
+    --paths "/" $(site_paths) "/shared.css" "/shared.js" \
       "/install.sh" "/install-daemon.sh" \
       "/favicon.ico" "/favicon-32x32.png" \
       "/apple-touch-icon.png" "/icon-192.png" "/hop-icon.png" \
@@ -474,12 +483,12 @@ aws s3 cp "${PROJECT_ROOT}/pkg/hop.service" "s3://${BUCKET}/hop.service" \
 # --- Website -----------------------------------------------------------------
 
 echo "==> Uploading site"
-aws s3 cp "${PROJECT_ROOT}/site/index.html" "s3://${BUCKET}/index.html" \
-  --content-type "text/html"
-aws s3 cp "${PROJECT_ROOT}/site/fleet.html" "s3://${BUCKET}/fleet.html" \
-  --content-type "text/html"
-aws s3 cp "${PROJECT_ROOT}/site/orchestration.html" "s3://${BUCKET}/orchestration.html" \
-  --content-type "text/html"
+# Every page in site/, not a hardcoded list: a new page that silently fails to
+# deploy looks exactly like a page that deployed fine.
+for page in "${PROJECT_ROOT}"/site/*.html; do
+  aws s3 cp "${page}" "s3://${BUCKET}/$(basename "${page}")" \
+    --content-type "text/html"
+done
 aws s3 cp "${PROJECT_ROOT}/site/shared.css" "s3://${BUCKET}/shared.css" \
   --content-type "text/css"
 aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
@@ -548,7 +557,7 @@ fi
 echo "==> Invalidating CloudFront cache"
 aws cloudfront create-invalidation \
   --distribution-id "${CF_DISTRIBUTION_ID}" \
-  --paths "/" "/index.html" "/fleet.html" "/orchestration.html" "/shared.css" "/shared.js" \
+  --paths "/" $(site_paths) "/shared.css" "/shared.js" \
     "/latest" "/install.sh" "/install-daemon.sh" "/hop.service" \
     "/favicon.ico" "/favicon-32x32.png" "/apple-touch-icon.png" \
     "/icon-192.png" "/hop-icon.png" "/v${VERSION}/*" \
