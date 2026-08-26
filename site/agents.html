@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Let an AI agent provision its own network</title>
+  <meta name="description" content="Most remote-access tools need a human to make an account, click through a console, and paste a key. WireHop needs none of that, so an AI agent can go from unreachable machines to a working private network on its own.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    /* --- Agents page overrides ------------------------------------------------ */
+
+    .blocker {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-top: 2.5rem;
+    }
+
+    .blocker > * { min-width: 0; }
+
+    .blocker-panel {
+      border-radius: 0.75rem;
+      padding: 1.75rem;
+      border: 1px solid var(--color-border);
+      background: var(--color-surface);
+    }
+
+    .blocker-panel h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .blocker-panel ol,
+    .blocker-panel ul {
+      list-style: none;
+      counter-reset: step;
+      display: flex;
+      flex-direction: column;
+      gap: 0.625rem;
+    }
+
+    .blocker-panel li {
+      font-size: 0.9rem;
+      line-height: 1.6;
+      color: var(--color-text-secondary);
+      padding-left: 1.5rem;
+      position: relative;
+    }
+
+    .blocker-them li::before {
+      counter-increment: step;
+      content: counter(step) ".";
+      position: absolute;
+      left: 0;
+      color: var(--color-text-tertiary);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+
+    .blocker-them li.human {
+      color: var(--color-accent-amber);
+    }
+
+    .blocker-them li.human::after {
+      content: " needs a human";
+      color: var(--color-accent-amber);
+      font-size: 0.775rem;
+      font-weight: 500;
+      opacity: 0.85;
+    }
+
+    .blocker-us li::before {
+      counter-increment: step;
+      content: counter(step) ".";
+      position: absolute;
+      left: 0;
+      color: var(--color-accent-green);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+
+    /* --- Eval callout --------------------------------------------------------- */
+
+    .eval {
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      background: var(--color-surface);
+      padding: 2rem;
+      margin-top: 2.5rem;
+    }
+
+    .eval h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.1rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .eval p { color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.75; }
+
+    .eval-checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 1.25rem;
+    }
+
+    .eval-check {
+      font-family: var(--font-mono);
+      font-size: 0.775rem;
+      color: var(--color-text-secondary);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--color-border);
+      border-radius: 0.375rem;
+      padding: 0.35rem 0.7rem;
+    }
+
+    @media (max-width: 860px) {
+      .blocker { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> For AI agents</div>
+    <h1>Let an AI agent<br><span class="gradient">provision its own network</span></h1>
+    <p>Your agent can write code, call tools, and reason about your infrastructure. Then it hits a wall: it cannot reach the machines. Every tool that would fix that asks it to open a browser and make an account. WireHop doesn't.</p>
+    <div class="hero-actions">
+      <a href="#try" class="btn btn-primary">Give your agent the skill</a>
+      <a href="#why" class="btn btn-ghost">Why other tools block</a>
+    </div>
+  </div>
+
+  <!-- Why agents get stuck -->
+  <section id="why">
+    <div class="container">
+      <div class="section-header">
+        <h2>Where an agent gets stuck</h2>
+        <p>The same task, with a hosted tool and with WireHop. The difference isn't speed, it's whether the agent has to stop.</p>
+      </div>
+
+      <div class="blocker">
+        <div class="blocker-panel">
+          <h3 style="color: var(--color-accent-amber);">A hosted mesh VPN</h3>
+          <ol class="blocker-them">
+            <li>Install the client</li>
+            <li class="human">Create an account in a browser</li>
+            <li class="human">Verify an email</li>
+            <li class="human">Open the admin console</li>
+            <li class="human">Generate an auth key and paste it</li>
+            <li>Bring up the network</li>
+          </ol>
+          <p style="color: var(--color-text-tertiary); font-size: 0.875rem; line-height: 1.65; margin-top: 1.25rem;">Four handoffs. The agent stops at step two and asks you to finish, which is the opposite of why you gave it the task.</p>
+        </div>
+
+        <div class="blocker-panel">
+          <h3 style="color: var(--color-accent-green);">WireHop</h3>
+          <ol class="blocker-us">
+            <li>Install on the machine to be reached</li>
+            <li>Mint an invite (single-use, time-limited)</li>
+            <li>Install on the other machine</li>
+            <li>Redeem the invite</li>
+          </ol>
+          <p style="color: var(--color-text-tertiary); font-size: 0.875rem; line-height: 1.65; margin-top: 1.25rem;">No handoffs. Nothing to sign up for, nothing to click, nobody to wait on. The agent finishes the job it was given.</p>
+        </div>
+      </div>
+
+      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 2.5rem;">
+        This isn't an accident of packaging. WireHop has <strong>no coordination server and no accounts by design</strong>: identity is a keypair written to disk on first run, and membership is a document your machines gossip among themselves. There is no console to click through because there is nothing to click through to.
+      </p>
+    </div>
+  </section>
+
+  <!-- The bootstrap -->
+  <section id="bootstrap" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>The whole bootstrap</h2>
+        <p>Two machines, four commands, no human. Everything speaks JSON so an agent never has to scrape output.</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-header">
+          <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+          <span class="code-title">What the agent runs</span>
+        </div>
+        <div class="code-body">
+<span class="comment"># On the machine to be reached</span>
+<span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- <span class="flag">--host</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--json</span>
+<span class="output">{"token":"eyJ0eX...","expires_in":900,"max_uses":1}</span>
+
+<span class="comment"># On the machine doing the reaching</span>
+<span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash
+<span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
+<span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
+
+<span class="comment"># That's it. Now, from either machine:</span>
+<span class="prompt">$</span> <span class="cmd">hop exec</span> <span class="flag">myserver</span> -- systemctl status api
+<span class="prompt">$</span> <span class="cmd">hop fleet exec</span> <span class="flag">production</span> -- uptime
+<span class="prompt">$</span> <span class="cmd">hop fleet list</span> <span class="flag">--json</span>
+        </div>
+      </div>
+
+      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 2rem;">
+        Errors are structured too. A failure prints one JSON envelope with a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">code</code>, a <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">retryable</code> flag, and a hint, so an agent can decide whether waiting will help instead of guessing from a string.
+      </p>
+    </div>
+  </section>
+
+  <!-- The eval -->
+  <section id="eval" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>We test this claim, not just make it</h2>
+        <p>"An agent can set it up alone" is checkable, so it's a test that runs against every build.</p>
+      </div>
+
+      <div class="eval">
+        <h3>The cold-start eval</h3>
+        <p>
+          Two bare Linux containers, no WireHop installed, no human reachable. A real language model gets exactly one tool, "run a shell command on machine X", and is asked for a working private network plus one command that runs across it. Then the harness throws away whatever the agent claimed and <strong>inspects the containers itself</strong>: is the binary really there, does a command issued on one machine really execute on the other, do both hold a virtual address, does a packet really cross between them, does a fleet-wide command really come back.
+        </p>
+        <div class="eval-checks">
+          <span class="eval-check">install</span>
+          <span class="eval-check">reach</span>
+          <span class="eval-check">private network</span>
+          <span class="eval-check">fleet command</span>
+        </div>
+        <p style="margin-top: 1.25rem;">
+          It scores by capability rather than by name, because the agent picks its own hostnames and roles. An agent that declares victory over a dead network scores zero.
+        </p>
+        <p style="margin-top: 1.25rem; color: var(--color-text-tertiary); font-size: 0.9rem;">
+          The harness is <code style="font-family: var(--font-mono); font-size: 0.825rem; color: var(--color-accent-teal);">tests/e2e/agent-coldstart.sh</code> in the repository, so you can run it against your own model rather than take our word for the result.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Try it -->
+  <section id="try" style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Give your agent the skill</h2>
+        <p>Two pieces: one that teaches an agent when to reach for WireHop, one that lets it operate your machines once it has.</p>
+      </div>
+
+      <div class="grid grid-2" style="gap: 2rem;">
+        <div class="card card-teal">
+          <h3>Before anything is installed</h3>
+          <p style="margin-bottom: 1.25rem;">The skill is plain markdown: when to use WireHop, the bootstrap above, and how to scope an invite so an agent gets the least access that does the job. Works in any framework that reads a skill file.</p>
+          <div class="code-block">
+            <div class="code-body" style="padding: 1rem 1.25rem;">
+<span class="prompt">$</span> <span class="cmd">/plugin marketplace add</span> <span class="flag">Keikai-Inc/wirehop</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-green">
+          <h3>Once it's installed</h3>
+          <p style="margin-bottom: 1.25rem;">A local tool server, running under your own identity. Nothing is hosted and nothing takes custody of your credentials. Add it to your agent's config and the fleet becomes callable.</p>
+          <div class="code-block">
+            <div class="code-body" style="padding: 1rem 1.25rem; font-size: 0.78rem;">
+{<span class="flag">"mcpServers"</span>: {
+  <span class="flag">"wirehop"</span>: {
+    <span class="flag">"command"</span>: <span class="output">"npx"</span>,
+    <span class="flag">"args"</span>: [<span class="output">"-y"</span>, <span class="output">"@wirehop/wirehop"</span>, <span class="output">"mcp"</span>]
+  }
+}}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 2.5rem;">
+        The most useful tool it exposes is <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop_exec</code>: a sandbox that runs JavaScript with bindings for exec, fleet, transfer, and admin. For anything multi-step, an agent writes one small program instead of orchestrating twenty separate tool calls.
+      </p>
+
+      <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 2rem;">
+        <a href="security.html" class="btn btn-primary">What an agent can and can't reach</a>
+        <a href="orchestration.html" class="btn btn-ghost">Scheduled and recurring work</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer id="site-footer"></footer>
+
+  <script src="shared.js"></script>
+</body>
+</html>

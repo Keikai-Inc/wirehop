@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WireHop, Personal Cloud Automation</title>
-  <meta name="description" content="WireHop turns any machine into an always-on automation backend. Schedule cron jobs, store encrypted credentials, call external APIs, and let AI manage it all.">
+  <meta name="description" content="Schedule recurring AI jobs on your own machine. WireHop turns any machine into an always-on automation backend: cron jobs, encrypted credentials, external APIs, and an AI tool that can manage it all.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -342,6 +342,49 @@ hop.log(resp.status);  <span class="comment">// 200</span>
 <span class="output">  health-monitor      */5 * * * *     enabled</span>
 <span class="output">  security-baseline   0 3 * * *       enabled</span>
 <span class="output">  email-monitor       0 7 * * *       enabled</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scheduling AI jobs -->
+  <section id="ai-jobs" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Schedule recurring AI jobs</h2>
+        <p>Work that keeps running on your own machine after you close the laptop.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1.25rem;">A scheduled job here runs on a machine you own, on a schedule you set, using credentials that never leave it. It can call a model, act on the answer, and store the result, all without a session open and without a third-party automation service holding your keys.</p>
+          <ul class="daemon-features">
+            <li>Survives disconnects: the daemon runs it, not your terminal</li>
+            <li>Credentials stay encrypted on the machine that uses them</li>
+            <li>Your AI tool can create, inspect, and change schedules directly</li>
+            <li>Output is kept on the machine, queryable later</li>
+          </ul>
+          <a href="agents.html" class="btn btn-ghost" style="margin-top: 1.75rem;">How agents get set up &rarr;</a>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+            <span class="code-title">Your AI tool</span>
+          </div>
+          <div class="code-body">
+<span class="output">"every morning at 7, check the</span>
+<span class="output"> backup logs and email me anything</span>
+<span class="output"> that failed"</span>
+
+<span class="comment"># what it creates</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron create backup-check \
+    <span class="flag">--schedule</span> <span class="output">"0 7 * * *"</span>
+
+<span class="output">&rarr; runs on myserver, not your laptop</span>
+<span class="output">&rarr; keeps running after you disconnect</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron list
           </div>
         </div>
       </div>
