@@ -138,7 +138,7 @@
       </p>
 
       <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 1.25rem;">
-        WireHop has no such service. A machine's identity is a keypair written to disk the first time it runs, and membership is a document your machines replicate among themselves. Joining means redeeming a token minted by a machine you already control.
+        WireHop has no such service. A machine proves who it is with a key it generated itself, and the roster of who belongs is replicated directly between your own machines. Joining means redeeming a token minted by a machine you already control.
       </p>
 
       <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 1.25rem;">
@@ -221,6 +221,11 @@
           <div class="vs-label">Audit log</div>
           <div class="vs-ours">Per machine, local, no central collector</div>
           <div class="vs-theirs">Centralized in the console, with streaming to a SIEM</div>
+        </div>
+        <div class="vs-row">
+          <div class="vs-label">Source and licence</div>
+          <div class="vs-ours"><span class="vs-win">Fully open source</span> under MIT or Apache-2.0. Permissive: ship it in a closed-source product if you like</div>
+          <div class="vs-theirs">Client is open source (BSD-3); the hosted coordination server is not. Headscale is a separate community reimplementation</div>
         </div>
         <div class="vs-row">
           <div class="vs-label">Third-party security audit</div>

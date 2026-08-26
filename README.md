@@ -5,7 +5,9 @@ VPNs should be as simple as SSH.**
 
 WireHop is a tool you run, not a service you buy. There is no company between
 you and your machines, and that includes us: no accounts, no coordination
-server, nothing that can be shut off.
+server, nothing that can be shut off. It is fully open source under a
+**permissive** licence, so you can read every line, fork it, or ship it inside
+a closed-source product.
 
 WireHop ships a single binary, `hop`. Install it on two machines and they can
 find each other and talk — over an encrypted peer-to-peer QUIC connection —
