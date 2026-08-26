@@ -16,7 +16,7 @@ hop is a single-binary CLI tool that provides secure shell access, file transfer
 > **hop's defining guarantee is decentralization, not minimalism.** The wedge is
 > that hop runs **independent of any third party or central control plane** —
 > not that it avoids a background process. As hop grows into a full private
-> network (the **[warren](warren.md)** — shipped; VPN opt-in/off by default), members run a
+> network (the **[warren](warren.md)** — shipped; VPN on by default for new hosts), members run a
 > local daemon (like Tailscale's, but with no coordination server behind it).
 > "Single binary, no central anything" is the promise; a per-member daemon is
 > fully in keeping with it.
@@ -89,17 +89,20 @@ hop mcp                 # start MCP server on stdio
 
 ```bash
 hop invite --role developer       # role decides reach over the VPN
-hop config set vpn on             # opt into the warren VPN (off by default)
+hop config set vpn off            # opt OUT of the warren VPN (on by default for new hosts)
 hop admin myhost grant abc123 ops # change a member's reach later
 ```
 
 A daemon can bring up a built-in P2P VPN: a virtual IP in `100.64.0.0/10`,
-MagicDNS (`*.hop`), and role→tag reach (default-deny). The VPN is **off by
-default** (since v0.6.37) — opt in with `--host`, `HOP_VPN=1`, or `hop config set
-vpn on`. (It was default-on in v0.6.32–0.6.36; the default was reverted while the
-warren's write-authorization trust model is hardened — see [security.md](security.md)
-and the warren trust note in
-[../technical/warren-internals.md](../technical/warren-internals.md).) Bringup is fail-safe
+MagicDNS (`*.hop`), and role→tag reach (default-deny). The VPN is **on by
+default for a new host** (since v0.9.16) — opt out with `--host --no-vpn` or
+`hop config set vpn off`. A config file predating the `vpn_enabled` field stays
+**off** on upgrade, so updating an existing host never silently brings up a VPN.
+(It was off by default in v0.6.37–0.9.15, an interim mitigation for the warren
+write-authorization gap; that gap is now closed by anchor-conditional
+author-validation enforce — see [security.md](security.md) and the warren trust
+note in [../technical/warren-internals.md](../technical/warren-internals.md).)
+Bringup is fail-safe
 — if a TUN can't be created or the CGNAT range conflicts (e.g. Tailscale), it's
 skipped and shell/exec/transfer are unaffected. See [warren.md](warren.md).
 

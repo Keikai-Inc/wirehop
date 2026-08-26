@@ -309,7 +309,7 @@ no token re-issue.
 - **Virtual IP allocation** — every node claims a stable `100.64.0.0/10`
   address. *(0.6.27)*
 
-#### Shipped — VPN data plane *(opt-in; off by default since 0.6.37)*
+#### Shipped — VPN data plane *(on by default for new hosts since 0.9.16)*
 - **VPN data plane** — `hop/vpn/1` QUIC-datagram forwarding over a TUN device,
   federation via write ticket. *(0.6.28)*
 - **MagicDNS** resolver, configurable per-warren domain. *(0.6.28, 0.6.30)*
@@ -327,13 +327,16 @@ no token re-issue.
 - **Ingress authentication** *(0.6.37)*: inbound `hop/vpn/1` datagrams are
   accepted only from a registered peer, with a source vIP matching that peer's
   registration (anti-spoof) and a destination of this host's own vIP.
-- **Opt-in / off by default** *(0.6.37)*: the VPN was default-on in
-  0.6.32–0.6.36; the default was reverted to **off** while the warren write
-  model is hardened (see [security.md](security.md) and C1 in
-  [../technical/security.md](../technical/security.md)). Enable with
-  `--host`, `HOP_VPN=1`, or `hop config set vpn on`. `HostConfig.vpn_enabled`
-  (default `false`) and the `HOP_VPN` env var (`1`=force-on past the conflict
-  guard, `0`=off) control it. Bringup is best-effort: a TUN-creation failure or a
+- **Opt-in / off by default** *(0.6.37)*, **re-defaulted on** *(0.9.16)*: the VPN
+  was default-on in 0.6.32–0.6.36, reverted to **off** in 0.6.37 while the warren
+  write model was hardened, and defaulted **on for new hosts** again in 0.9.16
+  once anchor-conditional author-validation enforce closed C1 (see
+  [security.md](security.md) and [../technical/security.md](../technical/security.md)).
+  `HostConfig::default()` is now `vpn_enabled: true`, while a config file that
+  predates the field still deserializes to `false` so upgrades never silently
+  enable it. Opt out with `--host --no-vpn` or `hop config set vpn off`; the
+  `HOP_VPN` env var (`1`=force-on past the conflict
+  guard, `0`=off) overrides. Bringup is best-effort: a TUN-creation failure or a
   `100.64.0.0/10` conflict (e.g. a host already running Tailscale) only skips the
   VPN — **core access is never affected**.
 
@@ -355,7 +358,7 @@ See the roadmap below.
 | **Role cleanup** | ✅ Shipped (compat shim) | Converge `PeerRole` + `RoleDefinition` into one named role. Configurable least-privilege **org-default role** (`member`). **`hop admin <host> grant`** for post-invite elevation. |
 | **M1 — Invisible ACL** | ✅ Shipped | Role→tag→ACL derivation, resolved at enforcement time. Host tagging via role/invite. Turns the VPN from "default-deny, no way to open it" into "opens automatically by role." |
 | **M2 — Network membership** | ◑ Mostly | Invite-to-network-with-a-role, doc-replicated membership every node reads, receiver-side ACL enforcement, and **data-plane ingress authentication** (source-vIP anti-spoof, v0.6.37) — **shipped**. Write-isolation is **shipped** — `node`/`warren-only` members hold a *read* ticket and write only their own write-isolated self-doc; the shared admin doc is admin-authored. Still **deferred**: flipping per-author validation from observe to **enforce** by default, and the full cryptographic Owner/Admin write *capability* (see C1 in [../technical/security.md](../technical/security.md) and [../technical/warren-internals.md](../technical/warren-internals.md)). |
-| **M3 — Usable end to end** | ◑ Mostly | `--join` brings up the VPN + the **live multi-node TUN e2e** (Cedar reach + reboot reconvergence) — shipped. The VPN is **off by default** (opt in via `--host`/`HOP_VPN=1`/`hop config set vpn on`) while M2's write model is hardened. Client-vs-node redemption polish and MagicDNS OS auto-config (split-DNS) remain. |
+| **M3 — Usable end to end** | ◑ Mostly | `--join` brings up the VPN + the **live multi-node TUN e2e** (Cedar reach + reboot reconvergence) — shipped. The VPN is **on by default for a new host** since v0.9.16 (opt out via `--host --no-vpn`/`hop config set vpn off`; a config predating the field stays off on upgrade), now that M2's write model is hardened by anchor-conditional author-validation enforce. Client-vs-node redemption polish and MagicDNS OS auto-config (split-DNS) remain. |
 | **M4 — One-line onboarding** | ◑ Partial | Installer `--join`/primer flags + the website command builder — **shipped**. Folding the warren ticket *into* the invite token, and the `install.sh`/node-installer rename, remain. |
 
 The only command a founder ever types remains `hop invite --role X`. Everything
@@ -653,11 +656,16 @@ items below are kept for the record.)*
   The ACL is derived from roles×tags and enforced on the forwarding path,
   validated by a live multi-node TUN e2e (real ICMP, role-gated, 0% loss, plus
   reboot reconvergence). Inbound datagrams are authenticated (source-vIP
-  anti-spoof, v0.6.37). The VPN is **off by default** as of v0.6.37 (opt in via
-  `--host` / `HOP_VPN=1` / `vpn_enabled=true`); a TUN failure or CGNAT conflict
-  only skips it, never core access.
-- 🔧 **Members get a *write* ticket → any member could rewrite membership/ACL/`vpn`/`name`.**
-  Tracked as **C1** in [../technical/security.md](../technical/security.md).
+  anti-spoof, v0.6.37). The VPN is **on by default for a new host** as of v0.9.16
+  (opt out via `--host --no-vpn` / `hop config set vpn off`; a config predating
+  the field stays off on upgrade); a TUN failure or CGNAT conflict only skips it,
+  never core access.
+- ✅ **Member write capability is constrained.** `node`/`warren-only` members hold
+  a *read* ticket and write only their own write-isolated self-doc, and a
+  founder-anchored warren rejects forged `vpn`/`ip`/`name` bindings via
+  anchor-conditional author-validation enforce. This closed **C1**, the gap the
+  old VPN-off default was mitigating; see
+  [../technical/security.md](../technical/security.md).
   The reconciliation says writes must be Owner/Admin-capability-gated and members
   get a **read** replica. *Fix:* split read vs write capability in the
   invite/join path + per-author write validation on read. (Prerequisite for safe
