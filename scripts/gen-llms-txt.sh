@@ -24,11 +24,15 @@ mkdir -p "$OUT"
 cat > "$OUT/llms.txt" <<EOF
 # WireHop
 
-> Secure peer-to-peer remote access and private networks. A single binary
-> named \`hop\`: no accounts, no port forwarding, no central coordination
-> server. Identity is a keypair on disk; membership is a document the machines
-> gossip among themselves. Built so an AI agent can construct and operate the
-> whole thing without a browser or a third-party account.
+> Secure private networking and remote access for Agents and users alike.
+> VPNs should be as simple as SSH.
+>
+> WireHop is a tool you run, not a service you buy. There is no company between
+> you and your machines, and that includes the authors: no accounts, no port
+> forwarding, no central coordination server, nothing that can be shut off.
+> Identity is a keypair on disk; membership is a document the machines gossip
+> among themselves. Built so an AI agent can construct and operate the whole
+> thing without a browser or a third-party account.
 
 Version: ${VERSION} · Repository: ${REPO} · License: MIT OR Apache-2.0
 

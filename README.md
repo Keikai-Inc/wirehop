@@ -1,7 +1,11 @@
 # WireHop
 
-**Reach any of your machines from anywhere — one binary, no accounts, no port
-forwarding, no central server.**
+**Secure private networking and remote access for Agents and users alike.
+VPNs should be as simple as SSH.**
+
+WireHop is a tool you run, not a service you buy. There is no company between
+you and your machines, and that includes us: no accounts, no coordination
+server, nothing that can be shut off.
 
 WireHop ships a single binary, `hop`. Install it on two machines and they can
 find each other and talk — over an encrypted peer-to-peer QUIC connection —
