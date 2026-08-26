@@ -1,6 +1,8 @@
 # WireHop
 
-Secure peer-to-peer remote access and private networks: a single binary, no
+Secure private networking and remote access for Agents and users alike. VPNs
+should be as simple as SSH. A tool you run, not a service you buy: a single
+binary, no
 accounts, no port forwarding, no central coordination server. Install it on two
 machines and they find each other and talk over an encrypted P2P QUIC
 connection, whatever networks they're on.
