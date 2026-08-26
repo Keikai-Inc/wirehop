@@ -54,6 +54,34 @@ containers and exercises the full connection/auth/exec/transfer/fleet surface.
 After Rust changes ALWAYS use `REBUILD=1 ./tests/e2e/run.sh` — the harness
 skips the cross-build otherwise and you'd test a stale binary.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request and **needs no
+secrets**, so it runs green on fork PRs:
+
+| job | what it gates |
+|---|---|
+| `test` (ubuntu + macOS) | clippy `-D warnings --all-targets`, workspace tests, release build, binary-version match |
+| `shell scripts` | `bash -n` over every tracked `.sh`, plus `shellcheck -S error` |
+| `workflow lint` | actionlint |
+| `site style` | `./site/check-style.sh` |
+
+Run the same checks locally before pushing:
+
+```bash
+RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
+cargo test --workspace
+./site/check-style.sh
+```
+
+**The OS matrix is load-bearing.** Code behind `#[cfg(target_os = ...)]` is only
+linted on the platform that compiles it, so clippy on a Mac cannot see a Linux
+lint (or vice versa). If you touch platform-gated code, expect CI to know things
+your laptop does not.
+
+`cargo fmt --check` is intentionally not a gate; the tree is not rustfmt-clean
+and normalising it is a separate change.
+
 ### Gate harnesses
 
 `tests/e2e/` also holds harnesses that each enforce one product claim and commit
