@@ -112,12 +112,26 @@ HOWTO
     printf '   .p12 export password (the one you chose at export): '
     read -rs P12_PASS; echo
   fi
+  # Verify, but distinguish "wrong password" from "this openssl cannot read
+  # this format" -- and never hard-fail on the latter. macOS ships LibreSSL,
+  # which rejects `-legacy` outright, while OpenSSL 3.x needs it for the
+  # old-format PKCS#12 that `security export` produces. Treating an unparseable
+  # file as a bad password blocks a perfectly good upload, which is exactly
+  # what happened the first time this ran. The runner imports with
+  # `security import`, not openssl, so openssl's opinion is advisory.
   for f in "$APP_P12" "$INST_P12"; do
-    openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys -legacy >/dev/null 2>&1 \
-      || openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys >/dev/null 2>&1 \
-      || die "password does not open $f"
+    out="$(openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys 2>&1 \
+           || openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys -legacy 2>&1)"
+    if printf '%s' "$out" | grep -q 'subject'; then
+      echo "   verified: $(basename "$f")"
+    elif printf '%s' "$out" | grep -qiE 'mac verify (failure|error)|invalid password|wrong password'; then
+      die "wrong password for $f (MAC verify failed)"
+    else
+      echo "   WARNING: this openssl ($(openssl version | cut -d' ' -f1-2)) cannot"
+      echo "            parse $(basename "$f"); skipping local verification."
+      echo "            The runner uses \`security import\`, which is unaffected."
+    fi
   done
-  echo "   both .p12 files verified"
 
   base64 -i "$APP_P12"  | set_secret APPLE_CERT_APPLICATION_P12
   base64 -i "$INST_P12" | set_secret APPLE_CERT_INSTALLER_P12
