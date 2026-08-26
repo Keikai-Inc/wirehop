@@ -9,23 +9,30 @@
 # via stdin. No value is ever echoed, passed as an argv (visible in `ps`), or
 # written to a temp file that outlives the run.
 #
-#   ./scripts/setup-ci-secrets.sh --app-p12 ~/Desktop/app.p12 \
-#                                 --installer-p12 ~/Desktop/installer.p12
+# The .p12 export must happen FIRST; this script only uploads. Either:
 #
-# Exporting the two .p12 files first (Keychain Access):
-#   1. Keychain Access -> login -> My Certificates
-#   2. Select "Developer ID Application: ..." -> File -> Export Items -> .p12
-#   3. Same for "Developer ID Installer: ..."
-#   4. Use the SAME password for both; this script asks for it once.
-#   Delete both files afterwards: they are your signing identity.
+#   A. one bundle straight from the keychain (no GUI navigation) --
+#        security find-identity -v      # check what will be included
+#        security export -k ~/Library/Keychains/login.keychain-db \
+#          -t identities -f pkcs12 -P 'pick-a-password' -o ~/wirehop-certs.p12
+#        ./scripts/setup-ci-secrets.sh --identities-p12 ~/wirehop-certs.p12
+#
+#   B. or two files via Keychain Access (login -> My Certificates -> export
+#      each Developer ID cert, SAME password for both) --
+#        ./scripts/setup-ci-secrets.sh --app-p12 ~/app.p12 --installer-p12 ~/installer.p12
+#
+# Run with no cert flags to set only the non-Apple secrets.
+# Delete the .p12 files afterwards: they are your signing identity.
 set -uo pipefail
 
 REPO="${HOP_PUBLIC_REPO:-Keikai-Inc/wirehop}"
-APP_P12="" ; INST_P12="" ; ASC_P8="" ; KEY_ID="" ; ISSUER=""
+APP_P12="" ; INST_P12="" ; BOTH_P12="" ; ASC_P8="" ; KEY_ID="" ; ISSUER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --app-p12)       APP_P12="$2"; shift 2 ;;
     --installer-p12) INST_P12="$2"; shift 2 ;;
+    # One file holding BOTH identities, as `security export` produces.
+    --identities-p12) BOTH_P12="$2"; shift 2 ;;
     --asc-p8)        ASC_P8="$2"; shift 2 ;;
     --asc-key-id)    KEY_ID="$2"; shift 2 ;;
     --asc-issuer)    ISSUER="$2"; shift 2 ;;
@@ -47,9 +54,40 @@ set_secret() { gh secret set "$1" --repo "$REPO" >/dev/null && ok "$1"; }
 say "Target repository: $REPO"
 
 # ── Apple signing identities ────────────────────────────────────────────────
+# A single --identities-p12 stands in for both: the workflow imports the file
+# and then selects identities BY NAME, so one bundle containing both is fine.
+if [ -n "$BOTH_P12" ]; then APP_P12="$BOTH_P12"; INST_P12="$BOTH_P12"; fi
+
 if [ -n "$APP_P12" ] || [ -n "$INST_P12" ]; then
-  [ -f "$APP_P12" ]  || die "--app-p12 not found: $APP_P12"
-  [ -f "$INST_P12" ] || die "--installer-p12 not found: $INST_P12"
+  if [ ! -f "$APP_P12" ] || [ ! -f "$INST_P12" ]; then
+    cat >&2 <<'HOWTO'
+ERROR: certificate file(s) not found.
+
+The .p12 export has to happen first; this script only uploads. Two ways:
+
+  A. One command (try this first). Exports every code-signing identity in your
+     login keychain into one bundle. Check what that includes first:
+
+       security find-identity -v          # expect the two Developer ID certs
+
+       security export -k ~/Library/Keychains/login.keychain-db \
+         -t identities -f pkcs12 -P 'pick-a-password' -o ~/wirehop-certs.p12
+
+     macOS may show an "allow access" prompt per key; click Allow. Then:
+
+       ./scripts/setup-ci-secrets.sh --identities-p12 ~/wirehop-certs.p12
+
+  B. Keychain Access, if you would rather export only the two:
+       login -> My Certificates -> select "Developer ID Application: ..."
+       -> File -> Export Items -> .p12, then the same for "Developer ID
+       Installer: ...". Use the SAME password for both. Then:
+
+       ./scripts/setup-ci-secrets.sh --app-p12 ~/app.p12 --installer-p12 ~/installer.p12
+
+  Delete the .p12 files afterwards: they are your signing identity.
+HOWTO
+    exit 1
+  fi
 
   say "Apple certificates"
   # Read the export password once, without echo, and verify it actually opens
