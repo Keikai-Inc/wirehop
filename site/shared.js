@@ -25,7 +25,7 @@
 
     navEl.innerHTML =
       '<a href="index.html" class="nav-brand">' +
-        '<img src="hop-icon.png" alt="hop" style="height:1.5rem;width:auto;filter:brightness(0) invert(1);"> hop' +
+        '<img src="hop-icon.png" alt="WireHop" style="height:1.5rem;width:auto;filter:brightness(0) invert(1);"> WireHop' +
       '</a>' +
       '<button class="nav-toggle" aria-label="Toggle navigation" ' +
         'onclick="document.querySelector(\'.nav-links\').classList.toggle(\'open\')">' +
