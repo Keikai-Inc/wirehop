@@ -292,7 +292,7 @@ pub fn sandboxed_shell(
         let _ = broker_config_dir;
         // On Linux, the sandbox is applied via a self-exec wrapper:
         // hop __sandbox-shell --policy <json> -- <shell> <args>
-        return linux::sandboxed_shell_command(policy, shell, username);
+        linux::sandboxed_shell_command(policy, shell, username)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
