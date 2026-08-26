@@ -203,7 +203,7 @@ denies that peer's next session, with no second admin required.
 
 #### VPN data plane (`hop/vpn/1`)
 
-When the VPN is enabled (off by default; see below), `NetDoc::enable_vpn`:
+When the VPN is enabled (on by default for new hosts; see below), `NetDoc::enable_vpn`:
 
 1. claims a stable virtual IP in `100.64.0.0/10` (deterministic hash + doc claim),
 2. creates a TUN device (`vpn::create_tun`, utun on macOS / `/dev/net/tun` on
@@ -278,10 +278,14 @@ transient gap from black-holing the tunnel rather than only degrading it:
   relay, which is what interrupts sync and strands content in the first place;
   the lock is the guarantee that exactly one worker exists.
 
-**Off by default, fail-safe.** As of v0.6.37 the VPN is off unless explicitly
-enabled (`--host` / `HOP_VPN=1` / `hop config set vpn on`) — the default was
-reverted while the warren's write-authorization trust model is hardened (see
-[Peer-to-Peer Private Network](#peer-to-peer-private-network-design) and `security.md` C1). Bringup is
+**On by default for new hosts, fail-safe.** As of v0.9.16 `HostConfig::default()`
+sets `vpn_enabled: true`, so a fresh `hop host` / `--host` install brings the VPN
+up; opt out with `--host --no-vpn` or `hop config set vpn off`. A config file that
+predates the field deserializes to `false`, so upgrading an existing host never
+silently enables it. (It was off by default in v0.6.37–v0.9.15 while the warren's
+write-authorization trust model was hardened; anchor-conditional
+author-validation enforce closed that gap — see
+[Peer-to-Peer Private Network](#peer-to-peer-private-network-design) and `security.md` C1.) Bringup is
 best-effort: if the TUN can't be created or `cgnat_range_in_use()` finds the
 `100.64.0.0/10` range already claimed by another interface (e.g. Tailscale), the
 VPN is skipped and the daemon serves normally. `HOP_VPN=1` forces past the
@@ -524,7 +528,7 @@ Written as append-only JSONL (one JSON object per line). The file is opened with
 
 ## Peer-to-Peer Private Network (Design)
 
-> **Status: MVP shipped — VPN off by default, as of v0.6.37.** The role-based
+> **Status: MVP shipped — VPN on by default for new hosts, as of v0.9.16.** The role-based
 > warren MVP (all 8 build-plan steps below) is implemented and validated by a
 > live multi-node TUN e2e (`tests/e2e/vpn-e2e.sh`, including reboot
 > reconvergence) plus the 53-test regression suite. The VPN data plane was
@@ -868,7 +872,7 @@ the proving ground for the doc and addressing before any commercial work.
 |-------|-------|-------------------|
 | **1. Decentralize state** ✅ *(per-host)* | Replace `peers.json`/`roles.json` with an iroh-docs replica. Migrate existing JSON on first start. Keep all current features (shell, exec, transfer, fleet, MCP). | Invites work even when the inviter is offline. |
 | **2. Virtual IPs** ✅ | Deterministic-proposal + doc-claim allocation (#2). Claimed per host on startup. | Tests conflict resolution without TUN complexity. |
-| **3. VPN packet plane** ✅ *(opt-in, best-effort)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket, **ingress authentication** (source-vIP anti-spoof, v0.6.37). Off by default (`--host`/`HOP_VPN=1`/`hop config set vpn on` to enable); skips gracefully on TUN failure / CGNAT conflict (`HOP_VPN=0` escape hatch). | Actual P2P LAN reachability. |
+| **3. VPN packet plane** ✅ *(opt-in, best-effort)* | TUN/utun (#6), `hop/vpn/1` over QUIC datagrams (#5), daemon-to-daemon forwarding, federation via write ticket, **ingress authentication** (source-vIP anti-spoof, v0.6.37). On by default for new hosts since v0.9.16 (`--host --no-vpn`/`hop config set vpn off` to opt out; a config predating the field stays off on upgrade); skips gracefully on TUN failure / CGNAT conflict (`HOP_VPN=0` escape hatch). | Actual P2P LAN reachability. |
 | **4. DNS + ACL** ✅ *(active when VPN enabled)* | MagicDNS resolver for `*.hop` (#7); role→tag→ACL filter on the forwarding path (#8, default-deny). Active whenever the VPN is enabled. | Friendly names + safe service exposure. |
 | **5. Commercial control plane** | Pluggable org-key trust root (#9), short-lived credentials (#4), user/device split already in place (#10), group/tag ACLs (#8/#10). | Strict, provable revocation for businesses. |
 | **6. Enterprise integration** | IdP bridge (#11), data-plane audit export (#12), network-lock co-signing (#13), key custody/recovery (#14). | SSO, SOC 2, key safety. |

@@ -174,20 +174,24 @@ you assign one role and both are set coherently. See
 
 ### Warren VPN security posture
 
-The VPN data plane is **off by default** (since v0.6.37) and **fail-safe** when
-enabled. Opt in with `--host`, `HOP_VPN=1`, or `hop config set vpn on`; the
-installer's node path (`--host`) enables it, and `--no-vpn` keeps it off. Bringup
-is best-effort, so a TUN-creation failure or a `100.64.0.0/10` conflict (e.g. a
-host already running Tailscale) only skips the VPN — `hop exec`/shell/transfer
-over the existing authenticated channels are never affected. `HOP_VPN=1` forces
-bringup past the conflict guard; `HOP_VPN=0` is a recovery escape hatch.
+The VPN data plane is **on by default for a new host** (since v0.9.16) and
+**fail-safe**. Opt out with `--host --no-vpn` or `hop config set vpn off`. A
+config file that predates the `vpn_enabled` field deserializes to **off**, so
+upgrading an existing host never silently brings up a VPN — only brand-new
+configs default on. Bringup is best-effort, so a TUN-creation failure or a
+`100.64.0.0/10` conflict (e.g. a host already running Tailscale) only skips the
+VPN — `hop exec`/shell/transfer over the existing authenticated channels are
+never affected. `HOP_VPN=1` forces bringup past the conflict guard; `HOP_VPN=0`
+is a recovery escape hatch.
 
-**Why off by default.** The warren's shared document is currently a *write-open*
-trust model — every member holds a `ShareMode::Write` ticket, so per-author write
-authorization is not yet enforced (tracked as **C1** in
-[../technical/security.md](../technical/security.md)). Defaulting the
-VPN off shrinks the blast radius to nodes that have deliberately opted in while
-that trust model is hardened.
+**Why it is safe to default on.** The VPN was off by default in v0.6.37–0.9.15
+as an interim mitigation: the warren's shared document was a *write-open* trust
+model, where every member held a `ShareMode::Write` ticket and per-author write
+authorization was not enforced (tracked as **C1**). That gap is now closed by
+**anchor-conditional author-validation enforce** — a founder-anchored warren
+rejects forged `vpn`/`ip`/`name` bindings (see `netdoc::ValidationMode` and C1 in
+[../technical/security.md](../technical/security.md)). With the
+condition the old default was mitigating removed, the default was restored.
 
 **Ingress is authenticated (v0.6.37).** Independent of the write model, inbound
 `hop/vpn/1` datagrams are dropped unless (a) the connecting node is a registered
