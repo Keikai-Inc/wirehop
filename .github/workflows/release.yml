@@ -169,22 +169,49 @@ jobs:
           done
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
-          # Prepend to the search list so codesign/productbuild find the identities.
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # Prepend to the search list so codesign/productbuild find the identities,
+          # WITHOUT dropping the ones already there (losing the login keychain
+          # mid-job breaks anything else that needs it). Collected into an array
+          # rather than relying on word splitting; macOS runners are bash 3.2,
+          # so `mapfile` is not available.
+          EXISTING=()
+          while IFS= read -r kc; do
+            [ -n "$kc" ] && EXISTING+=("$kc")
+          done < <(security list-keychains -d user | tr -d '"' | sed 's/^ *//;s/ *$//')
+          security list-keychains -d user -s "$KEYCHAIN" "${EXISTING[@]}"
           rm -f "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
           security find-identity -v -p codesigning "$KEYCHAIN"
 
+      # Two accepted credential shapes, so this is not blocked on creating an
+      # App Store Connect key. The .p8 API key is preferred (scoped, revocable
+      # on its own, carries no Apple ID); an app-specific password is the
+      # fallback and is what an existing local `notarytool store-credentials`
+      # setup already uses.
       - name: Store notarization credentials
         env:
           KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          echo "$KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
-          xcrun notarytool store-credentials wirehop-notary \
-            --key "$RUNNER_TEMP/asc.p8" --key-id "$KEY_ID" --issuer "$ISSUER"
-          rm -f "$RUNNER_TEMP/asc.p8"
+          if [ -n "${KEY_P8:-}" ]; then
+            echo "Using App Store Connect API key"
+            echo "$KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+            xcrun notarytool store-credentials wirehop-notary \
+              --key "$RUNNER_TEMP/asc.p8" --key-id "$KEY_ID" --issuer "$ISSUER"
+            rm -f "$RUNNER_TEMP/asc.p8"
+          elif [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+            echo "Using Apple ID + app-specific password"
+            xcrun notarytool store-credentials wirehop-notary \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$TEAM_ID"
+          else
+            echo "::error::No notarization credentials. Set APPLE_API_KEY_P8 (+ KEY_ID, ISSUER)" \
+                 "or APPLE_ID + APPLE_APP_PASSWORD + APPLE_TEAM_ID."
+            exit 1
+          fi
 
       - name: Build signed + notarized .pkg
         env:
@@ -266,14 +293,23 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           [ -n "${{ inputs.version }}" ] && VERSION="${{ inputs.version }}"
-          {
-            printf 'WireHop v%s — single binary `hop`.\n\n' "$VERSION"
-            printf '```bash\n'
-            printf 'curl -fsSL https://wirehop.org/install.sh | bash\n'
-            printf '```\n\n'
-            printf 'Installers are **signed and notarized**; binaries carry '
-            printf '`.sha256` and `.sig` sidecars verified by `install.sh`.\n'
-          } > "$RUNNER_TEMP/notes.md"
+          # Quoted heredoc: the body is literal markdown, so the backticks are
+          # not command substitution and $VERSION is substituted by sed after.
+          cat > "$RUNNER_TEMP/notes.md" <<'MD'
+          WireHop vVERSION_PLACEHOLDER — single binary `hop`.
+
+          ```bash
+          curl -fsSL https://wirehop.org/install.sh | bash
+          ```
+
+          Installers are **signed and notarized**; binaries carry `.sha256` and
+          `.sig` sidecars verified by `install.sh`.
+          MD
+          # Strip the YAML block indentation, then fill in the version.
+          sed -i '' -e 's/^          //' -e "s/VERSION_PLACEHOLDER/${VERSION}/" \
+            "$RUNNER_TEMP/notes.md" 2>/dev/null \
+            || sed -i -e 's/^          //' -e "s/VERSION_PLACEHOLDER/${VERSION}/" \
+                 "$RUNNER_TEMP/notes.md"
           gh release create "v${VERSION}" dist/* \
             --title "WireHop v${VERSION}" \
             --notes-file "$RUNNER_TEMP/notes.md" \

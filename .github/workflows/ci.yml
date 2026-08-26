@@ -1,0 +1,116 @@
+# Continuous integration: what must be true of every push and pull request.
+#
+# Deliberately does NOT need any secret. Fork pull requests get no secrets from
+# GitHub, so a CI workflow that depended on one would fail for every outside
+# contributor and make the project look broken to exactly the people we want
+# contributing. The release workflow is where credentials live.
+#
+# The OAuth client id/secret are build-time inputs (crates/hop-cli/build.rs).
+# They are absent here on purpose: build.rs must degrade to an unbaked binary
+# rather than fail, and this job is what proves it still does.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ci-${{ matrix.os }}
+
+      # NOTE: `cargo fmt --check` is deliberately NOT a gate. The tree has never
+      # been rustfmt-clean; running it rewrites 105 files / ~8k lines and does
+      # not even converge in one pass. That reformat may well be worth doing,
+      # but it is a separate decision with a blast radius of its own (blame,
+      # in-flight branches), not a precondition for CI going green.
+      #
+      # Clippy IS a gate: CLAUDE.md/AGENTS.md make warnings non-negotiable, and
+      # RUSTFLAGS=-D warnings above turns any warning into a failure.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p hop-cli
+
+      - name: Binary runs and reports the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          GOT="$(./target/release/hop --version | awk '{print $2}')"
+          echo "Cargo.toml=$EXPECTED  binary=$GOT"
+          [ "$EXPECTED" = "$GOT" ] || { echo "version mismatch"; exit 1; }
+
+  # The shipped shell surface is as load-bearing as the Rust: install.sh is the
+  # documented way to get WireHop, and a syntax error there breaks every new
+  # user while the Rust tests stay green.
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Syntax-check every tracked shell script
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done < <(git ls-files '*.sh')
+          exit "$fail"
+      - name: Shellcheck the installers and release tooling
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # -S error: style/info findings across a large legacy script surface
+          # would be noise; genuine errors must not merge.
+          shellcheck -S error install.sh install-daemon.sh scripts/*.sh pkg/*.sh
+
+  # The release workflow only ever executes on a tag push, so a mistake in it is
+  # discovered at the worst possible moment. Lint it on every change instead.
+  workflows:
+    name: workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  site:
+    name: site style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Enforces the mechanical half of site/STYLE.md: em-dashes, undefined CSS
+      # classes, dead internal links, anchors with no colour, and WCAG AA
+      # contrast. Every one of these has shipped to production at least once.
+      - name: Check site style
+        run: ./site/check-style.sh
