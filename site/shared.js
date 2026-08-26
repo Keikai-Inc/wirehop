@@ -3,11 +3,15 @@
     { label: 'Features',     href: '#features',     cross: 'index.html#features' },
     { label: 'Install',      href: '#install',      cross: 'index.html#install' },
     { label: 'How It Works', href: '#how-it-works', cross: 'index.html#how-it-works' },
-    { label: 'AI Agents',    href: '#ai-agents',    cross: 'index.html#ai-agents' },
+    { label: 'AI Agents',    href: 'agents.html',   cross: 'agents.html' },
     { label: 'Private Network', href: '#private-network', cross: 'index.html#private-network' },
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
+    { label: 'Security',     href: 'security.html', cross: 'security.html' },
   ];
+
+  // Pages that get an "active" nav highlight, matched on a path substring.
+  var PAGE_MATCH = ['fleet', 'orchestration', 'agents', 'security', 'vs-tailscale'];
 
   var path = location.pathname;
   var onIndex = path === '/' || path.endsWith('/index.html') || path.endsWith('/index') || /\/site\/?$/.test(path);
@@ -18,8 +22,14 @@
     var items = NAV_LINKS.map(function (link) {
       var url = (onIndex || !link.href.startsWith('#')) ? link.href : link.cross;
       var cls = '';
-      if (!onIndex && link.href === 'fleet.html' && path.indexOf('fleet') !== -1) cls = ' class="active"';
-      if (!onIndex && link.href === 'orchestration.html' && path.indexOf('orchestration') !== -1) cls = ' class="active"';
+      if (!onIndex) {
+        for (var i = 0; i < PAGE_MATCH.length; i++) {
+          if (link.href === PAGE_MATCH[i] + '.html' && path.indexOf(PAGE_MATCH[i]) !== -1) {
+            cls = ' class="active"';
+            break;
+          }
+        }
+      }
       return '<li><a href="' + url + '"' + cls + '>' + link.label + '</a></li>';
     }).join('');
 

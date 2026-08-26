@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WireHop Security Model</title>
+  <meta name="description" content="What an AI agent with WireHop access can and cannot do. Invite scoping, role-based reach, sandboxing, per-machine audit logs, and signed releases. Including what WireHop does not protect you from.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    /* --- Security page overrides --------------------------------------------- */
+
+    .can-cant {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.5rem;
+      margin-top: 2.5rem;
+    }
+
+    .can-cant > * { min-width: 0; }
+
+    .cc-panel {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      padding: 1.75rem;
+    }
+
+    .cc-panel h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.05rem;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+    }
+
+    .cc-panel ul {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .cc-panel li {
+      color: var(--color-text-secondary);
+      font-size: 0.925rem;
+      line-height: 1.6;
+      padding-left: 1.25rem;
+      position: relative;
+    }
+
+    .cc-panel li::before {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    .cc-yes li::before { content: "\2713"; color: var(--color-accent-green); }
+    .cc-no  li::before { content: "\2715"; color: var(--color-primary); }
+
+    /* --- Honest-limits callout ----------------------------------------------- */
+
+    .limits {
+      background: rgba(245, 158, 11, 0.06);
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      border-radius: 0.75rem;
+      padding: 1.75rem 2rem;
+      margin-top: 2.5rem;
+    }
+
+    .limits h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.05rem;
+      color: var(--color-accent-amber);
+      margin-bottom: 0.875rem;
+    }
+
+    .limits ul { list-style: none; display: flex; flex-direction: column; gap: 0.875rem; }
+
+    .limits li {
+      color: var(--color-text-secondary);
+      font-size: 0.925rem;
+      line-height: 1.65;
+    }
+
+    .limits li strong { color: var(--color-text); }
+
+    /* --- Layer table ---------------------------------------------------------- */
+
+    .layers { margin-top: 2.5rem; display: flex; flex-direction: column; gap: 1rem; }
+
+    .layer {
+      display: grid;
+      grid-template-columns: 11rem 1fr;
+      gap: 1.5rem;
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      padding: 1.5rem 1.75rem;
+      align-items: start;
+    }
+
+    .layer > * { min-width: 0; }
+
+    .layer-name {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--color-text);
+    }
+
+    .layer-name span {
+      display: block;
+      font-family: var(--font-body);
+      font-weight: 400;
+      font-size: 0.8rem;
+      color: var(--color-text-tertiary);
+      margin-top: 0.25rem;
+    }
+
+    .layer p { color: var(--color-text-secondary); font-size: 0.925rem; line-height: 1.65; }
+
+    .layer code {
+      font-family: var(--font-mono);
+      font-size: 0.825rem;
+      color: var(--color-accent-teal);
+    }
+
+    /* --- Scope table ---------------------------------------------------------- */
+
+    .scope-table {
+      margin-top: 2rem;
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      overflow: hidden;
+    }
+
+    .scope-row {
+      display: grid;
+      grid-template-columns: 16rem 1fr;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .scope-row:last-child { border-bottom: none; }
+
+    .scope-row > div { padding: 0.875rem 1.25rem; font-size: 0.9rem; min-width: 0; }
+
+    .scope-flag {
+      font-family: var(--font-mono);
+      font-size: 0.825rem;
+      color: var(--color-accent-teal);
+      background: rgba(255, 255, 255, 0.02);
+      border-right: 1px solid var(--color-border);
+      word-break: break-word;
+    }
+
+    .scope-desc { color: var(--color-text-secondary); }
+
+    @media (max-width: 860px) {
+      .can-cant { grid-template-columns: 1fr; }
+      .layer { grid-template-columns: 1fr; gap: 0.75rem; }
+      .scope-row { grid-template-columns: 1fr; }
+      .scope-flag { border-right: none; border-bottom: 1px solid var(--color-border); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Security model</div>
+    <h1>What it can reach,<br><span class="gradient">and what it can't</span></h1>
+    <p>WireHop hands a person or an AI agent real access to real machines. That is worth being precise about. This page is the honest version: the boundaries, how they are enforced, and where they stop.</p>
+    <div class="hero-actions">
+      <a href="#agent" class="btn btn-primary">If an agent is compromised</a>
+      <a href="#limits" class="btn btn-ghost">What this doesn't protect you from</a>
+    </div>
+  </div>
+
+  <!-- First principles -->
+  <div style="border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border); background: var(--color-surface);">
+    <div class="container" style="padding-top: 1.25rem; padding-bottom: 1.25rem; text-align: center;">
+      <p style="margin: 0; color: var(--color-text-secondary); font-size: 1rem;">
+        <strong style="color: var(--color-text);">There is no WireHop server.</strong> No account, no coordination service, no company that could be breached to reach your machines. There is nothing in the middle to compromise.
+      </p>
+    </div>
+  </div>
+
+  <!-- The agent question -->
+  <section id="agent">
+    <div class="container">
+      <div class="section-header">
+        <h2>If your AI agent is compromised</h2>
+        <p>The fair question to ask about any tool that lets software run commands on your machines. Here is the actual answer.</p>
+      </div>
+
+      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8;">
+        An agent using WireHop holds exactly one thing: an <strong>invite</strong> that was issued to it. An invite is a single-use, time-limited token, and it carries the limits you set when you made it. It is not a master key, and it cannot grant itself more than it was given.
+      </p>
+
+      <div class="can-cant">
+        <div class="cc-panel cc-yes">
+          <h3>What a scoped agent can do</h3>
+          <ul>
+            <li>Reach only the machines its role permits, and nothing else on your network</li>
+            <li>Run only the commands you allowed, if you set an allowlist</li>
+            <li>Read only the paths you scoped it to</li>
+            <li>Work until the invite expires, then stop</li>
+          </ul>
+        </div>
+        <div class="cc-panel cc-no">
+          <h3>What it cannot do</h3>
+          <ul>
+            <li>Escalate its own role, or mint invites, unless you gave it admin</li>
+            <li>Reach a machine whose tags its role doesn't cover: forwarding is default-deny</li>
+            <li>Write anywhere, if the invite is read-only</li>
+            <li>Act without a record: every machine keeps its own audit log</li>
+          </ul>
+        </div>
+      </div>
+
+      <p style="color: var(--color-text-tertiary); font-size: 0.925rem; max-width: 46rem; line-height: 1.8; margin-top: 2rem;">
+        The practical advice: give an agent the least invite that works. A monitoring agent wants <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">--tier client --read-only</code> with two or three allowed commands, not a full member of your network.
+      </p>
+
+      <div class="code-block" style="margin-top: 2rem;">
+        <div class="code-header">
+          <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+          <span class="code-title">Scoping an invite for an agent</span>
+        </div>
+        <div class="code-body">
+<span class="comment"># A monitoring agent: read-only, two commands, one machine, 1 hour</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--tier client --read-only</span> \
+    <span class="flag">--allow-command</span> df <span class="flag">--allow-command</span> uptime <span class="flag">--expiry</span> 3600
+
+<span class="comment"># A deploy agent: scoped to one directory, no network egress</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--preset</span> deploy <span class="flag">--scope</span> /var/www <span class="flag">--no-network</span>
+
+<span class="comment"># See what it actually did, on the machine it did it to</span>
+<span class="prompt">$</span> <span class="cmd">hop audit</span> <span class="flag">--since</span> 1h
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Two independent gates -->
+  <section id="layers" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Two independent gates</h2>
+        <p>Reach and confinement are separate questions, enforced separately. Both must allow an action.</p>
+      </div>
+
+      <div class="layers">
+        <div class="layer">
+          <div class="layer-name">Reach<span>can it connect at all?</span></div>
+          <div>
+            <p>Every member has a <strong>role</strong> (<code>member</code>, <code>developer</code>, <code>ops</code>, …) and every machine has <strong>tags</strong>. A packet is forwarded only if the sender's role covers the destination's tags. This is <strong>default-deny</strong>: a role with no tags reaches nothing, so a new member starts with no reach and gains it by being granted a role, not by editing a policy file.</p>
+          </div>
+        </div>
+        <div class="layer">
+          <div class="layer-name">Confinement<span>what may it do once in?</span></div>
+          <div>
+            <p>A session runs inside an OS-enforced sandbox: <strong>Seatbelt</strong> on macOS, <strong>Landlock</strong> on Linux. It governs which commands may run, which paths are visible, and whether outbound network is allowed. A client can ask for <em>more</em> restriction than the host set, never less: the two policies merge to the stricter of each.</p>
+          </div>
+        </div>
+        <div class="layer">
+          <div class="layer-name">Privilege<span>as whom does it run?</span></div>
+          <div>
+            <p>The daemon may listen as root, but shells, commands, and file transfers all run as the ordinary user bound into the invite. That user is fixed when the invite is made and <strong>cannot be changed by whoever redeems it</strong>.</p>
+          </div>
+        </div>
+        <div class="layer">
+          <div class="layer-name">Record<span>what happened?</span></div>
+          <div>
+            <p>Every machine writes its own audit log of connections, sessions, commands, transfers, and denials. There is no central collector to tamper with or subpoena, and no telemetry leaves your machines. Read it with <code>hop audit</code>.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Invite scoping reference -->
+  <section id="scoping" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Everything an invite can restrict</h2>
+        <p>Set these when you mint the token. They travel with it and cannot be widened by the recipient.</p>
+      </div>
+
+      <div class="scope-table">
+        <div class="scope-row">
+          <div class="scope-flag">--tier client</div>
+          <div class="scope-desc">Reach this one machine only. No membership in your private network.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--tier warren-only</div>
+          <div class="scope-desc">On your private network (we call one a <em>warren</em>), but refused a shell on the host.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--tier node</div>
+          <div class="scope-desc">Full member: reachable, with a virtual address and a name.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--tier admin</div>
+          <div class="scope-desc">Member, plus the ability to mint invites and grant roles. Give this sparingly.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--read-only</div>
+          <div class="scope-desc">No writes, deletes, or modifications to the filesystem.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--no-network</div>
+          <div class="scope-desc">No outbound network from anything the session runs.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--scope PATH</div>
+          <div class="scope-desc">Only these paths are visible. Repeatable.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--allow-command CMD</div>
+          <div class="scope-desc">Only these commands may run. Repeatable.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--preset monitor|audit|deploy</div>
+          <div class="scope-desc">Ready-made bundles of the above for common jobs.</div>
+        </div>
+        <div class="scope-row">
+          <div class="scope-flag">--expiry SECS</div>
+          <div class="scope-desc">How long the token stays redeemable. Defaults to 15 minutes.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Crypto and supply chain -->
+  <section id="crypto" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Identity, transport, and the binary itself</h2>
+        <p>What protects the connection, and what protects the thing you downloaded.</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card card-teal">
+          <h3>Identity is a keypair</h3>
+          <p>Each machine has an Ed25519 key generated on first run and stored with owner-only permissions. There is no account to phish and no password to reuse. Losing the key is losing the identity, which is the point.</p>
+        </div>
+        <div class="card card-amber">
+          <h3>Encrypted end to end</h3>
+          <p>Connections are QUIC with TLS 1.3 between your machines. When a direct path can't be punched through NAT, a relay forwards <em>encrypted</em> packets it cannot read. A relay sees that two machines are talking, never what they say.</p>
+        </div>
+        <div class="card card-green">
+          <h3>Signed releases</h3>
+          <p>Every published binary carries a SHA-256 checksum and an RSA signature. The installer verifies both against a key embedded in it and refuses to install on a mismatch. macOS packages are signed and notarized with Apple.</p>
+        </div>
+      </div>
+
+      <p style="color: var(--color-text-tertiary); font-size: 0.925rem; max-width: 46rem; line-height: 1.8; margin-top: 2rem;">
+        Invite tokens are hashed with Argon2 before storage, so the host keeps a verifier rather than the secret. Stored secrets are encrypted with ChaCha20-Poly1305. The source is public, so none of this has to be taken on faith.
+      </p>
+    </div>
+  </section>
+
+  <!-- Honest limits -->
+  <section id="limits" style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>What this does not protect you from</h2>
+        <p>A security page that only lists strengths isn't a security page.</p>
+      </div>
+
+      <div class="limits">
+        <ul>
+          <li><strong>An agent acting badly within its limits.</strong> Scoping bounds the blast radius; it does not make an agent's judgment good. If you grant write access to a directory, an agent that decides to delete the wrong file in that directory can. Scope to what the job needs and read the audit log.</li>
+          <li><strong>A compromised machine.</strong> If an attacker already has root on one of your machines, they have that machine's identity, and WireHop will treat them as that machine. Revoke it with <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">hop fleet prune</code> or an admin revoke.</li>
+          <li><strong>An invite you hand to the wrong party.</strong> A token is bearer credential until it is redeemed or expires. Short expiries and single use limit the window; they do not close it. Treat an unredeemed invite like a password.</li>
+          <li><strong>Sharing with people outside your control.</strong> WireHop is built for machines you own. It has no multi-tenant model, no per-customer isolation, and no SSO. If you need those, it is the wrong tool and we would rather say so.</li>
+          <li><strong>Traffic analysis at a relay.</strong> A relay cannot read your traffic, but it can observe that two nodes exchanged packets and roughly how much. If that matters to you, run your own relay.</li>
+          <li><strong>An unaudited codebase.</strong> WireHop has not had a third-party security audit. The code is public and the threat model is written down, which is not the same thing as an audit, and we are not going to imply otherwise.</li>
+        </ul>
+      </div>
+
+      <p style="color: var(--color-text-secondary); font-size: 0.95rem; max-width: 46rem; line-height: 1.8; margin-top: 2.5rem;">
+        Found something? Report it privately through GitHub's security advisories on the repository. We aim to acknowledge within 72 hours and will credit you in the release notes unless you'd rather we didn't.
+      </p>
+
+      <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 2rem;">
+        <a href="https://github.com/Keikai-Inc/wirehop/blob/main/SECURITY.md" class="btn btn-primary">Security policy</a>
+        <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/security.md" class="btn btn-ghost">Full threat model</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer id="site-footer"></footer>
+
+  <script src="shared.js"></script>
+</body>
+</html>

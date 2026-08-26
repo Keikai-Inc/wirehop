@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WireHop, Fleet Management</title>
-  <meta name="description" content="A fleet in WireHop is your warren, managed at scale: role-based access, host tags, and one-command invites, replicated to every machine, no master server. From a 5-person team to thousands of hosts.">
+  <meta name="description" content="Run a command across every machine from your AI tool or the command line. A fleet in WireHop is your warren, managed at scale: role-based access, host tags, and one-command invites, replicated to every machine, no master server.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -462,6 +462,48 @@
 <span class="prompt">$</span> <span class="cmd">hop admin</span> <span class="flag">rex</span> peers
 <span class="output">  alice   developer   online</span>
 <span class="output">  bob     ops         online</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- From your AI tool -->
+  <section id="from-your-ai-tool" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Run a command across every machine from your AI tool</h2>
+        <p>The same fan-out you just saw, asked for in plain language instead of typed.</p>
+      </div>
+
+      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
+        <div>
+          <p style="color: var(--color-text-secondary); margin-bottom: 1.25rem;">Add WireHop to your AI tool and it can select machines by role or tag and run one command across all of them, then bring the output back together. It skips machines that are offline and tells you how many it skipped, so a partial answer never looks like a complete one.</p>
+          <ul class="daemon-features">
+            <li>Selects by role or tag, the same way you would</li>
+            <li>Searches every machine's logs together, with per-machine provenance</li>
+            <li>Stays inside the limits the invite set: it cannot widen its own access</li>
+            <li>Every machine records what was run in its own audit log</li>
+          </ul>
+          <a href="agents.html" class="btn btn-ghost" style="margin-top: 1.75rem;">How agents get set up &rarr;</a>
+        </div>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+            <span class="code-title">Your AI tool</span>
+          </div>
+          <div class="code-body">
+<span class="output">"how much disk is left on every</span>
+<span class="output"> production box?"</span>
+
+<span class="comment"># what it runs</span>
+<span class="prompt">$</span> <span class="cmd">hop fleet exec</span> <span class="flag">production</span> -- df -h /
+
+<span class="output">&rarr; web-1    42% used</span>
+<span class="output">&rarr; web-2    38% used</span>
+<span class="output">&rarr; db-1     81% used</span>
+<span class="output">   1 machine offline, skipped</span>
           </div>
         </div>
       </div>
