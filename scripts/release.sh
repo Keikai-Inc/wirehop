@@ -453,6 +453,26 @@ for pkgarch in arm64 x86_64; do
     echo "Error: .pkg not found at ${PKG_SRC}"
     exit 1
   fi
+  # Verify what we are about to publish, rather than trusting that the signing
+  # env vars did their job. On 0.9.33 the arm64 .pkg was built signed and then
+  # destroyed by the next arch's build, so an UNSIGNED file was uploaded while
+  # the log still showed a successful signing step. Checking the artifact
+  # itself is the only claim worth making.
+  if [[ -n "${HOP_INSTALLER_ID:-}" && -n "${HOP_NOTARY_PROFILE:-}" ]]; then
+    echo "==> Verifying signature on hop-${VERSION}-${pkgarch}.pkg"
+    if ! pkgutil --check-signature "${PKG_SRC}" | grep -q "Status: signed"; then
+      echo "Error: signing was requested but ${PKG_SRC} is NOT signed." >&2
+      echo "       (a later --arch build can clobber an earlier one; build and" >&2
+      echo "        upload one arch at a time, or check build-pkg.sh output)" >&2
+      exit 1
+    fi
+    if ! spctl --assess --type install "${PKG_SRC}" 2>&1 | grep -q accepted; then
+      echo "Error: ${PKG_SRC} is signed but Gatekeeper does not accept it" >&2
+      echo "       (notarization or stapling did not complete)" >&2
+      exit 1
+    fi
+    echo "    signed + notarized + Gatekeeper-accepted"
+  fi
   echo "==> Uploading hop-${VERSION}-${pkgarch}.pkg to s3://${BUCKET}/v${VERSION}/"
   aws s3 cp "${PKG_SRC}" "s3://${BUCKET}/v${VERSION}/hop-${VERSION}-${pkgarch}.pkg"
 done

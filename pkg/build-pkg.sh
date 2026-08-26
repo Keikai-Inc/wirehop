@@ -49,7 +49,15 @@ SCRIPTS="$STAGING/scripts"
 RESOURCES="$STAGING/resources"
 OUTPUT="$STAGING/output"
 
-rm -rf "$STAGING"
+# Clear the BUILD scratch but never `output/`. Building a second arch used to
+# `rm -rf` the whole staging tree, silently destroying the first arch's
+# finished .pkg — including one that had already been notarized, which costs
+# minutes of Apple round-trip to reproduce. (This bit us on the 0.9.33 release:
+# arm64 was built and signed, then wiped by the x86_64 build, and shipped
+# unsigned.) Each arch writes a distinctly-named file, so keeping the directory
+# is safe; a rebuild of the SAME arch still overwrites its own artifact.
+rm -rf "$PAYLOAD" "$SCRIPTS" "$RESOURCES" \
+       "$STAGING/distribution.xml" "$STAGING/hop-component.pkg" "$STAGING/hop-universal"
 mkdir -p "$PAYLOAD/usr/local/bin"
 mkdir -p "$PAYLOAD/Library/LaunchDaemons"
 mkdir -p "$SCRIPTS"
