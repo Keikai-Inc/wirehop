@@ -16,6 +16,11 @@ html, body { overflow-x: hidden; }
   --color-text-tertiary: #9a9aa3;
   --color-border: rgba(255, 255, 255, 0.05);
   --color-border-hover: rgba(255, 255, 255, 0.12);
+  /* Link text on the dark background. --color-primary (#dc2626) is only
+     4.12:1 here, below WCAG AA 4.5:1; this is 5.29:1. --color-primary is
+     still correct as a BUTTON background, where white-on-red is 4.83:1. */
+  --color-link: #ef4444;
+  --color-link-hover: #f87171;
   --color-accent-teal: #2ec4b6;
   --color-accent-amber: #f59e0b;
   --color-accent-green: #10b981;
@@ -51,6 +56,19 @@ nav {
   background: rgba(9, 9, 11, 0.85);
   border-bottom: 1px solid var(--color-border);
 }
+
+/* --- Links ---------------------------------------------------------------
+   Base rule so no anchor can ever fall through to the browser default
+   blue, which is both off-palette and very low contrast on #09090b. */
+
+a { color: var(--color-link); }
+a:hover { color: var(--color-link-hover); }
+
+/* An anchor used as a container (card, button, nav item) is a layout
+   element, not link text: it must not colour the content inside it. */
+a.card, a.btn, a.nav-brand { color: inherit; text-decoration: none; }
+a.card:hover, a.nav-brand:hover { color: inherit; }
+a.btn-primary, a.btn-primary:hover { color: white; }
 
 .nav-brand {
   font-family: var(--font-display);
@@ -299,6 +317,7 @@ section {
 .card-icon-green { background: rgba(16, 185, 129, 0.1); color: var(--color-accent-green); }
 
 .card h3 {
+  color: var(--color-text);
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 1.125rem;

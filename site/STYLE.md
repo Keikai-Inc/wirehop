@@ -60,6 +60,20 @@ They do not know our vocabulary and they will not read carefully; they scan.
    two sentences. The same goes for en-dashes in prose; a hyphen is fine in
    `compound-words` and ranges.
 
+9. **Colours come from the palette, and text must pass WCAG AA.** Never hard-code
+   a colour; use the `--color-*` variables in `shared.css`. Body text needs at
+   least **4.5:1** contrast against its background (large/bold text 3:1). Two
+   traps to know about:
+   - **`--color-primary` (`#dc2626`) is not a text colour.** It measures 4.12:1
+     on the page background and fails AA. It is correct as a *button
+     background* (white on it is 4.83:1). For link and accent **text**, use
+     `--color-link`.
+   - **Every anchor needs a colour.** An `<a>` with no class and no colour
+     falls back to the browser's default blue: off-palette and barely legible
+     on `#09090b`. `shared.css` now sets a base `a` rule, and container
+     anchors (`a.card`, `a.btn`, `a.nav-brand`) inherit instead of colouring
+     their contents. If you add a new container-anchor pattern, add it there.
+
 ## Quick self-check before shipping a site change
 
 - Could a stranger read top-to-bottom and never hit a word they weren't just
@@ -70,5 +84,8 @@ They do not know our vocabulary and they will not read carefully; they scan.
 - Did I add words that explain *mechanism* instead of *use*? Cut them.
 - Any real hostnames, or competitor "inspired-by" credit? Remove them.
 - Any em-dashes? `grep -nE '—|&mdash;' site/*.html` must return nothing.
+- Any hard-coded colours or low-contrast text? Run `./site/check-style.sh`; it
+  fails on em-dashes, undefined CSS classes, anchors with no colour, and any
+  text colour below WCAG AA.
 
 After a copy change, redeploy with `./scripts/release.sh --site-only`.
