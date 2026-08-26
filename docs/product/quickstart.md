@@ -7,8 +7,8 @@ on every release, so the docs and the product can't drift.
 Install (any machine, no account, ~5 MB):
 
 ```bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash          # client (reach hosts)
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host   # node (private network)
+curl -fsSL https://wirehop.org/install.sh | bash          # client (reach hosts)
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host   # node (private network)
 ```
 
 The plain install is a **client**: no daemon, no VPN, just reach hosts you're
@@ -44,14 +44,14 @@ No SSH daemon, no port forwarding, no public IP. Works through NAT.
 Put the first machine on the warren (it auto-creates one):
 
 ```bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
 hop invite --role member       # invite another machine; prints a token
 ```
 
 On the second machine, join with the token (VPN comes up by default):
 
 ```bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host --invite <token>
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host --invite <token>
 ```
 
 Now every machine is reachable **by name** from any other, anywhere:

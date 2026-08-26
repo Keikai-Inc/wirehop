@@ -24,7 +24,7 @@ if (res.error) {
     console.error(
       'wirehop: no `hop` binary found.\n' +
         '  The download may have been skipped (WIREHOP_SKIP_DOWNLOAD=1) or failed.\n' +
-        '  Install one with:  curl -fsSL https://hop.keikai.ai/install.sh | bash'
+        '  Install one with:  curl -fsSL https://wirehop.org/install.sh | bash'
     );
     process.exit(127);
   }

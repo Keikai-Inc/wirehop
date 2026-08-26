@@ -50,7 +50,7 @@ What it does:
 
 - Linux-only; refuses macOS/Windows with a clear error.
 - Detects x86_64 / arm64.
-- If `hop` isn't installed, delegates to `https://hop.keikai.ai/install-daemon.sh`
+- If `hop` isn't installed, delegates to `https://wirehop.org/install-daemon.sh`
   first. If `hop` is installed but its daemon isn't running, exits
   with a "start hop and re-run" message — never tries to start hop
   for you (avoids clobbering manual / user-local / non-systemd

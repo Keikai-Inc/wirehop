@@ -16,7 +16,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/target/llms}"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | cut -d'"' -f2)"
 REPO="https://github.com/Keikai-Inc/wirehop"
-CDN="https://hop.keikai.ai"
+CDN="https://wirehop.org"
 
 mkdir -p "$OUT"
 

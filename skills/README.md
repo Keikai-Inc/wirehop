@@ -27,5 +27,5 @@ Add this repository as a plugin marketplace, then install the skill:
 agent framework's skill/knowledge directory, or serve it to a model directly —
 it has no dependencies and assumes no tooling.
 
-The same content is published at `https://hop.keikai.ai/llms.txt` for
+The same content is published at `https://wirehop.org/llms.txt` for
 retrieval-based agents.

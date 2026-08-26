@@ -107,12 +107,12 @@ from the first daemon and grows through invites.
 
 ```
 # Founder — install hop. The network ("warren") auto-creates; founder is Owner.
-curl -fsSL https://hop.keikai.ai | bash
+curl -fsSL https://wirehop.org | bash
 
 # Invite anyone (person or server) with a role:
 hop invite --role developer
 #  → prints a one-liner the recipient pastes:
-#     curl -fsSL https://hop.keikai.ai | bash -s -- --join <token>
+#     curl -fsSL https://wirehop.org | bash -s -- --join <token>
 #     (drop --join for CLI-only client access)
 
 # Recipient installs + redeems. They're on the warren with developer access —
@@ -143,11 +143,11 @@ with `hop connect --warren` (no re-invite). Node primers (forwarded by `install.
 
 ```bash
 # A production web host that joins an existing warren from one invite:
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- \
+curl -fsSL https://wirehop.org/install.sh | bash -s -- \
   --host --tag production,web --invite <token>
 
 # A laptop that just reaches the servers (no sudo, no VPN):
-curl -fsSL https://hop.keikai.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install.sh | bash
 ```
 
 Each primer is a wrapper over `hop config set <key> <value>` (or `hop warren

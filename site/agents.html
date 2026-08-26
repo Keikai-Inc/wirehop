@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Let an AI agent provision its own network</title>
   <meta name="description" content="Most remote-access tools need a human to make an account, click through a console, and paste a key. WireHop needs none of that, so an AI agent can go from unreachable machines to a working private network on its own.">
+  <link rel="canonical" href="https://wirehop.org/agents.html">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -199,12 +200,12 @@
         </div>
         <div class="code-body">
 <span class="comment"># On the machine to be reached</span>
-<span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- <span class="flag">--host</span>
+<span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash -s -- <span class="flag">--host</span>
 <span class="prompt">$</span> <span class="cmd">hop invite</span> <span class="flag">--json</span>
 <span class="output">{"token":"eyJ0eX...","expires_in":900,"max_uses":1}</span>
 
 <span class="comment"># On the machine doing the reaching</span>
-<span class="prompt">$</span> curl -fsSL https://hop.keikai.ai/install.sh | bash
+<span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
 

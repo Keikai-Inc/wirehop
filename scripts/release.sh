@@ -542,7 +542,7 @@ if [[ -n "${PUBLIC_REPO}" ]] && command -v gh &>/dev/null; then
 Install (verifies SHA-256 **and** an RSA signature against the key embedded in \`install.sh\`):
 
 \`\`\`bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install.sh | bash
 \`\`\`
 
 Attached: per-arch binaries for macOS/Linux (x86_64, arm64, armv7) with \`.sha256\` and \`.sig\` sidecars, plus macOS \`.pkg\` installers." \
@@ -578,5 +578,5 @@ for pkgarch in arm64 x86_64; do
   echo "  s3://${BUCKET}/v${VERSION}/hop-${VERSION}-${pkgarch}.pkg"
 done
 echo ""
-echo "CDN: https://hop.keikai.ai"
-echo "Install: curl -fsSL https://hop.keikai.ai/install.sh | bash"
+echo "CDN: https://wirehop.org"
+echo "Install: curl -fsSL https://wirehop.org/install.sh | bash"
