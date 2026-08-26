@@ -1,7 +1,7 @@
 {
   "name": "@wirehop/wirehop",
-  "version": "0.9.32",
-  "description": "WireHop — secure peer-to-peer remote access and private networks. Single binary, no accounts, no port forwarding, no coordination server. Includes an MCP server so AI agents can reach and operate your machines.",
+  "version": "0.9.33",
+  "description": "WireHop \u2014 secure peer-to-peer remote access and private networks. Single binary, no accounts, no port forwarding, no coordination server. Includes an MCP server so AI agents can reach and operate your machines.",
   "keywords": [
     "mcp",
     "modelcontextprotocol",
