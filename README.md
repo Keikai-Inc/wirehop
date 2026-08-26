@@ -17,11 +17,11 @@ end-to-end without a browser or a third-party account.
 
 ```bash
 # On the machine you want to reach:
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
 hop invite            # prints a one-time token
 
 # On your laptop:
-curl -fsSL https://hop.keikai.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install.sh | bash
 hop connect <token>   # you now have a shell — and a private network
 ```
 
@@ -59,7 +59,7 @@ The installer detects your OS/arch, verifies a SHA-256 checksum **and an RSA
 signature** against the key embedded in `install.sh`, and installs a single
 binary. Releases are published on the
 [Releases page](https://github.com/Keikai-Inc/wirehop/releases) and served from
-`https://hop.keikai.ai` (Keikai's CDN — WireHop is a Keikai Inc. open-source
+`https://wirehop.org` (Keikai's CDN — WireHop is a Keikai Inc. open-source
 project).
 
 macOS `.pkg` installers and per-arch binaries for macOS/Linux (x86_64, arm64,

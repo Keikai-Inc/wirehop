@@ -48,7 +48,7 @@ service, and nothing needs custody of your credentials.
 
 ```bash
 # On the machine you want to reach:
-hop host          # or: curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host
+hop host          # or: curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
 hop invite        # prints a one-time token
 
 # On your laptop:

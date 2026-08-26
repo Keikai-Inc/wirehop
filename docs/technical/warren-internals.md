@@ -1581,7 +1581,7 @@ as a **client** into a **user-writable** dir (`~/.local/bin`) with **zero sudo**
 has no escalation surface:
 
 ```
-curl -fsSL https://hop.keikai.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install.sh | bash
 ```
 
 "Server / warren / admin" is **not a separate install** — it's an **upgrade a

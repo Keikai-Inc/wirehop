@@ -22,7 +22,7 @@ const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 
 const VERSION = require('../package.json').version;
-const BASE = process.env.WIREHOP_CDN_URL || 'https://hop.keikai.ai';
+const BASE = process.env.WIREHOP_CDN_URL || 'https://wirehop.org';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 const OUT = path.join(BIN_DIR, process.platform === 'win32' ? 'hop.exe' : 'hop');
 

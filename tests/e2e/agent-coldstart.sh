@@ -110,7 +110,7 @@ case "$MODE" in
   *) echo "--mode must be assisted, discovery or both" >&2; exit 2 ;;
 esac
 if [ "$MODE" = discovery ] || [ "$MODE" = both ]; then
-  # The skill points at hop.keikai.ai. Serving a rewritten copy would be
+  # The skill points at the public site. Serving a rewritten copy would be
   # measuring a document nobody ships.
   [ "$LIVE" = 1 ] || note "discovery mode uses the PUBLISHED docs (skill URLs are hard-coded)"
 fi
@@ -158,7 +158,7 @@ docker network create "$NET" >/dev/null 2>&1 || true
 # key (and so CI can run this).
 DOCS_URL=""
 if [ "$LIVE" = 1 ]; then
-  DOCS_URL="https://hop.keikai.ai"
+  DOCS_URL="https://wirehop.org"
   note "using published CDN: $DOCS_URL"
 else
   say "building local CDN mirror"
@@ -177,14 +177,14 @@ else
   printf '%s' "$VERSION" > "$WORK/srv/latest"
 
   # Rewrite the CDN base and the embedded pubkey in the served install.sh, and
-  # repoint every hop.keikai.ai reference in the docs at the mirror.
+  # repoint every published-site reference in the docs at the mirror.
   DOCS_URL="http://docs:8080"
   python3 - "$ROOT/install.sh" "$WORK/eph.pub" "$WORK/srv/install.sh" "$DOCS_URL" <<'PY'
 import re, sys
 src, pubpath, dst, base = sys.argv[1:5]
 sh = open(src).read()
 pub = open(pubpath).read().strip()
-sh = sh.replace("https://hop.keikai.ai", base)
+sh = sh.replace("https://wirehop.org", base)
 # Replace the embedded release pubkey with the ephemeral one, preserving the
 # ${HOP_PUBKEY:-...} shape so the override path still works.
 # lambda repl: a literal string would have backslash escapes interpreted.
@@ -198,7 +198,7 @@ open(dst, "w").write(sh)
 PY
   [ $? -eq 0 ] || exit 1
   for f in llms.txt llms-full.txt; do
-    sed "s|https://hop.keikai.ai|$DOCS_URL|g" "$WORK/llms/$f" > "$WORK/srv/$f"
+    sed "s|https://wirehop.org|$DOCS_URL|g" "$WORK/llms/$f" > "$WORK/srv/$f"
   done
 
   docker rm -f "$DOCS_C" >/dev/null 2>&1 || true
@@ -420,7 +420,7 @@ if [ "$MODE" = assisted ] || [ "$MODE" = both ]; then
   case "$MODE_PASS" in 0/*) ANY_ZERO=1 ;; esac
 fi
 if [ "$MODE" = discovery ] || [ "$MODE" = both ]; then
-  run_mode discovery "https://hop.keikai.ai"
+  run_mode discovery "https://wirehop.org"
   RATE_LINES="${RATE_LINES}discovery ${MODE_PASS}\n"
   case "$MODE_PASS" in 0/*) ANY_ZERO=1 ;; esac
 fi

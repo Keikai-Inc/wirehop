@@ -269,7 +269,7 @@ jobs:
           {
             printf 'WireHop v%s — single binary `hop`.\n\n' "$VERSION"
             printf '```bash\n'
-            printf 'curl -fsSL https://hop.keikai.ai/install.sh | bash\n'
+            printf 'curl -fsSL https://wirehop.org/install.sh | bash\n'
             printf '```\n\n'
             printf 'Installers are **signed and notarized**; binaries carry '
             printf '`.sha256` and `.sig` sidecars verified by `install.sh`.\n'

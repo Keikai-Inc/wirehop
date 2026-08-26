@@ -46,7 +46,7 @@ This is the whole bootstrap. Two machines, four commands.
 **On the machine to be reached** (the "host" — a server, a home desktop):
 
 ```bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash -s -- --host
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
 hop invite
 ```
 
@@ -56,7 +56,7 @@ minutes by default. Get it to the other machine however the user prefers.
 **On the machine doing the reaching** (laptop):
 
 ```bash
-curl -fsSL https://hop.keikai.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install.sh | bash
 hop connect <token>
 ```
 
