@@ -13,9 +13,15 @@
 #
 #   A. one bundle straight from the keychain (no GUI navigation) --
 #        security find-identity -v      # check what will be included
+#        export HOP_P12_PASSWORD="$(openssl rand -base64 24)"
 #        security export -k ~/Library/Keychains/login.keychain-db \
-#          -t identities -f pkcs12 -P 'pick-a-password' -o ~/wirehop-certs.p12
+#          -t identities -f pkcs12 -P "$HOP_P12_PASSWORD" -o ~/wirehop-certs.p12
 #        ./scripts/setup-ci-secrets.sh --identities-p12 ~/wirehop-certs.p12
+#        rm ~/wirehop-certs.p12; unset HOP_P12_PASSWORD
+#
+#      The .p12 password is one you INVENT here; it is not an existing
+#      credential. Generating it into HOP_P12_PASSWORD means it is never typed,
+#      echoed, or left in shell history.
 #
 #   B. or two files via Keychain Access (login -> My Certificates -> export
 #      each Developer ID cert, SAME password for both) --
@@ -70,8 +76,9 @@ The .p12 export has to happen first; this script only uploads. Two ways:
 
        security find-identity -v          # expect the two Developer ID certs
 
+       export HOP_P12_PASSWORD="$(openssl rand -base64 24)"
        security export -k ~/Library/Keychains/login.keychain-db \
-         -t identities -f pkcs12 -P 'pick-a-password' -o ~/wirehop-certs.p12
+         -t identities -f pkcs12 -P "$HOP_P12_PASSWORD" -o ~/wirehop-certs.p12
 
      macOS may show an "allow access" prompt per key; click Allow. Then:
 
@@ -90,11 +97,21 @@ HOWTO
   fi
 
   say "Apple certificates"
-  # Read the export password once, without echo, and verify it actually opens
-  # both files before uploading anything. A wrong password here surfaces as an
-  # opaque mid-release failure on the runner.
-  printf '   .p12 export password: '
-  read -rs P12_PASS; echo
+  # The .p12 export password is one YOU choose at export time; it is not a
+  # pre-existing credential. It encrypts the bundle in transit and at rest in
+  # GitHub, and the runner uses it to import the certs.
+  #
+  # Prefer HOP_P12_PASSWORD: generate it, use it for `security export`, and
+  # pass it here without it ever being typed, echoed, or shell-history'd.
+  # Verified against both files before anything is uploaded, because a wrong
+  # password otherwise surfaces as an opaque failure mid-release.
+  if [ -n "${HOP_P12_PASSWORD:-}" ]; then
+    P12_PASS="$HOP_P12_PASSWORD"
+    echo "   using HOP_P12_PASSWORD from the environment"
+  else
+    printf '   .p12 export password (the one you chose at export): '
+    read -rs P12_PASS; echo
+  fi
   for f in "$APP_P12" "$INST_P12"; do
     openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys -legacy >/dev/null 2>&1 \
       || openssl pkcs12 -in "$f" -passin pass:"$P12_PASS" -nokeys >/dev/null 2>&1 \
