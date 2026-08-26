@@ -66,9 +66,13 @@ a:hover { color: var(--color-link-hover); }
 
 /* An anchor used as a container (card, button, nav item) is a layout
    element, not link text: it must not colour the content inside it. */
-a.card, a.btn, a.nav-brand { color: inherit; text-decoration: none; }
+a.card, a.nav-brand { color: inherit; text-decoration: none; }
 a.card:hover, a.nav-brand:hover { color: inherit; }
-a.btn-primary, a.btn-primary:hover { color: white; }
+
+/* Buttons set their own colour via .btn-primary / .btn-ghost, which outrank
+   the base `a` rule on their own. Do NOT add `a.btn` here: `a.btn` (0,1,1)
+   outranks `.btn-ghost` (0,1,0) and would silently override the variant. */
+a.btn { text-decoration: none; }
 
 .nav-brand {
   font-family: var(--font-display);
