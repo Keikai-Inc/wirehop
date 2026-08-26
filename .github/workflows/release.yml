@@ -251,8 +251,19 @@ jobs:
         run: |
           set -euo pipefail
           PKG=$(ls target/pkg-staging/output/*.pkg)
-          spctl --assess --type install -vv "$PKG"
-          spctl --assess --type install "$PKG" 2>&1 | grep -q accepted
+          # `spctl --assess` is SILENT on success unless -v/-vv is passed, and
+          # writes its verdict to stderr. Grepping the output of a bare
+          # invocation therefore finds nothing and fails a package that was in
+          # fact accepted -- which is exactly what happened on the first CI
+          # release. Capture the verbose output once and assert on it.
+          OUT="$(spctl --assess --type install -vv "$PKG" 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q 'accepted' \
+            || { echo "::error::Gatekeeper rejected $PKG"; exit 1; }
+          # Signed-but-not-notarized still says accepted on a machine that has
+          # the cert; assert the notarized source explicitly.
+          echo "$OUT" | grep -q 'source=Notarized Developer ID' \
+            || { echo "::error::$PKG is not notarized"; exit 1; }
           cp "$PKG" dist/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
