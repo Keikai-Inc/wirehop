@@ -146,6 +146,33 @@ jobs:
           cp "target/$TARGET/release/hop" "dist/$NAME"
           strip "dist/$NAME" 2>/dev/null || true
 
+      # Fail fast and legibly. Without this, a missing secret surfaces as an
+      # opaque `security import` or "no identity found" error several minutes
+      # into the job, which reads like a broken keychain rather than an unset
+      # secret. Names only are printed; values are never echoed.
+      - name: Check required secrets are present
+        env:
+          CERT_APP: ${{ secrets.APPLE_CERT_APPLICATION_P12 }}
+          CERT_INST: ${{ secrets.APPLE_CERT_INSTALLER_P12 }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
+          SIGN_ID: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          INST_ID: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+        run: |
+          set -uo pipefail
+          missing=""
+          for n in CERT_APP CERT_INST CERT_PASS SIGN_ID INST_ID; do
+            eval "v=\${$n:-}"
+            [ -n "$v" ] || missing="$missing $n"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required signing secrets:$missing"
+            echo "Run ./scripts/setup-ci-secrets.sh from the Mac holding the certs."
+            echo "Secret names map to: APPLE_CERT_APPLICATION_P12, APPLE_CERT_INSTALLER_P12,"
+            echo "APPLE_CERT_PASSWORD, APPLE_SIGN_IDENTITY, APPLE_INSTALLER_IDENTITY."
+            exit 1
+          fi
+          echo "All signing secrets present."
+
       # A throwaway keychain: created, unlocked, and used within this job, then
       # discarded with the runner. set-key-partition-list is what stops codesign
       # from blocking on a GUI prompt — the step that makes this unattended.
