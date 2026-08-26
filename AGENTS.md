@@ -54,6 +54,24 @@ containers and exercises the full connection/auth/exec/transfer/fleet surface.
 After Rust changes ALWAYS use `REBUILD=1 ./tests/e2e/run.sh` — the harness
 skips the cross-build otherwise and you'd test a stale binary.
 
+### Gate harnesses
+
+`tests/e2e/` also holds harnesses that each enforce one product claim and commit
+a `*-results.md` artifact, so a regression shows up as a diff:
+
+| Harness | Claim |
+|---|---|
+| `first-run.sh` | each core job completes cold within its time budget |
+| `soak-resilience.sh` | the network reconverges after perturbation within SLA |
+| `session-resilience.sh` | interactive-session recovery reaches VPN parity |
+| `agent-coldstart.sh` | an AI agent can build a working network with no human |
+
+`agent-coldstart.sh` drives a real model against two bare containers that have no
+`hop` binary, then scores the containers itself — the agent's own report is
+ignored. It needs `ANTHROPIC_API_KEY` and spends tokens, so it is run
+deliberately rather than on every change. `--self-test` checks the harness
+without touching the API.
+
 ## Code style
 
 - Commit messages: imperative mood, 1–2 sentence summary of the *why*.

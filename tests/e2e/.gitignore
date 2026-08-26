@@ -1,2 +1,8 @@
 # Binary copied into build context by run.sh (removed after test)
 hop
+
+# agent-coldstart.sh scratch: local CDN mirror, an EPHEMERAL signing key, and
+# agent transcripts. Never commit — the transcripts are large and the key,
+# though throwaway, would trip the export secret scan.
+# The scored artifact (agent-coldstart-results.md) IS committed.
+.coldstart/
