@@ -117,16 +117,25 @@ The published Linux binaries are **static musl** (no libc dependency, no
 
 | Build | Minimum kernel | Set by |
 |---|---|---|
-| Default (UPX-packed) | **3.17** (Oct 2014) | the UPX stub's `memfd_create(2)` |
-| `-uncompressed` variant | **2.6.27** (Oct 2008) | tokio's `eventfd2` / `epoll_create1` |
+| Default (UPX-packed) | **2.6.27** (Oct 2008) | tokio's `eventfd2` / `epoll_create1` |
+| `-uncompressed` variant | **2.6.27** (Oct 2008) | same |
 
-3.17 covers Debian 9+, Ubuntu 16.04+, RHEL 8+ and all current Alpine. It does
-**not** cover **RHEL/CentOS 7**, which ships 3.10 — there the packed binary dies
-before `main()` with no useful message.
+2.6.27 predates every distro still in service, including RHEL/CentOS 6 (2.6.32)
+and 7 (3.10).
 
-`install.sh` and the npm postinstall both read `uname -r` and fetch
-`hop-linux-<arch>-uncompressed` below 3.17, so this is handled automatically.
-The check is on the kernel, not the distro, since the constraint is the syscall.
+**Why the `-uncompressed` variant exists anyway.** UPX unpacking is a stub that
+runs before `main()`, and *which syscalls it needs depends on the UPX build*.
+Binaries packed by Alpine's UPX (releases through v0.9.33, produced by
+`scripts/release.sh`) unpack via `memfd_create(2)` and therefore require **3.17**,
+which excludes RHEL/CentOS 7. Binaries packed by Debian/Ubuntu's `upx-ucl` (CI,
+v0.9.35 onward) decompress in-memory via `mmap` and need nothing newer than the
+program itself.
+
+That is a toolchain detail that can change under us, so the uncompressed build
+is published as insurance rather than deleted. `install.sh` and the npm
+postinstall read `uname -r` and fetch `hop-linux-<arch>-uncompressed` below 3.17;
+the release gate asserts that variant still starts with `memfd_create` returning
+`ENOSYS`, so the fallback cannot quietly stop being one.
 
 Everything newer is used opportunistically with fallbacks and is **not**
 required: `getrandom` (3.17), `membarrier` (4.3), `rseq` (4.18), `io_uring`

@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WireHop FAQ and Linux compatibility</title>
+  <meta name="description" content="Answers about WireHop: how it works without a server, what it costs, which Linux distributions are supported, what an AI agent can and cannot reach, and how it compares to Tailscale and SSH.">
+  <link rel="canonical" href="https://wirehop.org/faq.html">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    /* --- FAQ page overrides -------------------------------------------------- */
+
+    .faq-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 2rem;
+      justify-content: center;
+    }
+
+    .faq-nav a {
+      font-size: 0.825rem;
+      font-weight: 500;
+      color: var(--color-text-secondary);
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.5rem;
+      padding: 0.4rem 0.8rem;
+      text-decoration: none;
+      transition: border-color 150ms, color 150ms;
+    }
+
+    .faq-nav a:hover { color: var(--color-text); border-color: var(--color-border-hover); }
+
+    .qa { margin-top: 1.25rem; }
+
+    .qa details {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      margin-bottom: 0.75rem;
+      overflow: hidden;
+    }
+
+    .qa details[open] { border-color: var(--color-border-hover); }
+
+    .qa summary {
+      cursor: pointer;
+      padding: 1.05rem 1.5rem;
+      font-weight: 600;
+      font-size: 0.975rem;
+      color: var(--color-text);
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .qa summary::-webkit-details-marker { display: none; }
+
+    .qa summary::after {
+      content: "+";
+      color: var(--color-text-tertiary);
+      font-weight: 400;
+      font-size: 1.25rem;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+
+    .qa details[open] summary::after { content: "\2212"; }
+
+    .qa .answer {
+      padding: 0 1.5rem 1.25rem;
+      color: var(--color-text-secondary);
+      font-size: 0.925rem;
+      line-height: 1.75;
+    }
+
+    .qa .answer p + p { margin-top: 0.875rem; }
+    .qa .answer strong { color: var(--color-text); }
+
+    .qa .answer code {
+      font-family: var(--font-mono);
+      font-size: 0.825rem;
+      color: var(--color-accent-teal);
+      overflow-wrap: anywhere;
+    }
+
+    .qa .answer ul {
+      list-style: none;
+      margin-top: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .qa .answer li { padding-left: 1.1rem; position: relative; }
+    .qa .answer li::before {
+      content: "\2022";
+      position: absolute;
+      left: 0;
+      color: var(--color-text-tertiary);
+    }
+
+    /* --- Compatibility table -------------------------------------------------- */
+
+    .compat {
+      margin-top: 2rem;
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      overflow: hidden;
+    }
+
+    .compat-row {
+      display: grid;
+      grid-template-columns: 1fr 8rem 7rem 1fr;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .compat-row:last-child { border-bottom: none; }
+    .compat-row > div { padding: 0.7rem 1rem; font-size: 0.875rem; min-width: 0; }
+
+    .compat-head {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 0.85rem;
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--color-text);
+    }
+
+    .compat-name { color: var(--color-text); font-weight: 500; }
+    .compat-k { font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-tertiary); }
+    .compat-note { color: var(--color-text-tertiary); font-size: 0.825rem; }
+    .compat-yes { color: var(--color-accent-green); font-weight: 600; }
+    .compat-test { color: var(--color-accent-teal); font-weight: 600; }
+
+    .legend {
+      margin-top: 1rem;
+      color: var(--color-text-tertiary);
+      font-size: 0.85rem;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 820px) {
+      .compat-row { grid-template-columns: 1fr 1fr; }
+      .compat-row.compat-header-row { display: none; }
+      .compat-k::before { content: "kernel "; }
+      .compat-note { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Questions and compatibility</div>
+    <h1>Straight answers,<br><span class="gradient">including the awkward ones</span></h1>
+    <p>What WireHop does, what it does not do, where it runs, and what it costs. If something here reads like marketing rather than an answer, that is a bug.</p>
+    <div class="faq-nav">
+      <a href="#basics">Basics</a>
+      <a href="#install">Install and platforms</a>
+      <a href="#compat">Linux compatibility</a>
+      <a href="#network">Networking</a>
+      <a href="#security">Security</a>
+      <a href="#agents">AI agents</a>
+      <a href="#compare">Alternatives</a>
+      <a href="#project">Project</a>
+    </div>
+  </div>
+
+  <!-- Basics -->
+  <section id="basics">
+    <div class="container">
+      <div class="section-header">
+        <h2>Basics</h2>
+        <p>What it is, and what it costs.</p>
+      </div>
+
+      <div class="qa">
+        <details open>
+          <summary>What is WireHop, in one sentence?</summary>
+          <div class="answer"><p>One binary, named <code>hop</code>, that lets you reach your own machines from anywhere and connect them into a private network, without an account, a coordination server, or port forwarding.</p></div>
+        </details>
+
+        <details>
+          <summary>What does it cost?</summary>
+          <div class="answer"><p>Nothing. It is open source under MIT or Apache-2.0, and there is no hosted service to buy. There is no paid tier today, and nothing in the tool is gated behind one.</p></div>
+        </details>
+
+        <details>
+          <summary>If there is no server, how do two machines find each other?</summary>
+          <div class="answer">
+            <p>They exchange keys once, through an invite you carry across yourself. After that each machine tries to reach the other directly, punching through NAT (the address translation your router does). When a direct path cannot be made, an encrypted <strong>relay</strong> forwards packets it cannot read.</p>
+            <p>The relay sees that two machines are talking and roughly how much. It cannot see what they say. You can run your own with <code>hop host --relay</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Is it really "no server", or is that marketing?</summary>
+          <div class="answer">
+            <p>There is no coordination server: no account, no directory of your machines, nothing that has to be up for your network to work. Membership is a document your own machines replicate between themselves.</p>
+            <p>There <em>are</em> relays, which are pure packet forwarders for the cases where NAT defeats a direct connection. They hold no membership data and cannot decrypt traffic. If that distinction matters to you, run your own.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>What happens to my network if this project disappears?</summary>
+          <div class="answer"><p>It keeps working. Your machines already hold their keys and their membership document, and nothing phones home for permission. You would stop getting updates, and the default relays would eventually go away, which matters only for machines that cannot connect directly. The source is permissively licensed, so a fork is always available.</p></div>
+        </details>
+
+        <details>
+          <summary>Do I need to run a daemon?</summary>
+          <div class="answer">
+            <p>Only on machines you want to <em>reach</em>. A laptop you connect <em>from</em> needs no daemon and no root: install and go.</p>
+            <p>The default install is client-only. Add <code>--host</code> to install the daemon.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section id="install" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Install and platforms</h2>
+        <p>What runs where, and how to get it.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>Which operating systems are supported?</summary>
+          <div class="answer">
+            <p><strong>macOS</strong> (Apple Silicon and Intel) and <strong>Linux</strong> (x86_64, arm64, armv7).</p>
+            <p><strong>Windows is not supported natively.</strong> It works under WSL2, which is a Linux install. Native Windows would need a different network layer and is not on the roadmap.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Do I have to pipe curl into bash?</summary>
+          <div class="answer">
+            <p>No. Read the script first (<code>curl -fsSL https://wirehop.org/install.sh | less</code>), or skip it: download the binary for your platform from the GitHub releases page along with its <code>.sha256</code> and <code>.sig</code>, verify both, and put it on your <code>PATH</code>. The installer does exactly that.</p>
+            <p>macOS users can install the signed and notarized <code>.pkg</code> instead.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How do I know the binary I downloaded is the one you built?</summary>
+          <div class="answer">
+            <p>Every release artifact ships a SHA-256 and an RSA signature. The installer checks both against a public key embedded in it, and <strong>refuses to install on a mismatch</strong> rather than warning and continuing.</p>
+            <p>Releases are built, signed and published by a GitHub Actions workflow you can read, so the artifacts trace back to a specific commit. macOS packages are additionally signed and notarized with Apple.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Does it need root?</summary>
+          <div class="answer">
+            <p>The client does not. Installing the <em>host daemon</em> does, because it runs at boot and can create a network device.</p>
+            <p>The daemon may listen as root, but shells, commands and file transfers all run as the ordinary user bound into the invite, and that user is fixed when the invite is made.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How do I update or uninstall?</summary>
+          <div class="answer">
+            <p>Re-run the installer to update. To remove it, delete the binary, and on a host machine stop and remove the daemon service. Configuration lives in <code>~/.config/hop</code> (user) or <code>/Library/Application Support/hop</code> and <code>/etc/hop</code> (system).</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Can I install it with npm, brew or cargo?</summary>
+          <div class="answer">
+            <p><strong>npm:</strong> yes, <code>npx -y @wirehop/wirehop</code>. It downloads the same signed binary and verifies the checksum and signature before installing.</p>
+            <p><strong>Homebrew and cargo install:</strong> not yet.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Compatibility -->
+  <section id="compat" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Linux compatibility</h2>
+        <p>The binaries are statically linked, so your distribution's age does not matter.</p>
+      </div>
+
+      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8;">
+        WireHop's Linux builds are <strong>static</strong>: they bundle their own C library and load nothing from your system. That removes the usual "GLIBC_2.34 not found" class of failure entirely. The only floor is the <strong>kernel</strong>, and it is <strong>2.6.27</strong> (from 2008), which is older than any distribution still in service.
+      </p>
+
+      <div class="compat">
+        <div class="compat-row compat-header-row">
+          <div class="compat-head">Distribution</div>
+          <div class="compat-head">Kernel</div>
+          <div class="compat-head">Works</div>
+          <div class="compat-head">Notes</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Ubuntu 20.04 / 22.04 / 24.04</div>
+          <div class="compat-k">5.4 - 6.8</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note">All three verified</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Debian 11 / 12</div>
+          <div class="compat-k">5.10 / 6.1</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note"></div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Alpine 3.18 / 3.20</div>
+          <div class="compat-k">any</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note">No glibc needed; static build</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Rocky Linux 9 / AlmaLinux 9</div>
+          <div class="compat-k">5.14</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note">RHEL 9 equivalents</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Fedora 40</div>
+          <div class="compat-k">6.8</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note"></div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">openSUSE Leap 15.6</div>
+          <div class="compat-k">6.4</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note"></div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Amazon Linux 2023</div>
+          <div class="compat-k">6.1</div>
+          <div class="compat-test">tested</div>
+          <div class="compat-note"></div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">RHEL / CentOS 8, Rocky 8</div>
+          <div class="compat-k">4.18</div>
+          <div class="compat-yes">yes</div>
+          <div class="compat-note">Well above the floor</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">RHEL / CentOS 7</div>
+          <div class="compat-k">3.10</div>
+          <div class="compat-yes">yes</div>
+          <div class="compat-note">See the note below on older releases</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">RHEL / CentOS 6</div>
+          <div class="compat-k">2.6.32</div>
+          <div class="compat-yes">yes</div>
+          <div class="compat-note">Just above the 2.6.27 floor. Untested</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Raspberry Pi OS (32 and 64 bit)</div>
+          <div class="compat-k">5.x / 6.x</div>
+          <div class="compat-yes">yes</div>
+          <div class="compat-note">Use armv7 for 32 bit, arm64 for 64 bit</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Arch, Manjaro, NixOS, Gentoo</div>
+          <div class="compat-k">current</div>
+          <div class="compat-yes">yes</div>
+          <div class="compat-note">Rolling releases are always well above the floor</div>
+        </div>
+        <div class="compat-row">
+          <div class="compat-name">Synology DSM, OpenWrt, QNAP</div>
+          <div class="compat-k">varies</div>
+          <div class="compat-note" style="color: var(--color-accent-amber); font-weight: 600;">untested</div>
+          <div class="compat-note">Should work if the kernel is 2.6.27+ and the CPU matches</div>
+        </div>
+      </div>
+
+      <p class="legend">
+        <strong style="color: var(--color-accent-teal);">tested</strong> means the release binary was executed in that distribution and printed its version.
+        <strong style="color: var(--color-accent-green);">yes</strong> means the kernel is above the floor and nothing else is required, but we have not run it there.
+        Kernel numbers are the distribution's shipped default; a machine with a newer kernel is also fine.
+      </p>
+
+      <div class="qa" style="margin-top: 2rem;">
+        <details>
+          <summary>Why is a kernel from 2008 the limit?</summary>
+          <div class="answer">
+            <p>The async runtime needs <code>eventfd2</code> and <code>epoll_create1</code>, which arrived in Linux 2.6.27. Everything newer that WireHop touches is optional and falls back if missing, including <code>getrandom</code>, <code>io_uring</code>, and the QUIC segmentation offload that speeds up bulk transfer.</p>
+            <p>This was measured by making each newer call fail the way an old kernel makes it fail, then checking the binary still starts. It has not been run on an actually-old kernel, so treat the very bottom of the range as reasoned rather than proven.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>I am on RHEL 7 or something equally old. Anything I should know?</summary>
+          <div class="answer">
+            <p>Current releases run there directly. Releases up to v0.9.33 were compressed with a tool whose unpacking step needed Linux 3.17, which RHEL 7 does not have, so those specific builds fail immediately on startup.</p>
+            <p>Every release also publishes an uncompressed build (<code>hop-linux-&lt;arch&gt;-uncompressed</code>) as insurance, and the installer picks it automatically on kernels below 3.17. You do not have to do anything.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Does it work in Docker, or on a VPS with a weird kernel?</summary>
+          <div class="answer">
+            <p>Yes for reaching machines, running commands, and copying files. The private network needs a TUN device (<code>/dev/net/tun</code>), which containers only have if you grant it. Without one, WireHop logs that the network could not start and keeps everything else working rather than failing.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Which CPU architectures?</summary>
+          <div class="answer">
+            <p>x86_64, arm64 (aarch64), and armv7 for 32-bit ARM such as older Raspberry Pi. There is no 32-bit x86, RISC-V, or MIPS build.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Networking -->
+  <section id="network" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Networking</h2>
+        <p>NAT, firewalls, and what happens when the network moves.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>Do I need to open ports or configure my router?</summary>
+          <div class="answer"><p>No. Both machines make outbound connections and meet in the middle. Nothing needs to be reachable from the internet, and nothing needs a static address.</p></div>
+        </details>
+
+        <details>
+          <summary>Will it work behind carrier-grade NAT, or on mobile data?</summary>
+          <div class="answer"><p>Yes. Direct connection is attempted first and often succeeds even there. When it cannot, traffic falls back to an encrypted relay automatically. You do not choose; it switches on its own.</p></div>
+        </details>
+
+        <details>
+          <summary>What happens when I close my laptop or change networks?</summary>
+          <div class="answer">
+            <p>Sessions survive it. The remote shell keeps running, and the connection re-establishes on the new network. Reconnection typically takes a second or two.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Can I reach devices that cannot run WireHop, like a printer or NAS?</summary>
+          <div class="answer"><p>Yes. One machine on that network can bridge it, so the rest of your machines reach those devices by address. You can also forward a single remote port to your laptop, the way <code>ssh -L</code> does.</p></div>
+        </details>
+
+        <details>
+          <summary>Does it conflict with Tailscale or another VPN?</summary>
+          <div class="answer"><p>They coexist. WireHop checks whether the <code>100.64.0.0/10</code> address range is already in use and skips starting its own network rather than fighting over it. Reaching machines, running commands and copying files keep working either way.</p></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Security -->
+  <section id="security" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Security</h2>
+        <p>The short version. The <a href="security.html">security model</a> has the long one, including what this does not protect you from.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>What can someone do with a stolen invite?</summary>
+          <div class="answer">
+            <p>Exactly what the invite allows, until it expires or is redeemed. Invites are single-use and time-limited (15 minutes by default), and carry the restrictions you set: which machines, which commands, which paths, read-only or not.</p>
+            <p>Treat an unredeemed invite like a password. Short expiries limit the window; they do not close it.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Is my traffic really end-to-end encrypted?</summary>
+          <div class="answer"><p>Yes, QUIC with TLS 1.3 between your machines. A relay forwards packets it cannot decrypt. Identity is an Ed25519 keypair generated on each machine that never leaves it.</p></div>
+        </details>
+
+        <details>
+          <summary>Has it been audited?</summary>
+          <div class="answer"><p>No. There has been no third-party security audit. The source is public and the threat model is written down, which is not the same thing, and we would rather say so than imply otherwise.</p></div>
+        </details>
+
+        <details>
+          <summary>How do I revoke a machine?</summary>
+          <div class="answer"><p><code>hop fleet prune</code>, or an admin revoke. The revocation replicates to the rest of your machines. Each machine also keeps its own local audit log of connections, sessions and commands, readable with <code>hop audit</code>; there is no central collector.</p></div>
+        </details>
+
+        <details>
+          <summary>Do you collect telemetry?</summary>
+          <div class="answer"><p>No. Nothing is reported anywhere. There is no analytics, no crash reporting, and no account to attach any of it to.</p></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Agents -->
+  <section id="agents" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>AI agents</h2>
+        <p>The <a href="agents.html">agent page</a> covers the setup; these are the questions that follow it.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>Why does an AI agent need this rather than a normal VPN?</summary>
+          <div class="answer"><p>Because every hosted alternative requires a human to create an account in a browser and paste a key. An agent stops there and asks you to finish. WireHop has no account step, so an agent can go from unreachable machines to a working network on its own.</p></div>
+        </details>
+
+        <details>
+          <summary>What can an agent do if it is compromised?</summary>
+          <div class="answer">
+            <p>Whatever its invite allows, and no more. It cannot raise its own access, cannot reach machines its role does not cover (forwarding is deny-by-default), and cannot act without leaving a record on each machine.</p>
+            <p>Give an agent the smallest invite that does the job. A monitoring agent wants read-only access with two allowed commands, not full membership.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Do you host anything for AI tools?</summary>
+          <div class="answer"><p>No. The tool server runs locally under your own identity. Nothing is hosted, and nothing takes custody of your credentials.</p></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Alternatives -->
+  <section id="compare" style="padding-top: 0;">
+    <div class="container">
+      <div class="section-header">
+        <h2>Alternatives</h2>
+        <p>Where other tools are the better answer.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>Should I use this instead of Tailscale?</summary>
+          <div class="answer">
+            <p>Not always. Tailscale is better if you need Windows, iOS or Android clients, a web console, single sign-on, centralized audit, or a published security audit.</p>
+            <p>WireHop is better if you want an agent to set it up alone, want nobody in the middle at all, or want the shell, file sync and fleet commands in the same tool as the network. The <a href="vs-tailscale.html">full comparison</a> is honest in both directions.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>SSH already works for me. Why change?</summary>
+          <div class="answer"><p>Then do not. SSH is everywhere and battle-tested. WireHop wins when the machine is not reachable, when you want to act on many machines at once, or when you want an agent operating them. Not otherwise.</p></div>
+        </details>
+
+        <details>
+          <summary>Can I use it to share access with customers, or expose a service publicly?</summary>
+          <div class="answer"><p>No, and it is not built for either. There is no multi-tenant model and no per-customer isolation, and it does not publish anything to the public internet. Port forwarding brings a remote port to <em>you</em>, like <code>ssh -L</code>. For public exposure use a tunnel service; for customer access use something designed for it.</p></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- Project -->
+  <section id="project" style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div class="section-header">
+        <h2>The project</h2>
+        <p>Who makes it and how it is built.</p>
+      </div>
+
+      <div class="qa">
+        <details>
+          <summary>Who is behind it, and how is it funded?</summary>
+          <div class="answer"><p>Keikai Inc. It is open source under MIT or Apache-2.0, with no paid tier and no outside funding attached to it. If that changes, the license on what is already published cannot be taken back.</p></div>
+        </details>
+
+        <details>
+          <summary>Is it production ready?</summary>
+          <div class="answer">
+            <p>It is pre-1.0 and used daily by its authors. Releases are gated on automated tests that yank networks, restart hosts and measure how long recovery takes, and every Linux build must start on old distributions before it can ship.</p>
+            <p>Being straight about it: there has been no third-party audit, the version number is below 1.0 for a reason, and the surface is large. Judge it accordingly.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How do I report a bug or a vulnerability?</summary>
+          <div class="answer"><p>Bugs: GitHub issues. Vulnerabilities: private security advisories on the repository, not a public issue. We aim to acknowledge within 72 hours.</p></div>
+        </details>
+
+        <details>
+          <summary>Can I contribute?</summary>
+          <div class="answer"><p>Yes. The repository has a contributing guide, and CI runs on pull requests from forks without needing any secret, so your build goes green like anyone else's.</p></div>
+        </details>
+      </div>
+
+      <div style="text-align: center; padding: 3rem 2rem; margin-top: 3rem; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem;">
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Still unanswered?</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Open an issue and ask. If the question was worth asking, it belongs on this page.</p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="https://github.com/Keikai-Inc/wirehop/issues" class="btn btn-primary">Ask on GitHub</a>
+          <a href="index.html#install" class="btn btn-ghost">Install WireHop</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer id="site-footer"></footer>
+
+  <script src="shared.js"></script>
+</body>
+</html>

@@ -10,11 +10,12 @@
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
     { label: 'Security',     href: 'security.html', cross: 'security.html' },
+    { label: 'FAQ',          href: 'faq.html',      cross: 'faq.html' },
     { label: 'Source',       href: REPO,             cross: REPO },
   ];
 
   // Pages that get an "active" nav highlight, matched on a path substring.
-  var PAGE_MATCH = ['fleet', 'orchestration', 'agents', 'security', 'vs-tailscale'];
+  var PAGE_MATCH = ['fleet', 'orchestration', 'agents', 'security', 'vs-tailscale', 'faq'];
 
   var path = location.pathname;
   var onIndex = path === '/' || path.endsWith('/index.html') || path.endsWith('/index') || /\/site\/?$/.test(path);
