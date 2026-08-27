@@ -307,6 +307,25 @@ jobs:
           done
           rm -f "$RUNNER_TEMP/key.pem"
 
+      # Print the OIDC subject before assuming the role. "Not authorized to
+      # perform sts:AssumeRoleWithWebIdentity" says nothing about WHY, and the
+      # sub is not what the docs imply: GitHub now issues an immutable form
+      # carrying numeric org/repo ids
+      # (repo:Owner@<orgid>/repo@<repoid>:environment:name), so an IAM trust
+      # policy written against the documented repo:Owner/repo form silently
+      # never matches. The sub is not a secret; the token is, and is not shown.
+      - name: Show OIDC subject (for trust-policy debugging)
+        run: |
+          set -euo pipefail
+          TOKEN="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)"
+          CLAIMS="$(printf '%s' "$TOKEN" | cut -d. -f2)"
+          # base64url -> base64, pad, decode.
+          CLAIMS="$(printf '%s' "$CLAIMS" | tr '_-' '/+')"
+          while [ $(( ${#CLAIMS} % 4 )) -ne 0 ]; do CLAIMS="${CLAIMS}="; done
+          echo "OIDC sub: $(printf '%s' "$CLAIMS" | base64 -d 2>/dev/null | jq -r .sub)"
+          echo "OIDC aud: $(printf '%s' "$CLAIMS" | base64 -d 2>/dev/null | jq -r .aud)"
+
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
