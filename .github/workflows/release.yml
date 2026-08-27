@@ -125,6 +125,11 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/hop" "dist/${{ matrix.name }}"
           strip "dist/${{ matrix.name }}" 2>/dev/null || true
+          # Keep an unpacked copy BEFORE upx. The UPX stub unpacks via
+          # memfd_create(2) = Linux 3.17+, so the packed binary cannot start on
+          # RHEL/CentOS 7 (3.10) at all. install.sh checks `uname -r` and fetches
+          # this variant below 3.17; unpacked, the floor is tokio's 2.6.27.
+          cp "dist/${{ matrix.name }}" "dist/${{ matrix.name }}-uncompressed"
           BEFORE=$(stat -c%s "dist/${{ matrix.name }}")
           # UPX cuts the static musl binaries ~72-76%, which is the difference
           # between a ~5MB and a ~20MB download. `upx -t` self-tests the packed
@@ -167,15 +172,36 @@ jobs:
           fi
           echo "  static: no PT_INTERP"
           EXPECTED="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          for img in debian:11 alpine:3.20; do
-            GOT="$(docker run --rm --platform "$PLAT" -v "$PWD/dist:/w:ro" "$img" \
-                     "/w/${{ matrix.name }}" --version 2>&1 | tail -1)"
-            echo "  $img -> $GOT"
-            case "$GOT" in
-              "hop $EXPECTED") ;;
-              *) echo "::error::${{ matrix.name }} does not run on $img: $GOT"; exit 1 ;;
-            esac
+          # BOTH variants must run: the packed one is what most users get, and
+          # the uncompressed one is the only thing standing between an old-kernel
+          # user and a binary that dies before main().
+          for variant in "${{ matrix.name }}" "${{ matrix.name }}-uncompressed"; do
+            for img in debian:11 alpine:3.20; do
+              GOT="$(docker run --rm --platform "$PLAT" -v "$PWD/dist:/w:ro" "$img" \
+                       "/w/$variant" --version 2>&1 | tail -1)"
+              echo "  $variant on $img -> $GOT"
+              case "$GOT" in
+                "hop $EXPECTED") ;;
+                *) echo "::error::$variant does not run on $img: $GOT"; exit 1 ;;
+              esac
+            done
           done
+          # The uncompressed build exists to survive a kernel without
+          # memfd_create. Prove that directly rather than trusting the label:
+          # seccomp ENOSYS is what an old kernel does.
+          cat > /tmp/nomemfd.json <<'SECCOMP'
+          { "defaultAction": "SCMP_ACT_ALLOW",
+            "syscalls": [ { "names": ["memfd_create"], "action": "SCMP_ACT_ERRNO", "errnoRet": 38 } ] }
+          SECCOMP
+          sed -i 's/^          //' /tmp/nomemfd.json
+          GOT="$(docker run --rm --platform "$PLAT" --security-opt seccomp=/tmp/nomemfd.json \
+                   -v "$PWD/dist:/w:ro" debian:11 \
+                   "/w/${{ matrix.name }}-uncompressed" --version 2>&1 | tail -1)"
+          echo "  uncompressed, memfd_create blocked -> $GOT"
+          case "$GOT" in
+            "hop $EXPECTED") ;;
+            *) echo "::error::uncompressed build still needs memfd_create: $GOT"; exit 1 ;;
+          esac
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

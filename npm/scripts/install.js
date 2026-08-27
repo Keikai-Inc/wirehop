@@ -18,6 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 
@@ -25,6 +26,23 @@ const VERSION = require('../package.json').version;
 const BASE = process.env.WIREHOP_CDN_URL || 'https://wirehop.org';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 const OUT = path.join(BIN_DIR, process.platform === 'win32' ? 'hop.exe' : 'hop');
+
+/**
+ * True when the running kernel predates memfd_create(2) (Linux 3.17, Oct 2014).
+ *
+ * The published Linux binaries are UPX-packed; the UPX stub unpacks through
+ * memfd_create, so on an older kernel the binary dies before main() with no
+ * useful message. RHEL/CentOS 7 ships 3.10 and is the common case. Gate on the
+ * KERNEL rather than the distro: the constraint is the syscall.
+ */
+function needsUncompressed() {
+  if (process.platform !== 'linux') return false;
+  const m = /^(\d+)\.(\d+)/.exec(os.release() || '');
+  if (!m) return false; // unparseable release: assume modern, do not mis-route
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major < 3 || (major === 3 && minor < 17);
+}
 
 /** Map Node's platform/arch onto published artifact names. */
 function artifactName() {
@@ -36,7 +54,12 @@ function artifactName() {
     'linux:x64': 'hop-linux-x86_64',
     'linux:arm': 'hop-linux-armv7',
   };
-  return table[`${platform}:${arch}`] || null;
+  const base = table[`${platform}:${arch}`] || null;
+  if (base && needsUncompressed()) {
+    console.log(`[wirehop] kernel ${os.release()} predates memfd_create; using the uncompressed build`);
+    return `${base}-uncompressed`;
+  }
+  return base;
 }
 
 async function fetchBuffer(url) {

@@ -158,7 +158,29 @@ info "Installing hop v${VERSION}"
 
 # --- Download binary + checksum ----------------------------------------------
 
+# The published Linux binaries are UPX-packed (~70% smaller). The UPX stub
+# unpacks via memfd_create(2), which is Linux 3.17+ (Oct 2014) -- so on an older
+# kernel the packed binary dies before main() with no useful message. RHEL/CentOS
+# 7 ships 3.10 and is the common case. An uncompressed build is published
+# alongside for exactly this; it needs only 2.6.27 (tokio's eventfd2/epoll_create1).
+#
+# Gate on the KERNEL, not the distro: the constraint is the syscall, and this
+# also covers old kernels on distros nobody thought to special-case.
 BINARY_NAME="hop-${OS}-${ARCH}"
+if [[ "${OS}" == "linux" ]]; then
+  KREL="$(uname -r 2>/dev/null || echo 0.0)"
+  KMAJ="${KREL%%.*}"
+  KREST="${KREL#*.}"
+  KMIN="${KREST%%.*}"
+  # Non-numeric (unexpected uname) -> assume modern rather than mis-route.
+  case "${KMAJ}${KMIN}" in
+    ''|*[!0-9]*) KMAJ=99; KMIN=99 ;;
+  esac
+  if [[ "${KMAJ}" -lt 3 || ( "${KMAJ}" -eq 3 && "${KMIN}" -lt 17 ) ]]; then
+    info "Kernel ${KREL} predates memfd_create (3.17); using the uncompressed build"
+    BINARY_NAME="hop-${OS}-${ARCH}-uncompressed"
+  fi
+fi
 BINARY_URL="${BASE_URL}/v${VERSION}/${BINARY_NAME}"
 CHECKSUM_URL="${BINARY_URL}.sha256"
 
