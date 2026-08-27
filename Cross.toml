@@ -1,5 +1,13 @@
-# aarch64-unknown-linux-musl is built natively via docker run (no QEMU),
-# so it's not listed here. See scripts/release.sh and docker/Dockerfile.aarch64-musl.
+# scripts/release.sh builds aarch64-unknown-linux-musl natively via `docker run`
+# with docker/Dockerfile.aarch64-musl (no QEMU on Apple Silicon), so the local
+# release path does not consult this entry. CI has no native arm64 host and uses
+# `cross` for all three targets; the entry below is what it resolves.
+
+[target.aarch64-unknown-linux-musl]
+image = "hop-cross-aarch64-musl-ci"
+
+[target.aarch64-unknown-linux-musl.env]
+passthrough = ["AWS_LC_SYS_CMAKE_BUILDER"]
 
 [target.x86_64-unknown-linux-musl]
 image = "hop-cross-x86_64-musl"

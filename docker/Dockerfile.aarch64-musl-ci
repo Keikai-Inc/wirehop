@@ -1,0 +1,15 @@
+# aarch64-unknown-linux-musl for CI, via the official cross-rs base.
+#
+# Distinct from Dockerfile.aarch64-musl, which pulls a toolchain from musl.cc so
+# it can build NATIVELY on an Apple Silicon workstation (no QEMU). That is the
+# right trade locally and the wrong one in CI: musl.cc is a single flaky
+# third-party host with no availability guarantee, and it took down a release
+# build ("tar: Error is not recoverable"). CI runs x86_64 and uses QEMU anyway,
+# so it can use the same cross-rs base as the other two targets and depend on
+# nothing but ghcr.
+#
+# cmake is the addition: the stock image's GCC trips a known aws-lc-sys bug
+# unless AWS_LC_SYS_CMAKE_BUILDER=1 selects the cmake builder.
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*

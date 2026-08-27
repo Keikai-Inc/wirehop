@@ -83,8 +83,8 @@ jobs:
             dockerfile: docker/Dockerfile.x86_64-musl
           - target: aarch64-unknown-linux-musl
             name: hop-linux-arm64
-            image: hop-cross-aarch64-musl
-            dockerfile: docker/Dockerfile.aarch64-musl
+            image: hop-cross-aarch64-musl-ci
+            dockerfile: docker/Dockerfile.aarch64-musl-ci
           - target: armv7-unknown-linux-musleabihf
             name: hop-linux-armv7
             image: hop-cross-armv7-musl
@@ -113,21 +113,11 @@ jobs:
           AWS_LC_SYS_CMAKE_BUILDER: "1"
           HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
           HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            # Not routed through cross: this image is rust:1-bookworm plus a
-            # musl.cc toolchain rather than a cross-rs base, so cargo runs in it
-            # directly. Mirrors scripts/release.sh.
-            docker run --rm \
-              -e HOP_GOOGLE_CLIENT_ID -e HOP_GOOGLE_CLIENT_SECRET \
-              -v "$PWD:/build" \
-              ${{ matrix.image }} \
-              cargo build --release --target ${{ matrix.target }} \
-                --manifest-path /build/Cargo.toml -p hop-cli
-          else
-            cross build --release --target ${{ matrix.target }} -p hop-cli
-          fi
+        # All three targets go through cross against an image built above, so
+        # there is one code path rather than a special case per arch. Uses
+        # --release (full LTO) rather than the local release-cross profile:
+        # QEMU segfaults on aws-lc-sys assembly under thin-LTO rebuilds.
+        run: cross build --release --target ${{ matrix.target }} -p hop-cli
 
       - name: Stage + compress
         run: |
