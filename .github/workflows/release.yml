@@ -74,36 +74,101 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - armv7-unknown-linux-gnueabihf
+        include:
+          - target: x86_64-unknown-linux-musl
+            name: hop-linux-x86_64
+            image: hop-cross-x86_64-musl
+            dockerfile: docker/Dockerfile.x86_64-musl
+          - target: aarch64-unknown-linux-musl
+            name: hop-linux-arm64
+            image: hop-cross-aarch64-musl
+            dockerfile: docker/Dockerfile.aarch64-musl
+          - target: armv7-unknown-linux-musleabihf
+            name: hop-linux-armv7
+            image: hop-cross-armv7-musl
+            dockerfile: docker/Dockerfile.armv7-musl
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+
+      # MUSL, not gnu. A glibc-linked binary only runs on distros with a glibc
+      # at least as new as the builder's: v0.9.34 was built here against
+      # Ubuntu 24.04 and would not start on Ubuntu 22.04, Debian 11, or Alpine
+      # at all. Static musl runs everywhere, which is what a single downloadable
+      # binary has to do. The stock cross images carry a GCC too old for
+      # aws-lc-sys, hence the repo's own images.
+      - name: Build cross image
+        run: docker build -t ${{ matrix.image }} -f ${{ matrix.dockerfile }} .
+
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
-      - name: Build
+
+      - name: Build (musl)
         env:
           AWS_LC_SYS_CMAKE_BUILDER: "1"
           HOP_GOOGLE_CLIENT_ID: ${{ secrets.HOP_GOOGLE_CLIENT_ID }}
           HOP_GOOGLE_CLIENT_SECRET: ${{ secrets.HOP_GOOGLE_CLIENT_SECRET }}
-        run: cross build --release --target ${{ matrix.target }} -p hop-cli
-      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            # Not routed through cross: this image is rust:1-bookworm plus a
+            # musl.cc toolchain rather than a cross-rs base, so cargo runs in it
+            # directly. Mirrors scripts/release.sh.
+            docker run --rm \
+              -e HOP_GOOGLE_CLIENT_ID -e HOP_GOOGLE_CLIENT_SECRET \
+              -v "$PWD:/build" \
+              ${{ matrix.image }} \
+              cargo build --release --target ${{ matrix.target }} \
+                --manifest-path /build/Cargo.toml -p hop-cli
+          else
+            cross build --release --target ${{ matrix.target }} -p hop-cli
+          fi
+
+      - name: Stage + compress
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/hop" "dist/${{ matrix.name }}"
+          strip "dist/${{ matrix.name }}" 2>/dev/null || true
+          BEFORE=$(stat -c%s "dist/${{ matrix.name }}")
+          # UPX cuts the static musl binaries ~72-76%, which is the difference
+          # between a ~5MB and a ~20MB download. `upx -t` self-tests the packed
+          # binary; a bad pack must fail the release, not ship.
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          upx --best --lzma "dist/${{ matrix.name }}" >/dev/null
+          upx -t "dist/${{ matrix.name }}" >/dev/null
+          AFTER=$(stat -c%s "dist/${{ matrix.name }}")
+          echo "${{ matrix.name }}: $BEFORE -> $AFTER bytes"
+
+      # The gate that would have caught v0.9.34. Assert the binary actually
+      # STARTS on an old-glibc distro and on musl-only Alpine, rather than
+      # trusting that the target triple was right.
+      - name: Verify it runs on old distros
         run: |
           set -euo pipefail
           case "${{ matrix.target }}" in
-            x86_64-*)  NAME=hop-linux-x86_64 ;;
-            aarch64-*) NAME=hop-linux-arm64 ;;
-            armv7-*)   NAME=hop-linux-armv7 ;;
+            x86_64-*) PLAT=linux/amd64 ;;
+            aarch64-*) PLAT=linux/arm64 ;;
+            armv7-*)   echo "armv7: no runner platform to exec on; skipped"; exit 0 ;;
           esac
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hop" "dist/$NAME"
-          strip "dist/$NAME" 2>/dev/null || true
+          docker run --rm --privileged \
+            tonistiigi/binfmt@sha256:66e11bea77a5ea9d6f0fe79b57cd2b189b5d15b93a2bdb925be22949232e4e55 --install all >/dev/null 2>&1 || true
+          EXPECTED="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          for img in debian:11 alpine:3.20; do
+            GOT="$(docker run --rm --platform "$PLAT" -v "$PWD/dist:/w:ro" "$img" \
+                     "/w/${{ matrix.name }}" --version 2>&1 | tail -1)"
+            echo "  $img -> $GOT"
+            case "$GOT" in
+              "hop $EXPECTED") ;;
+              *) echo "::error::${{ matrix.name }} does not run on $img: $GOT"; exit 1 ;;
+            esac
+          done
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.target }}
