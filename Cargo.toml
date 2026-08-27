@@ -3,7 +3,7 @@ members = ["crates/hop-cli", "crates/hop-core", "crates/hop-ext-echo", "crates/h
 resolver = "2"
 
 [workspace.package]
-version = "0.9.34"
+version = "0.9.35"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Keikai-Inc/wirehop"
