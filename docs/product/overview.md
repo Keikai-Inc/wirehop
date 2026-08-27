@@ -106,6 +106,37 @@ Bringup is fail-safe
 — if a TUN can't be created or the CGNAT range conflicts (e.g. Tailscale), it's
 skipped and shell/exec/transfer are unaffected. See [warren.md](warren.md).
 
+## Supported platforms
+
+macOS and Linux. Windows via WSL only.
+
+### Linux kernel floor
+
+The published Linux binaries are **static musl** (no libc dependency, no
+`ld.so`), so distro age does not matter. The kernel does:
+
+| Build | Minimum kernel | Set by |
+|---|---|---|
+| Default (UPX-packed) | **3.17** (Oct 2014) | the UPX stub's `memfd_create(2)` |
+| `-uncompressed` variant | **2.6.27** (Oct 2008) | tokio's `eventfd2` / `epoll_create1` |
+
+3.17 covers Debian 9+, Ubuntu 16.04+, RHEL 8+ and all current Alpine. It does
+**not** cover **RHEL/CentOS 7**, which ships 3.10 — there the packed binary dies
+before `main()` with no useful message.
+
+`install.sh` and the npm postinstall both read `uname -r` and fetch
+`hop-linux-<arch>-uncompressed` below 3.17, so this is handled automatically.
+The check is on the kernel, not the distro, since the constraint is the syscall.
+
+Everything newer is used opportunistically with fallbacks and is **not**
+required: `getrandom` (3.17), `membarrier` (4.3), `rseq` (4.18), `io_uring`
+(5.1), `clone3` (5.3), `openat2`/`GRND_INSECURE` (5.6), `faccessat2` (5.8).
+QUIC `UDP_SEGMENT`/`UDP_GRO` (4.18/5.0) degrade to plain sends when absent.
+
+*Measured by returning `ENOSYS` for each syscall via seccomp, which is what an
+old kernel does. Startup and `hop host` were exercised this way; the VPN data
+plane needs `/dev/net/tun` and has not been tested below 6.x.*
+
 ## Architecture
 
 ```
