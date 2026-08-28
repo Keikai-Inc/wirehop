@@ -101,6 +101,9 @@ tempfile = "3"
 # connections (the fix was filed upstream at quinn-rs/quinn); if not, patch
 # `quinn` instead. Tracked as a Phase 1 robustness item.
 [patch.crates-io]
+# See docs/technical/iroh-fork.md for what is in the fork, why crates.io
+# publishing is blocked by it, and the measured cost of moving to upstream 1.1.
+#
 # Redirect iroh AND its sibling workspace crates (iroh-base, iroh-relay) to our
 # fork: upstream iroh 0.97.0 + the macOS relay-connection-cascade fix. All three
 # must be patched together — iroh-docs/blobs/gossip pull iroh-base/iroh-relay
