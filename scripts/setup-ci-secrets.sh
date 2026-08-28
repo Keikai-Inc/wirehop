@@ -204,6 +204,17 @@ else
   echo "   (without these the release binary ships without \`hop auth gmail\`)"
 fi
 
+# ── npm ─────────────────────────────────────────────────────────────────────
+say "npm publish token"
+if [ -n "${NPM_TOKEN:-}" ]; then
+  printf '%s' "$NPM_TOKEN" | set_secret NPM_TOKEN
+else
+  echo "   SKIPPED: export NPM_TOKEN first (npmjs.com -> Access Tokens ->"
+  echo "   Granular Access Token, read+write on @wirehop/wirehop)."
+  echo "   \`npm token create\` is the legacy flow and wants your account"
+  echo "   password plus an OTP, which does not work with passkey-only 2FA."
+fi
+
 # ── AWS + CDN ───────────────────────────────────────────────────────────────
 say "AWS publish role and CDN"
 printf '%s' "${AWS_ROLE_ARN:-arn:aws:iam::064311028681:role/wirehop-github-release}" \
