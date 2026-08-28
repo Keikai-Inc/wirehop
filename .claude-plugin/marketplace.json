@@ -1,0 +1,14 @@
+{
+  "name": "wirehop",
+  "owner": {
+    "name": "Keikai Inc.",
+    "url": "https://wirehop.org"
+  },
+  "plugins": [
+    {
+      "name": "wirehop",
+      "source": "./",
+      "description": "Reach, operate and network your own machines: remote shell, cross-fleet execution, file sync, a private mesh network and a scheduler, with no accounts and no coordination server."
+    }
+  ]
+}

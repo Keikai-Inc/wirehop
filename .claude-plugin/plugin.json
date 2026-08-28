@@ -1,0 +1,13 @@
+{
+  "name": "wirehop",
+  "description": "Reach, operate and network your own machines without accounts, port forwarding, or a coordination server. Bundles the wirehop skill: when to reach for it, the cold-start bootstrap, and how to scope an invite to least privilege.",
+  "version": "0.9.36",
+  "author": {
+    "name": "Keikai Inc.",
+    "url": "https://wirehop.org"
+  },
+  "homepage": "https://wirehop.org",
+  "repository": "https://github.com/Keikai-Inc/wirehop",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["vpn", "remote-access", "p2p", "mesh", "ssh", "devops", "fleet"]
+}
