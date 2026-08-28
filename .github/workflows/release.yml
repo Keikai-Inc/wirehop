@@ -75,6 +75,8 @@ permissions:
 jobs:
   # ── Linux binaries (x86_64 + arm64 + armv7) ────────────────────────────────
   linux:
+    # Never on the private mirror; see ci.yml for why.
+    if: github.repository != 'thedracle/hop'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -213,6 +215,8 @@ jobs:
 
   # ── macOS binaries + signed, notarized .pkg installers ─────────────────────
   macos:
+    # Never on the private mirror; see ci.yml for why. macOS bills at 10x.
+    if: github.repository != 'thedracle/hop'
     # macos-14 is Apple Silicon; both slices cross-compile from it.
     runs-on: macos-14
     # Secrets are scoped to this environment. Configure it in repo Settings →
@@ -376,6 +380,7 @@ jobs:
   # ── Sign artifacts, publish to S3 + GitHub Releases ────────────────────────
   publish:
     needs: [linux, macos]
+    if: github.repository != 'thedracle/hop'
     runs-on: ubuntu-latest
     # Same gate: holds the RSA release key and the AWS role.
     environment: release

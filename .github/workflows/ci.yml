@@ -11,6 +11,16 @@
 
 name: ci
 
+# NEVER let this run on the private mirror (thedracle/hop). Actions is free and
+# unlimited on PUBLIC repositories; on a private one it is metered, and macOS
+# runners bill at 10x. This workflow spends ~100 billed minutes per push there,
+# which burned ~1800 of a 2000-minute monthly allowance in two days before
+# anyone noticed. CI belongs on the public repo, where it costs nothing.
+#
+# The check is by name rather than `github.event.repository.private` so that
+# FORKS of the public repo still run CI normally: a contributor's fork should
+# go green like anyone else's.
+
 on:
   push:
     branches: [main]
@@ -27,6 +37,7 @@ env:
 
 jobs:
   test:
+    if: github.repository != 'thedracle/hop'
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -72,6 +83,7 @@ jobs:
   # documented way to get WireHop, and a syntax error there breaks every new
   # user while the Rust tests stay green.
   scripts:
+    if: github.repository != 'thedracle/hop'
     name: shell scripts
     runs-on: ubuntu-latest
     steps:
@@ -94,6 +106,7 @@ jobs:
   # The release workflow only ever executes on a tag push, so a mistake in it is
   # discovered at the worst possible moment. Lint it on every change instead.
   workflows:
+    if: github.repository != 'thedracle/hop'
     name: workflow lint
     runs-on: ubuntu-latest
     steps:
@@ -105,6 +118,7 @@ jobs:
           ./actionlint -color
 
   site:
+    if: github.repository != 'thedracle/hop'
     name: site style
     runs-on: ubuntu-latest
     steps:
