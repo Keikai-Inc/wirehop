@@ -26,6 +26,9 @@
 #                                crates/hop-cli/build.rs; NOT in the source)
 #   AWS_ROLE_ARN                 IAM role for OIDC (no long-lived AWS keys)
 #   CF_DISTRIBUTION_ID           CloudFront distribution id
+#   NPM_TOKEN                    npm granular access token, read+write on
+#                                @wirehop/wirehop. Optional: without it the
+#                                npm step warns and skips rather than failing
 #
 # Export the .p12 files on the Mac that holds the certs:
 #   security find-identity -v            # confirm both are present
@@ -470,3 +473,52 @@ jobs:
             --title "WireHop v${VERSION}" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             || gh release upload "v${VERSION}" dist/* --clobber
+
+      # npm LAST, deliberately: the postinstall downloads from
+      # <cdn>/v<package.json version>/, so the artifacts must already be on S3
+      # or a fresh install of the new version 404s. Publishing here rather than
+      # by hand is also what stops npm drifting behind the releases, which it
+      # did (npm sat on 0.9.33 while the CDN served 0.9.36, so `npx` handed
+      # people stale binaries).
+      - name: Publish npm wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN not set, skipping npm publish."
+            echo "Create a granular access token scoped to @wirehop/wirehop with"
+            echo "read+write, then: gh secret set NPM_TOKEN"
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "${{ inputs.version }}" ] && VERSION="${{ inputs.version }}"
+
+          cd npm
+          # The wrapper's version IS the download path, so it must match the
+          # release rather than whatever is committed.
+          node -e '
+            const fs=require("fs"), p="package.json";
+            const d=JSON.parse(fs.readFileSync(p));
+            d.version=process.argv[1];
+            fs.writeFileSync(p, JSON.stringify(d,null,2)+"\n");
+          ' "$VERSION"
+
+          if npm view "@wirehop/wirehop@${VERSION}" version >/dev/null 2>&1; then
+            echo "@wirehop/wirehop@${VERSION} already published, nothing to do."
+            exit 0
+          fi
+
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          npm publish --access public
+          rm -f ~/.npmrc
+
+          # Confirm what the registry actually serves, rather than trusting that
+          # publish succeeded.
+          for _ in $(seq 1 10); do
+            GOT="$(npm view "@wirehop/wirehop@${VERSION}" version 2>/dev/null || true)"
+            [ "$GOT" = "$VERSION" ] && { echo "npm now serves ${GOT}"; exit 0; }
+            sleep 6
+          done
+          echo "::error::published but the registry does not report ${VERSION}"
+          exit 1
