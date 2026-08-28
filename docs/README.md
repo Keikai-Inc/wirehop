@@ -30,6 +30,7 @@ separate files have been consolidated here.
 | [warren-internals.md](technical/warren-internals.md) | The warren's full internal design: iroh endpoint/relay/netmon networking + VPN data plane, orchestratorless iroh-docs state (the 13 design decisions), per-member write-isolated self-docs (C1), install/invite capability tiers, and the Cedar-based ACL (with a Tailscale comparison) |
 | [security.md](technical/security.md) | Security internals: Ed25519/Argon2/ChaCha20 crypto, the sandbox (validator/broker, Seatbelt, Landlock), privilege separation (monitor/worker), and the standing source-level security audit with remediation status |
 | [cron-security.md](technical/cron-security.md) | Cron scheduler trust model and hardening roadmap: what the JS runtime can/can't reach, known gaps, priority order |
+| [iroh-fork.md](technical/iroh-fork.md) | Why WireHop pins a forked iroh, what the two client-side patches fix, why crates.io publishing is blocked by it, and the measured scope of migrating to upstream 1.1 |
 | [datastore.md](technical/datastore.md) | redb tables, IPC protocol, DsRequest/DsResponse, retention |
 | [transfer.md](technical/transfer.md) | Delta algorithm, negotiation, privilege-separated helper |
 | [js-runtime.md](technical/js-runtime.md) | QuickJS, async bridge, binding architecture |
