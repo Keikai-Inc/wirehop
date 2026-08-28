@@ -1,6 +1,6 @@
 {
   "name": "@wirehop/wirehop",
-  "version": "0.9.36",
+  "version": "0.9.37",
   "description": "WireHop \u2014 secure peer-to-peer remote access and private networks. Single binary, no accounts, no port forwarding, no coordination server. Includes an MCP server so AI agents can reach and operate your machines.",
   "keywords": [
     "mcp",
