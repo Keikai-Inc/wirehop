@@ -144,6 +144,7 @@ site_paths() {
   for p in "${PROJECT_ROOT}"/site/*.html; do
     printf '/%s\n' "$(basename "${p}")"
   done
+  printf '/wirehop-release.pub\n'
 }
 
 # --- Site-only mode ----------------------------------------------------------
@@ -162,6 +163,10 @@ if [[ "${SITE_ONLY}" == true ]]; then
     --content-type "text/css"
   aws s3 cp "${PROJECT_ROOT}/site/shared.js" "s3://${BUCKET}/shared.js" \
     --content-type "application/javascript"
+  # The release-signing public key, so a download can be verified by hand
+  # against the same key install.sh embeds (see the FAQ "verify" answer).
+  aws s3 cp "${PROJECT_ROOT}/site/wirehop-release.pub" "s3://${BUCKET}/wirehop-release.pub" \
+    --content-type "text/plain"
 
   # install.sh / install-daemon.sh are deployed site assets too — keep them in
   # sync on a site-only redeploy (e.g. install-location or copy changes).

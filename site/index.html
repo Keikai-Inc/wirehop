@@ -346,6 +346,11 @@
           <div class="comparison-cell comparison-other">Tailscale needs its coordinator; ngrok its servers</div>
         </div>
         <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Third-party security audit</div>
+          <div class="comparison-cell hop-col">Not yet; the threat model and a standing self-audit are published</div>
+          <div class="comparison-cell comparison-other">Tailscale: yes, published</div>
+        </div>
+        <div class="comparison-row">
           <div class="comparison-cell comparison-label">Account required</div>
           <div class="comparison-cell hop-col">No</div>
           <div class="comparison-cell comparison-other">Tailscale, ngrok require accounts</div>
@@ -429,6 +434,14 @@
 <span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./project server:~/project
           </div>
         </div>
+        <p style="color: var(--color-text-secondary); margin-top: 1.5rem; max-width: 46rem; line-height: 1.8;">
+          <strong>Prefer not to pipe a script into your shell?</strong> Every release is also on
+          <a href="https://github.com/Keikai-Inc/wirehop/releases">GitHub Releases</a> as plain binaries
+          with a <code>.sha256</code> and an RSA <code>.sig</code> beside each one, as a signed and notarized
+          macOS <code>.pkg</code>, and on npm as <code>npx -y @wirehop/wirehop</code>. The signing key is
+          <a href="wirehop-release.pub">wirehop-release.pub</a>; the FAQ shows
+          <a href="faq.html#verify">how to check a download by hand</a>.
+        </p>
       </div>
     </div>
   </section>

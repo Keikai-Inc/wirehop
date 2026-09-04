@@ -259,6 +259,12 @@
           <div class="answer">
             <p>Every release artifact ships a SHA-256 and an RSA signature. The installer checks both against a public key embedded in it, and <strong>refuses to install on a mismatch</strong> rather than warning and continuing.</p>
             <p>Releases are built, signed and published by a GitHub Actions workflow you can read, so the artifacts trace back to a specific commit. macOS packages are additionally signed and notarized with Apple.</p>
+            <p id="verify">To check a download yourself, with nothing but <code>curl</code> and <code>openssl</code>:</p>
+            <pre><code>curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64
+curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64.sig
+curl -fsSLO https://wirehop.org/wirehop-release.pub
+openssl dgst -sha256 -verify wirehop-release.pub -signature hop-linux-x86_64.sig hop-linux-x86_64</code></pre>
+            <p>It prints <code>Verified OK</code> or fails. The same key is embedded in <code>install.sh</code>, so you can compare the two.</p>
           </div>
         </details>
 
