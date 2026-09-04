@@ -138,8 +138,11 @@ async fn real_main() -> Result<()> {
             cmd_host(secret_key, &config_dir, quiet, relay, relay_port, reload_handle).await
         }
         Command::Recover { quiet } => cmd_recover(quiet),
-        Command::Invite { creator, user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
+        Command::Invite { action, creator, user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            if let Some(action) = action {
+                return cmd_invite_action(&config_dir, action);
+            }
             // `--creator`: print this host's standing creator invite (the former
             // `hop creator-invite`) instead of minting a new one.
             if creator {
@@ -907,20 +910,22 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         let ticket_str = ticket.to_string();
                         // 0600 — this is a warren *write* ticket (security-audit H7).
                         let _ = config::write_secret_file(&cfg.join("netdoc.ticket"), &ticket_str);
-                        // The creator invite is generated at startup, before the
-                        // netdoc namespace exists, so it can't embed the ticket
-                        // up front. Augment it now (same secret) so the founder's
-                        // invite doubles as the warren join token.
+                        // The founder's own doc author is the C1 trust anchor
+                        // that warren invites hand to joining nodes (in
+                        // `AuthResultV2`, after the secret verified). Persist it
+                        // here so `grant_for_tier` can read it; the creator
+                        // invite itself no longer carries the write ticket.
+                        let _ = config::write_secret_file(&cfg.join("netdoc-founder.author"), &net.author_hex());
                         let ci_path = cfg.join("creator_invite");
                         if let Ok(tok_str) = std::fs::read_to_string(&ci_path)
                             && let Ok(mut tok) = hop_core::invite::decode_invite(tok_str.trim())
-                            && tok.warren_ticket.is_none()
+                            && (tok.warren_ticket.is_some() || tok.founder_author.is_some())
                         {
-                            tok.warren_ticket = Some(ticket_str);
-                            // Pin the founder's doc author as the C1 trust anchor:
-                            // a joining node records this as the trusted admin
-                            // author for validating admin-owned doc entries.
-                            tok.founder_author = Some(net.author_hex());
+                            // A creator_invite written by an older binary
+                            // embeds the write ticket; strip it in place.
+                            tok.warren_ticket = None;
+                            tok.founder_author = None;
+                            tok.tier = hop_core::invite::InviteTier::Admin;
                             if let Ok(reencoded) = hop_core::invite::encode_invite(&tok) {
                                 let _ = config::write_shared_file(&ci_path, &reencoded);
                                 tracing::info!("creator invite augmented with warren ticket + founder author");
@@ -1203,7 +1208,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             #[cfg(not(unix))]
             let creator_username: Option<String> = None;
 
-            match invite::generate_invite_with_role(
+            match invite::generate_invite_with_tier(
                 &public_key,
                 config_dir,
                 relay_url_str.as_deref(),
@@ -1214,6 +1219,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 3600, // 1-hour expiry
                 hop_core::sandbox::SandboxPolicy::default(),
                 None, // single-use
+                hop_core::invite::InviteTier::Admin,
             ) {
                 Ok(token) => {
                     // Write to file with restricted permissions
@@ -1510,6 +1516,7 @@ async fn handle_incoming_inner(
         &remote_id,
         config_dir,
         netdoc_ref,
+        protocol_version,
     )
     .await?;
 
@@ -2150,6 +2157,77 @@ pub(crate) fn id_via_daemon(config_dir: &std::path::Path) -> Result<Option<Strin
             other => anyhow::bail!("unexpected admin response from daemon: {other:?}"),
         },
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// `hop invite list` / `hop invite revoke <id>`: through the daemon when one is
+/// running (it owns the pending-invite store under privsep), else locally.
+fn cmd_invite_action(config_dir: &std::path::Path, action: cli::InviteAction) -> Result<()> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    use hop_core::invite::{PendingInviteInfo, PendingInvitesStore};
+    let req = match &action {
+        cli::InviteAction::List { .. } => AdminRequest::ListInvites,
+        cli::InviteAction::Revoke { id } => AdminRequest::RevokeInvite { id: id.clone() },
+    };
+    let resp = match DaemonConnection::connect(config_dir) {
+        Ok(conn) => match conn.request(&DsRequest::Admin(Box::new(req)))? {
+            DsResponse::Admin(resp) => *resp,
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        },
+        Err(_) => {
+            // No daemon: operate on the store directly.
+            let mut store = PendingInvitesStore::load(config_dir)?;
+            store.prune_expired(15 * 60);
+            match &action {
+                cli::InviteAction::List { .. } => AdminResponse::InviteList { invites: store.list(15 * 60) },
+                cli::InviteAction::Revoke { id } => {
+                    let full = store.revoke(id)?;
+                    store.save(config_dir)?;
+                    AdminResponse::InviteRevoked { id: full }
+                }
+            }
+        }
+    };
+    match (action, resp) {
+        (cli::InviteAction::List { json }, AdminResponse::InviteList { invites }) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&invites)?);
+                return Ok(());
+            }
+            if invites.is_empty() {
+                println!("No pending invites.");
+                return Ok(());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            println!("{:<10} {:<12} {:<12} {:<10} EXPIRES", "ID", "TIER", "USER", "USES");
+            for PendingInviteInfo { id, tier, username, uses, max_uses, expires_at, .. } in invites {
+                let left = expires_at.saturating_sub(now);
+                let uses_s = match max_uses {
+                    Some(m) => format!("{uses}/{m}"),
+                    None => format!("{uses}/1"),
+                };
+                println!(
+                    "{:<10} {:<12} {:<12} {:<10} in {}m{:02}s",
+                    if id.is_empty() { "(legacy)".to_string() } else { id },
+                    tier.as_str(),
+                    username.unwrap_or_else(|| "-".into()),
+                    uses_s,
+                    left / 60,
+                    left % 60
+                );
+            }
+            Ok(())
+        }
+        (cli::InviteAction::Revoke { .. }, AdminResponse::InviteRevoked { id }) => {
+            println!("Revoked invite {id}.");
+            Ok(())
+        }
+        (_, AdminResponse::Error { message }) => anyhow::bail!("{message}"),
+        (_, other) => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
 
@@ -3243,6 +3321,25 @@ async fn cmd_exec(
     command: &[String],
     sandbox: hop_core::sandbox::SandboxPolicy,
 ) -> Result<()> {
+    match exec_remote(target, config_dir, command, sandbox).await? {
+        SessionOutcome::Exited(code) => std::process::exit(code),
+        SessionOutcome::Disconnected => {
+            eprintln!("Connection lost");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run one command on `target` and return how the session ended, without
+/// exiting the process. `cmd_exec` is the CLI wrapper that turns the outcome
+/// into an exit status; the warren join uses this directly because it has
+/// more to do after the redeem.
+async fn exec_remote(
+    target: &str,
+    config_dir: &std::path::Path,
+    command: &[String],
+    sandbox: hop_core::sandbox::SandboxPolicy,
+) -> Result<SessionOutcome> {
     let command_str = command.join(" ");
 
     let exec_msg: ClientMessage = if sandbox.is_restricted() {
@@ -3260,15 +3357,7 @@ async fn cmd_exec(
     .await?;
 
     let mut stdin_rx = spawn_stdin_reader();
-    let outcome = shell::client_exec_session(send, recv, &mut stdin_rx).await?;
-
-    match outcome {
-        SessionOutcome::Exited(code) => std::process::exit(code),
-        SessionOutcome::Disconnected => {
-            eprintln!("Connection lost");
-            std::process::exit(1);
-        }
-    }
+    shell::client_exec_session(send, recv, &mut stdin_rx).await
 }
 
 /// Parse a `hop tunnel` port spec: `<port>` (local==remote) or `<localport>:<remoteport>`.
@@ -4153,6 +4242,18 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
         }
         AdminResponse::MetricsReceived { count } => {
             println!("Received {count} metric point(s)");
+        }
+        AdminResponse::InviteList { invites } => {
+            if invites.is_empty() {
+                println!("No pending invites.");
+            } else {
+                for inv in invites {
+                    println!("{} tier={} user={} uses={}", if inv.id.is_empty() { "(legacy)".to_string() } else { inv.id }, inv.tier.as_str(), inv.username.unwrap_or_else(|| "-".into()), inv.uses);
+                }
+            }
+        }
+        AdminResponse::InviteRevoked { id } => {
+            println!("Revoked invite {id}.");
         }
         AdminResponse::Error { message } => {
             eprintln!("Error: {message}");
@@ -6718,11 +6819,39 @@ async fn do_warren_join(
     let (ticket, founder_author, founder_node, redeem, tier) = match invite {
         Some(tok) => {
             let decoded = hop_core::invite::decode_invite(&tok).context("invalid invite token")?;
-            let t = decoded.warren_ticket.clone().context(
-                "this invite does not carry a warren — the host has no VPN/warren enabled",
-            )?;
-            let tier = decoded.effective_tier();
-            (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok), tier)
+            match decoded.warren_ticket.clone() {
+                // Legacy (pre-hop/4) token: the ticket rides in the token.
+                Some(t) => {
+                    let tier = decoded.effective_tier();
+                    (t, decoded.founder_author.clone(), Some(decoded.node_id.clone()), Some(tok), tier)
+                }
+                // hop/4 token: redeem first; the host grants the ticket after
+                // the secret verified, and the auth step leaves it for us here.
+                None => {
+                    anyhow::ensure!(
+                        decoded.tier.is_warren_node(),
+                        "this invite is reach-only (client tier); ask for a node or admin invite to join the warren"
+                    );
+                    println!("Joining warren — redeeming invite for membership...");
+                    match exec_remote(&tok, config_dir, &["true".to_string()], hop_core::sandbox::SandboxPolicy::default())
+                        .await
+                        .context("invite redemption failed")?
+                    {
+                        SessionOutcome::Exited(_) => {}
+                        SessionOutcome::Disconnected => anyhow::bail!("connection lost while redeeming the invite"),
+                    }
+                    // The redeem started a mux agent (it holds this config dir's
+                    // datastore lock). Stop it so the node daemon we're about to
+                    // bring up can acquire the datastore.
+                    let _ = agent::stop_agent(config_dir);
+                    let grant = mux::take_invite_grant(config_dir)
+                        .context("the host accepted the invite but granted no warren (is it running hop 0.9.38 or newer with a warren?)")?;
+                    let t = grant.warren_ticket.context(
+                        "this invite does not carry a warren — the host has no VPN/warren enabled",
+                    )?;
+                    (t, grant.founder_author, Some(grant.founder_node), None, grant.tier)
+                }
+            }
         }
         None => {
             let stored = std::fs::read_to_string(config_dir.join("warren-ticket")).context(
@@ -6749,13 +6878,7 @@ async fn do_warren_join(
     // Redeem for membership (auth handshake → the inviting host records us).
     if let Some(tok) = redeem {
         println!("Joining warren — redeeming invite for membership...");
-        let secret_key = config::load_or_generate_identity(config_dir)?;
-        if let Err(e) = cmd_exec(
-            secret_key, &tok, config_dir, &["true".to_string()],
-            hop_core::sandbox::SandboxPolicy::default(),
-        )
-        .await
-        {
+        if let Err(e) = exec_remote(&tok, config_dir, &["true".to_string()], hop_core::sandbox::SandboxPolicy::default()).await {
             tracing::warn!("membership redeem failed (namespace still joined): {e:#}");
         }
         // The redeem started a mux agent (it holds this config dir's datastore
@@ -6784,21 +6907,30 @@ fn maybe_upgrade_warren_on_connect(
     let Ok(decoded) = hop_core::invite::decode_invite(target) else {
         return Ok(());
     };
-    let Some(ticket) = decoded.warren_ticket.as_deref() else {
-        return Ok(()); // client tier — reach only, never upgrades
+    // Where the warren came from: a legacy token carries the ticket itself; a
+    // hop/4 token gets it from the host after auth (left for us by the agent).
+    let (ticket, founder_author, founder_node, tier) = match decoded.warren_ticket.clone() {
+        Some(t) => (t, decoded.founder_author.clone(), decoded.node_id.clone(), decoded.effective_tier()),
+        None => match mux::take_invite_grant(config_dir) {
+            Some(g) if g.warren_ticket.is_some() => {
+                let t = g.warren_ticket.clone().unwrap_or_default();
+                (t, g.founder_author, g.founder_node, g.tier)
+            }
+            _ => return Ok(()), // client tier — reach only, never upgrades
+        },
     };
     println!();
     println!("This invite carries a warren — putting this machine on it.");
     if !prepare_warren_join(
         config_dir,
-        ticket,
-        decoded.founder_author.as_deref(),
-        Some(&decoded.node_id),
+        &ticket,
+        founder_author.as_deref(),
+        Some(&founder_node),
         on_warren_conflict,
     )? {
         return Ok(());
     }
-    self_upgrade_to_node(config_dir, decoded.effective_tier(), yes)
+    self_upgrade_to_node(config_dir, tier, yes)
 }
 
 async fn cmd_warren(

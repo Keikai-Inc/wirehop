@@ -1706,7 +1706,7 @@ where
                         break Ok(SessionOutcome::Exited(code));
                     }
                     Ok(HostMessage::WindowSizeAck) => {}
-                    Ok(HostMessage::AuthResult { .. }) => {
+                    Ok(HostMessage::AuthResult { .. }) | Ok(HostMessage::AuthResultV2 { .. }) => {
                         tracing::warn!("Unexpected auth result during shell session");
                     }
                     Ok(HostMessage::SessionInfo { .. }) => {

@@ -369,7 +369,7 @@
       </div>
 
       <p style="color: var(--color-text-tertiary); font-size: 0.925rem; max-width: 46rem; line-height: 1.8; margin-top: 2rem;">
-        Invite tokens are hashed with Argon2 before storage, so the host keeps a verifier rather than the secret. Stored secrets are encrypted with ChaCha20-Poly1305. None of this has to be taken on faith. The implementation is public and permissively licensed, so you can verify it yourself, or hand it to a model and have it verify it for you.
+        Invite secrets are hashed before storage, so the host keeps a verifier rather than the secret, and a used invite token grants nothing. Stored secrets are encrypted with ChaCha20-Poly1305. None of this has to be taken on faith. The implementation is public and permissively licensed, so you can verify it yourself, or hand it to a model and have it verify it for you.
       </p>
     </div>
   </section>

@@ -51,7 +51,7 @@ The core library providing networking, authentication, protocol, file transfer, 
 | `config/mod.rs` | Identity management, peer/known-host stores, host config |
 | `datastore/` | Embedded redb database: KV, time-series, cron, secrets |
 | `fleet/` | Fleet membership, heartbeat, tagging |
-| `invite/mod.rs` | Invite token generation/verification (Argon2 hashing) |
+| `invite/mod.rs` | Invite token generation/verification (SHA-256 verifiers; post-auth grants) |
 | `net/mod.rs` | iroh endpoint creation, QUIC connection management |
 | `net/netmon.rs` | Network interface polling, reconnection triggers |
 | `netdoc/mod.rs` | **Warren network document**: iroh-docs/gossip/blobs CRDT (on an isolated endpoint) holding membership, roles, revocations, virtual IPs, VPN endpoints, host tags, names; virtual-IP allocation, role→tag→ACL reach resolver, federation (DocTickets), MagicDNS |
@@ -74,7 +74,7 @@ tun           # TUN/utun device for the VPN data plane (unix)
 tokio         # Async runtime
 bincode       # Binary serialization for wire protocol
 redb          # Embedded key-value database
-argon2        # Password hashing for invite auth
+argon2        # Verifies pending invites written by hop <= 0.9.37 (until they expire)
 chacha20poly1305  # AEAD encryption for secrets
 portable-pty  # Cross-platform PTY spawning
 landlock      # Linux filesystem sandbox (cfg(target_os = "linux"))
@@ -154,7 +154,7 @@ All versions are pinned in the workspace root and referenced via `.workspace = t
 | `bincode` | 2 | Binary serialization with serde |
 | `serde` / `serde_json` | 1 | Serialization framework |
 | `redb` | 2 | Embedded database (ACID, zero-copy reads) |
-| `argon2` | 0.5 | Password hashing for invite auth |
+| `argon2` | 0.5 | Verifies legacy (<= 0.9.37) pending-invite hashes until they expire |
 | `chacha20poly1305` | 0.10 | AEAD encryption for secrets |
 | `sha2` | 0.10 | SHA-256 for key derivation |
 | `zstd` | 0.13 | Compression for wire frames and file transfer |
@@ -193,11 +193,12 @@ pub const ALPN_V0: &[u8] = b"hop/0";  // Legacy: basic shell + auth + transfer
 pub const ALPN_V1: &[u8] = b"hop/1";  // + compression, content hashing, parallel streams, delta transfer
 pub const ALPN_V2: &[u8] = b"hop/2";  // + admin protocol, fleet, roles
 pub const ALPN_V3: &[u8] = b"hop/3";  // + zstd compression on large frames (Output messages)
+pub const ALPN_V4: &[u8] = b"hop/4";  // + AuthResultV2: invite grants delivered after auth
 
 pub const VPN_ALPN: &[u8] = b"hop/vpn/1";  // Warren VPN data plane (separate endpoint)
 ```
 
-The host endpoint binds with ALPNs in preference order: `[V3, V2, V1, V0]`. The `negotiated_protocol_version()` function maps the negotiated ALPN to a `u8` (0-3).
+The host endpoint binds with ALPNs in preference order: `[V4, V3, V2, V1, V0]`. The `negotiated_protocol_version()` function maps the negotiated ALPN to a `u8` (0-4). The client agent dials `hop/4` first and steps down to `hop/3`, then `hop/2`, when a host refuses the ALPN (a dial *timeout* is not a version mismatch and is not retried on an older ALPN).
 
 `hop/vpn/1` is **not** part of this stack: it runs on the warren's separate,
 isolated netdoc endpoint (see [Warren protocols](#warren-protocols-vpn--netdoc))
@@ -291,8 +292,24 @@ pub enum HostMessage {
     SessionError(String),                 // Session setup failure
     PeerResponse(PeerResponse),           // Peer-op result (secrets/kv/cap/cron/ext/tap)
     NetdocAuthorAck { recorded: bool },   // Ack for AnnounceNetdocAuthor; recorded=true on the trust anchor
+    AuthResultV2 {                        // hop/4+: invite auth result WITH the invite's grant
+        authorized: bool,
+        reason: Option<String>,           //   why not (never reveals whether an invite existed)
+        tier: InviteTier,                 //   tier recorded when the invite was minted
+        warren_ticket: Option<String>,    //   read ticket (node/warren-only), write ticket (admin), None (client)
+        founder_author: Option<String>,   //   founder's netdoc author id (C1 trust anchor), warren tiers
+        host_name: Option<String>,        //   host's name, for the client's known-hosts alias
+    },
 }
 ```
+
+`AuthResultV2` is the reason `hop/4` exists. Before it, an invite token
+embedded the warren ticket (a plain `hop invite` on a warren host even embedded
+the **write** ticket), so a token stayed a live capability after its secret was
+burned. On `hop/4` the host answers a verified `AuthResponse` with
+`AuthResultV2`, and the token carries nothing but node id, secret, relay hint
+and tier. A `hop/3` client still gets the one-bit `AuthResult` (and a legacy
+token that carries its own ticket still works as before).
 
 ### ClientMessage (Client -> Host)
 
@@ -303,7 +320,7 @@ pub enum ClientMessage {
         cols: u16, rows: u16,
         pixel_width: u16, pixel_height: u16,
     },
-    AuthResponse { secret: Vec<u8> },     // Invite secret (hex, plaintext over E2E-encrypted QUIC)
+    AuthResponse { secret: Vec<u8> },     // Invite secret (hex, plaintext over E2E-encrypted QUIC); metered per node on the host
     RequestShell,                         // Basic shell session (V0)
     RequestShellV2 {                      // Persistent session (V1+)
         session_id: Option<String>,       //   None = new, Some = resume

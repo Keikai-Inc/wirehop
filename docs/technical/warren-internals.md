@@ -545,7 +545,9 @@ Written as append-only JSONL (one JSON object per line). The file is opened with
 > don't have to be reworked when we get there.
 
 > **Trust model (C1).** Write-isolation is now **shipped**: `node`/`warren-only`
-> invites carry a **read** ticket (not a write ticket), and each member writes
+> invites grant a **read** ticket (not a write ticket), delivered in
+> `AuthResultV2` after the secret verifies (hop/4; the token itself carries no
+> ticket at all), and each member writes
 > only its own **write-isolated self-doc** — the shared admin doc (membership,
 > roles, `peer/N.vip`/`.vpn_endpoint`) is admin-authored. Per-author write
 > validation runs against the founder/admin author binding. What remains

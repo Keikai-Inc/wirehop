@@ -1,12 +1,13 @@
 //! Invite token generation and verification.
 
 use anyhow::{Context, Result};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use iroh::PublicKey;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::config::PeerRole;
@@ -38,16 +39,19 @@ pub struct InviteToken {
     /// Sandbox restrictions for this invite (default: unrestricted).
     #[serde(default, skip_serializing_if = "sandbox_is_unrestricted")]
     pub sandbox: SandboxPolicy,
-    /// The warren's namespace ticket (iroh-docs `DocTicket`), so redeeming this
-    /// invite can put the machine on the warren VPN as a node. `None` for hosts
-    /// that have no warren yet (degrades to direct-session access only).
+    /// The warren's namespace ticket (iroh-docs `DocTicket`).
+    /// Legacy (pre-hop/4) only: a token that carried this stayed a usable
+    /// read (or, for a plain `hop invite`, write!) capability long after the
+    /// secret was burned. Tickets are now delivered in `AuthResultV2` after
+    /// the secret verified. Still decoded so old tokens keep working against
+    /// old hosts; a new token never carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warren_ticket: Option<String>,
     /// Explicit capability tier (see `docs/technical/install-and-invite-tiers.md`).
     /// Decides whether redeeming this invite stays a client or self-upgrades to a
     /// warren node, and (once the C1 read/write split lands) the ticket scope.
     /// Old invites have no `tier`; `tier()` infers one for them.
-    #[serde(default, skip_serializing_if = "InviteTier::is_default")]
+    #[serde(default)]
     pub tier: InviteTier,
     /// The founder's iroh-docs author id (hex), pinned alongside `warren_ticket`.
     /// A joining node records this as the **trusted admin author** — the C1
@@ -74,9 +78,6 @@ pub enum InviteTier {
 }
 
 impl InviteTier {
-    fn is_default(&self) -> bool {
-        *self == InviteTier::Client
-    }
 
     /// Whether redeeming this tier makes the machine a warren node (needs the
     /// daemon → the self-upgrade / sudo path). `Client` does not.
@@ -122,10 +123,22 @@ fn sandbox_is_unrestricted(policy: &SandboxPolicy) -> bool {
 }
 
 /// A pending invite stored on the host side.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInvite {
-    /// Argon2 hash of the secret.
+    /// Hash of the secret: `sha256:<hex>` (hop/4+). Entries written by older
+    /// binaries hold a `$argon2id$…` PHC string and are still verified until
+    /// they expire. The secret is 256 bits of CSPRNG output, so a fast hash is
+    /// the right tool; Argon2 only made every bogus attempt cost the host
+    /// ~19 MiB and tens of milliseconds.
     pub secret_hash: String,
+    /// Short id for `hop invite list` / `revoke`: the first 8 hex chars of
+    /// sha256(secret). Empty for entries written by older binaries.
+    #[serde(default)]
+    pub id: String,
+    /// Capability tier recorded at mint time. Decides what the host grants
+    /// after the secret verifies (see [`grant_for_tier`]).
+    #[serde(default)]
+    pub tier: InviteTier,
     /// Unix timestamp when the invite was created.
     pub created_at: u64,
     /// Unix username the invited peer will log in as.
@@ -196,14 +209,13 @@ impl PendingInvitesStore {
             Err(_) => return None,
         };
 
-        let argon2 = Argon2::default();
-        let idx = self.invites.iter().position(|inv| {
-            if let Ok(stored_hash) = PasswordHash::new(&inv.secret_hash) {
-                argon2.verify_password(client_secret_str.as_bytes(), &stored_hash).is_ok()
-            } else {
-                false
-            }
-        })?;
+        // One SHA-256 per attempt, compared against every pending entry in
+        // constant time. Legacy Argon2 entries are verified the slow way.
+        let presented_sha = sha256_hex(client_secret_str.as_bytes());
+        let idx = self
+            .invites
+            .iter()
+            .position(|inv| secret_matches(&inv.secret_hash, client_secret_str, &presented_sha))?;
 
         // Reject (and drop) an expired invite before honoring it.
         let now = unix_now();
@@ -215,10 +227,12 @@ impl PendingInvitesStore {
 
         let inv = &mut self.invites[idx];
         let consumed = ConsumedInvite {
+            id: inv.id.clone(),
             username: inv.username.clone(),
             role: inv.role.clone(),
             role_name: inv.role_name.clone(),
             sandbox: inv.sandbox.clone(),
+            tier: inv.tier,
         };
         inv.uses += 1;
         // Single-use (max_uses None) is removed immediately; reusable is removed
@@ -231,12 +245,154 @@ impl PendingInvitesStore {
     }
 }
 
+impl PendingInvitesStore {
+    /// Pending invites as the operator sees them (`hop invite list`). Never
+    /// includes the secret or its hash.
+    pub fn list(&self, default_max_age: u64) -> Vec<PendingInviteInfo> {
+        self.invites
+            .iter()
+            .map(|inv| {
+                let limit = if inv.expiry_secs > 0 { inv.expiry_secs } else { default_max_age };
+                PendingInviteInfo {
+                    id: inv.id.clone(),
+                    created_at: inv.created_at,
+                    expires_at: inv.created_at.saturating_add(limit),
+                    tier: inv.tier,
+                    role_name: inv.role_name.clone(),
+                    username: inv.username.clone(),
+                    uses: inv.uses,
+                    max_uses: inv.max_uses,
+                }
+            })
+            .collect()
+    }
+
+    /// Revoke one pending invite by id or unambiguous id prefix. Returns the
+    /// full id that was removed.
+    pub fn revoke(&mut self, id_prefix: &str) -> Result<String> {
+        anyhow::ensure!(!id_prefix.is_empty(), "invite id is empty");
+        let matches: Vec<usize> = self
+            .invites
+            .iter()
+            .enumerate()
+            .filter(|(_, inv)| !inv.id.is_empty() && inv.id.starts_with(id_prefix))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.as_slice() {
+            [] => anyhow::bail!("no pending invite matches '{id_prefix}' (see `hop invite list`)"),
+            [i] => Ok(self.invites.remove(*i).id),
+            _ => anyhow::bail!("'{id_prefix}' matches {} pending invites; give more characters", matches.len()),
+        }
+    }
+}
+
+/// One row of `hop invite list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingInviteInfo {
+    pub id: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub tier: InviteTier,
+    pub role_name: Option<String>,
+    pub username: Option<String>,
+    pub uses: u32,
+    pub max_uses: Option<u32>,
+}
+
 /// Result of consuming an invite.
 pub struct ConsumedInvite {
+    /// Short id of the pending entry (empty for entries written by older binaries).
+    pub id: String,
     pub username: Option<String>,
     pub role: PeerRole,
     pub role_name: Option<String>,
     pub sandbox: SandboxPolicy,
+    /// Tier recorded at mint time; decides the post-auth grant.
+    pub tier: InviteTier,
+}
+
+const SHA256_PREFIX: &str = "sha256:";
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
+/// Storage form of a secret: `sha256:<hex>`.
+pub fn hash_secret(secret_hex: &str) -> String {
+    format!("{SHA256_PREFIX}{}", sha256_hex(secret_hex.as_bytes()))
+}
+
+/// The short id an operator sees for an invite: first 8 hex chars of sha256(secret).
+pub fn short_id_for_secret(secret_hex: &str) -> String {
+    sha256_hex(secret_hex.as_bytes())[..8].to_string()
+}
+
+/// Constant-time equality for equal-length byte strings.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Does `presented` match a stored hash? `presented_sha` is sha256(presented)
+/// in hex, computed once per attempt by the caller.
+fn secret_matches(stored: &str, presented: &str, presented_sha: &str) -> bool {
+    if let Some(h) = stored.strip_prefix(SHA256_PREFIX) {
+        return ct_eq(h.as_bytes(), presented_sha.as_bytes());
+    }
+    if stored.starts_with("$argon2") {
+        // Written by a pre-hop/4 binary; such entries expire within their TTL.
+        if let Ok(ph) = PasswordHash::new(stored) {
+            return Argon2::default().verify_password(presented.as_bytes(), &ph).is_ok();
+        }
+    }
+    false
+}
+
+/// The tier a `hop invite` gets when none is asked for: a warren node if this
+/// host has a warren, otherwise reach-only.
+pub fn default_tier(config_dir: &Path) -> InviteTier {
+    if config_dir.join("netdoc.ticket").exists() {
+        InviteTier::Node
+    } else {
+        InviteTier::Client
+    }
+}
+
+/// What a redeemed invite grants beyond reach. Delivered to the client in
+/// `AuthResultV2` over the authenticated stream, after the secret verified,
+/// and never embedded in the token.
+#[derive(Debug, Clone, Default)]
+pub struct InviteGrant {
+    pub tier: InviteTier,
+    /// Read ticket for node / warren-only, write ticket for admin, none for client.
+    pub warren_ticket: Option<String>,
+    /// The founder's netdoc author id (C1 trust anchor), warren tiers only.
+    pub founder_author: Option<String>,
+    /// This host's name, for the client's known-hosts alias.
+    pub host_name: Option<String>,
+}
+
+/// Resolve the grant for an invite of `tier` on this host.
+pub fn grant_for_tier(config_dir: &Path, tier: InviteTier) -> InviteGrant {
+    let read = |name: &str| {
+        std::fs::read_to_string(config_dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let warren_ticket = match tier {
+        InviteTier::Client => None,
+        InviteTier::WarrenOnly | InviteTier::Node => read("netdoc-read.ticket"),
+        InviteTier::Admin => read("netdoc.ticket"),
+    };
+    let founder_author = if tier.is_warren_node() { resolve_founder_author(config_dir) } else { None };
+    InviteGrant { tier, warren_ticket, founder_author, host_name: system_hostname() }
 }
 
 /// Get the system hostname.
@@ -260,7 +416,7 @@ pub fn generate_invite(
     username: Option<&str>,
     host_name: Option<&str>,
 ) -> Result<String> {
-    generate_invite_with_role(
+    generate_invite_with_tier(
         host_public_key,
         config_dir,
         relay_url,
@@ -271,6 +427,7 @@ pub fn generate_invite(
         15 * 60,
         SandboxPolicy::default(),
         None, // single-use
+        default_tier(config_dir),
     )
 }
 
@@ -295,7 +452,7 @@ pub struct InviteParams {
 /// Resolve this host's founder (trust-anchor) doc author. A federated node has
 /// it persisted (`netdoc-founder.author`); the founder itself carries it in its
 /// own augmented `creator_invite`. Used to pin C1 trust into issued invites.
-fn resolve_founder_author(config_dir: &Path) -> Option<String> {
+pub fn resolve_founder_author(config_dir: &Path) -> Option<String> {
     if let Ok(s) = std::fs::read_to_string(config_dir.join("netdoc-founder.author")) {
         let s = s.trim().to_string();
         if !s.is_empty() {
@@ -344,7 +501,12 @@ pub fn build_invite_token(
         ),
     };
 
-    let token = generate_invite_with_role(
+    // The tier is recorded with the pending invite; the host resolves the
+    // matching grant (read/write ticket, founder anchor) only after the secret
+    // verifies, and hands it over in `AuthResultV2`. Nothing about the warren
+    // rides in the token.
+    let tier = params.tier.unwrap_or_else(|| default_tier(config_dir));
+    generate_invite_with_tier(
         host_public_key,
         config_dir,
         relay_url,
@@ -355,33 +517,8 @@ pub fn build_invite_token(
         params.expiry.unwrap_or(15 * 60),
         params.sandbox.clone(),
         params.max_uses,
-    )?;
-
-    // Stamp the explicit tier + (for warren tiers) the founder anchor / read
-    // ticket. Safe post-generation: the pending-invite store records only the
-    // secret/role/sandbox, never the tier or warren_ticket.
-    let token = if let Some(t) = params.tier {
-        let mut decoded = decode_invite(&token)?;
-        decoded.tier = t;
-        if t == InviteTier::Client {
-            decoded.warren_ticket = None;
-            decoded.founder_author = None;
-        } else {
-            decoded.founder_author = resolve_founder_author(config_dir);
-            if matches!(t, InviteTier::Node | InviteTier::WarrenOnly)
-                && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
-            {
-                let rt = rt.trim().to_string();
-                if !rt.is_empty() {
-                    decoded.warren_ticket = Some(rt);
-                }
-            }
-        }
-        encode_invite(&decoded)?
-    } else {
-        token
-    };
-    Ok(token)
+        tier,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,6 +534,44 @@ pub fn generate_invite_with_role(
     sandbox: SandboxPolicy,
     max_uses: Option<u32>,
 ) -> Result<String> {
+    // A creator invite on a warren host grants admin (the write ticket);
+    // anything else gets the host's default tier.
+    let tier = match (&role, default_tier(config_dir)) {
+        (PeerRole::Creator, InviteTier::Node) => InviteTier::Admin,
+        (_, t) => t,
+    };
+    generate_invite_with_tier(
+        host_public_key,
+        config_dir,
+        relay_url,
+        username,
+        host_name,
+        role,
+        role_name,
+        expiry_secs,
+        sandbox,
+        max_uses,
+        tier,
+    )
+}
+
+/// Generate an invite with an explicit capability tier. The tier is stored
+/// with the pending invite and decides the post-auth grant; the token itself
+/// carries only what the client needs to dial and prove the secret.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_invite_with_tier(
+    host_public_key: &PublicKey,
+    config_dir: &Path,
+    relay_url: Option<&str>,
+    username: Option<&str>,
+    host_name: Option<&str>,
+    role: PeerRole,
+    role_name: Option<String>,
+    expiry_secs: u64,
+    sandbox: SandboxPolicy,
+    max_uses: Option<u32>,
+    tier: InviteTier,
+) -> Result<String> {
     // Validate the username early so bad values never reach storage.
     // Skip validation for Creator role (maps to root).
     #[cfg(unix)]
@@ -411,23 +586,15 @@ pub fn generate_invite_with_role(
     rand::rng().fill_bytes(&mut secret_bytes);
     let secret_hex = hex::encode(secret_bytes);
 
-    // Hash the secret with Argon2 for storage
-    let mut salt_bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut salt_bytes);
-    let salt_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(salt_bytes);
-    let salt = argon2::password_hash::SaltString::from_b64(&salt_b64)
-        .map_err(|e| anyhow::anyhow!("Failed to create salt: {e}"))?;
-    let argon2 = Argon2::default();
-    let secret_hash = argon2
-        .hash_password(secret_hex.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!("Failed to hash invite secret: {e}"))?
-        .to_string();
-
+    let secret_hash = hash_secret(&secret_hex);
+    let id = short_id_for_secret(&secret_hex);
     // Store the pending invite
     let mut store = PendingInvitesStore::load(config_dir)?;
     store.prune_expired(expiry_secs);
     store.invites.push(PendingInvite {
         secret_hash,
+        id,
+        tier,
         created_at: unix_now(),
         username: username.map(String::from),
         role: role.clone(),
@@ -439,30 +606,22 @@ pub fn generate_invite_with_role(
     });
     store.save(config_dir)?;
 
-    // Build the token
-    let resolved_host_name = host_name
-        .map(String::from)
-        .or_else(system_hostname);
-    // Embed the warren's namespace ticket (if this host has a warren) so the
-    // invite doubles as the warren join token. The daemon writes it to
-    // <config>/netdoc.ticket on startup; absent → direct-session access only.
-    let warren_ticket = std::fs::read_to_string(config_dir.join("netdoc.ticket"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Build the token: only what the client needs to dial the host and prove
+    // the secret. Username, role and sandbox live in the pending store; the
+    // warren ticket and founder anchor are granted after auth. An explicit
+    // `--name` is kept, since a label is not a capability; the host's own name
+    // is delivered after auth instead.
     let token = InviteToken {
         node_id: host_public_key.to_string(),
         secret: secret_hex,
         relay_url: relay_url.map(String::from),
-        username: username.map(String::from),
-        host_name: resolved_host_name,
-        role,
-        role_name: role_name.clone(),
-        sandbox,
-        warren_ticket,
-        // Explicit tiers aren't emitted yet (pending the C1 read/write split);
-        // `effective_tier()` infers from warren_ticket+role for now.
-        tier: InviteTier::default(),
+        username: None,
+        host_name: host_name.map(String::from),
+        role: PeerRole::Peer,
+        role_name: None,
+        sandbox: SandboxPolicy::default(),
+        warren_ticket: None,
+        tier,
         founder_author: None,
     };
     let json = serde_json::to_string(&token)?;
@@ -649,7 +808,10 @@ mod tests {
 
         let decoded = decode_invite(&token_str).unwrap();
         assert_eq!(decoded.node_id, public.to_string());
-        assert_eq!(decoded.role, PeerRole::Creator);
+        // The role is recorded on the host, not in the token.
+        assert_eq!(decoded.role, PeerRole::Peer);
+        let store = PendingInvitesStore::load(dir.path()).unwrap();
+        assert_eq!(store.invites[0].role, PeerRole::Creator);
         assert_eq!(decoded.host_name.as_deref(), Some("test-host"));
         assert_eq!(decoded.relay_url.as_deref(), Some("https://relay.example.com"));
         assert!(is_invite_token(&token_str));
@@ -763,6 +925,8 @@ mod tests {
             invites: vec![
                 PendingInvite {
                     secret_hash: "old".into(),
+                    id: String::new(),
+                    tier: InviteTier::Client,
                     created_at: 1000,
                     username: None,
                     role: PeerRole::Peer,
@@ -774,6 +938,8 @@ mod tests {
                 },
                 PendingInvite {
                     secret_hash: "new".into(),
+                    id: String::new(),
+                    tier: InviteTier::Client,
                     created_at: unix_now(),
                     username: None,
                     role: PeerRole::Creator,
@@ -789,4 +955,100 @@ mod tests {
         assert_eq!(store.invites.len(), 1);
         assert_eq!(store.invites[0].role, PeerRole::Creator);
     }
+    #[test]
+    fn new_tokens_carry_no_capability_or_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        // A warren host: both tickets on disk.
+        std::fs::write(dir.path().join("netdoc.ticket"), "WRITE-TICKET").unwrap();
+        std::fs::write(dir.path().join("netdoc-read.ticket"), "READ-TICKET").unwrap();
+        let secret = iroh::SecretKey::from_bytes(&[7u8; 32]);
+        let params = InviteParams {
+            username: None,
+            role_name: Some("developer".into()),
+            tier: None,
+            host_name: None,
+            max_uses: None,
+            expiry: None,
+            sandbox: SandboxPolicy::default(),
+        };
+        let token = build_invite_token(&secret.public(), dir.path(), Some("https://relay.example"), &params).unwrap();
+        let decoded = decode_invite(&token).unwrap();
+        assert!(decoded.warren_ticket.is_none(), "no ticket in the token");
+        assert!(decoded.founder_author.is_none());
+        assert!(decoded.username.is_none(), "username stays on the host");
+        assert!(decoded.host_name.is_none(), "host name is delivered after auth");
+        assert_eq!(decoded.tier, InviteTier::Node, "default tier on a warren host");
+        assert_eq!(decoded.relay_url.as_deref(), Some("https://relay.example"));
+        let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(&token).unwrap()).unwrap();
+        assert!(!raw.contains("TICKET"), "raw token must not contain either ticket: {raw}");
+        // The pending entry remembers everything the token no longer says.
+        let store = PendingInvitesStore::load(dir.path()).unwrap();
+        let inv = &store.invites[0];
+        assert_eq!(inv.tier, InviteTier::Node);
+        assert_eq!(inv.role_name.as_deref(), Some("developer"));
+        assert!(inv.secret_hash.starts_with("sha256:"));
+        assert_eq!(inv.id.len(), 8);
+    }
+
+    #[test]
+    fn grant_follows_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netdoc.ticket"), "WRITE-TICKET").unwrap();
+        std::fs::write(dir.path().join("netdoc-read.ticket"), "READ-TICKET").unwrap();
+        std::fs::write(dir.path().join("netdoc-founder.author"), "author-abc").unwrap();
+        assert_eq!(grant_for_tier(dir.path(), InviteTier::Client).warren_ticket, None);
+        let node = grant_for_tier(dir.path(), InviteTier::Node);
+        assert_eq!(node.warren_ticket.as_deref(), Some("READ-TICKET"));
+        assert_eq!(node.founder_author.as_deref(), Some("author-abc"));
+        assert_eq!(grant_for_tier(dir.path(), InviteTier::WarrenOnly).warren_ticket.as_deref(), Some("READ-TICKET"));
+        assert_eq!(grant_for_tier(dir.path(), InviteTier::Admin).warren_ticket.as_deref(), Some("WRITE-TICKET"));
+    }
+
+    #[test]
+    fn default_tier_is_client_without_a_warren() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(default_tier(dir.path()), InviteTier::Client);
+        std::fs::write(dir.path().join("netdoc.ticket"), "x").unwrap();
+        assert_eq!(default_tier(dir.path()), InviteTier::Node);
+    }
+
+    #[test]
+    fn sha256_entries_verify_and_legacy_argon2_entries_still_verify() {
+        use argon2::PasswordHasher;
+        let secret = "deadbeefcafebabe";
+        let sha = hash_secret(secret);
+        let presented_sha = sha256_hex(secret.as_bytes());
+        assert!(secret_matches(&sha, secret, &presented_sha));
+        assert!(!secret_matches(&sha, "wrong", &sha256_hex(b"wrong")));
+        // An entry written by a pre-hop/4 binary.
+        let salt = argon2::password_hash::SaltString::from_b64("c29tZXNhbHRzb21lc2FsdA").unwrap();
+        let legacy = Argon2::default().hash_password(secret.as_bytes(), &salt).unwrap().to_string();
+        assert!(legacy.starts_with("$argon2"));
+        assert!(secret_matches(&legacy, secret, &presented_sha));
+        assert!(!secret_matches(&legacy, "wrong", &sha256_hex(b"wrong")));
+        assert!(!secret_matches("garbage", secret, &presented_sha));
+    }
+
+    #[test]
+    fn list_and_revoke_by_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = iroh::SecretKey::from_bytes(&[9u8; 32]);
+        let t1 = generate_invite(&secret.public(), dir.path(), None, None, None).unwrap();
+        let _t2 = generate_invite(&secret.public(), dir.path(), None, None, None).unwrap();
+        let mut store = PendingInvitesStore::load(dir.path()).unwrap();
+        let rows = store.list(900);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.expires_at == r.created_at + 900));
+        let id1 = short_id_for_secret(&decode_invite(&t1).unwrap().secret);
+        assert!(rows.iter().any(|r| r.id == id1));
+        let removed = store.revoke(&id1[..4]).unwrap();
+        assert_eq!(removed, id1);
+        assert_eq!(store.invites.len(), 1);
+        assert!(store.revoke("zz").is_err());
+        assert!(store.revoke("").is_err());
+        // The revoked secret no longer redeems.
+        let s1 = decode_invite(&t1).unwrap().secret;
+        assert!(store.try_consume(s1.as_bytes()).is_none());
+    }
+
 }

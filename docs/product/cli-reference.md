@@ -208,12 +208,33 @@ hop invite --preset monitor
 ```
 
 **Tiers** (orthogonal axes — session reach, warren membership, admin — collapsed
-into four): a `client` invite reaches only the issuing host and strips any warren
-ticket (it can never self-upgrade). `warren-only` puts the machine on the VPN
-(vIP/MagicDNS) but refuses host sessions (`network_only` role). `node` is a full
-warren member. `admin` redeems with creator access. Warren tiers pin the founder
-trust anchor (C1). (The read- vs write-scoped ticket split is tracked separately;
-see `docs/technical/warren-internals.md` §10.)
+into four): a `client` invite reaches only the issuing host and can never
+self-upgrade. `warren-only` puts the machine on the VPN (vIP/MagicDNS) but
+refuses host sessions (`network_only` role). `node` is a full warren member.
+`admin` redeems with creator access. The tier is recorded with the pending
+invite on the host; the matching grant (the warren's **read** ticket for
+`node`/`warren-only`, the **write** ticket for `admin`, plus the founder trust
+anchor) is handed to the client **after** the secret verifies, over the
+authenticated connection. The token itself carries only the host's node id, the
+secret, a relay hint and the tier, so a used or expired token is inert.
+
+**What the token contains:** `node_id`, `secret`, `relay_url`, `tier`, and
+`host_name` only if you passed `--name`. Username, role and sandbox stay on the
+host. (Tokens minted by hop ≤ 0.9.37 embedded the warren ticket and metadata;
+they still redeem against any host.)
+
+#### `hop invite list` / `hop invite revoke <id>`
+
+```bash
+hop invite list            # pending invites: id, tier, user, uses, time left
+hop invite list --json
+hop invite revoke 3f9a1c2b # by id or unambiguous prefix
+```
+
+Pending invites expire on their own (15 minutes by default); `revoke` is for
+cancelling one early. Attempts to redeem are metered per connecting node
+(5 in a burst, then 5 per minute, with a 60-second cool-off), so a stray node
+id cannot make the host do unbounded work.
 
 The invited peer joins with the given role; the role's host tags decide what it
 can reach over the warren VPN (default-deny). Elevate later with `hop admin

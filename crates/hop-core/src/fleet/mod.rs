@@ -593,7 +593,11 @@ pub fn handle_create_fleet_invite(
     // A fleet invite is the reusable, warren-scoped path: one token N hosts
     // redeem. max_uses > 1 makes the underlying pending invite reusable.
     let max_uses_opt = (max_uses > 1).then_some(max_uses);
-    let token = match invite::generate_invite_with_role(
+    // The tier is recorded with the pending invite; the grant (read/write
+    // ticket, founder anchor) is resolved after the secret verifies and sent in
+    // `AuthResultV2`. The legacy default (no tier) is an admin invite.
+    let effective_tier = tier.unwrap_or(InviteTier::Admin);
+    let token = match invite::generate_invite_with_tier(
         host_public_key,
         config_dir,
         relay_url,
@@ -604,6 +608,7 @@ pub fn handle_create_fleet_invite(
         expiry_secs,
         crate::sandbox::SandboxPolicy::default(),
         max_uses_opt,
+        effective_tier,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -612,59 +617,10 @@ pub fn handle_create_fleet_invite(
             };
         }
     };
-    // Stamp the explicit tier (+ founder anchor / client-tier warren strip), like
-    // `hop invite --tier`. Safe post-generation: the pending-invite store records
-    // only the secret/role, not the tier/warren_ticket.
-    let token = match tier {
-        None => token,
-        Some(t) => match stamp_invite_tier(config_dir, &token, t) {
-            Ok(s) => s,
-            Err(e) => {
-                return AdminResponse::Error {
-                    message: format!("failed to stamp fleet invite tier: {e}"),
-                };
-            }
-        },
-    };
-    tracing::info!("Fleet invite created (tier {:?}) with tags: {:?}", tier.map(|t| t.as_str()), tags);
+    tracing::info!("Fleet invite created (tier {}) with tags: {:?}", effective_tier.as_str(), tags);
     AdminResponse::FleetInviteCreated { token }
 }
 
-/// Stamp an explicit `InviteTier` onto a freshly-generated token: set the tier
-/// field, pin the founder author for warren tiers, and strip the warren ticket
-/// for the client tier (so it can never self-upgrade). Mirrors `cmd_invite`.
-fn stamp_invite_tier(config_dir: &Path, token: &str, tier: crate::invite::InviteTier) -> anyhow::Result<String> {
-    use crate::invite::InviteTier;
-    let mut decoded = invite::decode_invite(token)?;
-    decoded.tier = tier;
-    if tier == InviteTier::Client {
-        decoded.warren_ticket = None;
-        decoded.founder_author = None;
-    } else {
-        // Founder author: persisted (federated node) or in the host's creator_invite.
-        decoded.founder_author = std::fs::read_to_string(config_dir.join("netdoc-founder.author"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string(config_dir.join("creator_invite"))
-                    .ok()
-                    .and_then(|ci| invite::decode_invite(ci.trim()).ok())
-                    .and_then(|t| t.founder_author)
-            });
-        // #3b Phase 4 — ticket scope follows the tier: node/warren-only carry the
-        // READ ticket; only admin keeps write. Legacy fallback when absent.
-        if matches!(tier, InviteTier::Node | InviteTier::WarrenOnly)
-            && let Ok(rt) = std::fs::read_to_string(config_dir.join("netdoc-read.ticket"))
-        {
-            let rt = rt.trim().to_string();
-            if !rt.is_empty() {
-                decoded.warren_ticket = Some(rt);
-            }
-        }
-    }
-    invite::encode_invite(&decoded)
-}
 
 pub fn handle_list_fleet(config_dir: &Path, tag_filter: Option<&str>) -> AdminResponse {
     match FleetStore::load(config_dir) {
@@ -1426,8 +1382,8 @@ mod tests {
     }
 
     #[test]
-    fn fleet_invite_tier_stamping() {
-        use crate::invite::{decode_invite, InviteTier};
+    fn fleet_invite_tier_recorded_on_host_not_in_token() {
+        use crate::invite::{decode_invite, InviteTier, PendingInvitesStore};
         let dir = tempfile::tempdir().unwrap();
         let pk = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let make = |tier: Option<&str>| {
@@ -1437,52 +1393,37 @@ mod tests {
             AdminResponse::FleetInviteCreated { token } => decode_invite(&token).unwrap(),
             other => panic!("expected FleetInviteCreated, got {other:?}"),
         };
+        let last_entry = || {
+            let store = PendingInvitesStore::load(dir.path()).unwrap();
+            store.invites.last().cloned().unwrap()
+        };
 
-        // Default (no tier) → legacy Creator/admin.
-        assert_eq!(tok_of(make(None)).role, PeerRole::Creator);
+        // Default (no tier) → legacy Creator/admin, recorded on the host.
+        let t = tok_of(make(None));
+        assert_eq!(t.tier, InviteTier::Admin);
+        assert_eq!(last_entry().role, PeerRole::Creator);
+        assert_eq!(last_entry().tier, InviteTier::Admin);
         // A warren tier with no warren on the host → error.
         assert!(matches!(make(Some("node")), AdminResponse::Error { .. }));
-        // Give the host a warren ticket; warren tiers now work.
+        // Give the host a warren ticket; warren tiers now work, but the token
+        // still carries no ticket: the grant is delivered after auth.
         std::fs::write(dir.path().join("netdoc.ticket"), "dummy-ticket").unwrap();
+        std::fs::write(dir.path().join("netdoc-read.ticket"), "dummy-READ-ticket").unwrap();
 
         let node = tok_of(make(Some("node")));
         assert_eq!(node.tier, InviteTier::Node);
-        assert_eq!(node.role, PeerRole::Peer);
-        assert!(node.warren_ticket.is_some());
+        assert!(node.warren_ticket.is_none());
+        assert_eq!(last_entry().role, PeerRole::Peer);
+        assert_eq!(crate::invite::grant_for_tier(dir.path(), last_entry().tier).warren_ticket.as_deref(), Some("dummy-READ-ticket"));
 
         let admin = tok_of(make(Some("admin")));
         assert_eq!(admin.tier, InviteTier::Admin);
-        assert_eq!(admin.role, PeerRole::Creator);
+        assert!(admin.warren_ticket.is_none());
+        assert_eq!(crate::invite::grant_for_tier(dir.path(), last_entry().tier).warren_ticket.as_deref(), Some("dummy-ticket"));
 
-        let warren_only = tok_of(make(Some("warren-only")));
-        assert_eq!(warren_only.tier, InviteTier::WarrenOnly);
-        assert_eq!(warren_only.role_name.as_deref(), Some("warren-only"));
-
-        // Client tier strips the warren ticket (can't self-upgrade).
         let client = tok_of(make(Some("client")));
-        assert!(client.warren_ticket.is_none());
-
-        // Unknown tier → error.
-        assert!(matches!(make(Some("bogus")), AdminResponse::Error { .. }));
-
-        // #3b Phase 4 — once a READ ticket is persisted, node/warren-only carry
-        // it (read scope); admin keeps the write ticket.
-        std::fs::write(dir.path().join("netdoc-read.ticket"), "dummy-READ-ticket").unwrap();
-        assert_eq!(
-            tok_of(make(Some("node"))).warren_ticket.as_deref(),
-            Some("dummy-READ-ticket"),
-            "node tier must carry the read ticket"
-        );
-        assert_eq!(
-            tok_of(make(Some("warren-only"))).warren_ticket.as_deref(),
-            Some("dummy-READ-ticket"),
-            "warren-only tier must carry the read ticket"
-        );
-        assert_eq!(
-            tok_of(make(Some("admin"))).warren_ticket.as_deref(),
-            Some("dummy-ticket"),
-            "admin tier keeps the WRITE ticket"
-        );
+        assert_eq!(client.tier, InviteTier::Client);
+        assert!(crate::invite::grant_for_tier(dir.path(), last_entry().tier).warren_ticket.is_none());
     }
 
     #[test]

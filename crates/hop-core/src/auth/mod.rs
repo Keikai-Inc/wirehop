@@ -2,8 +2,10 @@
 
 use anyhow::{Result, anyhow};
 use iroh::PublicKey;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::{PeerRole, PeersStore};
 use crate::invite::PendingInvitesStore;
@@ -14,6 +16,94 @@ use iroh::endpoint::{RecvStream, SendStream};
 /// Without this, two concurrent connections with the same invite token
 /// could both pass verification before either removes the invite.
 static INVITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Per-remote-node budget for invite attempts. The invite path is the only
+/// thing an unauthorized node can make this host do work for, so it is
+/// metered before any store is touched: a burst of [`AUTH_BURST`] attempts,
+/// refilling at [`AUTH_REFILL_PER_SEC`], and a [`AUTH_BAN`] cool-off once the
+/// budget is spent. Keyed by node id (the QUIC handshake already proved it).
+struct AuthBucket {
+    tokens: f64,
+    last: Instant,
+    banned_until: Option<Instant>,
+}
+
+const AUTH_BURST: f64 = 5.0;
+const AUTH_REFILL_PER_SEC: f64 = 1.0 / 12.0; // 5 per minute sustained
+const AUTH_BAN: Duration = Duration::from_secs(60);
+const AUTH_IDLE_FORGET: Duration = Duration::from_secs(10 * 60);
+
+static AUTH_LIMITER: LazyLock<Mutex<HashMap<PublicKey, AuthBucket>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Spend one invite attempt for `remote`. `false` means the attempt must be
+/// refused without looking at the invite store.
+pub fn auth_attempt_allowed(remote: &PublicKey) -> bool {
+    let mut map = AUTH_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    auth_attempt_allowed_at(&mut map, remote, Instant::now())
+}
+
+fn auth_attempt_allowed_at(
+    map: &mut HashMap<PublicKey, AuthBucket>,
+    remote: &PublicKey,
+    now: Instant,
+) -> bool {
+    // Forget nodes that have been quiet; keeps the map bounded under churn.
+    map.retain(|_, b| now.duration_since(b.last) < AUTH_IDLE_FORGET || b.banned_until.is_some_and(|t| t > now));
+    let bucket = map.entry(*remote).or_insert(AuthBucket {
+        tokens: AUTH_BURST,
+        last: now,
+        banned_until: None,
+    });
+    if let Some(until) = bucket.banned_until {
+        if until > now {
+            bucket.last = now;
+            return false;
+        }
+        // The ban is over: one attempt, and no refill credit for time served.
+        bucket.banned_until = None;
+        bucket.tokens = 1.0;
+        bucket.last = now;
+    }
+    let elapsed = now.duration_since(bucket.last).as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed * AUTH_REFILL_PER_SEC).min(AUTH_BURST);
+    bucket.last = now;
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        bucket.banned_until = Some(now + AUTH_BAN);
+        false
+    }
+}
+
+/// Tell the client how auth went. hop/4 clients get the full grant; older
+/// clients get the one-bit answer they understand.
+async fn send_auth_result(
+    send: &mut SendStream,
+    protocol_version: u8,
+    authorized: bool,
+    reason: Option<&str>,
+    grant: Option<crate::invite::InviteGrant>,
+) -> Result<()> {
+    if protocol_version >= 4 {
+        let g = grant.unwrap_or_default();
+        proto::write_message(
+            send,
+            &HostMessage::AuthResultV2 {
+                authorized,
+                reason: reason.map(String::from),
+                tier: g.tier,
+                warren_ticket: g.warren_ticket,
+                founder_author: g.founder_author,
+                host_name: g.host_name,
+            },
+        )
+        .await
+    } else {
+        proto::write_message(send, &HostMessage::AuthResult { authorized }).await
+    }
+}
 
 /// Result of authenticating a connecting client.
 pub enum AuthOutcome {
@@ -112,12 +202,15 @@ fn record_unauthorized(remote_id: &PublicKey) {
 ///
 /// Reads the first message from the client. If it's an `AuthResponse` (invite flow),
 /// verifies the secret. If it's a `RequestShell`, checks the authorized peers list.
+/// `protocol_version` is the negotiated ALPN version; on hop/4+ a successful
+/// invite redemption answers with `AuthResultV2` carrying the invite's grant.
 pub async fn authenticate_client(
     send: &mut SendStream,
     recv: &mut RecvStream,
     remote_id: &PublicKey,
     config_dir: &Path,
     netdoc: Option<&crate::netdoc::NetDoc>,
+    protocol_version: u8,
 ) -> Result<(AuthOutcome, Option<ClientMessage>)> {
     let peers = PeersStore::load(config_dir)?;
 
@@ -126,6 +219,22 @@ pub async fn authenticate_client(
 
     match &msg {
         ClientMessage::AuthResponse { secret } => {
+            // Meter first: an unauthorized node must not be able to make this
+            // host hash anything at will.
+            if !auth_attempt_allowed(remote_id) {
+                send_auth_result(send, protocol_version, false, Some("too many attempts; try again in a minute"), None).await?;
+                tracing::warn!("Invite attempt from {} rate-limited", remote_id.fmt_short());
+                crate::audit::record(
+                    crate::audit::AuditEvent::new(
+                        crate::audit::AuditCategory::Connection,
+                        "connection.rejected",
+                        crate::audit::AuditOutcome::Deny,
+                    )
+                    .actor(remote_id.to_string())
+                    .detail("invite attempts rate-limited"),
+                );
+                return Ok((AuthOutcome::Rejected, None));
+            }
             // Invite flow: verify the secret.
             // Hold a lock to prevent TOCTOU races (two connections consuming the same invite).
             let consumed = {
@@ -177,10 +286,17 @@ pub async fn authenticate_client(
                     tracing::warn!("netdoc: failed to mirror invited peer: {e:#}");
                 }
 
-                // Tell client they're authorized
-                proto::write_message(send, &HostMessage::AuthResult { authorized: true }).await?;
-
-                tracing::info!("Invite accepted for peer {} (role: {:?})", remote_id.fmt_short(), consumed.role);
+                // Tell the client it is authorized, and (hop/4) what the
+                // invite grants: the warren ticket and founder anchor for
+                // warren tiers, resolved now rather than embedded in the token.
+                let grant = crate::invite::grant_for_tier(config_dir, consumed.tier);
+                send_auth_result(send, protocol_version, true, None, Some(grant)).await?;
+                tracing::info!(
+                    "Invite accepted for peer {} (role: {:?}, tier: {})",
+                    remote_id.fmt_short(),
+                    consumed.role,
+                    consumed.tier.as_str()
+                );
                 crate::audit::record(
                     crate::audit::AuditEvent::new(
                         crate::audit::AuditCategory::Membership,
@@ -189,12 +305,11 @@ pub async fn authenticate_client(
                     )
                     .actor(remote_id.to_string())
                     .user_opt(consumed.username.as_deref())
-                    .detail(format!("role={:?}", consumed.role)),
+                    .detail(format!("role={:?} tier={} invite={}", consumed.role, consumed.tier.as_str(), consumed.id)),
                 );
                 Ok((AuthOutcome::InviteAccepted { username: consumed.username, role: consumed.role, sandbox: consumed.sandbox }, None))
             } else {
-                proto::write_message(send, &HostMessage::AuthResult { authorized: false })
-                    .await?;
+                send_auth_result(send, protocol_version, false, Some("invite rejected (expired, already used, or unknown)"), None).await?;
                 tracing::warn!("Invalid invite from peer {}", remote_id.fmt_short());
                 crate::audit::record(
                     crate::audit::AuditEvent::new(
@@ -318,6 +433,47 @@ pub async fn authenticate_client(
 mod tests {
     use super::*;
     use crate::sandbox::SandboxPolicy;
+
+    fn node(n: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    #[test]
+    fn limiter_allows_burst_then_bans_then_recovers() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        let a = node(1);
+        for _ in 0..5 {
+            assert!(auth_attempt_allowed_at(&mut map, &a, t0));
+        }
+        assert!(!auth_attempt_allowed_at(&mut map, &a, t0));
+        assert!(!auth_attempt_allowed_at(&mut map, &a, t0 + Duration::from_secs(30)));
+        assert!(auth_attempt_allowed_at(&mut map, &a, t0 + Duration::from_secs(61)));
+        assert!(!auth_attempt_allowed_at(&mut map, &a, t0 + Duration::from_secs(62)));
+    }
+
+    #[test]
+    fn limiter_is_per_node() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        let (a, b) = (node(1), node(2));
+        for _ in 0..6 {
+            auth_attempt_allowed_at(&mut map, &a, t0);
+        }
+        assert!(!auth_attempt_allowed_at(&mut map, &a, t0));
+        assert!(auth_attempt_allowed_at(&mut map, &b, t0));
+    }
+
+    #[test]
+    fn limiter_refills_over_time() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        let a = node(3);
+        for _ in 0..5 {
+            assert!(auth_attempt_allowed_at(&mut map, &a, t0));
+        }
+        assert!(auth_attempt_allowed_at(&mut map, &a, t0 + Duration::from_secs(12)));
+    }
 
     #[test]
     fn name_with_username() {

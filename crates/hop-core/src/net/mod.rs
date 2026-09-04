@@ -12,7 +12,7 @@ use iroh::address_lookup::AddrFilter;
 use iroh::endpoint::{Connection, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr};
 
-use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3};
+use crate::proto::{ALPN_V0, ALPN_V1, ALPN_V2, ALPN_V3, ALPN_V4};
 
 /// True if `ip` is a hop VPN *overlay* address — reachable only THROUGH the hop
 /// tunnel, never a valid *underlay* transport path. Covers both:
@@ -166,7 +166,7 @@ pub async fn create_host_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .relay_mode(hop_relay_mode())
         .transport_config(hop_transport_config())
         .addr_filter(hop_addr_filter())
-        .alpns(vec![ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
+        .alpns(vec![ALPN_V4.to_vec(), ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec(), ALPN_V0.to_vec()])
         .bind()
         .await
         .context("Failed to bind iroh endpoint")?;
@@ -336,10 +336,12 @@ pub async fn connect_to_host_with_alpn_timeout(
 }
 
 /// Return the protocol version negotiated on a connection.
-/// Returns 3 for `hop/3`, 2 for `hop/2`, 1 for `hop/1`, 0 for `hop/0` or anything else.
+/// Returns 4 for `hop/4`, 3 for `hop/3`, 2 for `hop/2`, 1 for `hop/1`, 0 for `hop/0` or anything else.
 pub fn negotiated_protocol_version(conn: &Connection) -> u8 {
     let alpn = conn.alpn();
-    if alpn == ALPN_V3 {
+    if alpn == ALPN_V4 {
+        4
+    } else if alpn == ALPN_V3 {
         3
     } else if alpn == ALPN_V2 {
         2

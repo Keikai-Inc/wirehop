@@ -54,6 +54,26 @@ pub fn handle_admin_request(
         AdminRequest::HostIdentity => AdminResponse::HostIdentity {
             node_id: host_public_key.to_string(),
         },
+        AdminRequest::ListInvites => match invite::PendingInvitesStore::load(config_dir) {
+            Ok(mut store) => {
+                store.prune_expired(15 * 60);
+                AdminResponse::InviteList { invites: store.list(15 * 60) }
+            }
+            Err(e) => AdminResponse::Error { message: format!("{e:#}") },
+        },
+        AdminRequest::RevokeInvite { id } => match invite::PendingInvitesStore::load(config_dir) {
+            Ok(mut store) => match store.revoke(&id) {
+                Ok(full) => match store.save(config_dir) {
+                    Ok(()) => {
+                        log_admin_action(config_dir, "revoke_invite", &full);
+                        AdminResponse::InviteRevoked { id: full }
+                    }
+                    Err(e) => AdminResponse::Error { message: format!("{e:#}") },
+                },
+                Err(e) => AdminResponse::Error { message: format!("{e:#}") },
+            },
+            Err(e) => AdminResponse::Error { message: format!("{e:#}") },
+        },
         AdminRequest::ListPeers => handle_list_peers(config_dir),
         AdminRequest::RemovePeer { node_id_prefix } => {
             handle_remove_peer(config_dir, &node_id_prefix)
@@ -603,7 +623,11 @@ mod tests {
         match resp {
             AdminResponse::InviteCreated { token } => {
                 let decoded = crate::invite::decode_invite(&token).unwrap();
-                assert_eq!(decoded.role, PeerRole::Creator);
+                // The role is recorded with the pending invite, never in the token.
+                assert_eq!(decoded.role, PeerRole::Peer);
+                assert!(decoded.warren_ticket.is_none());
+                let store = crate::invite::PendingInvitesStore::load(dir.path()).unwrap();
+                assert_eq!(store.invites[0].role, PeerRole::Creator);
                 assert_eq!(decoded.relay_url.as_deref(), Some("https://relay.example.com"));
             }
             other => panic!("expected InviteCreated, got {other:?}"),

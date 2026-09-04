@@ -18,6 +18,8 @@ pub const ALPN_V2: &[u8] = b"hop/2";
 
 /// ALPN protocol identifier for hop v3 (zstd compression on large frames).
 pub const ALPN_V3: &[u8] = b"hop/3";
+/// ALPN protocol identifier for hop v4 (post-auth invite grants: `AuthResultV2`).
+pub const ALPN_V4: &[u8] = b"hop/4";
 
 /// Messages sent from the host to the client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +48,26 @@ pub enum HostMessage {
     /// receiver is the founder/admin and wrote the binding; false when it
     /// accepted the announce but is not the trust anchor (member retries later).
     NetdocAuthorAck { recorded: bool },
+    /// Auth result on hop/4+. What the redeemed invite grants is delivered
+    /// here, over the authenticated stream, and never inside the token: a
+    /// hop/4 invite token carries only node id, secret, relay hint and tier,
+    /// so a used or expired token is inert. Appended at the END of the enum
+    /// (bincode encodes the variant index); only sent when hop/4 negotiated.
+    AuthResultV2 {
+        authorized: bool,
+        /// Why not, when `authorized` is false. Never says whether an invite
+        /// with that secret existed.
+        reason: Option<String>,
+        /// Capability tier recorded when the invite was minted.
+        tier: crate::invite::InviteTier,
+        /// Warren ticket for warren tiers: the read ticket for node and
+        /// warren-only, the write ticket for admin. `None` for client tier.
+        warren_ticket: Option<String>,
+        /// The founder's netdoc author id (the C1 trust anchor), warren tiers only.
+        founder_author: Option<String>,
+        /// The host's human-readable name, for the client's known-hosts alias.
+        host_name: Option<String>,
+    },
 }
 
 /// Messages sent from the client to the host.
@@ -208,6 +230,10 @@ pub enum AdminRequest {
     RedeemAggregateInvite { secret: String },
     /// Push metric points from a remote host to the orchestrator's datastore.
     PushMetrics { points: Vec<PushMetricPoint> },
+    /// List this host's pending (unredeemed) invites.
+    ListInvites,
+    /// Revoke a pending invite by id (or unambiguous id prefix).
+    RevokeInvite { id: String },
 }
 
 /// A single metric point pushed from a remote host.
@@ -271,6 +297,10 @@ pub enum AdminResponse {
     MetricsReceived { count: usize },
     /// Error response.
     Error { message: String },
+    /// Pending invites (`ListInvites`).
+    InviteList { invites: Vec<crate::invite::PendingInviteInfo> },
+    /// A pending invite was revoked (`RevokeInvite`).
+    InviteRevoked { id: String },
 }
 
 /// Summary info about an authorized peer.

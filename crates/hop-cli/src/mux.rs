@@ -178,6 +178,38 @@ pub struct ResolvedHost {
     pub relay_url: Option<iroh::RelayUrl>,
 }
 
+/// What a redeemed invite granted, as written by the auth step for the
+/// `hop connect` flow to consume (`take_invite_grant`). Lives only between
+/// the authorized handshake and the warren self-upgrade that follows it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InviteGrantFile {
+    pub tier: hop_core::invite::InviteTier,
+    pub warren_ticket: Option<String>,
+    pub founder_author: Option<String>,
+    /// The inviting host's node id.
+    pub founder_node: String,
+    /// True when the ticket came from a pre-hop/4 token rather than the host.
+    pub legacy_token: bool,
+}
+
+const GRANT_FILE: &str = "invite-grant.json";
+
+impl InviteGrantFile {
+    pub fn save(&self, config_dir: &Path) -> Result<()> {
+        let json = serde_json::to_string(self)?;
+        hop_core::config::write_secret_file(&config_dir.join(GRANT_FILE), &json)
+    }
+}
+
+/// Take (read and delete) the grant left by the last authorized invite
+/// redemption, if any.
+pub fn take_invite_grant(config_dir: &Path) -> Option<InviteGrantFile> {
+    let path = config_dir.join(GRANT_FILE);
+    let data = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(&data).ok()
+}
+
 /// One-shot authentication to perform after the dial succeeds, before the
 /// session request. Resolved up front from the target so the responsive connect
 /// loop only has to drive the (retriable) dial.
@@ -187,7 +219,10 @@ pub enum AuthStep {
     /// Invite token — send the secret, expect an AuthResult, then save the host.
     Invite {
         secret: Vec<u8>,
-        desired_name: String,
+        /// Alias to save the host under. `None` when the token did not name
+        /// the host; the host's own name (from `AuthResultV2`) is used then.
+        desired_name: Option<String>,
+        /// Legacy (pre-hop/4) tokens carry the warren ticket themselves.
         warren_ticket: Option<String>,
     },
 }
@@ -257,10 +292,7 @@ pub fn resolve_target(
             .map(|u| u.parse())
             .transpose()
             .context("Invalid relay URL in invite token")?;
-        let desired_name = cli_name
-            .map(String::from)
-            .or(token.host_name)
-            .unwrap_or_else(|| format!("host-{}", host_id.fmt_short()));
+        let desired_name = cli_name.map(String::from).or(token.host_name);
         crate::agent_out::banner(&format!("Connecting to host {}...", host_id.fmt_short()));
         return Ok(ConnectPlan {
             host_id,
@@ -343,31 +375,55 @@ pub async fn finish_auth_and_request(
                 tokio::time::timeout(AGENT_DIAL_TIMEOUT, proto::read_message(read))
                     .await
                     .context("timed out waiting for the host's auth result")??;
-            match result {
-                HostMessage::AuthResult { authorized: true } => {
-                    print!("Authorized!\r\n");
-                    let mut hosts = KnownHostsStore::load(config_dir)?;
-                    let actual_name = hosts.add_host_dedup(
-                        &plan.host_id,
-                        desired_name.clone(),
-                        plan.relay_str(),
-                    );
-                    hosts.save(config_dir)?;
-                    print!("Saved as known host: {actual_name}\r\n");
-                    let _ = std::io::stdout().flush();
-                    if let Some(ticket) = warren_ticket.as_deref() {
-                        let path = config_dir.join("warren-ticket");
-                        if let Err(e) = std::fs::write(&path, ticket) {
-                            tracing::debug!("could not persist warren ticket: {e}");
-                        }
-                    }
-                    proto::write_message(write, session_request).await?;
+            // The grant: on hop/4 it arrives in `AuthResultV2`; a legacy token
+            // may carry the ticket itself (older hosts still answer with the
+            // one-bit `AuthResult`).
+            let (host_name, grant) = match result {
+                HostMessage::AuthResult { authorized: true } => (None, InviteGrantFile {
+                    tier: hop_core::invite::InviteTier::default(),
+                    warren_ticket: warren_ticket.clone(),
+                    founder_author: None,
+                    founder_node: plan.host_id.to_string(),
+                    legacy_token: warren_ticket.is_some(),
+                }),
+                HostMessage::AuthResultV2 { authorized: true, tier, warren_ticket: granted, founder_author, host_name, .. } => {
+                    (host_name, InviteGrantFile {
+                        tier,
+                        warren_ticket: granted,
+                        founder_author,
+                        founder_node: plan.host_id.to_string(),
+                        legacy_token: false,
+                    })
                 }
                 HostMessage::AuthResult { authorized: false } => {
                     anyhow::bail!("Invite rejected by host (expired or already used)");
                 }
+                HostMessage::AuthResultV2 { authorized: false, reason, .. } => {
+                    anyhow::bail!("Invite rejected by host: {}", reason.unwrap_or_else(|| "expired or already used".into()));
+                }
                 other => anyhow::bail!("Unexpected response from host: {other:?}"),
+            };
+            print!("Authorized!\r\n");
+            let name = desired_name
+                .clone()
+                .or(host_name)
+                .unwrap_or_else(|| format!("host-{}", plan.host_id.fmt_short()));
+            let mut hosts = KnownHostsStore::load(config_dir)?;
+            let actual_name = hosts.add_host_dedup(&plan.host_id, name, plan.relay_str());
+            hosts.save(config_dir)?;
+            print!("Saved as known host: {actual_name}\r\n");
+            let _ = std::io::stdout().flush();
+            if let Some(ticket) = grant.warren_ticket.as_deref() {
+                if let Err(e) = std::fs::write(config_dir.join("warren-ticket"), ticket) {
+                    tracing::debug!("could not persist warren ticket: {e}");
+                }
+                // The full grant, for `hop connect` to act on right after this
+                // session request (self-upgrade to a warren node).
+                if let Err(e) = grant.save(config_dir) {
+                    tracing::debug!("could not persist invite grant: {e}");
+                }
             }
+            proto::write_message(write, session_request).await?;
         }
     }
     Ok(())

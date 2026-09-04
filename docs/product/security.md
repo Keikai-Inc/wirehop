@@ -103,29 +103,39 @@ hop uses one-time invite tokens for initial authentication. An invite encodes th
 | `node_id` | string | Host's PublicKey (hex) |
 | `secret` | string | 32-byte random secret (hex) |
 | `relay_url` | string? | Relay URL hint |
-| `username` | string? | Unix user the peer logs in as |
-| `host_name` | string? | Human-readable host identifier |
-| `role` | PeerRole | `peer` (default) or `creator` |
-| `sandbox` | SandboxPolicy | Sandbox restrictions for this invite |
+| `tier` | InviteTier | `client`, `warren-only`, `node`, or `admin` |
+| `host_name` | string? | Only when the operator passed `--name` (a label, not a capability) |
+
+That is the whole token. The Unix username, role and sandbox policy stay in
+the host's pending-invite store; the warren ticket and founder trust anchor
+are delivered to the client **after** the secret verifies (`AuthResultV2`,
+hop/4). A used or expired token is therefore inert. Tokens minted by hop
+≤ 0.9.37 also carried `username`, `host_name`, `role`, `sandbox`,
+`warren_ticket` and `founder_author`; they still decode and redeem.
 
 #### Security properties
 
 - **One-time**: consumed on first use and removed from the pending store
 - **Expiry**: regular invites expire after 15 minutes; creator invites after 1 hour
-- **Argon2 hashing**: the secret is Argon2-hashed before storage; only the hash is persisted
+- **Inert after use**: nothing in the token outlives the secret; the warren grant is only ever sent over the authenticated connection
+- **Hashed at rest**: the host stores `sha256:<hex>` of the secret (256 bits of CSPRNG output need no password stretching); entries written by older versions (`$argon2id$…`) are still verified until they expire
+- **Metered**: redemption attempts are rate-limited per connecting node id (burst of 5, then 5 per minute, 60-second cool-off) before the store is touched
+- **Revocable**: `hop invite list` / `hop invite revoke <id>` manage pending invites
 - **Base64url encoding**: the token is JSON serialized and base64url-encoded for safe transport
 
 #### Flow
 
 ```
-Host:   hop invite [--user alice] [--preset monitor]
-          -> prints invite token
+Host:   hop invite [--user alice] [--tier node] [--preset monitor]
+          -> stores {sha256(secret), tier, user, role, sandbox}; prints token
 
 Client: hop connect <invite-token>
-          -> decodes token, connects to host, presents secret
-          -> host verifies Argon2 hash, consumes invite
+          -> decodes token, connects to host (hop/4), presents secret
+          -> host meters the attempt, verifies the hash, consumes the invite
+          -> host answers AuthResultV2 { tier, warren ticket, founder anchor, host name }
           -> peer is added to authorized peers (peers.json)
           -> peer is also mirrored into the network document (iroh-docs)
+          -> for node/admin tiers the client joins the warren with the granted ticket
 ```
 
 Since Phase 1 (0.6.26), authorization is **doc-aware**: membership lives in a

@@ -44,6 +44,9 @@ pub enum Command {
 
     /// Generate a one-time invite token/URL
     Invite {
+        /// `list` pending invites or `revoke <id>` one; no subcommand mints an invite.
+        #[command(subcommand)]
+        action: Option<InviteAction>,
         /// Print this host's standing **creator** invite (admin tier) instead of
         /// minting a new one — useful for headless/Docker bootstrap. Ignores the
         /// other invite-shaping flags.
@@ -1174,5 +1177,21 @@ pub enum PeersAction {
         id: String,
         /// New name
         name: String,
+    },
+}
+
+/// Manage pending invites on this host.
+#[derive(Subcommand, Debug)]
+pub enum InviteAction {
+    /// List pending (unredeemed) invites: id, tier, user, expiry, uses
+    List {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a pending invite by id (or unambiguous id prefix)
+    Revoke {
+        /// Invite id from `hop invite list`
+        id: String,
     },
 }

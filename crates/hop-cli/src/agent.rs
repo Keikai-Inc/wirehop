@@ -462,42 +462,40 @@ async fn do_connect(
 
     tracing::debug!("do_connect: {} relay_hint={:?}", host_id.fmt_short(), relay.as_ref().map(|u| u.to_string()));
 
-    match net::connect_to_host_with_alpn_timeout(
-        endpoint,
-        host_id,
-        relay.as_ref(),
-        hop_core::proto::ALPN_V3,
-        MUX_DIAL_TIMEOUT,
-    )
-    .await
-    {
-        Ok((conn, _)) => {
-            tracing::debug!("do_connect: hop/3 connected to {}", host_id.fmt_short());
-            spawn_zombie_watchdog(conn.clone(), host_id);
-            Ok(conn)
-        }
-        Err(e) if is_dial_timeout(&e) => {
-            tracing::debug!("do_connect: hop/3 dial to {} timed out — dead path, NOT falling back to hop/2", host_id.fmt_short());
-            Err(e)
-        }
-        Err(_) => {
-            tracing::debug!(
-                "hop/3 not supported by {}, falling back to hop/2",
-                host_id.fmt_short()
-            );
-            let (conn, _) = net::connect_to_host_with_alpn_timeout(
-                endpoint,
-                host_id,
-                relay.as_ref(),
-                hop_core::proto::ALPN_V2,
-                MUX_DIAL_TIMEOUT,
-            )
-            .await?;
-            tracing::debug!("do_connect: hop/2 fallback connected to {}", host_id.fmt_short());
-            spawn_zombie_watchdog(conn.clone(), host_id);
-            Ok(conn)
+    // Newest protocol first; an older host refuses the ALPN and we step down.
+    // A dial *timeout* is a dead path, not a version mismatch, so it is not
+    // retried on an older ALPN.
+    let mut last_err = None;
+    for (alpn, label) in [
+        (hop_core::proto::ALPN_V4, "hop/4"),
+        (hop_core::proto::ALPN_V3, "hop/3"),
+        (hop_core::proto::ALPN_V2, "hop/2"),
+    ] {
+        match net::connect_to_host_with_alpn_timeout(
+            endpoint,
+            host_id,
+            relay.as_ref(),
+            alpn,
+            MUX_DIAL_TIMEOUT,
+        )
+        .await
+        {
+            Ok((conn, _)) => {
+                tracing::debug!("do_connect: {label} connected to {}", host_id.fmt_short());
+                spawn_zombie_watchdog(conn.clone(), host_id);
+                return Ok(conn);
+            }
+            Err(e) if is_dial_timeout(&e) => {
+                tracing::debug!("do_connect: {label} dial to {} timed out — dead path, NOT falling back", host_id.fmt_short());
+                return Err(e);
+            }
+            Err(e) => {
+                tracing::debug!("{label} not supported by {}, trying an older protocol", host_id.fmt_short());
+                last_err = Some(e);
+            }
         }
     }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no protocol version accepted by {}", host_id.fmt_short())))
 }
 
 // ---------------------------------------------------------------------------

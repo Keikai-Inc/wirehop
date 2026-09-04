@@ -42,41 +42,50 @@ Storage location:
 
 `load_identity()` reads an existing identity without generating one. Used by `hop invite` to read the daemon's identity. Errors if the file does not exist.
 
-### Argon2 Invite Authentication
+### Invite Authentication
 
-Invite tokens authenticate new peers to a host. The flow uses Argon2id to prevent offline brute-force attacks on stored invite hashes.
+Invite tokens authenticate new peers to a host. The secret is 256 bits of
+CSPRNG output, so the stored verifier is a plain SHA-256 (there is nothing for
+a password-stretching function to defend; Argon2, used before hop/4, only made
+every bogus attempt expensive for the host). Offline brute force is bounded by
+the secret's entropy, and online attempts are metered per node id.
 
 #### Invite Generation
 
-`generate_invite_with_role()` in `crates/hop-core/src/invite/mod.rs`:
+`generate_invite_with_tier()` in `crates/hop-core/src/invite/mod.rs`:
 
 1. Generate 32 bytes of random secret via `rand::rng().fill_bytes()`
 2. Hex-encode the secret (64 hex characters)
-3. Generate 16-byte random salt, base64-encode it
-4. Hash the hex secret with `Argon2::default()` (Argon2id, default parameters)
-5. Store `PendingInvite { secret_hash, created_at, username, role, sandbox }` in `pending_invites.json`
-6. Build `InviteToken` struct, JSON-encode, base64url-encode
+3. Store `sha256:<hex of sha256(secret)>` as the verifier and the first 8 hex chars as the invite `id`
+4. Store `PendingInvite { secret_hash, id, tier, created_at, username, role, role_name, sandbox, max_uses, expiry_secs }` in `pending_invites.json`
+5. Build the minimal `InviteToken` (node id, secret, relay hint, tier, optional `--name`), JSON-encode, base64url-encode
 
 ```rust
 pub struct InviteToken {
     pub node_id: String,              // Host's public key (hex)
     pub secret: String,               // 32-byte random secret (hex)
-    pub relay_url: Option<String>,    // Host's relay URL
-    pub username: Option<String>,     // Unix username binding
-    pub host_name: Option<String>,    // Human-readable hostname
-    pub role: PeerRole,               // Peer | Creator
-    pub sandbox: SandboxPolicy,       // Sandbox restrictions
+    pub relay_url: Option<String>,    // Host's relay URL hint
+    pub tier: InviteTier,             // client | warren-only | node | admin
+    pub host_name: Option<String>,    // only with `--name`
+    // Legacy fields (hop <= 0.9.37 tokens), decoded but never emitted:
+    // username, role, role_name, sandbox, warren_ticket, founder_author
 }
 ```
+
+Everything else about the invite (username, role, sandbox, and which warren
+ticket to grant) lives in the host's `pending_invites.json` entry, keyed by the
+secret's hash. The grant is resolved by `invite::grant_for_tier` only after
+the secret verifies and is sent in `HostMessage::AuthResultV2` (hop/4).
 
 #### Verification
 
 When a client connects with `ClientMessage::AuthResponse { secret }`:
 
-1. `PendingInvitesStore::try_consume()` iterates all pending invites
-2. For each invite, parses the stored `$argon2id$...` hash with `PasswordHash::new()`
-3. Verifies `Argon2::default().verify_password(client_secret, stored_hash)`
-4. On match: **removes** the invite from the store (single-use), returns `ConsumedInvite { username, role, sandbox }`
+0. `auth::auth_attempt_allowed(remote_node_id)` meters the attempt (token bucket per node id: burst 5, refill 5/min, 60 s ban when spent). A refused attempt gets `authorized: false` without touching the store.
+1. `PendingInvitesStore::try_consume()` computes `sha256(secret)` once
+2. Each pending entry is compared in constant time against its `sha256:<hex>` hash; a `$argon2id$…` entry written by an older binary is verified with Argon2 until it expires
+3. On match: **removes** the invite from the store (single-use), returns `ConsumedInvite { id, username, role, role_name, sandbox, tier }`
+4. `invite::grant_for_tier(tier)` reads the read ticket (`node`/`warren-only`) or write ticket (`admin`) and the founder author; on hop/4 they go back in `AuthResultV2`
 
 #### TOCTOU Safety
 
@@ -982,7 +991,7 @@ working report to act on**, not a sign-off.
 > write-authorization, H8 secrets KDF, H10 root redeem) with the reasoning.
 
 > **Headline.** The cryptographic transport (iroh/QUIC, node-key auth), the
-> invite primitives (CSPRNG secret, constant-time Argon2, atomic single-use), and
+> invite primitives (CSPRNG secret, constant-time hash compare, atomic single-use), and
 > the Cedar policy engine are sound *in isolation*. The serious problems are in
 > the **trust model around them**, and they matter more because the warren VPN is
 > **default-on** (`crates/hop-cli/src/main.rs:424`), despite module docs still
