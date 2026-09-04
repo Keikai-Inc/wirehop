@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WireHop: secure private networking and remote access</title>
-  <meta name="description" content="Secure private networking and remote access for Agents and users alike. VPNs should be as simple as SSH. A tool you run, not a service you buy: one binary, no accounts, nobody in the middle.">
+  <meta name="description" content="Secure private networking and remote access for Agents and users alike. VPNs should be as simple as SSH. A tool you run, not a service you buy: one binary, no accounts, no coordination server.">
   <link rel="canonical" href="https://wirehop.org/">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
@@ -296,8 +296,8 @@
           <div class="card-icon card-icon-teal">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           </div>
-          <h3>No third party, ever</h3>
-          <p>Your machines connect directly and privately, end-to-end encrypted. There is no coordination server to phone home to and no third party in your trust path. Your keys are generated on your machines and never leave them.</p>
+          <h3>No account, no coordination server</h3>
+          <p>Your machines connect directly, end-to-end encrypted, and nothing has to be up for them to find each other. Your keys are generated on your machines and never leave them. When NAT blocks a direct path, an encrypted relay forwards packets it cannot read; run your own with one flag.</p>
         </div>
 
         <div class="card card-amber">
@@ -341,8 +341,8 @@
           <div class="comparison-cell comparison-header">SSH / Tailscale / ngrok</div>
         </div>
         <div class="comparison-row">
-          <div class="comparison-cell comparison-label">Third party in the middle</div>
-          <div class="comparison-cell hop-col">None: nothing to sign up for</div>
+          <div class="comparison-cell comparison-label">What has to be up for it to work</div>
+          <div class="comparison-cell hop-col">Nothing of ours: no account, no coordination server. A relay only when NAT blocks a direct path, and you can run your own</div>
           <div class="comparison-cell comparison-other">Tailscale needs its coordinator; ngrok its servers</div>
         </div>
         <div class="comparison-row">
@@ -379,7 +379,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Install, invite, connect</h2>
-        <p>Up and running in under a minute. No accounts, no servers, no VPN config.</p>
+        <p>Up and running in under a minute. No accounts, no coordination server, no VPN config.</p>
       </div>
 
       <div class="steps">
@@ -691,6 +691,15 @@
                 <div>
                   <div style="font-weight: 600; font-size: 0.9rem;">Linux</div>
                   <div style="color: var(--color-text-tertiary); font-size: 0.8rem;">x86_64, ARM64 &amp; ARMv7</div>
+                </div>
+              </div>
+            </div>
+            <div class="card" style="padding: 1rem 1.25rem;">
+              <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <span style="font-size: 1.25rem;">&#129513;</span>
+                <div>
+                  <div style="font-weight: 600; font-size: 0.9rem;">Windows</div>
+                  <div style="color: var(--color-text-tertiary); font-size: 0.8rem;">As a client under WSL today. A native client is planned; a Windows host is not yet.</div>
                 </div>
               </div>
             </div>
