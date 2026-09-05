@@ -149,6 +149,10 @@ pub enum ClientMessage {
         #[serde(default)]
         vpn_endpoint: Option<String>,
     },
+    /// Watch an existing session without being able to type into it (hop/4+;
+    /// appended last). `session_id` may be an unambiguous prefix. Allowed for
+    /// the session's owner and for admins; the host drops every `Input`.
+    RequestView { session_id: String },
 }
 
 // --- Admin protocol (hop/2+) ---
@@ -337,6 +341,8 @@ pub struct SessionSummary {
     pub bells: u64,
     pub rows: u16,
     pub cols: u16,
+    /// Read-only viewers currently attached (`hop <host> --view`).
+    pub viewers: u32,
 }
 
 /// Summary info about an authorized peer.

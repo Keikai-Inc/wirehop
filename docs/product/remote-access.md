@@ -78,6 +78,20 @@ The host answers from its session registry; nothing is stored. Over the
 network this is `PeerRequest::ListSessions` (hop/4), so a host older than
 0.9.38 reports "unexpected request" rather than a list.
 
+### Watching a session without typing
+
+```bash
+hop connect myserver --view 0d054d72      # id or unique prefix from `hop sessions`
+```
+
+The viewer gets the session's screen, sized to its own terminal, and every
+byte the session produces from then on. Keystrokes are dropped **on the
+host**, never forwarded, so watching a session someone else is working in
+cannot disturb it; a viewer's resize re-renders its own copy and never
+resizes the PTY. `q` or Ctrl-C leaves. A session's owner may view it; an
+admin (creator role) may view any session on the host. `hop sessions` counts
+viewers per session (the JSON `viewers` field).
+
 ### Attention
 
 When a session rings the bell (BEL, OSC 9, or OSC 777) while nobody is

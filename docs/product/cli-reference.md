@@ -144,6 +144,7 @@ folded into `connect`).
 | `-y, --yes` | Consent to the privileged node setup without prompting (headless) |
 | `--on-warren-conflict <ACTION>` | Resolve a conflict with a different, populated warren: `replace` (switch), `abort` (keep) |
 | `--warren` | Join the warren from the **stored** ticket (no target/invite) |
+| `--view <SESSION>` | Watch an existing session (id or unique prefix from `hop sessions`) without being able to type; `q` leaves |
 
 ```bash
 hop connect <invite-token>          # connect + (if the invite carries a warren) join it

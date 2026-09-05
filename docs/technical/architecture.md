@@ -332,6 +332,7 @@ pub enum ClientMessage {
         pixel_width: u16, pixel_height: u16,
     },
     AuthResponse { secret: Vec<u8> },     // Invite secret (hex, plaintext over E2E-encrypted QUIC); metered per node on the host
+    RequestView { session_id: String },   // hop/4+ (appended last): read-only view of a session; host drops all Input
     RequestShell,                         // Basic shell session (V0)
     RequestShellV2 {                      // Persistent session (V1+)
         session_id: Option<String>,       //   None = new, Some = resume

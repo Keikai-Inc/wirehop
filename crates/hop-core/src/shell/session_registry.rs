@@ -70,6 +70,10 @@ pub struct DetachedSession {
     /// Handle for the broker background task (macOS sandbox proxy).
     /// Aborted when the session is cleaned up.
     pub broker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Read-only viewers: each gets a copy of every PTY output chunk (best
+    /// effort, `try_send`; a stalled viewer loses chunks rather than stalling
+    /// the session). Shared with the PTY reader task.
+    pub viewers: Arc<Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,
     /// Off-screen virtual terminal that absorbs every PTY output byte.
     /// On reconnect, `screen.lock().render_full_repaint()` produces bytes
     /// that paint the current grid onto the new client's terminal —
@@ -173,6 +177,47 @@ impl SessionRegistry {
         self.sessions.get(session_id)
     }
 
+    /// Resolve `prefix` to exactly one live session id.
+    pub fn resolve_prefix(&self, prefix: &str) -> Result<String, String> {
+        if prefix.is_empty() {
+            return Err("empty session id".into());
+        }
+        let hits: Vec<&String> = self.sessions.keys().filter(|k| k.starts_with(prefix)).collect();
+        match hits.as_slice() {
+            [] => Err(format!("no session matches '{prefix}' (see `hop sessions`)")),
+            [one] => Ok((*one).clone()),
+            _ => Err(format!("'{prefix}' matches {} sessions; give more characters", hits.len())),
+        }
+    }
+
+    /// Add a read-only viewer. Owners may view their own sessions; admins any.
+    pub fn attach_view(
+        &mut self,
+        prefix: &str,
+        peer_id: &str,
+        is_admin: bool,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<ViewResult, String> {
+        let id = self.resolve_prefix(prefix)?;
+        let s = self.sessions.get(&id).ok_or_else(|| "session vanished".to_string())?;
+        if s.peer_id != peer_id && !is_admin {
+            return Err("not your session (admins may view any)".into());
+        }
+        if s.has_exited() {
+            return Err("that session has exited".into());
+        }
+        if let Ok(mut v) = s.viewers.lock() {
+            v.retain(|t| !t.is_closed());
+            v.push(tx);
+        }
+        Ok(ViewResult {
+            session_id: id,
+            screen: s.screen.clone(),
+            exit_rx: s.exit_rx.clone(),
+            viewers: s.viewers.clone(),
+        })
+    }
+
     /// Every session as an operator sees it, newest first.
     pub fn summaries(&self) -> Vec<crate::proto::SessionSummary> {
         let mut out: Vec<crate::proto::SessionSummary> = self
@@ -186,7 +231,9 @@ impl SessionRegistry {
                     }
                     Err(_) => (None, 0, 0, 0),
                 };
+                let viewers = s.viewers.lock().map(|v| v.iter().filter(|t| !t.is_closed()).count() as u32).unwrap_or(0);
                 crate::proto::SessionSummary {
+                    viewers,
                     session_id: s.session_id.clone(),
                     peer_id: s.peer_id.clone(),
                     username: s.username.clone(),
@@ -341,6 +388,23 @@ pub enum RegistryCommand {
     ReapExpired,
     /// Snapshot every session for a listing.
     List { reply: oneshot::Sender<Vec<crate::proto::SessionSummary>> },
+    /// Attach a read-only viewer (owner or admin; id may be a unique prefix).
+    AttachView {
+        session_id: String,
+        peer_id: String,
+        is_admin: bool,
+        tx: mpsc::Sender<Vec<u8>>,
+        reply: oneshot::Sender<Result<ViewResult, String>>,
+    },
+}
+
+/// What a read-only viewer gets: the screen to repaint from, the exit
+/// channel, and the viewer list to remove itself from when it leaves.
+pub struct ViewResult {
+    pub session_id: String,
+    pub screen: Arc<Mutex<VtScreen>>,
+    pub exit_rx: watch::Receiver<Option<i32>>,
+    pub viewers: Arc<Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,
 }
 
 /// A session asked for attention (bell, OSC 9, OSC 777) while no client was
@@ -445,6 +509,20 @@ impl RegistryHandle {
         let _ = self.tx.send(RegistryCommand::ReapExpired).await;
     }
 
+    /// Attach a read-only viewer to a session. `Err` carries the reason
+    /// (unknown or ambiguous id, not the owner).
+    pub async fn attach_view(
+        &self,
+        session_id: String,
+        peer_id: String,
+        is_admin: bool,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<ViewResult, String> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(RegistryCommand::AttachView { session_id, peer_id, is_admin, tx, reply }).await;
+        rx.await.unwrap_or_else(|_| Err("session registry unavailable".to_string()))
+    }
+
     /// Every session on this host, newest first.
     pub async fn list(&self) -> Vec<crate::proto::SessionSummary> {
         let (reply, rx) = oneshot::channel();
@@ -525,6 +603,9 @@ async fn run_registry_actor(
             RegistryCommand::List { reply } => {
                 let _ = reply.send(registry.summaries());
             }
+            RegistryCommand::AttachView { session_id, peer_id, is_admin, tx, reply } => {
+                let _ = reply.send(registry.attach_view(&session_id, &peer_id, is_admin, tx));
+            }
             RegistryCommand::ReapExpired => {
                 registry.reap_expired();
             }
@@ -574,6 +655,7 @@ mod tests {
             detached_at: if attached { None } else { Some(Instant::now()) },
             attached,
             started_unix_ms: 0,
+            viewers: Arc::new(Mutex::new(Vec::new())),
             attach_epoch: 0,
             broker_handle: None,
             screen: Arc::new(Mutex::new(VtScreen::new(24, 80))),
@@ -734,4 +816,25 @@ mod tests {
         assert!(reg.lookup("session-a").is_some());
         assert!(reg.lookup("session-b").is_some());
     }
+    #[test]
+    fn attach_view_owner_admin_and_prefix_rules() {
+        let mut reg = SessionRegistry::new(Duration::from_secs(60), 10);
+        let s = make_session("abcdef0123456789", "peer-A", true, None);
+        reg.insert(s);
+        let (tx, _rx) = mpsc::channel(4);
+        // Unknown and ambiguous prefixes are refused; a unique prefix resolves.
+        assert!(reg.attach_view("zzz", "peer-A", false, tx.clone()).is_err());
+        assert!(reg.attach_view("", "peer-A", false, tx.clone()).is_err());
+        // Another peer cannot view; an admin can; the owner can.
+        assert!(reg.attach_view("abcd", "peer-B", false, tx.clone()).is_err());
+        assert!(reg.attach_view("abcd", "peer-B", true, tx.clone()).is_ok());
+        let v = reg.attach_view("abcdef01", "peer-A", false, tx.clone()).unwrap();
+        assert_eq!(v.session_id, "abcdef0123456789");
+        assert_eq!(v.viewers.lock().unwrap().len(), 2);
+        assert_eq!(reg.summaries()[0].viewers, 2);
+        // Ambiguity with a second session sharing the prefix.
+        reg.insert(make_session("abcdef9999999999", "peer-A", true, None));
+        assert!(reg.attach_view("abcdef", "peer-A", false, tx).is_err());
+    }
+
 }

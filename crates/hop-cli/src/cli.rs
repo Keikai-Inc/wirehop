@@ -128,6 +128,10 @@ pub enum Command {
         /// connection. The headless join that replaces `hop warren join`.
         #[arg(long)]
         warren: bool,
+        /// Watch an existing session on the host without being able to type
+        /// into it (id or unique prefix from `hop sessions`). `q` leaves.
+        #[arg(long, value_name = "SESSION")]
+        view: Option<String>,
     },
 
     /// View or update host configuration

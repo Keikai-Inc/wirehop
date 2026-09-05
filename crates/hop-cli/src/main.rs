@@ -168,7 +168,7 @@ async fn real_main() -> Result<()> {
         }
         Command::Connect {
             target, name, read_only, no_network, scopes, allow_commands, preset,
-            yes, on_warren_conflict, warren,
+            yes, on_warren_conflict, warren, view,
         } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
@@ -176,6 +176,7 @@ async fn real_main() -> Result<()> {
             cmd_connect(
                 secret_key, target.as_deref(), &config_dir, name.as_deref(), sandbox,
                 ConnectWarrenOpts { yes, on_warren_conflict, warren },
+                view,
             )
             .await
         }
@@ -444,6 +445,7 @@ async fn real_main() -> Result<()> {
                 cmd_connect(
                     secret_key, Some(&ext.target), &config_dir, ext.name.as_deref(), sandbox,
                     ConnectWarrenOpts { yes: false, on_warren_conflict: None, warren: false },
+                    None,
                 )
                 .await
             }
@@ -1808,6 +1810,7 @@ async fn dispatch_session(
             ClientMessage::RequestShell
                 | ClientMessage::RequestShellV2 { .. }
                 | ClientMessage::RequestShellV3 { .. }
+                | ClientMessage::RequestView { .. }
                 | ClientMessage::RequestTransfer(_)
                 | ClientMessage::RequestExec { .. }
                 | ClientMessage::RequestExecV2 { .. }
@@ -1844,6 +1847,11 @@ async fn dispatch_session(
             let merged = sandbox.merge_stricter(&client_sandbox);
             tracing::info!("Starting persistent shell session with client sandbox (resume: {})", session_id.is_some());
             shell::host_shell_session_persistent(send, recv, username, peer_id, session_id, registry, &merged, config_dir, protocol_version).await?;
+        }
+        Some(ClientMessage::RequestView { session_id }) => {
+            tracing::info!("Starting read-only view of session {}", &session_id[..8.min(session_id.len())]);
+            let is_admin = *role == config::PeerRole::Creator;
+            shell::host_view_session(send, recv, peer_id, is_admin, session_id, registry, protocol_version).await?;
         }
         Some(ClientMessage::RequestTransfer(req)) => {
             // Same security check as shell/exec: when daemon runs as root,
@@ -3053,6 +3061,8 @@ fn rebuild_session_request(
             session_id,
             sandbox: sandbox.clone(),
         },
+        // A view reconnects to the same session it was watching.
+        ClientMessage::RequestView { session_id: watched } => ClientMessage::RequestView { session_id: watched.clone() },
         _ => ClientMessage::RequestShellV2 { session_id },
     }
 }
@@ -3075,6 +3085,7 @@ async fn cmd_connect(
     cli_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
     warren_opts: ConnectWarrenOpts,
+    view: Option<String>,
 ) -> Result<()> {
     // `--warren` means "join the warren (no shell session)": from the invite given
     // as the target, else from the ticket stored by a prior connection. This is
@@ -3096,7 +3107,10 @@ async fn cmd_connect(
     };
 
     // Choose the protocol variant based on whether sandbox is restricted
-    let session_msg: ClientMessage = if sandbox.is_restricted() {
+    let view_only = view.is_some();
+    let session_msg: ClientMessage = if let Some(watched) = view {
+        ClientMessage::RequestView { session_id: watched }
+    } else if sandbox.is_restricted() {
         ClientMessage::RequestShellV3 { session_id: None, sandbox }
     } else {
         ClientMessage::RequestShellV2 { session_id: None }
@@ -3134,10 +3148,15 @@ async fn cmd_connect(
     // connection above authorized us, which is the membership redeem. A
     // client-tier invite is a no-op. Best-effort: a failure here must not block
     // the shell session the user asked for.
-    if let Err(e) = maybe_upgrade_warren_on_connect(
-        config_dir, target, warren_opts.yes, warren_opts.on_warren_conflict,
-    ) {
+    if !view_only
+        && let Err(e) = maybe_upgrade_warren_on_connect(
+            config_dir, target, warren_opts.yes, warren_opts.on_warren_conflict,
+        )
+    {
         eprint!("warren upgrade skipped: {e:#}\r\n");
+    }
+    if view_only {
+        eprint!("[view-only: keys are not sent; press q to leave]\r\n");
     }
 
     // Bracketed-paste / lost-chunk state, shared across reconnections so a
@@ -3146,7 +3165,7 @@ async fn cmd_connect(
 
     // Run the first shell session
     let (mut session_id, mut outcome) =
-        shell::client_shell_session_v2(first_send, first_recv, &mut stdin_rx, &mut replay).await?;
+        shell::client_session(first_send, first_recv, &mut stdin_rx, &mut replay, view_only).await?;
 
     // Anti-flapping state: track recent reconnections to detect rapid cycling
     let mut last_reconnect_time: Option<std::time::Instant> = None;
@@ -3277,6 +3296,7 @@ async fn cmd_connect(
                             &mut stdin_rx,
                             &mut replay,
                             to_send,
+                            view_only,
                         )
                         .await?;
                         session_id = new_session_id.or(session_id);
@@ -5111,6 +5131,7 @@ fn print_sessions(host: &str, sessions: &[hop_core::proto::SessionSummary], json
             "exited": s.exited,
             "title": s.title,
             "bells": s.bells,
+            "viewers": s.viewers,
             "size": format!("{}x{}", s.cols, s.rows),
         })).collect();
         agent_out::emit(&serde_json::json!({ "host": host, "sessions": rows }));
@@ -5307,7 +5328,7 @@ async fn cmd_sessions(
             match r {
                 Ok(s) => hosts.push(serde_json::json!({ "host": name, "sessions": s.iter().map(|x| serde_json::json!({
                     "session_id": x.session_id, "user": x.username, "attached": x.attached, "started": x.started_ms,
-                    "idle_secs": x.idle_secs, "exited": x.exited, "title": x.title, "bells": x.bells })).collect::<Vec<_>>() })),
+                    "idle_secs": x.idle_secs, "exited": x.exited, "title": x.title, "bells": x.bells, "viewers": x.viewers })).collect::<Vec<_>>() })),
                 Err(e) => hosts.push(serde_json::json!({ "host": name, "error": format!("{e:#}") })),
             }
         }

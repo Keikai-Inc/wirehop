@@ -731,6 +731,7 @@ fn spawn_cancellable_pty_reader(
     // local path, where the child-exit watcher owns the exit channel.
     exit_on_eof: Option<watch::Sender<Option<i32>>>,
     attention: Option<AttentionSource>,
+    viewers: Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,
 ) -> Result<()> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -790,6 +791,16 @@ fn spawn_cancellable_pty_reader(
                             // awaiting, so we never hold the Ref across .await.
                             let tx = route_rx.borrow().clone();
                             let attached = tx.is_some();
+                            // Viewers get a copy, best effort: a stalled viewer
+                            // loses chunks rather than stalling the session.
+                            if let Ok(mut vs) = viewers.lock()
+                                && !vs.is_empty()
+                            {
+                                vs.retain(|v| !v.is_closed());
+                                for v in vs.iter() {
+                                    let _ = v.try_send(data.clone());
+                                }
+                            }
                             if let Some(tx) = tx {
                                 let _ = tx.send(data).await;
                             }
@@ -848,6 +859,7 @@ fn spawn_persistent_pty(
     Arc<std::sync::Mutex<hop_vt::VtScreen>>,                          // screen
     Option<u32>,                                                     // child pid (for kill-on-removal)
     Arc<tokio::sync::Notify>,                                        // reader cancel (release master fd on removal)
+    Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,               // read-only viewers
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -945,6 +957,7 @@ fn spawn_persistent_pty(
         username: username.map(String::from),
         tx,
     });
+    let viewers: Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     spawn_cancellable_pty_reader(
         master_fd,
         screen.clone(),
@@ -952,6 +965,7 @@ fn spawn_persistent_pty(
         reader_cancel.clone(),
         exit_on_eof,
         attention,
+        viewers.clone(),
     )?;
 
     // Input writer task. Unbounded so the shell select-loop never blocks on
@@ -1027,7 +1041,7 @@ fn spawn_persistent_pty(
         });
     }
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel, viewers))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -1205,6 +1219,87 @@ async fn run_attached_loop(
     outcome
 }
 
+/// Host side: a read-only view of an existing session. The viewer gets a
+/// repaint sized to its own terminal, then every output chunk; every
+/// `Input` it sends is dropped here, on the host, so watching a session
+/// someone else is working in cannot disturb it. Resizes re-render the
+/// viewer's copy and never touch the PTY.
+pub async fn host_view_session(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    peer_id: &str,
+    is_admin: bool,
+    session_id: String,
+    registry: RegistryHandle,
+    protocol_version: u8,
+) -> Result<()> {
+    let (size, _env, _leftover) = read_setup_messages(&mut recv).await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+    let view = match registry.attach_view(session_id, peer_id.to_string(), is_admin, tx.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = proto::write_message(&mut send, &HostMessage::SessionError(e.clone())).await;
+            anyhow::bail!("view refused: {e}");
+        }
+    };
+    crate::audit::record(
+        crate::audit::AuditEvent::new(crate::audit::AuditCategory::Session, "session.view", crate::audit::AuditOutcome::Info)
+            .actor(peer_id.to_string())
+            .detail(format!("session={}", &view.session_id[..8.min(view.session_id.len())])),
+    );
+    proto::write_message(&mut send, &HostMessage::SessionInfo { session_id: view.session_id.clone(), resumed: true }).await?;
+    let compress = protocol_version >= 3;
+    let repaint = view.screen.lock().unwrap().render(size.rows, size.cols, hop_vt::Prelude::Initial);
+    write_host_message(&mut send, &HostMessage::Output(repaint), compress).await?;
+    let mut exit_rx = view.exit_rx.clone();
+    let mut framed = proto::FramedReader::new(&mut recv);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result: Result<()> = loop {
+        tokio::select! {
+            Some(data) = rx.recv() => {
+                if let Err(e) = write_host_message(&mut send, &HostMessage::Output(data), compress).await {
+                    break Err(e);
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(e) = write_host_message(&mut send, &HostMessage::Output(Vec::new()), compress).await {
+                    break Err(e);
+                }
+            }
+            changed = exit_rx.changed() => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                // Copy out of the watch guard before awaiting.
+                let exited: Option<i32> = *exit_rx.borrow();
+                if let Some(code) = exited {
+                    let _ = proto::write_message(&mut send, &HostMessage::Exit(code)).await;
+                    break Ok(());
+                }
+            }
+            msg = framed.next::<ClientMessage>() => match msg {
+                Ok(ClientMessage::Input(_)) => {} // dropped: view-only
+                Ok(ClientMessage::WindowSize { rows, cols, .. }) => {
+                    let bytes = view.screen.lock().unwrap().render(rows, cols, hop_vt::Prelude::Resize);
+                    let _ = proto::write_message(&mut send, &HostMessage::WindowSizeAck).await;
+                    if let Err(e) = write_host_message(&mut send, &HostMessage::Output(bytes), compress).await {
+                        break Err(e);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break Ok(()), // client went away
+            }
+        }
+    };
+    drop(rx);
+    if let Ok(mut v) = view.viewers.lock() {
+        v.retain(|t| !t.same_channel(&tx));
+    }
+    drop(tx);
+    result
+}
+
 /// Host side: persistent shell session that survives client disconnects.
 ///
 /// Uses the session registry to store/retrieve PTY sessions. On disconnect,
@@ -1258,7 +1353,7 @@ pub async fn host_shell_session_persistent(
                 )
             } else {
                 // Session gone or exited — spawn new
-                let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
+                let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers) =
                     spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
@@ -1276,6 +1371,7 @@ pub async fn host_shell_session_persistent(
                     started_unix_ms: crate::shell::session_registry::unix_now_ms(),
                     attach_epoch: 1,
                     broker_handle: None,
+                    viewers,
                     screen: scr.clone(),
                 };
                 registry.insert(session).await;
@@ -1283,7 +1379,7 @@ pub async fn host_shell_session_persistent(
             }
         } else {
             // New connection — always spawn a new PTY
-            let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
+            let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
@@ -1301,6 +1397,7 @@ pub async fn host_shell_session_persistent(
                 started_unix_ms: crate::shell::session_registry::unix_now_ms(),
                 attach_epoch: 1,
                 broker_handle: None,
+                viewers,
                 screen: scr.clone(),
             };
             registry.insert(session).await;
@@ -1536,7 +1633,7 @@ pub async fn client_shell_session(
 
     // v1 has no reconnect, so paste/lost-chunk state is local and discarded.
     let mut replay = InputReplay::default();
-    let result = client_shell_loop(send, &mut recv, stdin_rx, &mut replay).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, &mut replay, false).await;
 
     // Always restore terminal
     let _ = terminal::disable_raw_mode();
@@ -1549,11 +1646,38 @@ pub async fn client_shell_session(
 /// Same as `client_shell_session` but reads the `SessionInfo` response after
 /// sending setup messages. Returns `(session_id, outcome)` so the caller can
 /// store the session ID for reconnection.
+/// Bytes that end a view-only session on the client: `q` or Ctrl-C.
+fn view_quit_key(data: &[u8]) -> bool {
+    data.contains(&b'q') || data.contains(&0x03)
+}
+
 pub async fn client_shell_session_v2(
+    send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    recv: impl tokio::io::AsyncRead + Unpin,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    replay: &mut InputReplay,
+) -> Result<(Option<String>, SessionOutcome)> {
+    client_session(send, recv, stdin_rx, replay, false).await
+}
+
+/// Like [`client_shell_session_v2`] but for a read-only view: keystrokes are
+/// never sent, and `q` or Ctrl-C ends the view.
+pub async fn client_view_session(
+    send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    recv: impl tokio::io::AsyncRead + Unpin,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    replay: &mut InputReplay,
+) -> Result<(Option<String>, SessionOutcome)> {
+    client_session(send, recv, stdin_rx, replay, true).await
+}
+
+/// Interactive or view-only client session, chosen by `view_only`.
+pub async fn client_session(
     mut send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
+    view_only: bool,
 ) -> Result<(Option<String>, SessionOutcome)> {
     use crossterm::terminal;
 
@@ -1615,7 +1739,7 @@ pub async fn client_shell_session_v2(
     // Raw mode is owned by the caller (cmd_connect) for the whole interactive
     // lifecycle, so it stays enabled continuously across reconnects — see
     // RawModeGuard. Don't toggle it here.
-    let result = client_shell_loop(send, &mut recv, stdin_rx, replay).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, replay, view_only).await;
 
     match result {
         Ok(outcome) => Ok((session_id, outcome)),
@@ -1634,6 +1758,7 @@ pub async fn client_shell_loop_resumed(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
     to_send: Vec<u8>,
+    view_only: bool,
 ) -> Result<SessionOutcome> {
     // Raw mode is owned by the caller (cmd_connect) for the whole lifecycle —
     // held continuously across reconnects so the stdin reader never drops to
@@ -1652,7 +1777,7 @@ pub async fn client_shell_loop_resumed(
             replay.observe(data);
         }
     }
-    client_shell_loop(send, &mut recv, stdin_rx, replay).await
+    client_shell_loop(send, &mut recv, stdin_rx, replay, view_only).await
 }
 
 /// Detect sleep/wake by observing wall-clock time jumps.
@@ -1675,6 +1800,7 @@ async fn client_shell_loop<S>(
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
+    view_only: bool,
 ) -> Result<SessionOutcome>
 where
     S: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1771,6 +1897,13 @@ where
         tokio::select! {
             // Stdin -> enqueue for the writer task (never blocks this loop).
             Some(data) = input_rx.recv() => {
+                // A view never sends keystrokes; `q` / Ctrl-C leaves it.
+                if view_only {
+                    if view_quit_key(&data) {
+                        break Ok(SessionOutcome::Exited(0));
+                    }
+                    continue;
+                }
                 // Observe paste state in enqueue order (== write order). `observe`
                 // SETS in_paste (it doesn't toggle), and in_paste is only consumed
                 // after a reconnect re-observes, so observing before the write is
@@ -2227,7 +2360,7 @@ mod reader_tests {
         let (_route_set, route_get) = watch::channel(Some(route_tx));
         let cancel = Arc::new(tokio::sync::Notify::new());
 
-        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone(), None, None)
+        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone(), None, None, Arc::new(std::sync::Mutex::new(Vec::new())))
             .expect("spawn reader");
 
         // 1) Data flows through before cancel.
