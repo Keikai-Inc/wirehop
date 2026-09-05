@@ -5,6 +5,7 @@
 //! running when its next fire time arrives, that tick is skipped. Missed runs
 //! (e.g. daemon was down) are coalesced into a single execution on startup.
 
+use hop_core::datastore::types::CronRunStatus;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,13 @@ pub fn spawn_cron_scheduler(
     backend: Option<Arc<dyn OrchestratorBackend>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // A run cannot outlive the daemon that started it: anything still
+        // marked running in the history was cut off by a restart.
+        match datastore.cron_runs_mark_interrupted(now_ms()) {
+            Ok(n) if n > 0 => eprintln!("[hop.cron] {n} run(s) were interrupted by the last daemon restart"),
+            Err(e) => tracing::warn!("cron: could not reconcile run history: {e:#}"),
+            _ => {}
+        }
         // Track which jobs are currently executing. Checked synchronously on
         // each tick before spawning — prevents duplicate runs entirely.
         let running: Arc<std::sync::Mutex<HashSet<String>>> =
@@ -100,6 +108,10 @@ async fn run_due_jobs(
         let be = backend.cloned();
         let running = Arc::clone(running);
         let job_id = job.id.clone();
+        let started = now;
+        if let Err(e) = datastore.cron_run_start(&job.id, started) {
+            tracing::warn!("cron: could not record run start for {}: {e:#}", job.id);
+        }
 
         tokio::spawn(async move {
             // RAII guard: clears the running flag on drop, even if the task
@@ -109,12 +121,55 @@ async fn run_due_jobs(
                 set: Arc::clone(&running),
                 id: job_id,
             };
-            if let Err(e) = execute_cron_job(&ds, &job, be.as_ref()).await {
-                let msg = format!("Cron job '{}' ({}) failed: {e:#}", job.name, job.id);
-                tracing::error!("{msg}");
-                eprintln!("[hop.cron] ERROR: {msg}");
-                store_cron_error(&ds, &job.id, &msg);
-                notify_cron_failure(&ds, &job, &msg).await;
+            let limit = job_timeout(&job);
+            // Hard deadline around the whole run. The JS interrupt handler
+            // only fires between statements, so a script stuck inside a
+            // blocking call (an HTTP request that never returns, a child
+            // process that never exits) would otherwise hang the job forever
+            // and invisibly. Past the deadline the run is recorded as timed
+            // out and the job is released for its next tick; the abandoned
+            // thread finishes or dies with the process.
+            let grace = Duration::from_secs(30);
+            let outcome = tokio::time::timeout(limit + grace, execute_cron_job(&ds, &job, be.as_ref(), limit)).await;
+            let ended = now_ms();
+            let (status, message) = match outcome {
+                Ok(Ok(output)) => (CronRunStatus::Ok, truncate(&output, 500).to_string()),
+                Ok(Err(e)) => {
+                    let msg = format!("{e:#}");
+                    // The runtime reports its own deadline as "interrupted"
+                    // (the QuickJS interrupt handler) or "timed out" (pending
+                    // jobs); either way the run hit its limit.
+                    let elapsed = Duration::from_millis(ended.saturating_sub(started));
+                    let hit_limit = msg.contains("timed out") || msg.contains("interrupted") || elapsed >= limit;
+                    if hit_limit {
+                        (CronRunStatus::Timeout, format!("exceeded the {}s run limit after {:.1}s ({msg})", limit.as_secs(), elapsed.as_secs_f64()))
+                    } else {
+                        (CronRunStatus::Error, msg)
+                    }
+                }
+                Err(_) => (
+                    CronRunStatus::Timeout,
+                    format!(
+                        "still running after {}s: a blocking call inside the script did not return; the run was abandoned",
+                        (limit + grace).as_secs()
+                    ),
+                ),
+            };
+            if let Err(e) = ds.cron_run_finish(&job.id, started, ended, status, &message) {
+                tracing::warn!("cron: could not record run end for {}: {e:#}", job.id);
+            }
+            match status {
+                CronRunStatus::Ok => {
+                    tracing::info!("Cron job '{}' completed: {}", job.name, truncate(&message, 200));
+                    eprintln!("[hop.cron] {} completed: {}", job.name, truncate(&message, 200));
+                }
+                _ => {
+                    let msg = format!("Cron job '{}' ({}) {}: {message}", job.name, job.id, status.as_str());
+                    tracing::error!("{msg}");
+                    eprintln!("[hop.cron] ERROR: {msg}");
+                    store_cron_error(&ds, &job.id, &msg);
+                    notify_cron_failure(&ds, &job, &msg).await;
+                }
             }
         });
     }
@@ -122,12 +177,28 @@ async fn run_due_jobs(
     Ok(())
 }
 
-/// Execute a single cron job's JS script.
+/// The scheduler's default wall-clock limit for one run. Must exceed the 60 s
+/// `hop.exec()` timeout so that fires first with a clear error, and is long
+/// enough for jobs that call `hop.claude()` a few times.
+pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The run limit for a job: its own `timeout_secs`, else the default.
+pub fn job_timeout(job: &hop_core::datastore::types::CronJob) -> Duration {
+    job.timeout_secs
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_JOB_TIMEOUT)
+}
+
+/// Execute a single cron job's JS script and return its output. Errors,
+/// including the runtime's own timeout, come back as `Err`; the caller
+/// records the run either way.
 async fn execute_cron_job(
     datastore: &Datastore,
     job: &hop_core::datastore::types::CronJob,
     backend: Option<&Arc<dyn OrchestratorBackend>>,
-) -> Result<()> {
+    js_timeout: Duration,
+) -> Result<String> {
     tracing::info!("Cron: executing job '{}' ({})", job.name, job.id);
 
     let mut runtime = JsRuntime::new();
@@ -152,33 +223,11 @@ async fn execute_cron_job(
         job.script.clone()
     };
 
-    // Timeout must exceed the 60s exec timeout in LocalBackend so that
-    // hop.exec() can fire its own timeout error instead of the JS runtime
-    // killing the script silently. Set to 5 minutes for AI-powered jobs
-    // that may invoke hop.claude() (each Claude call can take 30-60s).
-    let js_timeout = Duration::from_secs(300);
-
-    let result = if let Some(be) = backend {
+    if let Some(be) = backend {
         runtime.execute(&script, be, Some(js_timeout)).await
     } else {
         runtime.execute_script(&script, Some(js_timeout)).await
-    };
-
-    match &result {
-        Ok(output) => {
-            let msg = truncate(output, 200);
-            tracing::info!("Cron job '{}' completed: {msg}", job.name);
-            eprintln!("[hop.cron] {} completed: {msg}", job.name);
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            tracing::error!("Cron job '{}' script error: {msg}", job.name);
-            eprintln!("[hop.cron] ERROR: {} script error: {msg}", job.name);
-            store_cron_error(datastore, &job.id, &msg);
-        }
     }
-
-    Ok(())
 }
 
 /// RAII guard that removes a job ID from the running set on drop.
@@ -371,6 +420,7 @@ mod tests {
             catalog_id: None,
             sandbox: None,
             run_as_user: None,
+            timeout_secs: None,
         }
     }
 
@@ -529,4 +579,39 @@ mod tests {
             "last_run should be set after execution"
         );
     }
+    #[tokio::test]
+    async fn run_history_records_ok_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        ds.cron_add(&make_job("ok", "0 * * * * *", "return 'fine'", true, 0)).unwrap();
+        ds.cron_add(&make_job("bad", "0 * * * * *", "throw new Error('boom')", true, 0)).unwrap();
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let ok = ds.cron_runs("ok", 5).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].status, CronRunStatus::Ok);
+        assert_eq!(ok[0].message, "fine");
+        assert!(ok[0].duration_ms().is_some());
+        let bad = ds.cron_runs("bad", 5).unwrap();
+        assert_eq!(bad[0].status, CronRunStatus::Error);
+        assert!(bad[0].message.contains("boom"), "{}", bad[0].message);
+    }
+
+    #[tokio::test]
+    async fn run_history_records_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let running = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mut job = make_job("spin", "0 * * * * *", "while (true) {}", true, 0);
+        job.timeout_secs = Some(1);
+        ds.cron_add(&job).unwrap();
+        run_due_jobs(&ds, None, &running).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let runs = ds.cron_runs("spin", 5).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, CronRunStatus::Timeout, "{}", runs[0].message);
+        assert!(!running.lock().unwrap().contains("spin"), "job released after timeout");
+    }
+
 }

@@ -757,7 +757,7 @@ fn run_local_script_sync(
                 let _ = stdin.write_all(full_script.as_bytes());
                 // Drop stdin to close it — shell will read EOF and execute
             }
-            match child.wait_with_output() {
+            match wait_with_output_deadline(child, LOCAL_EXEC_TIMEOUT) {
                 Ok(o) => Ok(ExecResult {
                     stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
@@ -765,7 +765,7 @@ fn run_local_script_sync(
                 }),
                 Err(e) => Ok(ExecResult {
                     stdout: String::new(),
-                    stderr: format!("wait failed: {e}"),
+                    stderr: format!("{e}"),
                     exit_code: -1,
                 }),
             }
@@ -2134,4 +2134,53 @@ mod ssrf_tests {
         // A public literal passes the guard.
         assert!(ssrf_guard("https://1.1.1.1/").is_ok());
     }
+}
+
+/// Wall-clock cap on one `hop.local()` child. A child that never exits used to
+/// block the JS thread forever, past the cron job's own limit (the interrupt
+/// handler cannot fire inside a blocking wait). Past the cap the child is
+/// killed and the call returns an error the script can see.
+const LOCAL_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// `Child::wait_with_output` with a deadline: drains stdout/stderr on helper
+/// threads, polls the child, and kills it if it outlives `limit`.
+fn wait_with_output_deadline(
+    mut child: std::process::Child,
+    limit: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout.take() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr.take() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("hop.local: command did not finish within {}s and was killed", limit.as_secs());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => anyhow::bail!("wait failed: {e}"),
+        }
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
 }

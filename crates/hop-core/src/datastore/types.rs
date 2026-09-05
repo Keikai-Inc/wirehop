@@ -62,6 +62,59 @@ pub struct CronJob {
     /// `login -fp` (macOS) or `su -` (Linux).
     #[serde(default)]
     pub run_as_user: Option<String>,
+    /// Wall-clock limit for one run, in seconds. `None` = the scheduler's
+    /// default (300 s). Enforced by the JS interrupt handler between
+    /// statements and by a hard deadline around the whole run, so a script
+    /// stuck in a blocking call is still reported as timed out.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// How one cron run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRunStatus {
+    /// Started and not yet finished.
+    Running,
+    Ok,
+    /// The script threw, or the runtime reported an error.
+    Error,
+    /// The run exceeded its wall-clock limit.
+    Timeout,
+    /// The daemon restarted while the run was in flight.
+    Interrupted,
+}
+
+impl CronRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CronRunStatus::Running => "running",
+            CronRunStatus::Ok => "ok",
+            CronRunStatus::Error => "error",
+            CronRunStatus::Timeout => "timeout",
+            CronRunStatus::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// One execution of a cron job: what `hop cron list` and `hop cron logs`
+/// show. Stored per (job_id, started_ms); the newest runs are kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronRun {
+    pub job_id: String,
+    /// Unix ms when the run started.
+    pub started_ms: u64,
+    /// Unix ms when it finished; `None` while running.
+    pub ended_ms: Option<u64>,
+    pub status: CronRunStatus,
+    /// The script's return value on success, or the error, truncated.
+    pub message: String,
+}
+
+impl CronRun {
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.ended_ms.map(|e| e.saturating_sub(self.started_ms))
+    }
 }
 
 /// An encrypted secret stored in the secrets table.

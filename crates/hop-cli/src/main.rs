@@ -4835,6 +4835,7 @@ async fn cmd_cap_setup(id: &str, schedule: Option<&str>, target: Option<&str>, c
             catalog_id: Some(catalog_id),
             sandbox: Some(cap.tier.to_sandbox()),
             run_as_user: hop_core::unix_user::current_username(),
+            timeout_secs: None,
         };
         ds.cron_add(&job)?;
         println!("\u{2713} {} active (job {}).", cap.name, job_id);
@@ -4913,6 +4914,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 catalog_id: Some(catalog_id),
                 sandbox: Some(cap.tier.to_sandbox()),
                 run_as_user: hop_core::unix_user::current_username(),
+                timeout_secs: None,
             };
             ds.cron_add(&job)?;
             println!("Enabled capability '{}' (job {}, sandbox: {})", id, job_id, cap.tier.name());
@@ -5007,6 +5009,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                     catalog_id: Some(catalog_id),
                     sandbox: Some(cap.tier.to_sandbox()),
                     run_as_user: hop_core::unix_user::current_username(),
+                    timeout_secs: None,
                 };
                 ds.cron_add(&job)?;
                 println!("Triggered capability '{}' on targets '{}' (job {}, will run on next scheduler tick ~15s)", id, tag, job_id);
@@ -5031,6 +5034,7 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
                 catalog_id: Some(format!("cap:run:{}", id)),
                 sandbox: Some(cap.tier.to_sandbox()),
                 run_as_user: hop_core::unix_user::current_username(),
+                timeout_secs: None,
             };
             ds.cron_add(&job)?;
             println!("Triggered capability '{}' locally (job {}, will run on next scheduler tick ~15s)", id, job_id);
@@ -5090,10 +5094,15 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
     match action {
         CronAction::List => {
             let jobs = ds.cron_list()?;
+            let now = unix_now_ms();
+            // One line per job with what matters operationally: whether it is
+            // on, when it runs next, and how its last run ended (and why).
+            let last_of = |id: &str| ds.cron_runs(id, 1).ok().and_then(|r| r.into_iter().next());
             if agent_out::json_mode() {
                 let out: Vec<serde_json::Value> = jobs
                     .iter()
                     .map(|j| {
+                        let last = last_of(&j.id);
                         serde_json::json!({
                             "id": j.id,
                             "name": j.name,
@@ -5101,8 +5110,13 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                             "schedule": j.schedule,
                             "targets": j.targets,
                             "tags": j.tags,
+                            "timeout_secs": j.timeout_secs,
                             "last_run": j.last_run,
                             "next_run": j.next_run,
+                            "last_run_status": last.as_ref().map(|r| r.status.as_str()),
+                            "last_run_started": last.as_ref().map(|r| r.started_ms),
+                            "last_run_duration_ms": last.as_ref().and_then(|r| r.duration_ms()),
+                            "last_run_message": last.as_ref().map(|r| r.message.clone()),
                         })
                     })
                     .collect();
@@ -5110,10 +5124,22 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
             } else if jobs.is_empty() {
                 println!("No cron jobs.");
             } else {
+                println!("{:<10} {:<24} {:<9} {:<14} {:<12} LAST RUN", "ID", "NAME", "STATE", "SCHEDULE", "NEXT");
                 for j in &jobs {
-                    let status = if j.enabled { "enabled" } else { "disabled" };
-                    let targets = j.targets.as_deref().unwrap_or("-");
-                    println!("  {} {} [{}] schedule={} targets={}", j.id, j.name, status, j.schedule, targets);
+                    let state = if j.enabled { "enabled" } else { "disabled" };
+                    let next = if !j.enabled { "-".to_string() } else { format_relative_ms(j.next_run, now) };
+                    let last = match last_of(&j.id) {
+                        None => "never".to_string(),
+                        Some(r) => {
+                            let age = format_relative_ms(r.started_ms, now);
+                            let why = if r.message.is_empty() { String::new() } else { format!(": {}", truncate_line(&r.message, 60)) };
+                            match r.status {
+                                hop_core::datastore::types::CronRunStatus::Running => format!("running since {age}"),
+                                st => format!("{} {age}{why}", st.as_str()),
+                            }
+                        }
+                    };
+                    println!("{:<10} {:<24} {:<9} {:<14} {:<12} {}", j.id, truncate_line(&j.name, 24), state, truncate_line(&j.schedule, 14), next, last);
                 }
             }
         }
@@ -5129,13 +5155,22 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                     println!("Created:   {}", j.created_at);
                     println!("Last run:  {}", j.last_run.map(|t| t.to_string()).unwrap_or_else(|| "never".into()));
                     println!("Next run:  {}", j.next_run);
+                    println!("Timeout:   {}s", j.timeout_secs.unwrap_or(hop_mcp::cron::DEFAULT_JOB_TIMEOUT.as_secs()));
+                    let runs = ds.cron_runs(&j.id, 5)?;
+                    if !runs.is_empty() {
+                        println!("Recent runs (newest first; `hop cron logs {}` for more):", j.id);
+                        let now = unix_now_ms();
+                        for r in runs {
+                            println!("  {:<11} {:<14} {:>8}  {}", r.status.as_str(), format_relative_ms(r.started_ms, now), r.duration_ms().map(|d| format!("{}ms", d)).unwrap_or_default(), truncate_line(&r.message, 100));
+                        }
+                    }
                     println!("--- script ---");
                     println!("{}", j.script);
                 }
                 None => anyhow::bail!("Cron job '{id}' not found"),
             }
         }
-        CronAction::Create { name, schedule, script, file, targets, tags } => {
+        CronAction::Create { name, schedule, script, file, targets, tags, timeout } => {
             let script_content = match (script, file) {
                 (Some(s), _) => s,
                 (_, Some(path)) => std::fs::read_to_string(&path)
@@ -5165,12 +5200,36 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
                 catalog_id: None,
                 sandbox: None,
                 run_as_user: hop_core::unix_user::current_username(),
+                timeout_secs: timeout,
             };
             ds.cron_add(&job)?;
             println!("Created cron job: {id}");
         }
+        CronAction::Logs { id, limit } => {
+            let job = ds.cron_get(&id)?.with_context(|| format!("Cron job '{id}' not found"))?;
+            let runs = ds.cron_runs(&id, limit as usize)?;
+            if agent_out::json_mode() {
+                let out: Vec<serde_json::Value> = runs.iter().map(|r| serde_json::json!({
+                    "started": r.started_ms,
+                    "ended": r.ended_ms,
+                    "duration_ms": r.duration_ms(),
+                    "status": r.status.as_str(),
+                    "message": r.message,
+                })).collect();
+                agent_out::emit(&serde_json::json!({ "id": job.id, "name": job.name, "runs": out }));
+            } else if runs.is_empty() {
+                println!("No runs recorded yet for {} ({}).", job.name, job.id);
+            } else {
+                println!("{} ({}), newest first:", job.name, job.id);
+                for r in runs {
+                    let dur = r.duration_ms().map(|d| format!("{:.1}s", d as f64 / 1000.0)).unwrap_or_else(|| "-".into());
+                    println!("[{}] {:<11} {:>7}  {}", format_epoch_ms(r.started_ms), r.status.as_str(), dur, r.message);
+                }
+            }
+        }
         CronAction::Delete { id } => {
             if ds.cron_remove(&id)? {
+                let _ = ds.cron_runs_clear(&id);
                 println!("Deleted cron job: {id}");
             } else {
                 anyhow::bail!("Cron job '{id}' not found");
@@ -5252,6 +5311,34 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
 }
 
 /// Format epoch milliseconds as a human-readable UTC timestamp.
+/// "in 4m", "12s ago", "3h ago": how far `ts_ms` is from `now_ms`.
+fn format_relative_ms(ts_ms: u64, now_ms: u64) -> String {
+    let (delta, past) = if ts_ms <= now_ms { (now_ms - ts_ms, true) } else { (ts_ms - now_ms, false) };
+    let secs = delta / 1000;
+    let body = if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d", secs / 86_400)
+    };
+    if past { format!("{body} ago") } else { format!("in {body}") }
+}
+
+/// First line of `s`, cut to `max` chars with an ellipsis.
+fn truncate_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("");
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 fn format_epoch_ms(ms: u64) -> String {
     let secs = ms / 1000;
     let s = secs % 60;
@@ -7058,6 +7145,7 @@ fn handle_remote_cap_enable(
         catalog_id: Some(catalog_id),
         sandbox: Some(cap.tier.to_sandbox()),
         run_as_user: username.map(String::from),
+        timeout_secs: None,
     };
 
     match datastore.cron_add(&job) {
@@ -7095,6 +7183,7 @@ fn handle_remote_cap_run(
         catalog_id: Some(format!("cap:run:{id}")),
         sandbox: Some(cap.tier.to_sandbox()),
         run_as_user: username.map(String::from),
+        timeout_secs: None,
     };
 
     match datastore.cron_add(&job) {

@@ -873,8 +873,9 @@ Manage cron jobs on the daemon.
 
 | Subcommand | Description |
 |---|---|
-| `list` | List all cron jobs |
-| `get <id>` | Show full details of a cron job |
+| `list` | List all cron jobs with state, next run, and how the last run ended |
+| `get <id>` | Show full details of a cron job, with its 5 most recent runs |
+| `logs <id>` | Run history, newest first (`--limit N`, default 20; `--json`) |
 | `create` | Create a new cron job |
 | `delete <id>` | Delete a cron job |
 | `enable <id>` | Enable a cron job |
@@ -891,12 +892,14 @@ Manage cron jobs on the daemon.
 | `--file <PATH>` | Read script from a file |
 | `--targets <TAG>` | Fleet target tag (injected as `hop.targets`) |
 | `--tags <TAGS>` | Tags for this job (comma-separated) |
+| `--timeout <SECS>` | Wall-clock limit for one run (default 300) |
 
 ```bash
 hop cron list
 hop cron create --name "health" --schedule "0 */5 * * * *" --script "hop.log('ok')"
 hop cron create --name "backup" --schedule "0 0 3 * * *" --file backup.js --targets web
 hop cron get abc123
+hop cron logs abc123 --limit 50
 hop cron run abc123
 hop cron disable abc123
 hop cron delete abc123

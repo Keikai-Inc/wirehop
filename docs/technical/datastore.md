@@ -45,6 +45,9 @@ const TS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("ts")
 // Cron jobs: job_id -> bincode-encoded CronJob
 const CRON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cron");
 
+// Cron run history: (job_id, started_ms) -> bincode-encoded CronRun (newest 50 kept per job)
+const CRON_RUNS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("cron_runs");
+
 // Metadata: key -> bincode-encoded value (schema version, retention, etc.)
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -87,6 +90,16 @@ pub struct CronJob {
     pub targets: Option<String>,  // Fleet target tag for host resolution
     pub catalog_id: Option<String>,  // Dedup identifier
     pub sandbox: Option<SandboxPolicy>,
+    pub run_as_user: Option<String>, // Stamped at creation; hop.local() drops to this user
+    pub timeout_secs: Option<u64>,   // Per-run wall-clock limit (default 300)
+}
+
+pub struct CronRun {
+    pub job_id: String,
+    pub started_ms: u64,
+    pub ended_ms: Option<u64>,        // None while running
+    pub status: CronRunStatus,        // running | ok | error | timeout | interrupted
+    pub message: String,              // return value or error, truncated to 500 chars
 }
 
 pub struct SealedSecret {
@@ -132,8 +145,9 @@ pub enum DsRequest {
     CronFindByCatalogId { catalog_id: String },
     CronGetDue { now_ms: u64 },
     CronUpdateLastRun { id: String, ts: u64, next_run: u64 },
-
-    // Secrets operations
+    CronPurgeCorrupt,
+    CronRuns { id: String, limit: u32 },   // appended last; -> DsResponse::CronRuns(Vec<CronRun>)
+// Secrets operations
     SecretsGet { name: String },
     SecretsSet { name: String, value: Vec<u8> },
     SecretsDelete { name: String },

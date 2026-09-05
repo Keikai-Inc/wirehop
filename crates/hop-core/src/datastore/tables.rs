@@ -20,6 +20,9 @@ pub const AUDIT_SERIES: &str = "ev";
 /// Cron jobs: job_id → bincode-encoded CronJob.
 pub const CRON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cron");
 
+/// Cron run history: (job_id, started_ms) -> bincode-encoded CronRun.
+pub const CRON_RUNS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("cron_runs");
+
 /// Metadata: key → bincode-encoded value (schema version, retention policies, etc.).
 pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 

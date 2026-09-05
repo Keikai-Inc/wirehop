@@ -141,6 +141,25 @@ Persistent cron jobs that execute JavaScript in hop's sandboxed runtime. Jobs su
 | `targets` | string? | Fleet target tag; matching hosts injected as `hop.targets` |
 | `catalog_id` | string? | Dedup key for idempotent `ensure` operations |
 | `sandbox` | SandboxPolicy? | Restricts `hop.exec()`, `hop.fleet.exec()`, `hop.local()` in the script |
+| `timeout_secs` | u64? | Wall-clock limit for one run (default 300). Enforced between JS statements and by a hard deadline around the whole run |
+
+#### Run history
+
+Every run is recorded: when it started, when it ended, how it ended, and the
+script's return value or error (truncated to 500 characters). The newest 50
+runs per job are kept. A run cannot outlive the daemon that started it, so
+runs still marked `running` when the daemon restarts are marked `interrupted`.
+
+| Status | Meaning |
+|---|---|
+| `running` | started, not finished |
+| `ok` | the script returned; the message is its return value |
+| `error` | the script threw or the runtime failed; the message is the error |
+| `timeout` | the run exceeded `timeout_secs` (or the 300 s default). The JS interrupt handler fires between statements; a script stuck inside a blocking call is abandoned 30 s later and recorded as `timeout` too |
+| `interrupted` | the daemon restarted while the run was in flight |
+
+`hop.local()` children are killed after 240 s, so a command that never exits
+surfaces as an error the script can see instead of hanging the job.
 
 The schedule uses a **6-field cron format**: `sec min hour day month weekday`. Examples:
 - `0 */5 * * * *` -- every 5 minutes
@@ -155,9 +174,11 @@ hop cron create --name "health check" --schedule "0 */5 * * * *" --script "retur
 hop cron create --name "deploy" --schedule "0 0 2 * * *" --file ./scripts/deploy.js
 hop cron create --name "fleet metrics" --schedule "0 */1 * * * *" --targets "web" --tags fleet,metrics
 
-# List / inspect
+# List / inspect (list shows state, next run, and how the last run ended)
 hop cron list
-hop cron get <job-id>
+hop cron get <job-id>          # details + the 5 most recent runs
+hop cron logs <job-id>         # run history, newest first (--limit N, --json)
+hop cron create --name "slow" --schedule "0 0 * * * *" --file slow.js --timeout 900
 
 # Lifecycle
 hop cron enable <job-id>

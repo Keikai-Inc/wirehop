@@ -1020,6 +1020,17 @@ pub enum CronAction {
         /// Tags for this job (comma-separated)
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Wall-clock limit for one run, in seconds (default 300)
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+    },
+    /// Show recent runs of a cron job: when, how it ended, and why
+    Logs {
+        /// Job ID
+        id: String,
+        /// How many runs to show (newest first)
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
     },
     /// Delete a cron job
     Delete {

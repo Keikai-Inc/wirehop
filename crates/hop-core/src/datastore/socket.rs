@@ -358,6 +358,9 @@ fn dispatch_request(
         DsRequest::CronPurgeCorrupt => {
             DsResponse::StringList(ds.cron_purge_corrupt()?)
         }
+        DsRequest::CronRuns { id, limit } => {
+            DsResponse::CronRuns(ds.cron_runs(&id, limit as usize)?)
+        }
         DsRequest::SecretsGet { username, name } => {
             DsResponse::SecretValue(ds.secrets_get(&username, &name)?)
         }
@@ -547,6 +550,7 @@ mod tests {
             catalog_id: Some("test-cat".into()),
             sandbox: None,
             run_as_user: None,
+            timeout_secs: None,
         };
 
         // Add

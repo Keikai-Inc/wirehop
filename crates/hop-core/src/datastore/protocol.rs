@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{CronJob, KvEntry, MetricPoint, TimeSeriesQuery};
+use super::types::{CronJob, CronRun, KvEntry, MetricPoint, TimeSeriesQuery};
 
 /// Request from a client to the daemon's datastore.
 // Variants vary in size, but this is a short-lived IPC message serialized by
@@ -44,6 +44,8 @@ pub enum DsRequest {
     AuditAppend { event: Box<crate::audit::AuditEvent> },
     /// Query the per-node audit/flow log (most recent first).
     AuditQuery { query: crate::audit::AuditQuery },
+    /// Recent runs of one cron job, newest first. Appended last.
+    CronRuns { id: String, limit: u32 },
 }
 
 /// Response from the daemon's datastore to a client.
@@ -64,4 +66,5 @@ pub enum DsResponse {
     Admin(Box<crate::proto::AdminResponse>),
     NetStats(Box<crate::netstats::NetStatsSnapshot>),
     AuditEvents(Vec<crate::audit::AuditEvent>),
+    CronRuns(Vec<CronRun>),
 }

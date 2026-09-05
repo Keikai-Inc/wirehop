@@ -9,8 +9,8 @@ use redb::ReadableTable;
 
 use super::protocol::{DsRequest, DsResponse};
 use super::remote_dispatch;
-use super::tables::CRON_TABLE;
-use super::types::CronJob;
+use super::tables::{CRON_RUNS_TABLE, CRON_TABLE};
+use super::types::{CronJob, CronRun, CronRunStatus};
 use super::Datastore;
 
 /// Keys we have already warned about decoding (one warn per daemon lifetime
@@ -218,6 +218,154 @@ impl Datastore {
     }
 }
 
+/// Runs kept per job; older ones are pruned when a run finishes.
+pub const CRON_RUNS_KEEP: usize = 50;
+/// Longest message stored with a run.
+pub const CRON_RUN_MESSAGE_MAX: usize = 500;
+
+impl Datastore {
+    /// Record that a run of `job_id` started at `started_ms` (Local only; the
+    /// scheduler runs inside the daemon).
+    pub fn cron_run_start(&self, job_id: &str, started_ms: u64) -> Result<()> {
+        let run = CronRun {
+            job_id: job_id.to_string(),
+            started_ms,
+            ended_ms: None,
+            status: CronRunStatus::Running,
+            message: String::new(),
+        };
+        self.cron_run_put(&run)
+    }
+
+    /// Finish the run started at `started_ms` with a status and message
+    /// (truncated to [`CRON_RUN_MESSAGE_MAX`]), then prune to
+    /// [`CRON_RUNS_KEEP`] runs for the job.
+    pub fn cron_run_finish(
+        &self,
+        job_id: &str,
+        started_ms: u64,
+        ended_ms: u64,
+        status: CronRunStatus,
+        message: &str,
+    ) -> Result<()> {
+        let run = CronRun {
+            job_id: job_id.to_string(),
+            started_ms,
+            ended_ms: Some(ended_ms),
+            status,
+            message: truncate_chars(message, CRON_RUN_MESSAGE_MAX),
+        };
+        self.cron_run_put(&run)?;
+        self.cron_runs_prune(job_id, CRON_RUNS_KEEP)?;
+        Ok(())
+    }
+
+    fn cron_run_put(&self, run: &CronRun) -> Result<()> {
+        let txn = self.local_db().begin_write()?;
+        {
+            let mut table = txn.open_table(CRON_RUNS_TABLE)?;
+            let bytes = bincode::serde::encode_to_vec(run, bincode::config::standard())?;
+            table.insert((run.job_id.as_str(), run.started_ms), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The most recent `limit` runs of `job_id`, newest first.
+    pub fn cron_runs(&self, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
+        remote_dispatch!(self,
+            DsRequest::CronRuns { id: job_id.to_string(), limit: limit as u32 },
+            DsResponse::CronRuns(runs) => runs
+        );
+        let txn = self.local_db().begin_read()?;
+        let table = match txn.open_table(CRON_RUNS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut runs = Vec::new();
+        for item in table.range((job_id, 0u64)..(job_id, u64::MAX))?.rev() {
+            let (_, v) = item?;
+            if let Ok((run, _)) = bincode::serde::decode_from_slice::<CronRun, _>(v.value(), bincode::config::standard()) {
+                runs.push(run);
+            }
+            if runs.len() >= limit {
+                break;
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Drop all but the newest `keep` runs of `job_id`.
+    pub fn cron_runs_prune(&self, job_id: &str, keep: usize) -> Result<usize> {
+        let txn = self.local_db().begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(CRON_RUNS_TABLE)?;
+            let mut keys: Vec<u64> = Vec::new();
+            for item in table.range((job_id, 0u64)..(job_id, u64::MAX))? {
+                let (k, _) = item?;
+                keys.push(k.value().1);
+            }
+            let mut removed = 0;
+            if keys.len() > keep {
+                for started in &keys[..keys.len() - keep] {
+                    table.remove((job_id, *started))?;
+                    removed += 1;
+                }
+            }
+            removed
+        };
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Remove every run of `job_id` (when the job is deleted).
+    pub fn cron_runs_clear(&self, job_id: &str) -> Result<()> {
+        let _ = self.cron_runs_prune(job_id, 0)?;
+        Ok(())
+    }
+
+    /// Mark runs still `Running` as `Interrupted`: called once when the
+    /// scheduler starts, since a run cannot survive the daemon that ran it.
+    pub fn cron_runs_mark_interrupted(&self, now_ms: u64) -> Result<usize> {
+        let txn = self.local_db().begin_write()?;
+        let fixed = {
+            let mut table = match txn.open_table(CRON_RUNS_TABLE) {
+                Ok(t) => t,
+                Err(_) => return Ok(0),
+            };
+            let mut stale: Vec<CronRun> = Vec::new();
+            for item in table.iter()? {
+                let (_, v) = item?;
+                if let Ok((run, _)) = bincode::serde::decode_from_slice::<CronRun, _>(v.value(), bincode::config::standard())
+                    && run.status == CronRunStatus::Running
+                {
+                    stale.push(run);
+                }
+            }
+            for mut run in stale.iter().cloned() {
+                run.status = CronRunStatus::Interrupted;
+                run.ended_ms = Some(now_ms);
+                run.message = "the daemon restarted while this run was in flight".to_string();
+                let bytes = bincode::serde::encode_to_vec(&run, bincode::config::standard())?;
+                table.insert((run.job_id.as_str(), run.started_ms), bytes.as_slice())?;
+            }
+            stale.len()
+        };
+        txn.commit()?;
+        Ok(fixed)
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +385,7 @@ mod tests {
             catalog_id: None,
             sandbox: None,
             run_as_user: None,
+            timeout_secs: None,
         }
     }
 
@@ -375,4 +524,40 @@ mod tests {
         let job = make_job("bad", "not a cron expr", true, 1000);
         assert!(ds.cron_add(&job).is_err());
     }
+    #[test]
+    fn cron_runs_record_finish_prune_and_interrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("t.redb")).unwrap();
+        ds.cron_run_start("j1", 1000).unwrap();
+        let running = ds.cron_runs("j1", 10).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].status, CronRunStatus::Running);
+        ds.cron_run_finish("j1", 1000, 1500, CronRunStatus::Ok, "done").unwrap();
+        let runs = ds.cron_runs("j1", 10).unwrap();
+        assert_eq!(runs[0].status, CronRunStatus::Ok);
+        assert_eq!(runs[0].duration_ms(), Some(500));
+        assert_eq!(runs[0].message, "done");
+        // Newest first, bounded by limit.
+        for t in 2000..2060u64 {
+            ds.cron_run_start("j1", t).unwrap();
+            ds.cron_run_finish("j1", t, t + 1, CronRunStatus::Error, "boom").unwrap();
+        }
+        let runs = ds.cron_runs("j1", 5).unwrap();
+        assert_eq!(runs.len(), 5);
+        assert_eq!(runs[0].started_ms, 2059);
+        assert!(ds.cron_runs("j1", 1000).unwrap().len() <= CRON_RUNS_KEEP);
+        // Other jobs are untouched; a stale Running run is marked interrupted.
+        ds.cron_run_start("j2", 5000).unwrap();
+        assert_eq!(ds.cron_runs_mark_interrupted(6000).unwrap(), 1);
+        let j2 = ds.cron_runs("j2", 1).unwrap();
+        assert_eq!(j2[0].status, CronRunStatus::Interrupted);
+        assert_eq!(j2[0].ended_ms, Some(6000));
+        // Long messages are truncated.
+        let long = "x".repeat(2000);
+        ds.cron_run_finish("j2", 5000, 6001, CronRunStatus::Error, &long).unwrap();
+        assert!(ds.cron_runs("j2", 1).unwrap()[0].message.chars().count() <= CRON_RUN_MESSAGE_MAX + 1);
+        ds.cron_runs_clear("j2").unwrap();
+        assert!(ds.cron_runs("j2", 1).unwrap().is_empty());
+    }
+
 }
