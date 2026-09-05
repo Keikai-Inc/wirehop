@@ -25,4 +25,6 @@ regexes = [
   # would put a credential-shaped string in this file, which our own export
   # gate correctly rejects (it caught exactly that).
   "sk-ant-oat01-AbCdEf",
+  # "ChaCha20-Poly1305" is a cipher name in docs, not a key.
+  "ChaCha20-Poly1305",
 ]
