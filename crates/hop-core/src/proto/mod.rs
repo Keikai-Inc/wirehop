@@ -68,6 +68,16 @@ pub enum HostMessage {
         /// The host's human-readable name, for the client's known-hosts alias.
         host_name: Option<String>,
     },
+    /// Another session on this host rang the bell while nobody was attached
+    /// to it (hop/4+; appended last). Sent to every attached client on the
+    /// host so the notification reaches wherever the operator is sitting; the
+    /// client raises it as a terminal notification (OSC 9 / OSC 777).
+    Attention {
+        session_id: String,
+        title: Option<String>,
+        username: Option<String>,
+        host_name: Option<String>,
+    },
 }
 
 /// Messages sent from the client to the host.

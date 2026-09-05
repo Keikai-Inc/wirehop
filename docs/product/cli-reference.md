@@ -246,17 +246,19 @@ can reach over the warren VPN (default-deny). Elevate later with `hop admin
 
 ---
 
-### `hop sessions [<target>] [--all] [--json]`
+### `hop sessions [<target>] [--all] [--json] [--watch [--interval SECS]]`
 
 List persistent shell sessions: on this machine's daemon (no argument), on one
 host, or across every reachable warren member and known host (`--all`). Shows
 user, state, idle time, bells rung since the last attach, and the app's
-window title.
+window title. `--watch` keeps polling and raises a desktop notification when
+a detached session rings the bell.
 
 ```bash
 hop sessions
 hop sessions myserver
 hop sessions --all --json
+hop sessions --all --watch --interval 10
 ```
 
 ---
@@ -365,6 +367,7 @@ config directory.
 | `tags` | comma-separated | Host tags (drive role→tag reach + MagicDNS); empty clears |
 | `default_role` | role name | Role for invites that don't specify one (default `member`) |
 | `require_explicit_access` | `true` / `false` | "Lock" this host (G23): only roles **explicitly** granted its tags may open exec/shell/transfer/search sessions; admins exempt. Default `false` (open within the warren) |
+| `notify` | `on` / `off` | Relay attention events (a detached session rang the bell) to attached clients. Default `on`; applies to sessions started afterwards |
 
 ```bash
 hop config                          # show current config
@@ -374,6 +377,7 @@ hop config set vpn off              # disable the warren VPN
 hop config set tags production,web  # tag this host
 hop config set default_role developer
 hop config set require_explicit_access true   # lock: explicit grants only
+hop config set notify off           # no attention relays from this host
 hop config path                     # print the host config directory
 ```
 

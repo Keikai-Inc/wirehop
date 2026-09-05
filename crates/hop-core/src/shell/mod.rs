@@ -689,6 +689,38 @@ fn pty_write_all_blocking<W: std::io::Write + ?Sized>(w: &mut W, data: &[u8]) {
 }
 
 #[cfg(unix)]
+/// Where a PTY reader publishes attention events for its session.
+struct AttentionSource {
+    session_id: String,
+    username: Option<String>,
+    tx: tokio::sync::broadcast::Sender<session_registry::AttentionEvent>,
+}
+
+/// One attention event per session per 30 s, so a program that rings the
+/// bell in a loop interrupts once.
+fn attention_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+    match last {
+        Some(t) if now.duration_since(*t) < COOLDOWN => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// The bytes a client writes to its terminal to raise an attention event as a
+/// desktop notification: OSC 9 (iTerm2, kitty, ghostty, WezTerm, foot, VS Code,
+/// Windows Terminal) followed by OSC 777 (urxvt style), both harmless where
+/// unsupported.
+pub fn attention_notification_bytes(host: Option<&str>, title: Option<&str>, session_id: &str) -> Vec<u8> {
+    let what = title.filter(|t| !t.is_empty()).map(String::from).unwrap_or_else(|| format!("session {}", &session_id[..8.min(session_id.len())]));
+    let where_ = host.unwrap_or("a host");
+    let body = format!("{what} on {where_} wants attention");
+    let clean: String = body.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]9;WireHop: {clean}\x07\x1b]777;notify;WireHop;{clean}\x07").into_bytes()
+}
+
 fn spawn_cancellable_pty_reader(
     master_fd: std::os::unix::io::RawFd,
     screen: Arc<std::sync::Mutex<hop_vt::VtScreen>>,
@@ -698,6 +730,7 @@ fn spawn_cancellable_pty_reader(
     // report exit — the reader signals it on master EOF instead. `None` for the
     // local path, where the child-exit watcher owns the exit channel.
     exit_on_eof: Option<watch::Sender<Option<i32>>>,
+    attention: Option<AttentionSource>,
 ) -> Result<()> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -722,6 +755,7 @@ fn spawn_cancellable_pty_reader(
 
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
+        let mut last_attention: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
@@ -746,12 +780,33 @@ fn spawn_cancellable_pty_reader(
                         Ok(Ok(0)) => break,            // EOF: slave fully closed
                         Ok(Ok(n)) => {
                             let data = buf[..n].to_vec();
-                            { screen.lock().unwrap().advance(&data); }
+                            let (rang, title) = {
+                                let mut scr = screen.lock().unwrap();
+                                let before = scr.bells();
+                                scr.advance(&data);
+                                (scr.bells() > before, scr.title())
+                            };
                             // Clone the sender out of the watch borrow *before*
                             // awaiting, so we never hold the Ref across .await.
                             let tx = route_rx.borrow().clone();
+                            let attached = tx.is_some();
                             if let Some(tx) = tx {
                                 let _ = tx.send(data).await;
+                            }
+                            // A bell with nobody watching is a request for
+                            // attention; publish it (at most one per 30 s per
+                            // session) for attached clients to relay.
+                            if rang
+                                && !attached
+                                && let Some(src) = &attention
+                                && attention_due(&mut last_attention, std::time::Instant::now())
+                            {
+                                let _ = src.tx.send(session_registry::AttentionEvent {
+                                    session_id: src.session_id.clone(),
+                                    title,
+                                    username: src.username.clone(),
+                                    at_ms: session_registry::unix_now_ms(),
+                                });
                             }
                         }
                         Ok(Err(_)) => break,           // read error (e.g. EIO on hangup)
@@ -783,6 +838,7 @@ fn spawn_persistent_pty(
     env_vars: &HashMap<String, String>,
     sandbox: &crate::sandbox::SandboxPolicy,
     config_dir: &std::path::Path,
+    attention: Option<tokio::sync::broadcast::Sender<session_registry::AttentionEvent>>,
 ) -> Result<(
     String,                                                          // session_id
     mpsc::UnboundedSender<Vec<u8>>,                                  // input_tx
@@ -881,12 +937,21 @@ fn spawn_persistent_pty(
     } else {
         None
     };
+    // Attention events are published only when the host has notifications on
+    // (`hop config set notify off` silences them; read at session start).
+    let notify_on = crate::config::HostConfig::load(config_dir).map(|c| c.notify).unwrap_or(true);
+    let attention = attention.filter(|_| notify_on).map(|tx| AttentionSource {
+        session_id: session_id.clone(),
+        username: username.map(String::from),
+        tx,
+    });
     spawn_cancellable_pty_reader(
         master_fd,
         screen.clone(),
         output_route_rx.clone(),
         reader_cancel.clone(),
         exit_on_eof,
+        attention,
     )?;
 
     // Input writer task. Unbounded so the shell select-loop never blocks on
@@ -979,6 +1044,9 @@ async fn run_attached_loop(
     exit_rx: &mut watch::Receiver<Option<i32>>,
     leftover_msg: Option<ClientMessage>,
     protocol_version: u8,
+    own_session_id: &str,
+    mut attention_rx: Option<tokio::sync::broadcast::Receiver<session_registry::AttentionEvent>>,
+    host_name: Option<String>,
 ) -> AttachOutcome {
     /// Heartbeat interval: send an empty Output so the client knows we're alive.
     const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1045,6 +1113,26 @@ async fn run_attached_loop(
 
     let outcome = loop {
         tokio::select! {
+            // Another session on this host wants attention: relay to this
+            // client (hop/4+), which raises it wherever the operator sits.
+            ev = async {
+                match attention_rx.as_mut() {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(ev) = ev
+                    && ev.session_id != own_session_id
+                    && protocol_version >= 4
+                {
+                    let _ = host_tx.send(HostMessage::Attention {
+                        session_id: ev.session_id,
+                        title: ev.title,
+                        username: ev.username,
+                        host_name: host_name.clone(),
+                    });
+                }
+            }
             Some(data) = output_rx.recv() => {
                 if host_tx.send(HostMessage::Output(data)).is_err() {
                     break AttachOutcome::Disconnected;
@@ -1171,7 +1259,7 @@ pub async fn host_shell_session_persistent(
             } else {
                 // Session gone or exited — spawn new
                 let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
-                    spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
+                    spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
                     session_id: sid.clone(),
@@ -1196,7 +1284,7 @@ pub async fn host_shell_session_persistent(
         } else {
             // New connection — always spawn a new PTY
             let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel) =
-                spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir)?;
+                spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
                 session_id: sid.clone(),
@@ -1356,6 +1444,9 @@ pub async fn host_shell_session_persistent(
         &mut exit_rx,
         leftover_msg,
         protocol_version,
+        &session_id,
+        Some(registry.attention_subscribe()),
+        crate::invite::system_hostname(),
     )
     .await;
 
@@ -1710,6 +1801,12 @@ where
                     Ok(HostMessage::WindowSizeAck) => {}
                     Ok(HostMessage::AuthResult { .. }) | Ok(HostMessage::AuthResultV2 { .. }) => {
                         tracing::warn!("Unexpected auth result during shell session");
+                    }
+                    Ok(HostMessage::Attention { session_id, title, host_name, .. }) => {
+                        // `HOP_NOTIFY=off` silences relayed attention events on this client.
+                        if !matches!(std::env::var("HOP_NOTIFY").as_deref(), Ok("off") | Ok("0") | Ok("false")) {
+                            let _ = stdout_tx.send(attention_notification_bytes(host_name.as_deref(), title.as_deref(), &session_id));
+                        }
                     }
                     Ok(HostMessage::SessionInfo { .. }) => {
                         // Late SessionInfo — ignore
@@ -2130,7 +2227,7 @@ mod reader_tests {
         let (_route_set, route_get) = watch::channel(Some(route_tx));
         let cancel = Arc::new(tokio::sync::Notify::new());
 
-        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone(), None)
+        spawn_cancellable_pty_reader(read_fd, screen.clone(), route_get, cancel.clone(), None, None)
             .expect("spawn reader");
 
         // 1) Data flows through before cancel.
@@ -2285,5 +2382,24 @@ mod input_replay_tests {
         r.observe(b"");
         assert!(r.in_paste());
     }
+    #[test]
+    fn attention_due_rate_limits_per_session() {
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        assert!(attention_due(&mut last, t0));
+        assert!(!attention_due(&mut last, t0 + std::time::Duration::from_secs(10)));
+        assert!(attention_due(&mut last, t0 + std::time::Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn attention_bytes_are_osc9_and_osc777_without_control_chars() {
+        let b = attention_notification_bytes(Some("gpu-box"), Some("claude: fix\x07 build"), "abcdef0123456789");
+        let s = String::from_utf8(b).unwrap();
+        assert!(s.starts_with("\x1b]9;WireHop: claude: fix build on gpu-box wants attention\x07"));
+        assert!(s.contains("\x1b]777;notify;WireHop;claude: fix build on gpu-box wants attention\x07"));
+        let b = attention_notification_bytes(None, None, "abcdef0123456789");
+        assert!(String::from_utf8(b).unwrap().contains("session abcdef01 on a host wants attention"));
+    }
+
 }
 

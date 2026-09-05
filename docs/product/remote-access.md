@@ -78,6 +78,23 @@ The host answers from its session registry; nothing is stored. Over the
 network this is `PeerRequest::ListSessions` (hop/4), so a host older than
 0.9.38 reports "unexpected request" rather than a list.
 
+### Attention
+
+When a session rings the bell (BEL, OSC 9, or OSC 777) while nobody is
+attached to it, the host tells every client that *is* attached to one of its
+other sessions, and that client raises a terminal notification (OSC 9, which
+iTerm2, kitty, ghostty, WezTerm, foot, VS Code and Windows Terminal show on
+the desktop; OSC 777 for urxvt-style terminals). So a long-running agent that
+finishes, or asks a question, reaches you in whichever window you are working
+in. One event per session per 30 seconds.
+
+- Off on the host: `hop config set notify off` (applies to sessions started
+  afterwards).
+- Off on a client: `HOP_NOTIFY=off`.
+- Attached nowhere: `hop sessions --all --watch` polls every host and raises
+  a desktop notification (`osascript` on macOS, `notify-send` on Linux) when a
+  detached session rings the bell. `--interval <secs>` sets the poll (default 15).
+
 ### Multi-Session Support
 
 Each peer can have multiple concurrent sessions. Sessions are keyed by session ID (not by peer+username), so multiple `hop connect` invocations create independent PTYs.

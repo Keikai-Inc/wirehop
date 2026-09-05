@@ -370,6 +370,13 @@ pub enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Keep polling every host and raise a desktop notification when a
+        /// detached session rings the bell
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval for --watch, in seconds
+        #[arg(long, default_value_t = 15, value_name = "SECS")]
+        interval: u64,
     },
     /// Internal: list processes without setuid (works inside macOS sandbox)
     #[command(name = "__ps", hide = true)]
@@ -690,7 +697,7 @@ pub enum LanAction {
 pub enum ConfigAction {
     /// Set a configuration value
     Set {
-        /// Configuration key (session_timeout, max_sessions, vpn, tags, default_role)
+        /// Configuration key (session_timeout, max_sessions, vpn, notify, tags, default_role)
         key: String,
         /// New value
         value: String,

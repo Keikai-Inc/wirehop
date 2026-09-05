@@ -371,10 +371,10 @@ async fn real_main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
-        Command::Sessions { target, all, json } => {
+        Command::Sessions { target, all, json, watch, interval } => {
             let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let user_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            cmd_sessions(&host_dir, &user_dir, target.as_deref(), all, json).await
+            cmd_sessions(&host_dir, &user_dir, target.as_deref(), all, json, watch.then_some(interval)).await
         }
         Command::LogSources => cmd_logsources(),
         Command::LogSearch { source, since, grep, limit, line_cap } => {
@@ -5143,17 +5143,125 @@ fn print_sessions(host: &str, sessions: &[hop_core::proto::SessionSummary], json
     }
 }
 
-/// `hop sessions [<host>] [--all]`: the persistent shell sessions on this host,
-/// one remote host, or every reachable warren member and known host. A `*N`
-/// in BELL means the session rang the bell N times since anyone last looked.
+/// Ask every online warren member and known host (and this host's daemon, when
+/// there is one) for its sessions, in parallel.
+async fn collect_sessions_all(
+    host_config_dir: &std::path::Path,
+    user_config_dir: &std::path::Path,
+) -> Vec<(String, Result<Vec<hop_core::proto::SessionSummary>>)> {
+    use hop_core::proto::{ClientMessage, HostMessage, PeerRequest, PeerResponse};
+    async fn remote(cfg: &std::path::Path, target: &str) -> Result<Vec<hop_core::proto::SessionSummary>> {
+        let msg = ClientMessage::RequestPeerOp(PeerRequest::ListSessions);
+        let (_resolved, _send, mut recv) = mux::connect_to_host(cfg, target, None, &msg).await?;
+        let resp: HostMessage = tokio::time::timeout(std::time::Duration::from_secs(20), hop_core::proto::read_message(&mut recv))
+            .await
+            .context("timed out")??;
+        match resp {
+            HostMessage::PeerResponse(PeerResponse::Sessions(s)) => Ok(s),
+            HostMessage::PeerResponse(PeerResponse::Error(e)) => anyhow::bail!("{e}"),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        }
+    }
+    let now = unix_now_secs();
+    let self_id = id_via_daemon(host_config_dir).ok().flatten();
+    let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for m in &snap.members {
+        if self_id.as_deref() == Some(m.node_id.as_str()) || !m.is_online(now, 300) {
+            continue;
+        }
+        if seen.insert(m.node_id.clone()) {
+            targets.push((m.node_id.clone(), m.name.clone()));
+        }
+    }
+    if let Ok(hosts) = KnownHostsStore::load(user_config_dir) {
+        for h in &hosts.hosts {
+            if seen.insert(h.node_id.clone()) {
+                targets.push((h.name.clone(), h.name.clone()));
+            }
+        }
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (t, name) in targets {
+        let cfg = user_config_dir.to_path_buf();
+        set.spawn(async move { (name, remote(&cfg, &t).await) });
+    }
+    let mut results: Vec<(String, Result<Vec<hop_core::proto::SessionSummary>>)> = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Ok(conn) = hop_core::datastore::socket::DaemonConnection::connect(host_config_dir)
+        && let Ok(hop_core::datastore::protocol::DsResponse::Admin(r)) = conn.request(&hop_core::datastore::protocol::DsRequest::Admin(Box::new(AdminRequest::ListSessions)))
+        && let AdminResponse::Sessions(s) = *r
+    {
+        results.insert(0, ("this host".to_string(), Ok(s)));
+    }
+    results
+}
+
+/// Raise a desktop notification on this machine, best-effort: `osascript` on
+/// macOS, `notify-send` on Linux. Falls back to a line on stderr.
+fn desktop_notify(title: &str, body: &str) {
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control() && *c != '"' && *c != '\\').collect::<String>();
+    let (t, b) = (clean(title), clean(body));
+    #[cfg(target_os = "macos")]
+    let ok = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!("display notification \"{b}\" with title \"{t}\""))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    #[cfg(not(target_os = "macos"))]
+    let ok = std::process::Command::new("notify-send").arg(&t).arg(&b).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("[hop] {t}: {b}");
+    }
+}
+
+/// `hop sessions [<host>] [--all] [--watch]`: the persistent shell sessions on
+/// this host, one remote host, or every reachable warren member and known host.
+/// A `*N` in BELL means the session rang the bell N times since anyone last
+/// looked. `--watch` polls the fleet and raises a desktop notification when a
+/// detached session rings the bell.
 async fn cmd_sessions(
     host_config_dir: &std::path::Path,
     user_config_dir: &std::path::Path,
     target: Option<&str>,
     all: bool,
     json: bool,
+    watch_secs: Option<u64>,
 ) -> Result<()> {
     use hop_core::proto::{ClientMessage, HostMessage, PeerRequest, PeerResponse};
+    if let Some(every) = watch_secs {
+        let every = every.max(5);
+        eprintln!("Watching sessions every {every}s; a detached session that rings the bell raises a notification. Ctrl-C to stop.");
+        let mut seen: std::collections::HashMap<(String, String), (u64, std::time::Instant)> = std::collections::HashMap::new();
+        loop {
+            let results = collect_sessions_all(host_config_dir, user_config_dir).await;
+            let now = std::time::Instant::now();
+            for (host, r) in &results {
+                let Ok(list) = r else { continue };
+                for s in list {
+                    let key = (host.clone(), s.session_id.clone());
+                    // (bells last seen, when we last notified). A first sighting
+                    // records the count without notifying: only NEW bells matter.
+                    let entry = seen.entry(key).or_insert((s.bells, now - std::time::Duration::from_secs(3600)));
+                    let new_bells = s.bells > entry.0;
+                    let cooled = now.duration_since(entry.1) >= std::time::Duration::from_secs(30);
+                    if new_bells && !s.attached && cooled {
+                        let what = s.title.clone().unwrap_or_else(|| format!("session {}", &s.session_id[..8.min(s.session_id.len())]));
+                        desktop_notify("WireHop", &format!("{what} on {host} wants attention"));
+                        println!("[{}] {host}: {what} rang the bell", format_epoch_ms(unix_now_ms()));
+                        entry.1 = now;
+                    }
+                    entry.0 = s.bells;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+        }
+    }
     async fn remote(cfg: &std::path::Path, target: &str) -> Result<Vec<hop_core::proto::SessionSummary>> {
         let msg = ClientMessage::RequestPeerOp(PeerRequest::ListSessions);
         let (_resolved, _send, mut recv) = mux::connect_to_host(cfg, target, None, &msg).await?;
@@ -5188,44 +5296,7 @@ async fn cmd_sessions(
         }
         return Ok(());
     }
-    // Fleet-wide: every online warren member plus known hosts, in parallel.
-    let now = unix_now_secs();
-    let self_id = id_via_daemon(host_config_dir).ok().flatten();
-    let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    let mut targets: Vec<(String, String)> = Vec::new();
-    for m in &snap.members {
-        if self_id.as_deref() == Some(m.node_id.as_str()) || !m.is_online(now, 300) {
-            continue;
-        }
-        if seen.insert(m.node_id.clone()) {
-            targets.push((m.node_id.clone(), m.name.clone()));
-        }
-    }
-    if let Ok(hosts) = KnownHostsStore::load(user_config_dir) {
-        for h in &hosts.hosts {
-            if seen.insert(h.node_id.clone()) {
-                targets.push((h.name.clone(), h.name.clone()));
-            }
-        }
-    }
-    let mut set = tokio::task::JoinSet::new();
-    for (t, name) in targets {
-        let cfg = user_config_dir.to_path_buf();
-        set.spawn(async move { (name, remote(&cfg, &t).await) });
-    }
-    let mut results: Vec<(String, Result<Vec<hop_core::proto::SessionSummary>>)> = Vec::new();
-    while let Some(Ok(r)) = set.join_next().await {
-        results.push(r);
-    }
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-    // Include this host when it is one.
-    if let Ok(conn) = hop_core::datastore::socket::DaemonConnection::connect(host_config_dir)
-        && let Ok(hop_core::datastore::protocol::DsResponse::Admin(r)) = conn.request(&hop_core::datastore::protocol::DsRequest::Admin(Box::new(AdminRequest::ListSessions)))
-        && let AdminResponse::Sessions(s) = *r
-    {
-        results.insert(0, ("this host".to_string(), Ok(s)));
-    }
+    let results = collect_sessions_all(host_config_dir, user_config_dir).await;
     if results.is_empty() {
         println!("No reachable hosts.");
         return Ok(());
@@ -6398,6 +6469,11 @@ fn set_host_config_value(config_dir: &std::path::Path, key: &str, value: &str) -
             let on = parse_bool_value(value)?;
             cfg.vpn_enabled = on;
             format!("vpn set to {}", if on { "on" } else { "off" })
+        }
+        "notify" => {
+            let on = parse_bool_value(value)?;
+            cfg.notify = on;
+            format!("notify set to {} (applies to sessions started from now on)", if on { "on" } else { "off" })
         }
         "tags" => {
             // Comma-separated; empty string clears tags.

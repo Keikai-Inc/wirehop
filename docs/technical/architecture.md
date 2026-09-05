@@ -292,6 +292,9 @@ pub enum HostMessage {
     SessionError(String),                 // Session setup failure
     PeerResponse(PeerResponse),           // Peer-op result (secrets/kv/cap/cron/ext/tap)
     NetdocAuthorAck { recorded: bool },   // Ack for AnnounceNetdocAuthor; recorded=true on the trust anchor
+    Attention {                           // hop/4+: another session on this host rang the bell unattended
+        session_id: String, title: Option<String>, username: Option<String>, host_name: Option<String>,
+    },
     AuthResultV2 {                        // hop/4+: invite auth result WITH the invite's grant
         authorized: bool,
         reason: Option<String>,           //   why not (never reveals whether an invite existed)

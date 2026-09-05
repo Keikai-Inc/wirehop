@@ -555,7 +555,11 @@ pub struct HostConfig {
     /// MagicDNS. Empty = untagged.
     #[serde(default)]
     pub tags: Vec<String>,
-
+    /// Relay attention events (a detached session rang the bell) to attached
+    /// clients so they can raise a desktop notification. `hop config set notify
+    /// off` silences them; takes effect for sessions started afterwards.
+    #[serde(default = "default_true")]
+    pub notify: bool,
     /// Whether the warren VPN data plane is enabled. **On by default for a NEW
     /// host** (`HostConfig::default()`) — a fresh `hop host` / `--host` install
     /// brings up the warren VPN so a member can reach peers by name without an
@@ -624,6 +628,10 @@ fn vpn_default_for_existing_config() -> bool {
     false
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_session_timeout() -> u64 {
     86400
 }
@@ -639,6 +647,7 @@ impl Default for HostConfig {
             max_sessions: default_max_sessions(),
             default_role: default_role_name(),
             tags: Vec::new(),
+            notify: true,
             vpn_enabled: default_vpn_enabled(),
             audit_level: default_audit_level(),
             require_explicit_access: false,

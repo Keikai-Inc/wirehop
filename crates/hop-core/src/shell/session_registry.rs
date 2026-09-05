@@ -343,15 +343,36 @@ pub enum RegistryCommand {
     List { reply: oneshot::Sender<Vec<crate::proto::SessionSummary>> },
 }
 
+/// A session asked for attention (bell, OSC 9, OSC 777) while no client was
+/// attached to it. Broadcast host-wide so attached clients can relay it.
+#[derive(Debug, Clone)]
+pub struct AttentionEvent {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub at_ms: u64,
+}
+
 /// Cloneable handle to the registry actor.
 #[derive(Clone)]
 pub struct RegistryHandle {
     tx: mpsc::Sender<RegistryCommand>,
+    attention: tokio::sync::broadcast::Sender<AttentionEvent>,
 }
-
 impl RegistryHandle {
     fn new(tx: mpsc::Sender<RegistryCommand>) -> Self {
-        Self { tx }
+        let (attention, _) = tokio::sync::broadcast::channel(64);
+        Self { tx, attention }
+    }
+
+    /// Where PTY readers publish attention events.
+    pub fn attention_sender(&self) -> tokio::sync::broadcast::Sender<AttentionEvent> {
+        self.attention.clone()
+    }
+
+    /// Subscribe an attached client loop to attention events.
+    pub fn attention_subscribe(&self) -> tokio::sync::broadcast::Receiver<AttentionEvent> {
+        self.attention.subscribe()
     }
 
     /// Attach to an existing session by session_id.
