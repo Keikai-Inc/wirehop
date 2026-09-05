@@ -303,6 +303,14 @@ pub enum HostMessage {
 }
 ```
 
+`PeerRequest::ListSessions` / `PeerResponse::Sessions(Vec<SessionSummary>)`
+(both appended last, hop/4) back `hop sessions <host>`; the daemon socket
+serves the same list locally as `AdminRequest::ListSessions` /
+`AdminResponse::Sessions`. A `SessionSummary` carries session id, owner,
+user, attached flag, start time, idle seconds, exit status, the app's OSC
+title, bells since the last attach, and the grid size; the host's `VtScreen`
+records titles and bells through alacritty's event listener.
+
 `AuthResultV2` is the reason `hop/4` exists. Before it, an invite token
 embedded the warren ticket (a plain `hop invite` on a warren host even embedded
 the **write** ticket), so a token stayed a live capability after its secret was

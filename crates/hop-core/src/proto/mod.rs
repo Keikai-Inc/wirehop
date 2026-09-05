@@ -234,6 +234,8 @@ pub enum AdminRequest {
     ListInvites,
     /// Revoke a pending invite by id (or unambiguous id prefix).
     RevokeInvite { id: String },
+    /// List this host's persistent PTY sessions (served by the daemon socket).
+    ListSessions,
 }
 
 /// A single metric point pushed from a remote host.
@@ -301,6 +303,30 @@ pub enum AdminResponse {
     InviteList { invites: Vec<crate::invite::PendingInviteInfo> },
     /// A pending invite was revoked (`RevokeInvite`).
     InviteRevoked { id: String },
+    /// This host's sessions (`ListSessions`).
+    Sessions(Vec<SessionSummary>),
+}
+
+/// One persistent PTY session as `hop sessions` shows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// Owning peer's node id.
+    pub peer_id: String,
+    pub username: Option<String>,
+    pub attached: bool,
+    /// Unix ms when the session was created.
+    pub started_ms: u64,
+    /// Seconds since a client was last attached (0 while attached).
+    pub idle_secs: u64,
+    /// The shell's exit status once it has exited.
+    pub exited: Option<i32>,
+    /// The captured app's window title (OSC 0/2), if any.
+    pub title: Option<String>,
+    /// Bells rung since the last attach: the session asked for attention.
+    pub bells: u64,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Summary info about an authorized peer.
@@ -455,6 +481,8 @@ pub enum PeerRequest {
 
     /// Close an open extension stream from the peer side.
     ExtensionStreamClose { stream_id: u64 },
+    /// List this host's persistent PTY sessions (hop/4+; appended last).
+    ListSessions,
 }
 
 /// Response to a PeerRequest.
@@ -490,6 +518,8 @@ pub enum PeerResponse {
 
     /// The extension closed an open stream (e.g., session ended).
     ExtensionStreamClosed { stream_id: u64, reason: Option<String> },
+    /// Reply to `ListSessions` (appended last).
+    Sessions(Vec<SessionSummary>),
 }
 
 /// Summary info for a registered extension.

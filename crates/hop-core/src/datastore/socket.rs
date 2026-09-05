@@ -112,6 +112,7 @@ pub async fn spawn_listener(
     datastore: Datastore,
     host_public_key: iroh::PublicKey,
     netdoc: NetDocHandle,
+    sessions: Option<crate::shell::session_registry::RegistryHandle>,
 ) -> Result<JoinHandle<()>> {
     let path = socket_path(config_dir);
 
@@ -152,8 +153,9 @@ pub async fn spawn_listener(
                     let ds = datastore.clone();
                     let cfg = config_dir.clone();
                     let nd = netdoc.clone();
+                    let sess = sessions.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, ds, cfg, host_public_key, nd).await {
+                        if let Err(e) = handle_connection(stream, ds, cfg, host_public_key, nd, sess).await {
                             tracing::debug!("Socket client disconnected: {e:#}");
                         }
                     });
@@ -182,6 +184,7 @@ async fn handle_connection(
     config_dir: std::path::PathBuf,
     host_public_key: iroh::PublicKey,
     netdoc: NetDocHandle,
+    sessions: Option<crate::shell::session_registry::RegistryHandle>,
 ) -> Result<()> {
     loop {
         // Read request frame
@@ -225,7 +228,16 @@ async fn handle_connection(
             _ => None,
         };
 
-        let resp = if let Some((older, dry_run)) = prune {
+        // Session listing needs the registry actor (async), like prune.
+        let list_sessions = matches!(&req, DsRequest::Admin(a) if matches!(a.as_ref(), crate::proto::AdminRequest::ListSessions));
+        let resp = if list_sessions {
+            match &sessions {
+                Some(h) => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Sessions(h.list().await))),
+                None => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Error {
+                    message: "this daemon has no session registry".to_string(),
+                })),
+            }
+        } else if let Some((older, dry_run)) = prune {
             match netdoc.get() {
                 Some(nd) => {
                     let now = std::time::SystemTime::now()
@@ -399,7 +411,7 @@ mod tests {
         let ds_path = dir.path().join("test.redb");
         let ds = Datastore::open(&ds_path).unwrap();
 
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()), None)
             .await
             .unwrap();
 
@@ -453,7 +465,7 @@ mod tests {
     async fn socket_roundtrip_netstats() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()), None)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -480,7 +492,7 @@ mod tests {
     async fn socket_roundtrip_ts() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()), None)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -529,7 +541,7 @@ mod tests {
     async fn socket_roundtrip_cron() {
         let dir = tempfile::tempdir().unwrap();
         let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
-        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()))
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()), None)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

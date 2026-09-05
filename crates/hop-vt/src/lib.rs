@@ -20,7 +20,8 @@
 
 use std::io::Write as _;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
+use std::sync::{Arc, Mutex};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -53,9 +54,40 @@ pub enum Prelude {
 /// Off-screen terminal that ingests PTY output and snapshots its current
 /// state as bytes for a (re)attaching client.
 pub struct VtScreen {
-    term: Term<VoidListener>,
+    term: Term<EventSink>,
     processor: Processor,
     dims: FixedDims,
+    events: EventSink,
+}
+
+/// What the captured app said about itself, outside the grid: its window
+/// title (OSC 0/2) and how many times it rang the bell (BEL / OSC 9 / 777
+/// arrive here as `Event::Bell`). Read by session listings so an operator
+/// can see what each session is doing and which ones want attention.
+#[derive(Debug, Default)]
+struct ScreenEvents {
+    title: Option<String>,
+    bells: u64,
+}
+
+/// The `EventListener` handed to alacritty's `Term`; shares state with the
+/// owning `VtScreen`.
+#[derive(Clone, Default)]
+pub struct EventSink(Arc<Mutex<ScreenEvents>>);
+
+impl EventListener for EventSink {
+    fn send_event(&self, event: Event) {
+        let mut ev = match self.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match event {
+            Event::Title(t) => ev.title = if t.is_empty() { None } else { Some(t) },
+            Event::ResetTitle => ev.title = None,
+            Event::Bell => ev.bells = ev.bells.saturating_add(1),
+            _ => {}
+        }
+    }
 }
 
 impl VtScreen {
@@ -69,11 +101,31 @@ impl VtScreen {
         let cols = cols.max(1);
         let dims = FixedDims::new(rows, cols);
         let config = Config { scrolling_history: 0, ..Default::default() };
-        let term = Term::new(config, &dims, VoidListener);
+        let events = EventSink::default();
+        let term = Term::new(config, &dims, events.clone());
         Self {
             term,
             processor: Processor::new(),
             dims,
+            events,
+        }
+    }
+
+    /// The captured app's current window title (OSC 0/2), if it set one.
+    pub fn title(&self) -> Option<String> {
+        self.events.0.lock().map(|e| e.title.clone()).unwrap_or(None)
+    }
+
+    /// Bells rung since the last [`take_bells`](Self::take_bells).
+    pub fn bells(&self) -> u64 {
+        self.events.0.lock().map(|e| e.bells).unwrap_or(0)
+    }
+
+    /// Return and clear the bell count (an attach acknowledges them).
+    pub fn take_bells(&self) -> u64 {
+        match self.events.0.lock() {
+            Ok(mut e) => std::mem::take(&mut e.bells),
+            Err(_) => 0,
         }
     }
 
@@ -762,4 +814,17 @@ mod tests {
             "repaint missing kitty keyboard set sequence"
         );
     }
+    #[test]
+    fn title_and_bells_are_captured() {
+        let mut v = VtScreen::new(24, 80);
+        assert_eq!(v.title(), None);
+        v.advance(b"\x1b]0;claude: fix the build\x07hello\x07\x07");
+        assert_eq!(v.title().as_deref(), Some("claude: fix the build"));
+        assert_eq!(v.bells(), 2);
+        assert_eq!(v.take_bells(), 2);
+        assert_eq!(v.bells(), 0);
+        v.advance(b"\x1b]2;\x07");
+        assert_eq!(v.title(), None);
+    }
+
 }

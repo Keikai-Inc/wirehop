@@ -54,6 +54,10 @@ pub fn handle_admin_request(
         AdminRequest::HostIdentity => AdminResponse::HostIdentity {
             node_id: host_public_key.to_string(),
         },
+        // Served asynchronously by the daemon socket (needs the registry actor).
+        AdminRequest::ListSessions => AdminResponse::Error {
+            message: "session listing is served by the daemon socket".to_string(),
+        },
         AdminRequest::ListInvites => match invite::PendingInvitesStore::load(config_dir) {
             Ok(mut store) => {
                 store.prune_expired(15 * 60);

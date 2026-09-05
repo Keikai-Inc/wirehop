@@ -21,6 +21,8 @@ pub fn handle_peer_request(
     username: &str,
 ) -> PeerResponse {
     match request {
+        // Served by the host connection loop, which owns the registry handle.
+        PeerRequest::ListSessions => PeerResponse::Error("session listing is served by the host connection".to_string()),
         // --- Secrets (scoped to peer's username) ---
         PeerRequest::SecretsGet { name } => match datastore.secrets_get(username, &name) {
             Ok(value) => PeerResponse::SecretValue(value),

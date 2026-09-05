@@ -246,6 +246,21 @@ can reach over the warren VPN (default-deny). Elevate later with `hop admin
 
 ---
 
+### `hop sessions [<target>] [--all] [--json]`
+
+List persistent shell sessions: on this machine's daemon (no argument), on one
+host, or across every reachable warren member and known host (`--all`). Shows
+user, state, idle time, bells rung since the last attach, and the app's
+window title.
+
+```bash
+hop sessions
+hop sessions myserver
+hop sessions --all --json
+```
+
+---
+
 ## Execution
 
 ### `hop exec <target> -- <command...>`

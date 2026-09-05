@@ -61,6 +61,8 @@ pub struct DetachedSession {
     pub detached_at: Option<Instant>,
     /// Whether a client is currently attached.
     pub attached: bool,
+    /// Unix ms when the session was created.
+    pub started_unix_ms: u64,
     /// Monotonic epoch incremented on each attach. Allows stale
     /// disconnect handlers to detect they've been superseded by a
     /// newer attachment and skip the detach.
@@ -126,6 +128,10 @@ impl DetachedSession {
         self.attach_epoch += 1;
         self.attached = true;
         self.detached_at = None;
+        // Attaching acknowledges any bells the session rang while unwatched.
+        if let Ok(screen) = self.screen.lock() {
+            screen.take_bells();
+        }
         let _ = self.output_route.send(Some(client_tx));
         self.attach_epoch
     }
@@ -165,6 +171,38 @@ impl SessionRegistry {
     /// Look up a session by session_id.
     pub fn lookup(&self, session_id: &str) -> Option<&DetachedSession> {
         self.sessions.get(session_id)
+    }
+
+    /// Every session as an operator sees it, newest first.
+    pub fn summaries(&self) -> Vec<crate::proto::SessionSummary> {
+        let mut out: Vec<crate::proto::SessionSummary> = self
+            .sessions
+            .values()
+            .map(|s| {
+                let (title, bells, rows, cols) = match s.screen.lock() {
+                    Ok(scr) => {
+                        let (r, c) = scr.dims();
+                        (scr.title(), scr.bells(), r, c)
+                    }
+                    Err(_) => (None, 0, 0, 0),
+                };
+                crate::proto::SessionSummary {
+                    session_id: s.session_id.clone(),
+                    peer_id: s.peer_id.clone(),
+                    username: s.username.clone(),
+                    attached: s.attached,
+                    started_ms: s.started_unix_ms,
+                    idle_secs: s.detached_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                    exited: *s.exit_rx.borrow(),
+                    title,
+                    bells,
+                    rows,
+                    cols,
+                }
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.started_ms));
+        out
     }
 
     /// Look up a session by session_id (mutable).
@@ -301,6 +339,8 @@ pub enum RegistryCommand {
         reply: oneshot::Sender<bool>,
     },
     ReapExpired,
+    /// Snapshot every session for a listing.
+    List { reply: oneshot::Sender<Vec<crate::proto::SessionSummary>> },
 }
 
 /// Cloneable handle to the registry actor.
@@ -383,6 +423,13 @@ impl RegistryHandle {
     pub async fn reap_expired(&self) {
         let _ = self.tx.send(RegistryCommand::ReapExpired).await;
     }
+
+    /// Every session on this host, newest first.
+    pub async fn list(&self) -> Vec<crate::proto::SessionSummary> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(RegistryCommand::List { reply }).await;
+        rx.await.unwrap_or_default()
+    }
 }
 
 /// Spawn the registry actor task and return a handle to it.
@@ -454,6 +501,9 @@ async fn run_registry_actor(
                 let detached = registry.detach_if_current(&session_id, epoch);
                 let _ = reply.send(detached);
             }
+            RegistryCommand::List { reply } => {
+                let _ = reply.send(registry.summaries());
+            }
             RegistryCommand::ReapExpired => {
                 registry.reap_expired();
             }
@@ -467,6 +517,14 @@ pub fn generate_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
+}
+
+/// Unix time in milliseconds.
+pub fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -494,6 +552,7 @@ mod tests {
             exit_rx,
             detached_at: if attached { None } else { Some(Instant::now()) },
             attached,
+            started_unix_ms: 0,
             attach_epoch: 0,
             broker_handle: None,
             screen: Arc::new(Mutex::new(VtScreen::new(24, 80))),

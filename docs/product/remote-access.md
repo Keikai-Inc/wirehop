@@ -59,6 +59,25 @@ same event (artifact: `tests/e2e/session-results.md`).
 
 ---
 
+### Listing Sessions
+
+```bash
+hop sessions                 # sessions on this machine's daemon
+hop sessions myserver        # sessions on one host
+hop sessions --all           # every reachable warren member and known host
+hop sessions --all --json
+```
+
+One line per session: a short session id, the Unix user it runs as, its
+state (`attached`, `detached`, or `exited N`), how long it has been detached,
+a `*N` in BELL if it rang the bell N times since anyone last attached, and
+the captured app's window title (whatever it set with OSC 0/2, so a Claude
+Code session shows what it is working on). Attaching acknowledges the bells.
+
+The host answers from its session registry; nothing is stored. Over the
+network this is `PeerRequest::ListSessions` (hop/4), so a host older than
+0.9.38 reports "unexpected request" rather than a list.
+
 ### Multi-Session Support
 
 Each peer can have multiple concurrent sessions. Sessions are keyed by session ID (not by peer+username), so multiple `hop connect` invocations create independent PTYs.

@@ -371,6 +371,11 @@ async fn real_main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
+        Command::Sessions { target, all, json } => {
+            let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            let user_dir = config::ensure_config_dir(cli.config.as_deref())?;
+            cmd_sessions(&host_dir, &user_dir, target.as_deref(), all, json).await
+        }
         Command::LogSources => cmd_logsources(),
         Command::LogSearch { source, since, grep, limit, line_cap } => {
             cmd_logsearch(&source, &since, grep.as_deref(), limit, line_cap)
@@ -1335,6 +1340,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         datastore.clone(),
         public_key,
         netdoc_cell.clone(),
+        Some(registry.clone()),
     )
     .await?;
 
@@ -1946,6 +1952,9 @@ async fn dispatch_session(
             }
 
             let response = match request {
+                hop_core::proto::PeerRequest::ListSessions => {
+                    hop_core::proto::PeerResponse::Sessions(registry.list().await)
+                }
                 hop_core::proto::PeerRequest::CapEnable { ref id, ref schedule, ref targets } => {
                     handle_remote_cap_enable(&datastore, id, schedule.as_deref(), targets.as_deref(), username)
                 }
@@ -4255,6 +4264,7 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
         AdminResponse::InviteRevoked { id } => {
             println!("Revoked invite {id}.");
         }
+        AdminResponse::Sessions(sessions) => print_sessions("this host", &sessions, false),
         AdminResponse::Error { message } => {
             eprintln!("Error: {message}");
         }
@@ -5087,6 +5097,161 @@ async fn cmd_cap(config_dir: &std::path::Path, action: CapAction) -> Result<()> 
     Ok(())
 }
 
+/// Print one host's sessions as a table (or JSON), the shape shared by
+/// `hop sessions`, `hop sessions <host>` and the fleet-wide listing.
+fn print_sessions(host: &str, sessions: &[hop_core::proto::SessionSummary], json: bool) {
+    if json {
+        let rows: Vec<serde_json::Value> = sessions.iter().map(|s| serde_json::json!({
+            "host": host,
+            "session_id": s.session_id,
+            "user": s.username,
+            "attached": s.attached,
+            "started": s.started_ms,
+            "idle_secs": s.idle_secs,
+            "exited": s.exited,
+            "title": s.title,
+            "bells": s.bells,
+            "size": format!("{}x{}", s.cols, s.rows),
+        })).collect();
+        agent_out::emit(&serde_json::json!({ "host": host, "sessions": rows }));
+        return;
+    }
+    if sessions.is_empty() {
+        println!("{host}: no sessions.");
+        return;
+    }
+    let now = unix_now_ms();
+    println!("{host}:");
+    println!("  {:<18} {:<10} {:<9} {:<8} {:<5} TITLE", "SESSION", "USER", "STATE", "IDLE", "BELL");
+    for s in sessions {
+        let state = match (s.exited, s.attached) {
+            (Some(code), _) => format!("exited {code}"),
+            (None, true) => "attached".to_string(),
+            (None, false) => "detached".to_string(),
+        };
+        let idle = if s.attached { "-".to_string() } else { format_relative_ms(now.saturating_sub(s.idle_secs * 1000), now).replace(" ago", "") };
+        let bell = if s.bells > 0 { format!("*{}", s.bells) } else { "".to_string() };
+        println!(
+            "  {:<18} {:<10} {:<9} {:<8} {:<5} {}",
+            &s.session_id[..16.min(s.session_id.len())],
+            s.username.as_deref().unwrap_or("-"),
+            state,
+            idle,
+            bell,
+            s.title.as_deref().unwrap_or("")
+        );
+    }
+}
+
+/// `hop sessions [<host>] [--all]`: the persistent shell sessions on this host,
+/// one remote host, or every reachable warren member and known host. A `*N`
+/// in BELL means the session rang the bell N times since anyone last looked.
+async fn cmd_sessions(
+    host_config_dir: &std::path::Path,
+    user_config_dir: &std::path::Path,
+    target: Option<&str>,
+    all: bool,
+    json: bool,
+) -> Result<()> {
+    use hop_core::proto::{ClientMessage, HostMessage, PeerRequest, PeerResponse};
+    async fn remote(cfg: &std::path::Path, target: &str) -> Result<Vec<hop_core::proto::SessionSummary>> {
+        let msg = ClientMessage::RequestPeerOp(PeerRequest::ListSessions);
+        let (_resolved, _send, mut recv) = mux::connect_to_host(cfg, target, None, &msg).await?;
+        let resp: HostMessage = tokio::time::timeout(std::time::Duration::from_secs(20), hop_core::proto::read_message(&mut recv))
+            .await
+            .context("timed out")??;
+        match resp {
+            HostMessage::PeerResponse(PeerResponse::Sessions(s)) => Ok(s),
+            HostMessage::PeerResponse(PeerResponse::Error(e)) => anyhow::bail!("{e}"),
+            HostMessage::AuthResult { authorized: false } | HostMessage::AuthResultV2 { authorized: false, .. } => anyhow::bail!("not authorized"),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        }
+    }
+    if let Some(t) = target {
+        let sessions = remote(user_config_dir, t).await?;
+        print_sessions(t, &sessions, json);
+        return Ok(());
+    }
+    if !all {
+        // This host, through the daemon socket.
+        use hop_core::datastore::protocol::{DsRequest, DsResponse};
+        use hop_core::datastore::socket::DaemonConnection;
+        let conn = DaemonConnection::connect(host_config_dir)
+            .context("no daemon on this machine (is `hop host` running?); use `hop sessions <host>` or `--all`")?;
+        match conn.request(&DsRequest::Admin(Box::new(AdminRequest::ListSessions)))? {
+            DsResponse::Admin(r) => match *r {
+                AdminResponse::Sessions(s) => print_sessions("this host", &s, json),
+                AdminResponse::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            },
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+        return Ok(());
+    }
+    // Fleet-wide: every online warren member plus known hosts, in parallel.
+    let now = unix_now_secs();
+    let self_id = id_via_daemon(host_config_dir).ok().flatten();
+    let snap = hop_core::fleet::WarrenSnapshot::load(host_config_dir).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for m in &snap.members {
+        if self_id.as_deref() == Some(m.node_id.as_str()) || !m.is_online(now, 300) {
+            continue;
+        }
+        if seen.insert(m.node_id.clone()) {
+            targets.push((m.node_id.clone(), m.name.clone()));
+        }
+    }
+    if let Ok(hosts) = KnownHostsStore::load(user_config_dir) {
+        for h in &hosts.hosts {
+            if seen.insert(h.node_id.clone()) {
+                targets.push((h.name.clone(), h.name.clone()));
+            }
+        }
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (t, name) in targets {
+        let cfg = user_config_dir.to_path_buf();
+        set.spawn(async move { (name, remote(&cfg, &t).await) });
+    }
+    let mut results: Vec<(String, Result<Vec<hop_core::proto::SessionSummary>>)> = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    // Include this host when it is one.
+    if let Ok(conn) = hop_core::datastore::socket::DaemonConnection::connect(host_config_dir)
+        && let Ok(hop_core::datastore::protocol::DsResponse::Admin(r)) = conn.request(&hop_core::datastore::protocol::DsRequest::Admin(Box::new(AdminRequest::ListSessions)))
+        && let AdminResponse::Sessions(s) = *r
+    {
+        results.insert(0, ("this host".to_string(), Ok(s)));
+    }
+    if results.is_empty() {
+        println!("No reachable hosts.");
+        return Ok(());
+    }
+    if json {
+        let mut hosts = Vec::new();
+        for (name, r) in &results {
+            match r {
+                Ok(s) => hosts.push(serde_json::json!({ "host": name, "sessions": s.iter().map(|x| serde_json::json!({
+                    "session_id": x.session_id, "user": x.username, "attached": x.attached, "started": x.started_ms,
+                    "idle_secs": x.idle_secs, "exited": x.exited, "title": x.title, "bells": x.bells })).collect::<Vec<_>>() })),
+                Err(e) => hosts.push(serde_json::json!({ "host": name, "error": format!("{e:#}") })),
+            }
+        }
+        agent_out::emit(&serde_json::json!({ "hosts": hosts }));
+        return Ok(());
+    }
+    for (name, r) in &results {
+        match r {
+            Ok(s) => print_sessions(name, s, false),
+            Err(e) => println!("{name}: unreachable ({e:#})"),
+        }
+    }
+    Ok(())
+}
+
 fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
     let ds = hop_core::datastore::Datastore::connect(config_dir)
         .context("Failed to connect to daemon — is `hop host` running?")?;
@@ -5762,6 +5927,7 @@ fn display_peer_response(subcmd: &str, _args: &[String], resp: hop_core::proto::
         PeerResponse::Ok => {
             println!("OK");
         }
+        hop_core::proto::PeerResponse::Sessions(sessions) => print_sessions(subcmd, &sessions, false),
         PeerResponse::Error(msg) => {
             anyhow::bail!("{msg}");
         }

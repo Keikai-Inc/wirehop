@@ -360,6 +360,17 @@ pub enum Command {
         shell_args: Vec<String>,
     },
 
+    /// List persistent shell sessions: on this host, one host, or the whole fleet
+    Sessions {
+        /// Host to ask (alias, invite, or node id). Default: this machine's daemon
+        target: Option<String>,
+        /// Every reachable warren member and known host
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal: list processes without setuid (works inside macOS sandbox)
     #[command(name = "__ps", hide = true)]
     Ps,
