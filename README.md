@@ -39,7 +39,14 @@ hop exec <name> -- <command>      # run a command remotely
 hop sync ./project <name>:~/dst   # rsync-style sync over the P2P link
 hop fleet exec <role> -- <cmd>    # run across every machine with a role
 hop cron create ...               # leave scheduled work running on a node
+hop fleet list                    # every machine in the warren, with its virtual IP
 ```
+
+Those names and virtual IPs *are* the warren, the private network your machines
+form when they join. It is a real VPN: `ssh <name>`, `ping <name>`, a browser or
+any other tool reaches your machines by name over the encrypted overlay, with no
+`hop` subcommand and nothing to configure. `hop host --relay` lets a machine you
+control carry the relayed traffic instead of the defaults.
 
 ## How it works
 
