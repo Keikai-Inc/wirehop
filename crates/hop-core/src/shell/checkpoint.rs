@@ -468,7 +468,18 @@ mod tests {
         let mut child = std::process::Command::new("sleep").arg("42").spawn().unwrap();
         let pid = child.id();
         let alive = SessionCheckpoint { session_id: "s".into(), peer_id: "p".into(), username: None, cwd: None, command: Some("sleep 42".into()), child_pid: Some(pid), fg_pid: None, title: None };
-        assert_eq!(survivor_pid(&alive), Some(pid));
+        // `spawn` returns before the child has finished `exec`ing `sleep`, so the
+        // OS may not report its command line for a few ms — poll until it does
+        // rather than race it (this is a test artifact, not a production path).
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(p) = survivor_pid(&alive) {
+                found = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(found, Some(pid));
         // A pid that is alive but running something else does not match.
         let mismatch = SessionCheckpoint { command: Some("claude".into()), ..alive.clone() };
         assert_eq!(survivor_pid(&mismatch), None);
