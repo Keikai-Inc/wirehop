@@ -109,6 +109,50 @@ in. One event per session per 30 seconds.
   a desktop notification (`osascript` on macOS, `notify-send` on Linux) when a
   detached session rings the bell. `--interval <secs>` sets the poll (default 15).
 
+### Reattaching to a specific session
+
+```bash
+hop connect myserver --session 0d054d72   # id or unique prefix from `hop sessions`
+```
+
+A plain `hop connect` always starts a new session. `--session` attaches to one
+of *your* existing sessions on the host instead, so you can leave a session,
+list it later with `hop sessions`, and pick it back up by id. You can only
+attach to a session your node owns; use `--view` to watch someone else's.
+
+### Surviving a host restart
+
+Persistent sessions live in the host's memory, so a reboot or a daemon
+restart ends them. To bridge that, the daemon writes a **checkpoint** of its
+live sessions every minute and on a clean shutdown: for each session it
+records the owning peer, the Unix user, the working directory and the
+foreground command (read from the terminal's foreground process group, so it
+works under privilege separation too), and the window title. The file is
+`sessions-checkpoint.json` in the host config directory.
+
+After the host comes back, start the sessions again:
+
+```bash
+hop sessions restore              # relaunch every checkpointed session
+hop sessions restore --dry-run    # show what would start, change nothing
+hop sessions checkpoint           # write the checkpoint now, out of band
+```
+
+Each session is relaunched detached, as the same user, under that peer's
+current sandbox policy, in the recorded directory, running the recorded
+command. Programs that can resume a conversation are asked to: `claude` and
+`pi` come back with `--continue` (recognized whether invoked directly or
+through their npm `node …/cli.js` launcher). Attach to a restored session the
+usual way, or by id with `hop connect <host> --session <id>`.
+
+Restore skips a session that is **still running** — either already in the new
+registry, or a shell that outlived a daemon-only restart (matched by pid and
+command line) — so running it twice never duplicates an agent. It also skips a
+session whose owning peer this host no longer knows. After a genuine reboot
+those processes are gone, so every session is relaunched cleanly. Both
+`checkpoint` and `restore` go through the daemon socket and are audited
+(`session.restore`).
+
 ### Multi-Session Support
 
 Each peer can have multiple concurrent sessions. Sessions are keyed by session ID (not by peer+username), so multiple `hop connect` invocations create independent PTYs.

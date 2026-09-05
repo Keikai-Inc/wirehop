@@ -132,6 +132,10 @@ pub enum Command {
         /// into it (id or unique prefix from `hop sessions`). `q` leaves.
         #[arg(long, value_name = "SESSION")]
         view: Option<String>,
+        /// Attach to one of your existing sessions on the host instead of
+        /// starting a new one (id or unique prefix from `hop sessions`)
+        #[arg(long, value_name = "SESSION", conflicts_with = "view")]
+        session: Option<String>,
     },
 
     /// View or update host configuration
@@ -365,7 +369,11 @@ pub enum Command {
     },
 
     /// List persistent shell sessions: on this host, one host, or the whole fleet
+    #[command(args_conflicts_with_subcommands = true)]
     Sessions {
+        /// `checkpoint` this host's sessions now, or `restore` them after a restart
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
         /// Host to ask (alias, invite, or node id). Default: this machine's daemon
         target: Option<String>,
         /// Every reachable warren member and known host
@@ -1214,6 +1222,28 @@ pub enum PeersAction {
 }
 
 /// Manage pending invites on this host.
+#[derive(Subcommand, Debug)]
+pub enum SessionsAction {
+    /// Write this host's session checkpoint now (the daemon also writes one
+    /// every minute and on a clean shutdown)
+    Checkpoint {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start every checkpointed session again after the daemon restarted:
+    /// same user, same directory, same command (`claude`/`pi` resume with
+    /// `--continue`)
+    Restore {
+        /// Show what would start without starting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum InviteAction {
     /// List pending (unredeemed) invites: id, tier, user, expiry, uses

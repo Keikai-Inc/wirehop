@@ -168,7 +168,7 @@ async fn real_main() -> Result<()> {
         }
         Command::Connect {
             target, name, read_only, no_network, scopes, allow_commands, preset,
-            yes, on_warren_conflict, warren, view,
+            yes, on_warren_conflict, warren, view, session,
         } => {
             let config_dir = config::ensure_config_dir(cli.config.as_deref())?;
             let secret_key = config::load_or_generate_identity(&config_dir)?;
@@ -176,7 +176,7 @@ async fn real_main() -> Result<()> {
             cmd_connect(
                 secret_key, target.as_deref(), &config_dir, name.as_deref(), sandbox,
                 ConnectWarrenOpts { yes, on_warren_conflict, warren },
-                view,
+                ConnectSessionOpts { view, session },
             )
             .await
         }
@@ -372,10 +372,16 @@ async fn real_main() -> Result<()> {
         Command::Ps => {
             cmd_ps()
         }
-        Command::Sessions { target, all, json, watch, interval } => {
+        Command::Sessions { action, target, all, json, watch, interval } => {
             let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
-            let user_dir = config::ensure_config_dir(cli.config.as_deref())?;
-            cmd_sessions(&host_dir, &user_dir, target.as_deref(), all, json, watch.then_some(interval)).await
+            match action {
+                Some(cli::SessionsAction::Checkpoint { json }) => cmd_sessions_checkpoint(&host_dir, None, json),
+                Some(cli::SessionsAction::Restore { dry_run, json }) => cmd_sessions_checkpoint(&host_dir, Some(dry_run), json),
+                None => {
+                    let user_dir = config::ensure_config_dir(cli.config.as_deref())?;
+                    cmd_sessions(&host_dir, &user_dir, target.as_deref(), all, json, watch.then_some(interval)).await
+                }
+            }
         }
         Command::LogSources => cmd_logsources(),
         Command::LogSearch { source, since, grep, limit, line_cap } => {
@@ -445,7 +451,7 @@ async fn real_main() -> Result<()> {
                 cmd_connect(
                     secret_key, Some(&ext.target), &config_dir, ext.name.as_deref(), sandbox,
                     ConnectWarrenOpts { yes: false, on_warren_conflict: None, warren: false },
-                    None,
+                    ConnectSessionOpts::default(),
                 )
                 .await
             }
@@ -1346,6 +1352,23 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     )
     .await?;
 
+    // Session checkpoint: every minute and on a clean shutdown, so
+    // `hop sessions restore` can bring sessions back after a restart.
+    {
+        let reg = registry.clone();
+        let dir = config_dir.to_path_buf();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = hop_core::shell::checkpoint::write(&reg, &dir).await {
+                    tracing::warn!("session checkpoint failed: {e:#}");
+                }
+            }
+        });
+    }
+
     // Spawn cron scheduler: every 15s, check for due jobs and execute them.
     // Uses DirectBackend so cron jobs connect via the daemon's own iroh endpoint
     // instead of spawning a separate mux agent process (which would conflict
@@ -1440,16 +1463,17 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             }
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM, shutting down gracefully");
+                checkpoint_sessions_on_exit(&registry, config_dir).await;
                 break;
             }
             _ = sigint.recv() => {
                 tracing::info!("Received SIGINT, shutting down gracefully");
+                checkpoint_sessions_on_exit(&registry, config_dir).await;
                 break;
             }
         }
     }
-
-    // Tear down automatic split-DNS if *we* applied it (non-privsep: worker is
+// Tear down automatic split-DNS if *we* applied it (non-privsep: worker is
     // root, so configure_resolver wrote it directly). Under privsep the monitor
     // owns teardown and reverts it on exit, and an unprivileged worker can't undo
     // it anyway — so skip there. Idempotent and best-effort.
@@ -2976,6 +3000,14 @@ fn resolve_username(uid: u32) -> Option<String> {
 }
 
 /// Get the command line of a process via KERN_PROCARGS2 sysctl.
+/// How `hop <host>` picks a session: a new one, one of your existing ones by
+/// id/prefix (`--session`), or a read-only view of one (`--view`).
+#[derive(Default)]
+struct ConnectSessionOpts {
+    view: Option<String>,
+    session: Option<String>,
+}
+
 #[cfg(target_os = "macos")]
 fn get_proc_args(pid: i32) -> Option<String> {
     const KERN_PROCARGS2: libc::c_int = 49;
@@ -3085,7 +3117,7 @@ async fn cmd_connect(
     cli_name: Option<&str>,
     sandbox: hop_core::sandbox::SandboxPolicy,
     warren_opts: ConnectWarrenOpts,
-    view: Option<String>,
+    session_opts: ConnectSessionOpts,
 ) -> Result<()> {
     // `--warren` means "join the warren (no shell session)": from the invite given
     // as the target, else from the ticket stored by a prior connection. This is
@@ -3107,13 +3139,14 @@ async fn cmd_connect(
     };
 
     // Choose the protocol variant based on whether sandbox is restricted
+    let ConnectSessionOpts { view, session } = session_opts;
     let view_only = view.is_some();
     let session_msg: ClientMessage = if let Some(watched) = view {
         ClientMessage::RequestView { session_id: watched }
     } else if sandbox.is_restricted() {
-        ClientMessage::RequestShellV3 { session_id: None, sandbox }
+        ClientMessage::RequestShellV3 { session_id: session, sandbox }
     } else {
-        ClientMessage::RequestShellV2 { session_id: None }
+        ClientMessage::RequestShellV2 { session_id: session }
     };
 
     // Resolve the target first — fast and local. Prints the "Resolved … /
@@ -4285,6 +4318,10 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
             println!("Revoked invite {id}.");
         }
         AdminResponse::Sessions(sessions) => print_sessions("this host", &sessions, false),
+        AdminResponse::Checkpointed(sessions) => println!("Checkpoint written: {} session(s).", sessions.len()),
+        AdminResponse::Restored(outcomes) => {
+            println!("{} session(s) started.", outcomes.iter().filter(|o| o.new_session_id.is_some()).count())
+        }
         AdminResponse::Error { message } => {
             eprintln!("Error: {message}");
         }
@@ -5246,6 +5283,83 @@ fn desktop_notify(title: &str, body: &str) {
 /// A `*N` in BELL means the session rang the bell N times since anyone last
 /// looked. `--watch` polls the fleet and raises a desktop notification when a
 /// detached session rings the bell.
+/// Write the session checkpoint before the daemon exits (bounded, best-effort).
+async fn checkpoint_sessions_on_exit(registry: &session_registry::RegistryHandle, config_dir: &std::path::Path) {
+    match tokio::time::timeout(Duration::from_secs(5), hop_core::shell::checkpoint::write(registry, config_dir)).await {
+        Ok(Ok(n)) => tracing::info!("session checkpoint written ({n} sessions)"),
+        Ok(Err(e)) => tracing::warn!("session checkpoint failed: {e:#}"),
+        Err(_) => tracing::warn!("session checkpoint timed out"),
+    }
+}
+
+/// `hop sessions checkpoint` / `hop sessions restore`, through the daemon socket.
+fn cmd_sessions_checkpoint(host_config_dir: &std::path::Path, restore: Option<bool>, json: bool) -> Result<()> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    let conn = DaemonConnection::connect(host_config_dir)
+        .context("no daemon on this machine (is `hop host` running?)")?;
+    let req = match restore {
+        None => AdminRequest::CheckpointSessions,
+        Some(dry_run) => AdminRequest::RestoreSessions { dry_run },
+    };
+    let resp = match conn.request(&DsRequest::Admin(Box::new(req)))? {
+        DsResponse::Admin(r) => *r,
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
+    match resp {
+        AdminResponse::Checkpointed(sessions) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                return Ok(());
+            }
+            if sessions.is_empty() {
+                println!("Checkpoint written: no live sessions.");
+                return Ok(());
+            }
+            println!("Checkpoint written: {} session(s).", sessions.len());
+            for s in &sessions {
+                println!(
+                    "  {}  {:<10} {}  {}",
+                    &s.session_id[..8.min(s.session_id.len())],
+                    s.username.as_deref().unwrap_or("-"),
+                    s.cwd.as_deref().unwrap_or("?"),
+                    s.command.as_deref().unwrap_or("(shell prompt)"),
+                );
+            }
+        }
+        AdminResponse::Restored(outcomes) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                return Ok(());
+            }
+            if outcomes.is_empty() {
+                println!("Nothing to restore: no checkpoint on this host.");
+                return Ok(());
+            }
+            let dry = restore == Some(true);
+            for o in &outcomes {
+                let what = o.line.as_deref().map(|l| l.trim_end().to_string()).unwrap_or_else(|| "(shell prompt)".into());
+                let user = o.username.as_deref().unwrap_or("-");
+                match (&o.new_session_id, &o.skipped) {
+                    (Some(id), _) => println!("started  {}  {user:<10} {what}", &id[..8.min(id.len())]),
+                    (None, Some(why)) => println!("skipped  {}  {user:<10} {what}  ({why})", &o.session_id[..8.min(o.session_id.len())]),
+                    (None, None) if dry => println!("would start  {user:<10} {what}"),
+                    (None, None) => println!("not started  {user:<10} {what}"),
+                }
+            }
+            let started = outcomes.iter().filter(|o| o.new_session_id.is_some()).count();
+            if dry {
+                println!("Dry run: nothing started.");
+            } else {
+                println!("{started} session(s) started; attach with `hop <host>` or `hop sessions` to list them.");
+            }
+        }
+        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+    Ok(())
+}
+
 async fn cmd_sessions(
     host_config_dir: &std::path::Path,
     user_config_dir: &std::path::Path,

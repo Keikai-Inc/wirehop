@@ -250,6 +250,10 @@ pub enum AdminRequest {
     RevokeInvite { id: String },
     /// List this host's persistent PTY sessions (served by the daemon socket).
     ListSessions,
+    /// Write the session checkpoint now (daemon socket only).
+    CheckpointSessions,
+    /// Start every session in the checkpoint file again (daemon socket only).
+    RestoreSessions { dry_run: bool },
 }
 
 /// A single metric point pushed from a remote host.
@@ -319,6 +323,24 @@ pub enum AdminResponse {
     InviteRevoked { id: String },
     /// This host's sessions (`ListSessions`).
     Sessions(Vec<SessionSummary>),
+    /// The checkpoint that was just written (`CheckpointSessions`).
+    Checkpointed(Vec<crate::shell::checkpoint::SessionCheckpoint>),
+    /// What `RestoreSessions` did, one entry per checkpointed session.
+    Restored(Vec<RestoreOutcome>),
+}
+
+/// One checkpointed session's fate on restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreOutcome {
+    /// The session id in the checkpoint.
+    pub session_id: String,
+    pub username: Option<String>,
+    /// The shell line the session is started with (`cd … && …`), if any.
+    pub line: Option<String>,
+    /// New session id when a session was started; `None` on dry run or error.
+    pub new_session_id: Option<String>,
+    /// Why nothing was started: still running, peer unknown, spawn failed.
+    pub skipped: Option<String>,
 }
 
 /// One persistent PTY session as `hop sessions` shows it.

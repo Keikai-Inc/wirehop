@@ -145,6 +145,7 @@ folded into `connect`).
 | `--on-warren-conflict <ACTION>` | Resolve a conflict with a different, populated warren: `replace` (switch), `abort` (keep) |
 | `--warren` | Join the warren from the **stored** ticket (no target/invite) |
 | `--view <SESSION>` | Watch an existing session (id or unique prefix from `hop sessions`) without being able to type; `q` leaves |
+| `--session <SESSION>` | Attach to one of your own existing sessions (id or unique prefix) instead of starting a new one |
 
 ```bash
 hop connect <invite-token>          # connect + (if the invite carries a warren) join it
@@ -260,6 +261,24 @@ hop sessions
 hop sessions myserver
 hop sessions --all --json
 hop sessions --all --watch --interval 10
+```
+
+### `hop sessions checkpoint [--json]`
+
+Write the daemon's session checkpoint now (it also writes one every minute and
+on a clean shutdown). Records, per live session, the owning peer, the user, the
+working directory and the foreground command. Runs against this machine's daemon.
+
+### `hop sessions restore [--dry-run] [--json]`
+
+Start every checkpointed session again after a host restart: same user, same
+directory, same command, under the owning peer's current sandbox policy.
+`claude`/`pi` resume with `--continue`. Skips sessions that are still running
+and peers the host no longer knows. `--dry-run` shows what would start.
+
+```bash
+hop sessions restore --dry-run
+hop sessions restore
 ```
 
 ---

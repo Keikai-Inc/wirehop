@@ -228,15 +228,36 @@ async fn handle_connection(
             _ => None,
         };
 
-        // Session listing needs the registry actor (async), like prune.
-        let list_sessions = matches!(&req, DsRequest::Admin(a) if matches!(a.as_ref(), crate::proto::AdminRequest::ListSessions));
-        let resp = if list_sessions {
-            match &sessions {
-                Some(h) => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Sessions(h.list().await))),
-                None => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Error {
-                    message: "this daemon has no session registry".to_string(),
-                })),
-            }
+        // Session listing, checkpoint and restore need the registry actor
+        // (async), like prune.
+        enum SessionOp { List, Checkpoint, Restore { dry_run: bool } }
+        let session_op = match &req {
+            DsRequest::Admin(a) => match a.as_ref() {
+                crate::proto::AdminRequest::ListSessions => Some(SessionOp::List),
+                crate::proto::AdminRequest::CheckpointSessions => Some(SessionOp::Checkpoint),
+                crate::proto::AdminRequest::RestoreSessions { dry_run } => Some(SessionOp::Restore { dry_run: *dry_run }),
+                _ => None,
+            },
+            _ => None,
+        };
+        let resp = if let Some(op) = session_op {
+            use crate::proto::AdminResponse;
+            use crate::shell::checkpoint;
+            let r = match (&sessions, op) {
+                (None, _) => AdminResponse::Error { message: "this daemon has no session registry".to_string() },
+                (Some(h), SessionOp::List) => AdminResponse::Sessions(h.list().await),
+                (Some(h), SessionOp::Checkpoint) => match checkpoint::write(h, &config_dir).await
+                    .and_then(|_| checkpoint::CheckpointFile::load(&config_dir))
+                {
+                    Ok(f) => AdminResponse::Checkpointed(f.map(|f| f.sessions).unwrap_or_default()),
+                    Err(e) => AdminResponse::Error { message: format!("checkpoint failed: {e:#}") },
+                },
+                (Some(h), SessionOp::Restore { dry_run }) => match checkpoint::restore(h, &config_dir, dry_run).await {
+                    Ok(v) => AdminResponse::Restored(v),
+                    Err(e) => AdminResponse::Error { message: format!("restore failed: {e:#}") },
+                },
+            };
+            DsResponse::Admin(Box::new(r))
         } else if let Some((older, dry_run)) = prune {
             match netdoc.get() {
                 Some(nd) => {

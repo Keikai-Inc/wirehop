@@ -63,6 +63,9 @@ pub struct DetachedSession {
     pub attached: bool,
     /// Unix ms when the session was created.
     pub started_unix_ms: u64,
+    /// Second handle on the PTY master, for the session checkpoint (foreground
+    /// process group lookup). `None` when the dup failed.
+    pub pty_master: Option<Arc<std::os::fd::OwnedFd>>,
     /// Monotonic epoch incremented on each attach. Allows stale
     /// disconnect handlers to detect they've been superseded by a
     /// newer attachment and skip the detach.
@@ -219,6 +222,21 @@ impl SessionRegistry {
     }
 
     /// Every session as an operator sees it, newest first.
+    pub fn checkpoint_inputs(&self) -> Vec<super::checkpoint::CheckpointInput> {
+        self.sessions
+            .values()
+            .filter(|s| s.exit_rx.borrow().is_none())
+            .map(|s| super::checkpoint::CheckpointInput {
+                session_id: s.session_id.clone(),
+                peer_id: s.peer_id.clone(),
+                username: s.username.clone(),
+                child_pid: s.child_pid,
+                fg_pid: s.pty_master.as_deref().and_then(super::checkpoint::foreground_pid),
+                title: s.screen.lock().ok().and_then(|scr| scr.title()),
+            })
+            .collect()
+    }
+
     pub fn summaries(&self) -> Vec<crate::proto::SessionSummary> {
         let mut out: Vec<crate::proto::SessionSummary> = self
             .sessions
@@ -370,6 +388,10 @@ pub enum RegistryCommand {
     },
     Insert {
         session: DetachedSession,
+    },
+    /// What a checkpoint needs about every live (not exited) session.
+    Checkpoint {
+        reply: oneshot::Sender<Vec<super::checkpoint::CheckpointInput>>,
     },
     SetBrokerHandle {
         session_id: String,
@@ -529,6 +551,13 @@ impl RegistryHandle {
         let _ = self.tx.send(RegistryCommand::List { reply }).await;
         rx.await.unwrap_or_default()
     }
+
+    /// Per-session facts for a checkpoint (live sessions only).
+    pub async fn checkpoint_inputs(&self) -> Vec<super::checkpoint::CheckpointInput> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(RegistryCommand::Checkpoint { reply }).await;
+        rx.await.unwrap_or_default()
+    }
 }
 
 /// Spawn the registry actor task and return a handle to it.
@@ -555,6 +584,9 @@ async fn run_registry_actor(
                 size,
                 reply,
             } => {
+                // `hop <host> --session <prefix>` names a session the way
+                // `hop sessions` prints it; a reconnect sends the full id.
+                let session_id = registry.resolve_prefix(&session_id).unwrap_or(session_id);
                 let result = if let Some(session) = registry.lookup(&session_id) {
                     if session.has_exited() || session.peer_id != peer_id {
                         None
@@ -599,6 +631,9 @@ async fn run_registry_actor(
             RegistryCommand::DetachIfCurrent { session_id, epoch, reply } => {
                 let detached = registry.detach_if_current(&session_id, epoch);
                 let _ = reply.send(detached);
+            }
+            RegistryCommand::Checkpoint { reply } => {
+                let _ = reply.send(registry.checkpoint_inputs());
             }
             RegistryCommand::List { reply } => {
                 let _ = reply.send(registry.summaries());
@@ -655,6 +690,7 @@ mod tests {
             detached_at: if attached { None } else { Some(Instant::now()) },
             attached,
             started_unix_ms: 0,
+            pty_master: None,
             viewers: Arc::new(Mutex::new(Vec::new())),
             attach_epoch: 0,
             broker_handle: None,

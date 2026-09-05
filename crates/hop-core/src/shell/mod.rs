@@ -1,7 +1,7 @@
 //! PTY and terminal management.
 
+pub mod checkpoint;
 pub mod session_registry;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -860,6 +860,7 @@ fn spawn_persistent_pty(
     Option<u32>,                                                     // child pid (for kill-on-removal)
     Arc<tokio::sync::Notify>,                                        // reader cancel (release master fd on removal)
     Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,               // read-only viewers
+    Option<Arc<std::os::fd::OwnedFd>>,                               // PTY master (dup) for checkpoints
 )> {
     let session_id = session_registry::generate_session_id();
 
@@ -944,6 +945,15 @@ fn spawn_persistent_pty(
     let master_fd = session_pty
         .as_raw_fd()
         .context("PTY master exposes no raw fd")?;
+    // A second handle on the master for the session checkpoint: it asks the
+    // terminal which process group is in the foreground (works on the privsep
+    // path too, where the worker never sees the child's pid). Dropped with
+    // the registry entry.
+    let checkpoint_master: Option<Arc<std::os::fd::OwnedFd>> = {
+        use std::os::fd::FromRawFd;
+        let d = unsafe { libc::dup(master_fd) };
+        (d >= 0).then(|| Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) }))
+    };
     let exit_on_eof = if child.is_none() {
         Some(exit_tx.clone())
     } else {
@@ -1041,7 +1051,7 @@ fn spawn_persistent_pty(
         });
     }
 
-    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel, viewers))
+    Ok((session_id, input_tx, output_route_tx, resize_tx, exit_rx, screen, child_pid, reader_cancel, viewers, checkpoint_master))
 }
 
 /// Run the attached I/O loop: forward PTY output to client, client input to PTY.
@@ -1353,7 +1363,7 @@ pub async fn host_shell_session_persistent(
                 )
             } else {
                 // Session gone or exited — spawn new
-                let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers) =
+                let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers, pty_master) =
                     spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
                 let _ = output_route.send(Some(client_output_tx));
                 let session = DetachedSession {
@@ -1372,6 +1382,7 @@ pub async fn host_shell_session_persistent(
                     attach_epoch: 1,
                     broker_handle: None,
                     viewers,
+                    pty_master,
                     screen: scr.clone(),
                 };
                 registry.insert(session).await;
@@ -1379,7 +1390,7 @@ pub async fn host_shell_session_persistent(
             }
         } else {
             // New connection — always spawn a new PTY
-            let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers) =
+            let (sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers, pty_master) =
                 spawn_persistent_pty(username, initial_size, &env_vars, sandbox, config_dir, Some(registry.attention_sender()))?;
             let _ = output_route.send(Some(client_output_tx));
             let session = DetachedSession {
@@ -1398,6 +1409,7 @@ pub async fn host_shell_session_persistent(
                 attach_epoch: 1,
                 broker_handle: None,
                 viewers,
+                pty_master,
                 screen: scr.clone(),
             };
             registry.insert(session).await;

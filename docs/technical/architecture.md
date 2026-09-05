@@ -314,6 +314,21 @@ user, attached flag, start time, idle seconds, exit status, the app's OSC
 title, bells since the last attach, and the grid size; the host's `VtScreen`
 records titles and bells through alacritty's event listener.
 
+Sessions live only in the daemon's memory, so a restart ends them. The daemon
+writes a **session checkpoint** (`sessions-checkpoint.json` in the host config
+dir) every minute and on a clean shutdown, over the daemon socket via
+`AdminRequest::CheckpointSessions`. Each entry holds the owning peer, the user,
+the working directory and the foreground command line, read from the PTY's
+foreground process group (`tcgetpgrp` on the master) so it works under privsep,
+where the worker never sees the child pid. `AdminRequest::RestoreSessions`
+relaunches each entry detached, under the owning peer's current sandbox policy,
+typing `cd <dir> && <command>` into a fresh shell (`claude`/`pi` gain
+`--continue`); it skips sessions already live or whose recorded process
+outlived a daemon-only restart (pid + command-line match), so a restore never
+duplicates a running agent. These three (`ListSessions`, `CheckpointSessions`,
+`RestoreSessions`) are daemon-socket admin requests, not wire-protocol
+messages, so they needed no ALPN bump.
+
 `AuthResultV2` is the reason `hop/4` exists. Before it, an invite token
 embedded the warren ticket (a plain `hop invite` on a warren host even embedded
 the **write** ticket), so a token stayed a live capability after its secret was
