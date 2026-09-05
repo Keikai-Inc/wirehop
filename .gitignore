@@ -3,3 +3,9 @@ target/release-dist/
 tests/e2e/hop
 vendor/*/target/
 dhat-heap.json
+
+# Local agent guidance and session artifacts — never published. Agent guidance
+# for contributors lives in AGENTS.md; private planning lives in a separate repo.
+/CLAUDE.md
+/.claude/
+/docs/strategy/
