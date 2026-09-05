@@ -76,6 +76,16 @@ default relays.
   capability tiers and per-invite sandboxes (read-only, path-scoped,
   command-allowlisted). Every node keeps its own audit log.
 
+## Terminal audit (WireTap)
+
+[WireTap](https://github.com/Keikai-Inc/wiretap) is a companion tool that
+captures every TTY/PTY session on a Linux host straight from the kernel over
+eBPF. List active sessions, snapshot a screen, or watch a live byte stream —
+locally, or over WireHop by name (`hop <host> tap watch 0`). It can also freeze
+a session you decide is hostile or divert it into a namespace-sandboxed decoy.
+It runs standalone or as a WireHop extension; see
+[docs/product/tap.md](docs/product/tap.md).
+
 ## Where it comes from
 
 WireHop started in March 2026 as **hop**, an internal tool at Keikai, Inc. We
