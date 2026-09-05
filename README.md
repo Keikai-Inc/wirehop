@@ -43,10 +43,27 @@ hop fleet list                    # every machine in the warren, with its virtua
 ```
 
 Those names and virtual IPs *are* the warren, the private network your machines
-form when they join. It is a real VPN: `ssh <name>`, `ping <name>`, a browser or
-any other tool reaches your machines by name over the encrypted overlay, with no
-`hop` subcommand and nothing to configure. `hop host --relay` lets a machine you
-control carry the relayed traffic instead of the defaults.
+form when they join — a real VPN, not just a `hop` feature. Every node gets a
+virtual IP and a MagicDNS name (`<host>.hop`), so any app reaches it by name over
+the encrypted overlay, with no `hop` subcommand and nothing to configure:
+
+```bash
+ssh you@db.hop                 # plain SSH over the overlay, no server to run
+psql -h db.hop                 # or a database, a queue — anything TCP/UDP
+open vnc://mac.hop             # a desktop, by name
+open http://grafana.hop:3000   # an internal web UI, no port forwarding
+```
+
+When you want just one port and no VPN, forward it like `ssh -L`:
+
+```bash
+hop tunnel myserver 5900       # reach myserver's :5900 at localhost:5900
+```
+
+Even a device that can't run hop — a printer, a NAS, a Tablo — is reachable by
+its LAN IP once one node advertises a route to its subnet. And `hop host --relay`
+lets a machine you control carry the traffic NAT can't hole-punch, instead of the
+default relays.
 
 ## How it works
 
