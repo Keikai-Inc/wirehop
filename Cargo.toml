@@ -12,7 +12,7 @@ repository = "https://github.com/Keikai-Inc/wirehop"
 # Internal
 hop-core = { path = "crates/hop-core" }
 hop-mcp = { path = "crates/hop-mcp" }
-hop-vt = { path = "crates/hop-vt" }
+hop-vt = { path = "crates/hop-vt", package = "wirehop-vt" }
 
 # Networking
 # iroh referenced as a crates.io version so the [patch.crates-io] below redirects
