@@ -12,7 +12,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use hop_core::net::netmon;
-use hop_core::proto::{self, ClientMessage};
+use hop_core::proto::{self, ClientMessage, HostMessage};
 
 use crate::mux::{self, ResolvedHost};
 
@@ -189,13 +189,24 @@ pub async fn try_quick_reconnect(
 
 /// Outcome of the responsive initial connect.
 pub enum InitialConnectOutcome {
+    /// Dialed, authenticated, session requested and answered: the stream is
+    /// ready for the interactive loop. `session_id` is what the host assigned
+    /// (`None` only for a host too old to send `SessionInfo`).
     Connected {
         send: OwnedWriteHalf,
         recv: OwnedReadHalf,
+        session_id: Option<String>,
     },
     /// User pressed q / Ctrl+C while connecting.
     Quit,
 }
+
+/// How long the host gets to answer the session request once the dial is up.
+/// A healthy host answers `SessionInfo` in one round-trip. Silence here means
+/// the connection we were handed cannot carry stream data (2026-09-11: a
+/// pooled connection with a dead path, reused by every attempt for 20
+/// minutes); the next attempt evicts it and dials fresh.
+const SESSION_SETUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Drive the INITIAL connect responsively — the same live spinner, instant
 /// q/Ctrl+C, bounded per-attempt deadline, and backoff the reconnect path
@@ -221,6 +232,9 @@ pub async fn run_initial_connect(
     let mut net_watcher = NetWatcher::new();
     let mut attempt: u32 = 0;
     let mut consecutive_fail: u32 = 0;
+    // Set once an attempt got a connection but no answer to the session
+    // request: from then on every dial drops the pooled connection first.
+    let mut evict_first = false;
 
     loop {
         attempt += 1;
@@ -262,7 +276,7 @@ pub async fn run_initial_connect(
 
         // Connecting phase: the dial runs as a future polled alongside the
         // spinner, a 12s deadline, and stdin — so q/Ctrl+C cancel instantly.
-        let dial_fut = mux::dial_initial(config_dir, plan);
+        let dial_fut = mux::dial_initial_with(config_dir, plan, evict_first);
         tokio::pin!(dial_fut);
         let deadline = tokio::time::sleep(Duration::from_secs(12));
         tokio::pin!(deadline);
@@ -307,7 +321,88 @@ pub async fn run_initial_connect(
                 // invite already used) is terminal — don't loop on it.
                 mux::finish_auth_and_request(config_dir, plan, session_request, &mut send, &mut recv)
                     .await?;
-                return Ok(InitialConnectOutcome::Connected { send, recv });
+
+                // The host must now answer the session request. Bounded and
+                // responsive like the dial: a host that took the connection
+                // but never answers is a failed attempt, not a session.
+                let answer = {
+                    let setup = async {
+                        send_setup_messages(&mut send).await?;
+                        let m: HostMessage = proto::read_message(&mut recv).await?;
+                        Ok::<_, anyhow::Error>(m)
+                    };
+                    tokio::pin!(setup);
+                    let deadline = tokio::time::sleep(SESSION_SETUP_DEADLINE);
+                    tokio::pin!(deadline);
+                    let mut spinner = tokio::time::interval(Duration::from_millis(120));
+                    let mut spin: u64 = 0;
+                    loop {
+                        tokio::select! {
+                            r = &mut setup => break Some(r),
+                            _ = &mut deadline => break None,
+                            _ = spinner.tick() => {
+                                spin += 1;
+                                let _ = write!(
+                                    stdout,
+                                    "\r\x1b[K\x1b[33m[hop]\x1b[0m {} Connected, waiting for the host to open the session… ({}s)   q: cancel",
+                                    spinning_char(spin), start.elapsed().as_secs()
+                                );
+                                let _ = stdout.flush();
+                            }
+                            chunk = stdin_rx.recv() => {
+                                if let Some(data) = chunk {
+                                    match classify_chunk(&data, &mut pending) {
+                                        PollAction::Quit => {
+                                            let _ = write!(stdout, "\r\x1b[K");
+                                            let _ = stdout.flush();
+                                            return Ok(InitialConnectOutcome::Quit);
+                                        }
+                                        PollAction::RetryNow => { attempt = 0; user_retry = true; break None; }
+                                        PollAction::None => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = write!(stdout, "\r\x1b[K");
+                let _ = stdout.flush();
+                match answer {
+                    Some(Ok(HostMessage::SessionInfo { session_id, .. })) => {
+                        return Ok(InitialConnectOutcome::Connected { send, recv, session_id: Some(session_id) });
+                    }
+                    Some(Ok(HostMessage::SessionError(msg))) => anyhow::bail!("Host error: {msg}"),
+                    Some(Ok(_)) => {
+                        // A host from before SessionInfo: nothing to resume by,
+                        // but the session itself is fine.
+                        return Ok(InitialConnectOutcome::Connected { send, recv, session_id: None });
+                    }
+                    Some(Err(e)) => {
+                        let _ = write!(
+                            stdout,
+                            "\r\x1b[K\x1b[33m[hop]\x1b[0m Session request failed ({e:#}) — will drop the pooled connection and dial fresh\r\n"
+                        );
+                        evict_first = true;
+                    }
+                    None if user_retry => {
+                        evict_first = true;
+                    }
+                    None => {
+                        let _ = write!(
+                            stdout,
+                            "\r\x1b[K\x1b[33m[hop]\x1b[0m The host took the connection but did not answer the session request in {}s — dropping the pooled connection and dialing fresh\r\n",
+                            SESSION_SETUP_DEADLINE.as_secs()
+                        );
+                        evict_first = true;
+                    }
+                }
+                let _ = stdout.flush();
+                // Closing the IPC stream ends the agent's proxy for this attempt.
+                drop(send);
+                drop(recv);
+                if !user_retry {
+                    consecutive_fail += 1;
+                }
             }
             _ => {
                 // Dial failed or timed out (not a user-requested retry). After a

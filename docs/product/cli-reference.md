@@ -956,6 +956,27 @@ Print this node's identity (NodeId).
 hop id
 ```
 
+### `hop recover [--quiet]`
+
+Unwedge hop on this machine: kill stray user agents, remove their stale
+sockets, and restart the host daemon.
+
+```bash
+hop recover          # asks the daemon to restart itself over its socket (operator group, no root)
+sudo hop recover     # restarts the service directly (launchctl / systemctl)
+```
+
+Without root, the restart goes over the daemon socket (`DsRequest::Restart`):
+the daemon checkpoints its sessions, exits cleanly, and its supervisor brings
+it back with a fresh endpoint. That works from any operator shell, including
+one reached over hop. A daemon older than 0.9.38 ignores the request; the
+command then says to re-run with `sudo`.
+
+The daemon also restarts itself without being asked when its inbound
+liveness probe fails four times in a row (about 20 minutes unreachable
+through a relay that answers HTTPS). See
+[host-resilience.md](../technical/host-resilience.md).
+
 ### `hop mcp`
 
 Start MCP server (Model Context Protocol) for AI agent integration. Communicates over stdio using JSON-RPC 2.0.

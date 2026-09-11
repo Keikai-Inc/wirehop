@@ -21,6 +21,12 @@ pub const ALPN_V3: &[u8] = b"hop/3";
 /// ALPN protocol identifier for hop v4 (post-auth invite grants: `AuthResultV2`).
 pub const ALPN_V4: &[u8] = b"hop/4";
 
+/// ALPN for the host's own inbound-liveness probe (`net::health`). A throwaway
+/// endpoint dials the host through its relay with this ALPN; the host answers
+/// the QUIC handshake and both sides close. Nothing is sent on it, and a
+/// connection carrying it is never authenticated or dispatched.
+pub const ALPN_PROBE: &[u8] = b"hop/probe/1";
+
 /// Messages sent from the host to the client.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HostMessage {
@@ -78,6 +84,8 @@ pub enum HostMessage {
         username: Option<String>,
         host_name: Option<String>,
     },
+    /// Answer to [`ClientMessage::Ping`] (hop/4+; appended last).
+    Pong,
 }
 
 /// Messages sent from the client to the host.
@@ -153,6 +161,14 @@ pub enum ClientMessage {
     /// appended last). `session_id` may be an unambiguous prefix. Allowed for
     /// the session's owner and for admins; the host drops every `Input`.
     RequestView { session_id: String },
+    /// Liveness check on an already-authenticated connection (hop/4+; appended
+    /// last). Sent as the first message of a fresh bi-stream by a client about
+    /// to reuse a pooled connection; the host answers [`HostMessage::Pong`] on
+    /// the same stream and closes it. A connection that keeps QUIC keepalives
+    /// flowing but cannot deliver stream data (a dead path the transport has
+    /// not noticed) fails this within a second instead of stalling a session
+    /// for minutes.
+    Ping,
 }
 
 // --- Admin protocol (hop/2+) ---

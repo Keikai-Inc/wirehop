@@ -346,7 +346,22 @@ pub async fn dial_initial(
     tokio::net::unix::OwnedWriteHalf,
     tokio::net::unix::OwnedReadHalf,
 )> {
-    open_agent_stream(config_dir, &plan.host_id, plan.relay_str(), false).await
+    dial_initial_with(config_dir, plan, false).await
+}
+
+/// [`dial_initial`] with an explicit eviction flag: `evict_first` drops any
+/// pooled connection to the host before dialing. The initial-connect loop sets
+/// it after an attempt that got a connection but no answer to the session
+/// request — the signature of a pooled connection whose path is dead.
+pub async fn dial_initial_with(
+    config_dir: &Path,
+    plan: &ConnectPlan,
+    evict_first: bool,
+) -> Result<(
+    tokio::net::unix::OwnedWriteHalf,
+    tokio::net::unix::OwnedReadHalf,
+)> {
+    open_agent_stream(config_dir, &plan.host_id, plan.relay_str(), evict_first).await
 }
 
 /// After the dial is up, run any one-shot auth and send the session request.

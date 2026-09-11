@@ -1471,12 +1471,19 @@ fn claude_invoke(
             Ok(Some(_status)) => break,
             Ok(None) => {
                 if start.elapsed() > timeout {
+                    // kill() alone leaves a zombie for the daemon's lifetime:
+                    // the exit status has to be collected too.
                     let _ = child.kill();
+                    let _ = child.wait();
                     anyhow::bail!("claude timed out after {}s", timeout.as_secs());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => anyhow::bail!("claude wait error: {e}"),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("claude wait error: {e}");
+            }
         }
     }
 

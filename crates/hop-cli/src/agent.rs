@@ -109,7 +109,7 @@ enum AgentCommand {
     GetConnection {
         host_id: PublicKey,
         relay_url: Option<String>,
-        reply: oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>,
+        reply: ConnectReply,
     },
     /// Self-message from a spawned connect task when the QUIC handshake completes.
     ConnectDone {
@@ -120,6 +120,15 @@ enum AgentCommand {
     /// Skipped if the host still has live sessions (the conn is in use).
     RemoveConnection {
         host_id: PublicKey,
+    },
+    /// Evict one specific connection (by `stable_id`) that failed a liveness
+    /// check, live sessions or not: a connection that cannot carry stream data
+    /// is dead for every session on it, and closing it is what lets those
+    /// sessions notice and reconnect instead of waiting out a 75s deadline.
+    /// The id guard means a replacement dialed in the meantime is left alone.
+    ForceRemoveConnection {
+        host_id: PublicKey,
+        stable_id: usize,
     },
     /// A multiplexed proxy session for `host_id` started.
     SessionStarted {
@@ -146,12 +155,13 @@ struct AgentHandle {
 }
 
 impl AgentHandle {
-    /// Request a connection and per-host semaphore for the given host.
+    /// Request a connection and per-host semaphore for the given host. The
+    /// flag says whether it came from the pool (`true`) or was just dialed.
     async fn get_connection(
         &self,
         host_id: PublicKey,
         relay_url: Option<String>,
-    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>)> {
+    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>, bool)> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(AgentCommand::GetConnection {
@@ -169,6 +179,15 @@ impl AgentHandle {
         let _ = self
             .tx
             .send(AgentCommand::RemoveConnection { host_id })
+            .await;
+    }
+
+    /// Evict the connection with this `stable_id` regardless of live sessions
+    /// (fire-and-forget). See `AgentCommand::ForceRemoveConnection`.
+    async fn force_remove_connection(&self, host_id: PublicKey, stable_id: usize) {
+        let _ = self
+            .tx
+            .send(AgentCommand::ForceRemoveConnection { host_id, stable_id })
             .await;
     }
 
@@ -203,8 +222,9 @@ impl AgentHandle {
     }
 }
 
-/// Reply type for GetConnection: a live connection + per-host semaphore.
-type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>)>>;
+/// Reply type for GetConnection: a live connection + per-host semaphore +
+/// whether it was pooled (as opposed to freshly dialed for this request).
+type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>, bool)>>;
 
 /// Mutable state owned exclusively by the actor task.
 struct AgentState {
@@ -279,7 +299,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                             .entry(host_id)
                             .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
                             .clone();
-                        let _ = reply.send(Ok((conn.clone(), sem)));
+                        let _ = reply.send(Ok((conn.clone(), sem, true)));
                         continue;
                     }
                     // Dead connection — remove it
@@ -327,7 +347,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                             .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
                             .clone();
                         for reply in waiters {
-                            let _ = reply.send(Ok((conn.clone(), sem.clone())));
+                            let _ = reply.send(Ok((conn.clone(), sem.clone(), false)));
                         }
                     }
                     Err(e) => {
@@ -361,6 +381,24 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 }
             }
 
+            AgentCommand::ForceRemoveConnection { host_id, stable_id } => {
+                let matches = state
+                    .connections
+                    .get(&host_id)
+                    .map(|c| c.stable_id() == stable_id)
+                    .unwrap_or(false);
+                if matches
+                    && let Some(conn) = state.connections.remove(&host_id)
+                {
+                    tracing::info!(
+                        "mux: dropping pooled connection to {} that failed its liveness check ({} active session(s) will reconnect)",
+                        host_id.fmt_short(),
+                        state.active.get(&host_id).copied().unwrap_or(0)
+                    );
+                    conn.close(0u32.into(), b"failed-liveness-check");
+                }
+            }
+
             AgentCommand::SessionStarted { host_id } => {
                 session_inc(&mut state.active, host_id);
             }
@@ -374,6 +412,10 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 for (_, conn) in state.connections.drain() {
                     conn.close(0u32.into(), b"flush");
                 }
+                // Per-host semaphores are recreated on demand; a handle_client
+                // mid-connect keeps its own Arc. Dropping them here keeps the
+                // map from growing with every host ever dialed.
+                state.semaphores.clear();
             }
 
             AgentCommand::TouchActivity => {
@@ -436,6 +478,33 @@ fn spawn_zombie_watchdog(conn: Connection, host_id: PublicKey) {
             }
         }
     });
+}
+
+/// Budget for the pooled-connection liveness check. One application-level
+/// round-trip on a healthy connection is tens of milliseconds even through
+/// the relay; a connection that cannot answer in this long is not going to
+/// carry a session either.
+const POOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Prove a pooled connection can still carry stream data both ways: open a
+/// bi-stream, send `Ping`, expect `Pong` (hop/4+ hosts). `close_reason()` and
+/// the rx-stall watchdog only see the transport; on 2026-09-11 a pooled
+/// connection kept QUIC keepalives flowing for 20 minutes while no stream
+/// data reached the host, and every `hop connect` was handed that connection.
+async fn check_pooled_liveness(conn: &Connection) -> Result<Duration> {
+    use hop_core::proto::{self, ClientMessage, HostMessage};
+    let started = Instant::now();
+    let probe = async {
+        let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
+        proto::write_message(&mut send, &ClientMessage::Ping).await.context("send ping")?;
+        let reply: HostMessage = proto::read_message(&mut recv).await.context("read pong")?;
+        anyhow::ensure!(matches!(reply, HostMessage::Pong), "unexpected reply to ping: {reply:?}");
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(POOL_LIVENESS_TIMEOUT, probe)
+        .await
+        .map_err(|_| anyhow::anyhow!("no pong within {}s", POOL_LIVENESS_TIMEOUT.as_secs()))??;
+    Ok(started.elapsed())
 }
 
 /// True if the dial error was a timeout (dead/stale path) rather than a
@@ -529,28 +598,50 @@ async fn handle_client(
     // 2. Split IPC early so we can monitor liveness during setup
     let (mut ipc_read, mut ipc_write) = ipc.into_split();
 
-    // 3. Get connection + per-host semaphore, abort if IPC client disconnects
+    // 3. Get connection + per-host semaphore, abort if IPC client disconnects.
+    //    A pooled connection is checked before it is handed out (hop/4+): if it
+    //    can't answer a ping it is force-evicted and the loop dials fresh —
+    //    at most once, since the second pass returns a freshly dialed one.
     tracing::debug!("handle_client: getting connection for {}", host_id.fmt_short());
-    let (conn, sem) = tokio::select! {
-        result = handle.get_connection(host_id, req.relay_url) => {
-            match result {
-                Ok(pair) => {
-                    tracing::debug!("handle_client: connection obtained for {}", host_id.fmt_short());
-                    pair
+    let relay_url = req.relay_url;
+    let (conn, sem) = loop {
+        let (conn, sem, cached) = tokio::select! {
+            result = handle.get_connection(host_id, relay_url.clone()) => {
+                match result {
+                    Ok(triple) => {
+                        tracing::debug!("handle_client: connection obtained for {}", host_id.fmt_short());
+                        triple
+                    }
+                    Err(e) => {
+                        let _ = mux::write_ipc_message(
+                            &mut ipc_write,
+                            &MuxResult::Error(format!("{e:#}")),
+                        ).await;
+                        return Err(e);
+                    }
+                }
+            }
+            _ = wait_for_ipc_close(&mut ipc_read) => {
+                tracing::debug!("IPC client disconnected during connect ({})", host_id.fmt_short());
+                return Ok(());
+            }
+        };
+        if cached && conn.alpn() == hop_core::proto::ALPN_V4 {
+            match check_pooled_liveness(&conn).await {
+                Ok(rtt) => {
+                    tracing::debug!("handle_client: pooled connection to {} answered ping in {} ms", host_id.fmt_short(), rtt.as_millis());
                 }
                 Err(e) => {
-                    let _ = mux::write_ipc_message(
-                        &mut ipc_write,
-                        &MuxResult::Error(format!("{e:#}")),
-                    ).await;
-                    return Err(e);
+                    tracing::info!(
+                        "mux: pooled connection to {} failed its liveness check ({e:#}); dialing fresh",
+                        host_id.fmt_short()
+                    );
+                    handle.force_remove_connection(host_id, conn.stable_id()).await;
+                    continue;
                 }
             }
         }
-        _ = wait_for_ipc_close(&mut ipc_read) => {
-            tracing::debug!("IPC client disconnected during connect ({})", host_id.fmt_short());
-            return Ok(());
-        }
+        break (conn, sem);
     };
 
     // 4. Acquire semaphore, abort if IPC client disconnects while waiting

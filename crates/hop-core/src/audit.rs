@@ -294,14 +294,22 @@ pub fn id_floor(ts_ms: u64) -> u64 {
 // ── process-global sink ──────────────────────────────────────────────────────
 
 struct Sink {
-    tx: std::sync::mpsc::Sender<AuditEvent>,
+    tx: std::sync::mpsc::SyncSender<AuditEvent>,
     level: AuditLevel,
 }
 
 static SINK: OnceLock<Sink> = OnceLock::new();
 
-/// Install the global audit sink: events at or below `level` are buffered on an
-/// unbounded channel and drained by `drain` on a dedicated thread (so callers in
+/// Queue depth between [`record`] and the drain thread. The drain does one redb
+/// transaction per event; a burst (a reconnect storm records a `session.start`
+/// per resume — 13k of them for one session in the 2026-09-11 host log) must
+/// not grow the heap without bound. Past this, events are dropped and counted.
+const QUEUE_CAPACITY: usize = 8192;
+/// Events dropped because the queue was full.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Install the global audit sink: events at or below `level` are buffered on a
+/// bounded channel and drained by `drain` on a dedicated thread (so callers in
 /// hot paths never touch redb). Idempotent — a second call is ignored. No-op
 /// contexts (the client CLI, tests) simply never call this, so [`record`] is inert.
 pub fn init<F>(level: AuditLevel, drain: F)
@@ -311,7 +319,7 @@ where
     if level == AuditLevel::Off {
         return; // recording disabled — leave the sink uninstalled so record() is inert
     }
-    let (tx, rx) = std::sync::mpsc::channel::<AuditEvent>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AuditEvent>(QUEUE_CAPACITY);
     let mut drain = drain;
     std::thread::Builder::new()
         .name("hop-audit".into())
@@ -332,7 +340,20 @@ pub fn record(event: AuditEvent) {
     if sink.level < event.level() {
         return;
     }
-    let _ = sink.tx.send(event);
+    if sink.tx.try_send(event).is_err() {
+        // Full (or the drain died): drop rather than queue without bound. Note
+        // it once per power of two so the log says it happened without
+        // becoming the flood itself.
+        let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!("audit: queue full — {n} event(s) dropped so far");
+        }
+    }
+}
+
+/// Events dropped so far because the audit queue was full.
+pub fn dropped() -> u64 {
+    DROPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether recording is active at `level` or finer (lets callers skip building an

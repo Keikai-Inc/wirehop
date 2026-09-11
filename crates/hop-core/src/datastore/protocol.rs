@@ -46,6 +46,13 @@ pub enum DsRequest {
     AuditQuery { query: crate::audit::AuditQuery },
     /// Recent runs of one cron job, newest first. Appended last.
     CronRuns { id: String, limit: u32 },
+    /// Ask the daemon to restart itself (`hop recover` without root). The
+    /// daemon answers `Ok`, checkpoints its sessions, exits cleanly, and its
+    /// supervisor (privsep monitor / launchd / systemd) brings it back with a
+    /// freshly bound endpoint. Gated by the socket's operator group, which is
+    /// exactly the audience that needs it: the operator whose only path to
+    /// the host *was* hop. Appended last.
+    Restart,
 }
 
 /// Response from the daemon's datastore to a client.

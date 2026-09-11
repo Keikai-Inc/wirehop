@@ -137,7 +137,7 @@ async fn real_main() -> Result<()> {
             let secret_key = config::load_or_generate_identity(&config_dir)?;
             cmd_host(secret_key, &config_dir, quiet, relay, relay_port, reload_handle).await
         }
-        Command::Recover { quiet } => cmd_recover(quiet),
+        Command::Recover { quiet } => cmd_recover(quiet, cli.config.as_deref()),
         Command::Invite { action, creator, user, role, tier, max_uses, expiry, name, read_only, no_network, scopes, allow_commands, preset } => {
             let config_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             if let Some(action) = action {
@@ -467,6 +467,8 @@ enum DaemonRestart {
     Restarted,
     NotInstalled,
     NeedsRoot,
+    /// The daemon accepted a `Restart` request over its socket and is respawning.
+    RestartedViaSocket,
 }
 
 /// `hop recover`: clean up stale runtime state and restart the host daemon onto
@@ -477,7 +479,7 @@ enum DaemonRestart {
 /// restarts the host daemon so it rebinds the mux socket and client connects
 /// route through its single endpoint. Also invoked by install.sh after an
 /// upgrade, so installing == recovering.
-fn cmd_recover(quiet: bool) -> Result<()> {
+fn cmd_recover(quiet: bool, config_override: Option<&std::path::Path>) -> Result<()> {
     // 1. Kill stray client agents. The `[h]op` pattern matches the real process
     //    but NOT the pgrep/pkill cmdline itself (classic self-match guard).
     let mut killed = 0usize;
@@ -501,13 +503,26 @@ fn cmd_recover(quiet: bool) -> Result<()> {
         }
     }
 
-    // 3. Restart the host daemon onto the current binary (if installed).
-    let daemon = restart_host_daemon();
+    // 3. Restart the host daemon onto the current binary (if installed). Without
+    //    root, ask the running daemon to restart itself over its socket — the
+    //    socket is owned by the operator group, and an operator whose only
+    //    route to the host was hop has no other lever.
+    let daemon = match restart_host_daemon() {
+        DaemonRestart::NeedsRoot => match request_daemon_restart_via_socket(config_override) {
+            Ok(()) => DaemonRestart::RestartedViaSocket,
+            Err(e) => {
+                tracing::debug!("daemon socket restart unavailable: {e:#}");
+                DaemonRestart::NeedsRoot
+            }
+        },
+        other => other,
+    };
 
     if !quiet {
         let ver = env!("CARGO_PKG_VERSION");
         let daemon_msg = match daemon {
             DaemonRestart::Restarted => "daemon restarted",
+            DaemonRestart::RestartedViaSocket => "daemon asked to restart itself (over its socket, no root needed)",
             DaemonRestart::NotInstalled => "no host daemon installed",
             DaemonRestart::NeedsRoot => "daemon NOT restarted — re-run with `sudo hop recover`",
         };
@@ -515,6 +530,25 @@ fn cmd_recover(quiet: bool) -> Result<()> {
         println!("hop recovered (v{ver}) — cleared {killed} stale agent{plural}; {daemon_msg}");
     }
     Ok(())
+}
+
+/// Ask a running daemon to restart itself through its Unix socket (operator
+/// group, no root). An older daemon that predates `DsRequest::Restart` closes
+/// the connection without a reply, which surfaces here as an error.
+fn request_daemon_restart_via_socket(config_override: Option<&std::path::Path>) -> Result<()> {
+    use hop_core::datastore::protocol::{DsRequest, DsResponse};
+    use hop_core::datastore::socket::DaemonConnection;
+    // `--config DIR` targets a daemon serving that dir (tests, a second host on
+    // one machine); otherwise the installed system daemon.
+    let dir = config_override
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(config::system_config_dir);
+    let conn = DaemonConnection::connect(&dir).context("no daemon socket reachable")?;
+    match conn.request(&DsRequest::Restart).context("daemon did not answer the restart request")? {
+        DsResponse::Ok => Ok(()),
+        DsResponse::Error(e) => anyhow::bail!("daemon refused: {e}"),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -803,6 +837,18 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // crashes the interface watcher misses (the daemon's TCP session can stay
     // ESTABLISHED for hours after the relay link is functionally broken).
     let _relay_health = net::netmon::spawn_relay_health_watcher(endpoint.clone(), mux_flush);
+
+    // Self-restart channel: the operator (`hop recover` over the daemon socket,
+    // no root needed) and the inbound-liveness probe below both end the accept
+    // loop through it; the supervisor respawns a daemon with a fresh endpoint.
+    let (restart_tx, mut restart_rx) = mpsc::channel::<String>(1);
+    net::health::install_restart_handle(restart_tx);
+
+    // Inbound-liveness probe: periodically dial ourselves through the relay
+    // from a throwaway endpoint. The watchers above prove the relay is up; this
+    // proves *we* can be reached through it — the check that was missing when
+    // the host sat unreachable for an hour with every local signal green.
+    let _inbound_probe = net::health::spawn_inbound_probe(endpoint.clone(), public_key);
 
     // Network document (Phase 1): spawn the iroh-docs replication stack on its
     // own isolated endpoint and migrate existing peers/roles on first run. This
@@ -1461,6 +1507,11 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                     );
                 }
             }
+            Some(reason) = restart_rx.recv() => {
+                tracing::warn!("Restarting daemon: {reason}");
+                checkpoint_sessions_on_exit(&registry, config_dir).await;
+                break;
+            }
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM, shutting down gracefully");
                 checkpoint_sessions_on_exit(&registry, config_dir).await;
@@ -1510,6 +1561,23 @@ impl Drop for ConnCloseGuard<'_> {
 /// peers.json until then), and stays empty if netdoc init fails.
 type NetDocCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<hop_core::netdoc::NetDoc>>>;
 
+/// Budget for an inbound QUIC handshake. The client's own dial timeout is 10s
+/// (mux) to 30s; a handshake still pending after this is a client that gave
+/// up, and holding its state longer serves nobody.
+const QUIC_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// Budget from a completed QUIC handshake to a completed application
+/// handshake (first bi-stream + auth message). A well client does this in one
+/// round-trip. A client whose pooled connection keeps QUIC keepalives flowing
+/// but cannot deliver stream data sat in this window for 20 minutes on
+/// 2026-09-11, pinning a handler task and a `Connection` the whole time and
+/// never getting a session; closing it makes the client's next attempt re-dial.
+const APP_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
+/// First message on an additional bi-stream of an authenticated connection.
+const STREAM_FIRST_MESSAGE_DEADLINE: Duration = Duration::from_secs(30);
+/// A handshake slower than this names a host under load (swapped out, CPU
+/// starved) or a badly degraded path — log it so the episode is visible.
+const SLOW_HANDSHAKE: Duration = Duration::from_secs(1);
+
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     config_dir: &std::path::Path,
@@ -1519,8 +1587,44 @@ async fn handle_incoming(
     netdoc: NetDocCell,
 ) -> Result<()> {
     tracing::debug!("Awaiting QUIC handshake...");
-    let conn: iroh::endpoint::Connection = incoming.await?;
-    tracing::debug!("QUIC handshake complete from {}", conn.remote_id().fmt_short());
+    let started = std::time::Instant::now();
+    let conn: iroh::endpoint::Connection =
+        match tokio::time::timeout(QUIC_HANDSHAKE_DEADLINE, incoming).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                net::health::note_inbound_aborted();
+                return Err(e.into());
+            }
+            Err(_) => {
+                net::health::note_inbound_aborted();
+                tracing::warn!(
+                    "Inbound QUIC handshake still pending after {}s; dropping it",
+                    QUIC_HANDSHAKE_DEADLINE.as_secs()
+                );
+                return Ok(());
+            }
+        };
+    net::health::note_inbound_ok();
+    let handshake = started.elapsed();
+    if conn.alpn() == hop_core::proto::ALPN_PROBE {
+        // Our own liveness probe: the handshake was the whole point.
+        tracing::debug!("Inbound liveness probe answered ({} ms)", handshake.as_millis());
+        conn.close(0u32.into(), b"probe-ok");
+        return Ok(());
+    }
+    if handshake >= SLOW_HANDSHAKE {
+        tracing::warn!(
+            "Slow QUIC handshake from {}: {:.1}s (host under load or degraded path)",
+            conn.remote_id().fmt_short(),
+            handshake.as_secs_f64()
+        );
+    } else {
+        tracing::debug!(
+            "QUIC handshake complete from {} ({} ms)",
+            conn.remote_id().fmt_short(),
+            handshake.as_millis()
+        );
+    }
     let _close_guard = ConnCloseGuard { conn: &conn };
     handle_incoming_inner(&conn, config_dir, registry, datastore, ext_dispatcher, netdoc).await
 }
@@ -1537,20 +1641,45 @@ async fn handle_incoming_inner(
     let protocol_version = net::negotiated_protocol_version(conn);
     tracing::info!("Connection from: {} (protocol v{})", remote_id.fmt_short(), protocol_version);
 
-    // First bi-stream: full authentication
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    tracing::debug!("First bi-stream accepted from {}", remote_id.fmt_short());
-
-    let netdoc_ref = netdoc.get().map(|arc| arc.as_ref());
-    let (outcome, _first_msg) = auth::authenticate_client(
-        &mut send,
-        &mut recv,
-        &remote_id,
-        config_dir,
-        netdoc_ref,
-        protocol_version,
-    )
-    .await?;
+    // First bi-stream: full authentication — bounded (see APP_HANDSHAKE_DEADLINE).
+    let auth_started = std::time::Instant::now();
+    let authed = tokio::time::timeout(APP_HANDSHAKE_DEADLINE, async {
+        let (mut send, mut recv) = conn.accept_bi().await?;
+        tracing::debug!("First bi-stream accepted from {}", remote_id.fmt_short());
+        let netdoc_ref = netdoc.get().map(|arc| arc.as_ref());
+        let result = auth::authenticate_client(
+            &mut send,
+            &mut recv,
+            &remote_id,
+            config_dir,
+            netdoc_ref,
+            protocol_version,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((send, recv, result))
+    })
+    .await;
+    let (send, mut recv, (outcome, _first_msg)) = match authed {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            net::health::note_inbound_timed_out();
+            tracing::warn!(
+                "Peer {} completed the QUIC handshake but sent no auth within {}s; closing \
+                 (the client is probably reusing a pooled connection whose path is dead)",
+                remote_id.fmt_short(),
+                APP_HANDSHAKE_DEADLINE.as_secs()
+            );
+            return Ok(());
+        }
+    };
+    if auth_started.elapsed() >= SLOW_HANDSHAKE {
+        tracing::warn!(
+            "Slow auth handshake from {}: {:.1}s",
+            remote_id.fmt_short(),
+            auth_started.elapsed().as_secs_f64()
+        );
+    }
 
     tracing::debug!("Auth outcome for {}: {}",
         remote_id.fmt_short(),
@@ -1612,14 +1741,10 @@ async fn handle_incoming_inner(
 
     // Additional bi-streams: already authenticated (same QUIC connection = same peer).
     // This enables connection multiplexing — multiple sessions over one connection.
-    while let Ok((send, mut recv)) = conn.accept_bi().await {
-        let msg: ClientMessage = match proto::read_message(&mut recv).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::debug!("Failed to read message on multiplexed stream: {e:#}");
-                continue;
-            }
-        };
+    // The first message is read inside the per-stream task, with a deadline: a
+    // stream that opens and then says nothing must neither stall this accept
+    // loop (it used to be read inline) nor hold a task forever.
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let conn_c = conn.clone();
         let reg = registry.clone();
         let u = username.clone();
@@ -1631,6 +1756,34 @@ async fn handle_incoming_inner(
         let ext = ext_dispatcher.clone();
         let nd = netdoc.get().cloned();
         tokio::spawn(async move {
+            let msg: ClientMessage = match tokio::time::timeout(
+                STREAM_FIRST_MESSAGE_DEADLINE,
+                proto::read_message(&mut recv),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
+                    tracing::debug!("Failed to read message on multiplexed stream: {e:#}");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "Multiplexed stream from {} sent nothing in {}s; dropping it",
+                        &pid[..10.min(pid.len())],
+                        STREAM_FIRST_MESSAGE_DEADLINE.as_secs()
+                    );
+                    return;
+                }
+            };
+            // Liveness check from a client about to reuse this pooled connection
+            // (hop/4+): answer on the same stream and close it. Proves stream
+            // data flows both ways, which QUIC keepalives alone do not.
+            if matches!(msg, ClientMessage::Ping) {
+                let _ = proto::write_message(&mut send, &HostMessage::Pong).await;
+                let _ = send.finish();
+                return;
+            }
             if let Err(e) = dispatch_session(Some(msg), conn_c, send, recv, u.as_deref(), protocol_version, &pid, &r, &s, &cd, reg, ds, ext, nd).await {
                 tracing::error!("Session error: {e:#}");
             }
@@ -3166,9 +3319,9 @@ async fn cmd_connect(
 
     // Responsive initial connect: live spinner, instant q/Ctrl+C, bounded
     // per-attempt deadline, backoff, and wedged-agent self-heal.
-    let (first_send, first_recv) =
+    let (first_send, first_recv, first_session_id) =
         match reconnect::run_initial_connect(config_dir, &plan, &session_msg, &mut stdin_rx).await? {
-            reconnect::InitialConnectOutcome::Connected { send, recv } => (send, recv),
+            reconnect::InitialConnectOutcome::Connected { send, recv, session_id } => (send, recv, session_id),
             reconnect::InitialConnectOutcome::Quit => {
                 let _ = crossterm::terminal::disable_raw_mode();
                 return Ok(());
@@ -3196,9 +3349,14 @@ async fn cmd_connect(
     // paste interrupted by a reconnect is completed rather than stranded.
     let mut replay = shell::InputReplay::default();
 
-    // Run the first shell session
-    let (mut session_id, mut outcome) =
-        shell::client_session(first_send, first_recv, &mut stdin_rx, &mut replay, view_only).await?;
+    // Run the first shell session. The setup handshake (window size, env,
+    // SessionInfo) already happened inside run_initial_connect, under its
+    // deadline, so this is the same entry point the reconnect paths use.
+    let mut session_id = first_session_id;
+    let mut outcome = shell::client_shell_loop_resumed(
+        first_send, first_recv, &mut stdin_rx, &mut replay, Vec::new(), view_only,
+    )
+    .await?;
 
     // Anti-flapping state: track recent reconnections to detect rapid cycling
     let mut last_reconnect_time: Option<std::time::Instant> = None;

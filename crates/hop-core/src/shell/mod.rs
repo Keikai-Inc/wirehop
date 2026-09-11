@@ -1436,22 +1436,30 @@ pub async fn host_shell_session_persistent(
         }
     }
 
-    // Send SessionInfo to client
-    proto::write_message(
-        &mut send,
-        &HostMessage::SessionInfo {
-            session_id: session_id.clone(),
-            resumed,
-        },
-    )
-    .await?;
+    // From here until `run_attached_loop` takes over, the registry believes a
+    // client is attached. Every `?` in this window used to leave the session
+    // stuck `attached: true` with no attachment behind it — unreapable by the
+    // idle reaper and invisible to capacity eviction — so a client whose
+    // stream died right after (re)attaching (a routine event over months)
+    // leaked a live PTY, its shell tree and three parked blocking threads
+    // until the daemon restarted. Detach on any setup failure instead.
+    let setup: Result<()> = async {
+        // Send SessionInfo to client
+        proto::write_message(
+            &mut send,
+            &HostMessage::SessionInfo {
+                session_id: session_id.clone(),
+                resumed,
+            },
+        )
+        .await?;
 
-    tracing::info!(
-        "Shell session {} for peer {} (resumed: {})",
-        &session_id[..8],
-        peer_id,
-        resumed
-    );
+        tracing::info!(
+            "Shell session {} for peer {} (resumed: {})",
+            &session_id[..8],
+            peer_id,
+            resumed
+        );
 
     // Repaint on resume: render the current grid as bytes so the client
     // sees the present state — not whatever bytes happened to be in a
@@ -1540,6 +1548,19 @@ pub async fn host_shell_session_persistent(
         let _ = resize_tx.send(nudge_size);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let _ = resize_tx.send(initial_size);
+    }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = setup {
+        if registry.detach_if_current(session_id.clone(), attach_epoch).await {
+            tracing::info!(
+                "Session {} detached during setup for peer {} (client went away: {e:#})",
+                &session_id[..8],
+                peer_id
+            );
+        }
+        return Err(e);
     }
 
     // Run the attached I/O loop. `send` is moved in: the loop's writer task owns
@@ -1958,7 +1979,8 @@ where
                     }
                     Ok(HostMessage::AdminResponse(_))
                     | Ok(HostMessage::PeerResponse(_))
-                    | Ok(HostMessage::NetdocAuthorAck { .. }) => {
+                    | Ok(HostMessage::NetdocAuthorAck { .. })
+                    | Ok(HostMessage::Pong) => {
                         // Unexpected admin/peer response during shell session — ignore
                     }
                     Ok(HostMessage::SessionError(msg)) => {
@@ -2198,8 +2220,11 @@ pub async fn host_exec_session(
     // Drop the sender so output_rx closes when both stdout/stderr tasks finish
     drop(output_tx);
 
-    // Proxy client stdin to child stdin
-    if let Some(mut child_in) = child_stdin {
+    // Proxy client stdin to child stdin. Keep the handle: this task owns the
+    // QUIC recv stream and only ends when the client stops sending, so without
+    // an explicit abort it outlives the exec on a long-lived pooled connection
+    // (one parked task + open stream per exec, for the connection's lifetime).
+    let stdin_task = child_stdin.map(|mut child_in| {
         tokio::spawn(async move {
             while let Ok(ClientMessage::Input(data)) = proto::read_message::<ClientMessage>(&mut recv).await {
                 if child_in.write_all(&data).await.is_err() {
@@ -2208,8 +2233,8 @@ pub async fn host_exec_session(
                 let _ = child_in.flush().await;
             }
             // Drop child_in so the child sees EOF
-        });
-    }
+        })
+    });
 
     // Main loop: forward output, then wait for exit
     let compress = protocol_version >= 3;
@@ -2231,6 +2256,10 @@ pub async fn host_exec_session(
                 break;
             }
         }
+    }
+
+    if let Some(t) = stdin_task {
+        t.abort();
     }
 
     if clean_exit {

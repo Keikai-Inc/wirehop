@@ -53,7 +53,8 @@ The core library providing networking, authentication, protocol, file transfer, 
 | `fleet/` | Fleet membership, heartbeat, tagging |
 | `invite/mod.rs` | Invite token generation/verification (SHA-256 verifiers; post-auth grants) |
 | `net/mod.rs` | iroh endpoint creation, QUIC connection management |
-| `net/netmon.rs` | Network interface polling, reconnection triggers |
+| `net/netmon.rs` | Network interface polling, reconnection triggers (transient IPv6 addresses ignored) |
+| `net/health.rs` | Inbound handshake counters, the inbound liveness probe, the daemon self-restart channel (see [host-resilience.md](host-resilience.md)) |
 | `netdoc/mod.rs` | **Warren network document**: iroh-docs/gossip/blobs CRDT (on an isolated endpoint) holding membership, roles, revocations, virtual IPs, VPN endpoints, host tags, names; virtual-IP allocation, role→tag→ACL reach resolver, federation (DocTickets), MagicDNS |
 | `vpn/` | **Warren VPN data plane** (unix): TUN device (`100.64.0.0/10`, MTU 1280), ALPN `hop/vpn/1` over QUIC datagrams, `VpnInbound` handler, `role_reaches` ACL (`acl.rs`), DNS A-record codec (`dns.rs`), CGNAT-conflict guard |
 | `proto/mod.rs` | Wire protocol: message enums, frame encoding, ALPN versions |

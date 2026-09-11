@@ -240,7 +240,10 @@ async fn handle_connection(
             },
             _ => None,
         };
-        let resp = if let Some(op) = session_op {
+        let restart = matches!(req, DsRequest::Restart);
+        let resp = if restart {
+            DsResponse::Ok
+        } else if let Some(op) = session_op {
             use crate::proto::AdminResponse;
             use crate::shell::checkpoint;
             let r = match (&sessions, op) {
@@ -313,6 +316,18 @@ async fn handle_connection(
         stream.write_all(&resp_len).await?;
         stream.write_all(&resp_bytes).await?;
         stream.flush().await?;
+
+        // Only after the reply is on the wire: the caller sees `Ok` before the
+        // daemon goes away.
+        if restart {
+            let reason = "operator requested a restart over the daemon socket (hop recover)";
+            if crate::net::health::request_restart(reason) {
+                tracing::warn!("Restarting: {reason}");
+            } else {
+                tracing::warn!("Restart requested over the daemon socket but no restart handle is installed");
+            }
+            return Ok(());
+        }
     }
 }
 
@@ -391,6 +406,8 @@ fn dispatch_request(
         DsRequest::CronPurgeCorrupt => {
             DsResponse::StringList(ds.cron_purge_corrupt()?)
         }
+        // Handled in `handle_connection` (needs to reply before acting).
+        DsRequest::Restart => DsResponse::Ok,
         DsRequest::CronRuns { id, limit } => {
             DsResponse::CronRuns(ds.cron_runs(&id, limit as usize)?)
         }
