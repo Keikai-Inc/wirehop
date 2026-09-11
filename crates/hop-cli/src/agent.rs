@@ -130,6 +130,11 @@ enum AgentCommand {
         host_id: PublicKey,
         stable_id: usize,
     },
+    /// A pooled connection answered a `Ping`: refresh its verified timestamp.
+    NotePoolVerified {
+        host_id: PublicKey,
+        stable_id: usize,
+    },
     /// A multiplexed proxy session for `host_id` started.
     SessionStarted {
         host_id: PublicKey,
@@ -156,7 +161,7 @@ struct AgentHandle {
 
 impl AgentHandle {
     /// Request a connection and per-host semaphore for the given host. The
-    /// flag says whether it came from the pool (`true`) or was just dialed.
+    /// flag says whether the caller must still run the liveness check.
     async fn get_connection(
         &self,
         host_id: PublicKey,
@@ -188,6 +193,14 @@ impl AgentHandle {
         let _ = self
             .tx
             .send(AgentCommand::ForceRemoveConnection { host_id, stable_id })
+            .await;
+    }
+
+    /// Record that the pooled connection with this `stable_id` answered a ping.
+    async fn note_pool_verified(&self, host_id: PublicKey, stable_id: usize) {
+        let _ = self
+            .tx
+            .send(AgentCommand::NotePoolVerified { host_id, stable_id })
             .await;
     }
 
@@ -223,8 +236,10 @@ impl AgentHandle {
 }
 
 /// Reply type for GetConnection: a live connection + per-host semaphore +
-/// whether it was pooled (as opposed to freshly dialed for this request).
+/// whether it still needs a liveness check (pooled, and not verified within
+/// `POOL_VERIFY_WINDOW`). A freshly dialed connection never does.
 type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>, bool)>>;
+
 
 /// Mutable state owned exclusively by the actor task.
 struct AgentState {
@@ -237,6 +252,11 @@ struct AgentState {
     active: HashMap<PublicKey, usize>,
     /// In-flight connect waiters: queued reply channels for hosts being connected.
     pending: HashMap<PublicKey, Vec<ConnectReply>>,
+    /// When each host's pooled connection last proved it carries stream data:
+    /// the dial itself (a fresh handshake), or a `Ping`/`Pong` round-trip. A
+    /// cache hit inside `POOL_VERIFY_WINDOW` of that skips the ping, so a burst
+    /// of sessions reconnecting together runs one check, not one each.
+    verified: HashMap<PublicKey, Instant>,
     /// Self-sender for spawned connect tasks to send ConnectDone back.
     tx: mpsc::Sender<AgentCommand>,
     last_activity: Instant,
@@ -274,6 +294,7 @@ fn spawn_agent_actor(endpoint: Endpoint) -> AgentHandle {
         semaphores: HashMap::new(),
         active: HashMap::new(),
         pending: HashMap::new(),
+        verified: HashMap::new(),
         tx: tx.clone(),
         last_activity: Instant::now(),
     };
@@ -299,7 +320,12 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                             .entry(host_id)
                             .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
                             .clone();
-                        let _ = reply.send(Ok((conn.clone(), sem, true)));
+                        let needs_check = state
+                            .verified
+                            .get(&host_id)
+                            .map(|t| t.elapsed() >= POOL_VERIFY_WINDOW)
+                            .unwrap_or(true);
+                        let _ = reply.send(Ok((conn.clone(), sem, needs_check)));
                         continue;
                     }
                     // Dead connection — remove it
@@ -336,6 +362,8 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 match result {
                     Ok(conn) => {
                         state.connections.insert(host_id, conn.clone());
+                        // A completed handshake is proof enough for now.
+                        state.verified.insert(host_id, Instant::now());
                         tracing::debug!("actor: connect succeeded for {} (alpn: {}, pool size: {}, notifying {} waiters)",
                             host_id.fmt_short(),
                             std::str::from_utf8(conn.alpn()).unwrap_or("?"),
@@ -381,6 +409,17 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 }
             }
 
+            AgentCommand::NotePoolVerified { host_id, stable_id } => {
+                if state
+                    .connections
+                    .get(&host_id)
+                    .map(|c| c.stable_id() == stable_id)
+                    .unwrap_or(false)
+                {
+                    state.verified.insert(host_id, Instant::now());
+                }
+            }
+
             AgentCommand::ForceRemoveConnection { host_id, stable_id } => {
                 let matches = state
                     .connections
@@ -396,6 +435,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                         state.active.get(&host_id).copied().unwrap_or(0)
                     );
                     conn.close(0u32.into(), b"failed-liveness-check");
+                    state.verified.remove(&host_id);
                 }
             }
 
@@ -416,6 +456,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 // mid-connect keeps its own Arc. Dropping them here keeps the
                 // map from growing with every host ever dialed.
                 state.semaphores.clear();
+                state.verified.clear();
             }
 
             AgentCommand::TouchActivity => {
@@ -480,11 +521,20 @@ fn spawn_zombie_watchdog(conn: Connection, host_id: PublicKey) {
     });
 }
 
-/// Budget for the pooled-connection liveness check. One application-level
-/// round-trip on a healthy connection is tens of milliseconds even through
-/// the relay; a connection that cannot answer in this long is not going to
-/// carry a session either.
-const POOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for the pooled-connection liveness check. A dead connection never
+/// answers, so the only cost of a generous budget is how long the rare zombie
+/// case waits before re-dialing; a tight one turns every ordinary stall on a
+/// slow path into a teardown of every session on the connection. The first
+/// cut was 2s and did exactly that: on a path with multi-second stalls, each
+/// reconnect burst had one ping time out, evict the shared connection, drop
+/// every other session, and start the next burst.
+const POOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a fresh dial or a successful `Ping` vouches for a pooled
+/// connection. Sessions reconnecting together (a laptop waking, a network
+/// change) arrive within a second of each other; they must share one check
+/// rather than each open a ping stream on a connection that is still settling.
+/// See `AgentState::verified`.
+const POOL_VERIFY_WINDOW: Duration = Duration::from_secs(20);
 
 /// Prove a pooled connection can still carry stream data both ways: open a
 /// bi-stream, send `Ping`, expect `Pong` (hop/4+ hosts). `close_reason()` and
@@ -599,13 +649,14 @@ async fn handle_client(
     let (mut ipc_read, mut ipc_write) = ipc.into_split();
 
     // 3. Get connection + per-host semaphore, abort if IPC client disconnects.
-    //    A pooled connection is checked before it is handed out (hop/4+): if it
-    //    can't answer a ping it is force-evicted and the loop dials fresh —
-    //    at most once, since the second pass returns a freshly dialed one.
+    //    A pooled connection that has not proved itself recently is pinged
+    //    before it is handed out (hop/4+): if it can't answer, it is
+    //    force-evicted and the loop dials fresh — at most once, since the
+    //    second pass returns a freshly dialed (and therefore verified) one.
     tracing::debug!("handle_client: getting connection for {}", host_id.fmt_short());
     let relay_url = req.relay_url;
     let (conn, sem) = loop {
-        let (conn, sem, cached) = tokio::select! {
+        let (conn, sem, needs_check) = tokio::select! {
             result = handle.get_connection(host_id, relay_url.clone()) => {
                 match result {
                     Ok(triple) => {
@@ -626,10 +677,11 @@ async fn handle_client(
                 return Ok(());
             }
         };
-        if cached && conn.alpn() == hop_core::proto::ALPN_V4 {
+        if needs_check && conn.alpn() == hop_core::proto::ALPN_V4 {
             match check_pooled_liveness(&conn).await {
                 Ok(rtt) => {
                     tracing::debug!("handle_client: pooled connection to {} answered ping in {} ms", host_id.fmt_short(), rtt.as_millis());
+                    handle.note_pool_verified(host_id, conn.stable_id()).await;
                 }
                 Err(e) => {
                     tracing::info!(

@@ -101,7 +101,7 @@ restart.
 
 | Guard | Where | Behaviour |
 |---|---|---|
-| Pooled-connection liveness check | `agent.rs::check_pooled_liveness` | Before a *pooled* connection to a hop/4 host is handed to a session: open a bi-stream, send `ClientMessage::Ping`, expect `HostMessage::Pong` within 2 s. On failure the connection is force-evicted (live sessions or not, by `stable_id`, so a concurrent replacement is untouched) and the request dials fresh. |
+| Pooled-connection liveness check | `agent.rs::check_pooled_liveness` | Before a *pooled* connection to a hop/4 host is handed to a session, unless it was dialed or pinged successfully within the last 20 s: open a bi-stream, send `ClientMessage::Ping`, expect `HostMessage::Pong` within 8 s. On failure the connection is force-evicted (live sessions or not, by `stable_id`, so a concurrent replacement is untouched) and the request dials fresh. The first cut (2 s, a ping per session) turned every ordinary stall on a slow path into a teardown of every session, repeatedly; a dead connection never answers, so the deadline only sets how long the rare zombie case waits. |
 | Session-setup deadline | `reconnect.rs::run_initial_connect` | After the dial, the host has 10 s to answer the session request (`SessionInfo`). Silence or a stream error is a failed attempt: the next attempt dials with `evict_first`, dropping the pooled connection. The spinner says so. |
 | No silent fallthrough | `main.rs::cmd_connect` | The setup handshake now happens inside the connect loop, under its deadline; the interactive loop starts only with an answered session request. Previously a 5 s `SessionInfo` timeout was treated as "old host, continue". |
 
