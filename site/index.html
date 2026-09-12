@@ -324,6 +324,50 @@
     .install-note a { text-decoration: none; }
     .install-note a:hover { text-decoration: underline; }
 
+    /* --- Private network blurb -------------------------------------------------- */
+
+    .net { margin: 5.5rem 0 0; }
+
+    .net-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2.5rem;
+      align-items: center;
+      margin-top: 1.5rem;
+    }
+
+    .net-grid > * { min-width: 0; }
+
+    .net h2 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    .net .lede {
+      margin-top: 0.4rem;
+      font-size: 0.95rem;
+      color: var(--color-text-secondary);
+    }
+
+    .net p.body {
+      font-size: 0.925rem;
+      line-height: 1.6;
+      color: var(--color-text-secondary);
+    }
+
+    .net p.body + p.body { margin-top: 0.75rem; }
+
+    .net p.body code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      color: var(--color-accent-teal);
+    }
+
+    .net a { text-decoration: none; }
+    .net a:hover { text-decoration: underline; }
+
     /* --- Go further ------------------------------------------------------------ */
 
     .go { margin: 5.5rem 0 0; }
@@ -386,6 +430,7 @@
       .stp-label { padding-top: 0; }
       .cmdbox { font-size: 0.72rem; }
       .plans { grid-template-columns: 1fr; }
+      .net-grid { grid-template-columns: 1fr; gap: 1.25rem; }
       .lp-cta { flex-direction: column; align-items: stretch; }
       .lp-cta .btn { justify-content: center; }
     }
@@ -503,15 +548,37 @@ hop tunnel myserver 3000" onclick="copyCmd(this)"><svg width="16" height="16" vi
       </p>
     </section>
 
+    <!-- Private network -->
+    <section class="net" id="network">
+      <h2>Your own private network</h2>
+      <p class="lede">Every machine you invite is also on a VPN your machines run themselves. We call it a warren.</p>
+      <div class="net-grid">
+        <div>
+          <p class="body">Each machine gets a private address and a name like <code>myserver.hop</code>, reachable from anywhere by any other machine you invited. No coordination server, no port-forwarding, no config files. The tools you already use just work: screen-share into your desktop over VNC, ssh and scp by name, open a web UI on a box behind a home router.</p>
+          <p class="body">Bridge a printer, a NAS or a whole LAN through one machine that sits on it. <a href="private-network.html">How the private network works</a>.</p>
+        </div>
+        <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="open vnc://myserver.hop
+ssh myserver.hop
+scp report.pdf myserver.hop:~
+open http://myserver.hop:8080" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="comment"># screen-share into your desktop</span>
+<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span>
+
+<span class="comment"># the usual tools, by name</span>
+<span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">myserver.hop</span>
+<span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">myserver.hop</span>:~
+<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">http://myserver.hop:8080</span></div>
+      </div>
+    </section>
+
     <!-- Go further -->
     <section class="go" id="more">
       <h2>Go further</h2>
       <p class="lede">The same install, invite, connect. More machines, more hands.</p>
       <div class="plans">
-        <a class="plan" href="private-network.html">
-          <h3>Private network</h3>
-          <p>Every machine you invite answers by name from anywhere. Bridge a printer, a NAS or a whole LAN through one machine.</p>
-          <span class="go-link">ssh myserver.hop &rarr;</span>
+        <a class="plan" href="security.html">
+          <h3>Security</h3>
+          <p>Keys never leave your machines. Invites are single-use and time-limited, and every machine is default-deny until you hand one out.</p>
+          <span class="go-link">The threat model &rarr;</span>
         </a>
         <a class="plan" href="agents.html">
           <h3>AI agents</h3>
