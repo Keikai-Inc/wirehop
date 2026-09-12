@@ -2,11 +2,9 @@
   var REPO = 'https://github.com/Keikai-Inc/wirehop';
 
   var NAV_LINKS = [
-    { label: 'Features',     href: '#features',     cross: 'index.html#features' },
-    { label: 'Install',      href: '#install',      cross: 'index.html#install' },
-    { label: 'How It Works', href: '#how-it-works', cross: 'index.html#how-it-works' },
+    { label: 'Install',      href: 'install.html',  cross: 'install.html' },
+    { label: 'Private Network', href: 'private-network.html', cross: 'private-network.html' },
     { label: 'AI Agents',    href: 'agents.html',   cross: 'agents.html' },
-    { label: 'Private Network', href: '#private-network', cross: 'index.html#private-network' },
     { label: 'Fleet',        href: 'fleet.html',    cross: 'fleet.html' },
     { label: 'Automation',   href: 'orchestration.html', cross: 'orchestration.html' },
     { label: 'Security',     href: 'security.html', cross: 'security.html' },
@@ -15,7 +13,7 @@
   ];
 
   // Pages that get an "active" nav highlight, matched on a path substring.
-  var PAGE_MATCH = ['fleet', 'orchestration', 'agents', 'security', 'vs-tailscale', 'faq'];
+  var PAGE_MATCH = ['install', 'private-network', 'fleet', 'orchestration', 'agents', 'security', 'vs-tailscale', 'faq'];
 
   var path = location.pathname;
   var onIndex = path === '/' || path.endsWith('/index.html') || path.endsWith('/index') || /\/site\/?$/.test(path);
@@ -56,6 +54,13 @@
     footerEl.innerHTML =
       '<div class="footer-bottom">' +
         '<p class="footer-copy">&copy; 2026 <a href="https://keikai.ai">Keikai, Inc.</a> All rights reserved.</p>' +
+        '<p class="footer-links">' +
+          '<a href="install.html">Install</a>' +
+          '<a href="faq.html">FAQ</a>' +
+          '<a href="security.html">Security</a>' +
+          '<a href="https://github.com/Keikai-Inc/wirehop/tree/main/docs">Docs</a>' +
+          '<a href="' + REPO + '">Source</a>' +
+        '</p>' +
         '<p class="footer-tagline">\u201CThe world has changed. Security has to change with it.\u201D</p>' +
       '</div>';
   }

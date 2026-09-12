@@ -74,6 +74,24 @@ They do not know our vocabulary and they will not read carefully; they scan.
      anchors (`a.card`, `a.btn`, `a.nav-brand`) inherit instead of colouring
      their contents. If you add a new container-anchor pattern, add it there.
 
+## The landing page is the short version
+
+`index.html` is deliberately brief: hero, a terminal showing the product in use,
+five one-line features, the three install-and-use steps, and three links out.
+It should read in under a minute. Anything that explains *options*, *mechanism*,
+or *comparison* belongs on a secondary page, not the landing page:
+
+- install options, the command builder, platforms, verifying a download:
+  `install.html`
+- the private network, names, bridging a LAN, port forwarding:
+  `private-network.html`
+- the comparison table: `faq.html#compare`
+- AI agents: `agents.html`; fleet: `fleet.html`; scheduled work:
+  `orchestration.html`; threat model: `security.html`
+
+If a landing-page edit adds a paragraph, ask which secondary page it belongs on
+instead.
+
 ## Quick self-check before shipping a site change
 
 - Could a stranger read top-to-bottom and never hit a word they weren't just

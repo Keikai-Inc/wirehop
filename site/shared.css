@@ -466,6 +466,21 @@ footer {
 
 .footer-copy a:hover { text-decoration: underline; }
 
+.footer-links {
+  display: flex;
+  gap: 1.1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  font-size: 0.8rem;
+}
+
+.footer-links a {
+  color: var(--color-text-secondary);
+  text-decoration: none;
+}
+
+.footer-links a:hover { color: var(--color-text); }
+
 .footer-tagline {
   color: var(--color-text-tertiary);
   font-size: 0.75rem;
@@ -517,6 +532,7 @@ footer {
   .card { padding: 1.5rem; }
   .step { padding: 1.5rem 1rem; }
   .footer-bottom { flex-direction: column; text-align: center; }
+  .footer-links { justify-content: center; }
 }
 
 /* --- Feature checklists (used by index, fleet, orchestration) ------------- */

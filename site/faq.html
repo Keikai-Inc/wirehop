@@ -154,6 +154,56 @@
       .compat-k::before { content: "kernel "; }
       .compat-note { grid-column: 1 / -1; }
     }
+
+    /* --- At-a-glance comparison (moved here from the landing page) ------------ */
+
+    .comparison {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 1rem;
+      overflow: hidden;
+      margin-bottom: 3rem;
+    }
+
+    .comparison-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .comparison-row > * { min-width: 0; }
+    .comparison-row:last-child { border-bottom: none; }
+
+    .comparison-cell {
+      padding: 1rem 1.5rem;
+      font-size: 0.875rem;
+      border-right: 1px solid var(--color-border);
+      line-height: 1.55;
+    }
+
+    .comparison-cell:last-child { border-right: none; }
+
+    .comparison-header {
+      font-weight: 600;
+      font-family: var(--font-display);
+      color: var(--color-text);
+      background: var(--color-surface-elevated);
+    }
+
+    .comparison-cell.hop-col { color: var(--color-accent-green); font-weight: 500; }
+    .comparison-label { color: var(--color-text-secondary); }
+    .comparison-other { color: var(--color-text-tertiary); }
+
+    @media (max-width: 768px) {
+      .comparison-row { grid-template-columns: 1fr; }
+      .comparison-row.comparison-head { display: none; }
+      .comparison-cell { border-right: none; }
+      .comparison-label { font-weight: 600; color: var(--color-text); padding-bottom: 0.25rem; }
+      .comparison-cell.hop-col { padding-top: 0; padding-bottom: 0.25rem; }
+      .comparison-cell.hop-col::before { content: "WireHop: "; color: var(--color-text-tertiary); font-weight: 600; }
+      .comparison-other { padding-top: 0; }
+      .comparison-other::before { content: "Others: "; color: var(--color-text-tertiary); font-weight: 600; }
+    }
   </style>
 </head>
 <body>
@@ -550,6 +600,49 @@ openssl dgst -sha256 -verify wirehop-release.pub -signature hop-linux-x86_64.sig
         <p>Where other tools are the better answer.</p>
       </div>
 
+      <div class="comparison">
+        <div class="comparison-row comparison-head">
+          <div class="comparison-cell comparison-header"></div>
+          <div class="comparison-cell comparison-header" style="color: var(--color-link);">WireHop</div>
+          <div class="comparison-cell comparison-header">SSH / Tailscale / ngrok</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">What has to be up for it to work</div>
+          <div class="comparison-cell hop-col">Nothing of ours: no account, no coordination server. A relay only when NAT blocks a direct path, and you can run your own</div>
+          <div class="comparison-cell comparison-other">Tailscale needs its coordinator; ngrok its servers</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Third-party security audit</div>
+          <div class="comparison-cell hop-col">Not yet; the threat model and a standing self-audit are published</div>
+          <div class="comparison-cell comparison-other">Tailscale: yes, published</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Account required</div>
+          <div class="comparison-cell hop-col">No</div>
+          <div class="comparison-cell comparison-other">Tailscale, ngrok require accounts</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Setup</div>
+          <div class="comparison-cell hop-col">One command, under a minute</div>
+          <div class="comparison-cell comparison-other">VPN config, daemon, signup</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Works through NAT</div>
+          <div class="comparison-cell hop-col">Automatically, anywhere</div>
+          <div class="comparison-cell comparison-other">SSH needs port-forwarding</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Private network</div>
+          <div class="comparison-cell hop-col">Built in</div>
+          <div class="comparison-cell comparison-other">Tailscale only (separate tool)</div>
+        </div>
+        <div class="comparison-row">
+          <div class="comparison-cell comparison-label">Usable by AI agents</div>
+          <div class="comparison-cell hop-col">Yes: one skill, works today</div>
+          <div class="comparison-cell comparison-other">None</div>
+        </div>
+      </div>
+
       <div class="qa">
         <details>
           <summary>Should I use this instead of Tailscale?</summary>
@@ -610,7 +703,7 @@ openssl dgst -sha256 -verify wirehop-release.pub -signature hop-linux-x86_64.sig
         <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Open an issue and ask. If the question was worth asking, it belongs on this page.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="https://github.com/Keikai-Inc/wirehop/issues" class="btn btn-primary">Ask on GitHub</a>
-          <a href="index.html#install" class="btn btn-ghost">Install WireHop</a>
+          <a href="install.html" class="btn btn-ghost">Install WireHop</a>
         </div>
       </div>
     </div>
