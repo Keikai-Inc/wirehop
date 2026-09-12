@@ -891,7 +891,19 @@ pub async fn client_push_sync_transfer(
         summary.bytes_transferred = bytes;
         summary.bytes_saved = saved;
     } else {
-        let bytes = sender::send_files(send, local_dir, &files_only, progress, params).await?;
+        // Send in batches and drain acks between batches. Without draining
+        // during the send, a large tree deadlocks: the host acks every file
+        // inline, those acks fill the client's per-stream QUIC receive window
+        // (STREAM_RWND, ~1.25 MB — roughly 11-13k unread acks), the host then
+        // blocks writing the next ack and stops reading our file data, and both
+        // sides park until the helper's idle watchdog kills the session. This
+        // mirrors the batched drain already used by `client_push_copy`.
+        const SYNC_BATCH_SIZE: usize = 100;
+        let mut bytes = 0u64;
+        for batch in files_only.chunks(SYNC_BATCH_SIZE) {
+            bytes += sender::send_files(send, local_dir, batch, progress, params).await?;
+            drain_pending_acks(recv, progress, &mut summary.errors).await;
+        }
         summary.bytes_transferred = bytes;
     }
     summary.files_transferred = files_only.iter().filter(|e| !e.is_dir).count() as u64;
@@ -1544,6 +1556,188 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Host side of a sync-push, without a real `Connection` (the production
+    /// `host_sync_receive` takes one only for an unused parameter). Mirrors its
+    /// non-delta and delta branches so tests can drive a full sync roundtrip
+    /// over in-memory duplex streams.
+    async fn host_sync_receive_no_conn(
+        send: &mut (impl tokio::io::AsyncWrite + Unpin),
+        recv: &mut (impl tokio::io::AsyncRead + Unpin),
+        dest: &Path,
+        params: &NegotiatedParams,
+    ) {
+        let progress = progress::SilentProgress;
+
+        let dest_entries = if dest.is_dir() {
+            listing::walk_directory(dest).unwrap()
+        } else {
+            Vec::new()
+        };
+        write_file_list(send, dest_entries, params.chunked_listing())
+            .await
+            .unwrap();
+
+        let (files_to_send, _files_to_delete, dry_run) = read_transfer_plan(recv).await.unwrap();
+        assert!(!dry_run, "test does not exercise dry-run");
+        proto::write_message(send, &TransferMsg::PlanAck { proceed: true })
+            .await
+            .unwrap();
+
+        let delta_candidates: std::collections::HashSet<String> = files_to_send
+            .iter()
+            .filter(|f| {
+                !f.is_dir
+                    && !f.is_symlink
+                    && f.size >= proto::DELTA_MIN_FILE_SIZE
+                    && dest.join(&f.path).exists()
+                    && dest
+                        .join(&f.path)
+                        .metadata()
+                        .map(|m| m.len() >= proto::DELTA_MIN_FILE_SIZE)
+                        .unwrap_or(false)
+            })
+            .map(|f| f.path.clone())
+            .collect();
+
+        if delta_candidates.is_empty() {
+            receiver::receive_files(send, recv, dest, &progress, params)
+                .await
+                .unwrap();
+        } else {
+            receiver::receive_files_with_delta(
+                send,
+                recv,
+                dest,
+                &delta_candidates,
+                &files_to_send,
+                &progress,
+                params,
+            )
+            .await
+            .unwrap();
+        }
+        proto::write_message(send, &TransferMsg::Done).await.unwrap();
+    }
+
+    /// Run a full sync-push roundtrip over a deliberately small duplex so the
+    /// host's inline per-file acks fill the reverse buffer quickly. Wrapped in a
+    /// timeout: before the batched-drain / unbounded-reader fix this deadlocked
+    /// (the client sent every file before reading a single ack), so a regression
+    /// shows up as a timeout panic rather than a hang.
+    async fn sync_push_roundtrip(src: &Path, dst: &Path, params: NegotiatedParams) -> TransferSummary {
+        // 8 KiB each direction — far smaller than the acks a few thousand files
+        // produce, so an undrained reverse stream back-pressures within a
+        // fraction of the tree.
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let request = TransferRequest {
+            mode: TransferMode::Sync,
+            direction: TransferDirection::Push,
+            remote_path: dst.to_string_lossy().to_string(),
+            delete_extraneous: false,
+            dry_run: false,
+        };
+
+        let src = src.to_path_buf();
+        let params_c = params.clone();
+        let push = tokio::spawn(async move {
+            let progress = progress::SilentProgress;
+            client_push_sync(
+                &mut client_write,
+                &mut client_read,
+                &src,
+                &request,
+                &progress,
+                &params_c,
+            )
+            .await
+            .unwrap()
+        });
+
+        let dst = dst.to_path_buf();
+        let host = tokio::spawn(async move {
+            host_sync_receive_no_conn(&mut server_write, &mut server_read, &dst, &params).await;
+        });
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let summary = push.await.unwrap();
+            host.await.unwrap();
+            summary
+        })
+        .await;
+
+        joined.expect("sync push roundtrip deadlocked (regression) or timed out")
+    }
+
+    /// Regression: a large flat tree must not deadlock on the acks-fill-window
+    /// bug. ~2,500 files over an 8 KiB reverse buffer requires the client to
+    /// drain acks mid-send; the pre-fix single-shot send hung here.
+    #[tokio::test]
+    async fn sync_push_large_tree_no_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        const N: usize = 2500;
+        for i in 0..N {
+            std::fs::write(src.join(format!("f{i:05}.dat")), format!("body-{i}")).unwrap();
+        }
+
+        let summary = sync_push_roundtrip(&src, &dst, NegotiatedParams::legacy()).await;
+        assert_eq!(summary.files_transferred, N as u64);
+
+        let mut written = Vec::new();
+        collect_paths_recursive(&dst, &dst, &mut written);
+        assert_eq!(written.len(), N, "all files should land on dest");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("f01234.dat")).unwrap(),
+            "body-1234"
+        );
+    }
+
+    /// Regression: the delta path must not deadlock either. A handful of large
+    /// files present on both sides (delta candidates) followed by many small new
+    /// files exercises the reverse-stream reader after the last delta candidate,
+    /// where the pre-fix bounded(64) channel wedged once trailing acks piled up.
+    #[tokio::test]
+    async fn sync_push_delta_then_many_small_no_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        // Large files (>= DELTA_MIN_FILE_SIZE) present on both sides, changed on
+        // src → delta candidates. Names sort before the small files so the small
+        // ones stream after the last delta candidate.
+        let big = (proto::DELTA_MIN_FILE_SIZE as usize) + 4096;
+        for i in 0..3 {
+            let name = format!("a-big-{i}.bin");
+            std::fs::write(dst.join(&name), vec![b'x'; big]).unwrap();
+            let mut v = vec![b'x'; big];
+            v[big / 2] = b'y'; // small change so it is a delta candidate, not skipped
+            std::fs::write(src.join(&name), v).unwrap();
+        }
+
+        const SMALL: usize = 1500;
+        for i in 0..SMALL {
+            std::fs::write(src.join(format!("z-small-{i:05}.txt")), format!("s{i}")).unwrap();
+        }
+
+        let summary = sync_push_roundtrip(&src, &dst, NegotiatedParams::legacy()).await;
+        assert_eq!(summary.files_transferred, (SMALL + 3) as u64);
+
+        assert_eq!(std::fs::read_to_string(dst.join("z-small-00042.txt")).unwrap(), "s42");
+        // The changed big file reconstructed correctly on the receiver.
+        let got = std::fs::read(dst.join("a-big-0.bin")).unwrap();
+        assert_eq!(got.len(), big);
+        assert_eq!(got[big / 2], b'y');
     }
 
     #[tokio::test]

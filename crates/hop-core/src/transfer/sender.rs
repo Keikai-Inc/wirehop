@@ -400,11 +400,13 @@ pub async fn send_files_with_delta(
     // The reader_fut below pulls messages off `recv` as fast as iroh
     // delivers them, so the receiver's side is never throttled by our
     // disk pace. The main loop reads from `sig_rx` instead of `recv`
-    // directly. Channel capacity caps memory growth on a fast receiver
-    // / slow sender — once 64 sigs are buffered the reader awaits, but
-    // by that point the main loop has plenty to chew on without anyone
-    // stalling at the QUIC layer.
-    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<TransferMsg>(64);
+    // directly. The channel is unbounded so the reader never has to stop
+    // reading `recv` to wait for the main loop — if it did, the receiver's
+    // inline FileAcks would back up into the QUIC stream window and
+    // deadlock the transfer. FileAcks are drained here (not buffered),
+    // so only BlockSignatures accumulate, and only until the main loop
+    // reaches each delta candidate.
+    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMsg>();
     let reader_stop = std::sync::Arc::new(tokio::sync::Notify::new());
 
     let reader_fut = {
@@ -416,8 +418,35 @@ pub async fn send_files_with_delta(
                     res = proto::read_message::<TransferMsg>(recv) => {
                         match res {
                             Ok(msg) => {
-                                if sig_tx.send(msg).await.is_err() {
-                                    break;
+                                // Drain FileAcks straight to the progress
+                                // reporter; forward everything else (the
+                                // BlockSignatures the main loop needs) to the
+                                // channel. The reader must NEVER stop pulling
+                                // from `recv` — if acks accumulated unread they
+                                // would back up into the QUIC stream window, the
+                                // receiver would block writing the next ack, stop
+                                // reading our file data, and the transfer would
+                                // deadlock.
+                                match msg {
+                                    TransferMsg::FileAck {
+                                        path,
+                                        success,
+                                        error,
+                                    } => {
+                                        if success {
+                                            progress.file_confirmed(&path);
+                                        } else {
+                                            progress.file_error(
+                                                &path,
+                                                error.as_deref().unwrap_or("unknown error"),
+                                            );
+                                        }
+                                    }
+                                    other => {
+                                        if sig_tx.send(other).is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Err(_e) => {

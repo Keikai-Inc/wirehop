@@ -91,6 +91,33 @@ run of compressed `FileListChunk` / `TransferPlanChunk` messages, the final one
 carrying `last: true`. An empty listing still sends exactly one terminating
 chunk — otherwise the reader would block waiting for `last`.
 
+## Back-pressure: draining acks mid-send
+
+The host acks every file **inline** as it lands (`receiver::receive_files` →
+`send_ack`). The client therefore MUST read that reverse stream *while* it is
+still sending, not only after. If it does not, the host's un-read `FileAck`s
+accumulate in the client's per-stream QUIC receive window
+(`STREAM_RWND` in `net/mod.rs`, ~1.25 MB ≈ 11–13k acks); once it fills, the host
+blocks writing the next ack, stops reading file data, and both sides park until
+the helper's 600 s idle watchdog kills the session. This is a silent hang, not
+an error — the client just freezes partway through a large tree.
+
+Every push path guards against this the same way:
+
+| Path | Guard |
+|---|---|
+| `client_push_copy` (copy push) | send in `BATCH_SIZE` (100) chunks, `drain_pending_acks` between batches |
+| `client_push_sync_transfer`, non-delta | same batched send + `drain_pending_acks` |
+| `client_push_sync_transfer`, delta (`send_files_with_delta`) | a reader task pulls `recv` continuously into an **unbounded** channel; it forwards `BlockSignatures` to the main loop and drains `FileAck`s straight to the progress reporter, so it never has to stop reading |
+
+The delta reader's channel is unbounded on purpose: a bounded one lets the reader
+block once the main loop is busy sending a large file, which reintroduces the
+same deadlock a burst of trailing acks (or up-front signatures) can trigger.
+
+Regression coverage: `sync_push_large_tree_no_deadlock` and
+`sync_push_delta_then_many_small_no_deadlock` in `transfer/mod.rs` run a full
+roundtrip over an 8 KiB duplex and fail (via timeout) if either guard regresses.
+
 ## Delta Algorithm
 
 Implemented in `crates/hop-core/src/transfer/delta.rs`. An rsync-style block-matching algorithm that minimizes data transfer for files that have partially changed.
@@ -302,4 +329,4 @@ pub fn hash_file_content(path: &Path) -> Result<u64>
 
 Uses xxHash3-64 in streaming mode (64 KiB read buffer) to hash file contents without loading the entire file into memory. The hash is stored in `FileEntry.content_hash` for sync comparison.
 
-*Last updated: v0.6.33*
+*Last updated: v0.9.40*
