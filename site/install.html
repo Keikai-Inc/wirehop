@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Install WireHop</title>
-  <meta name="description" content="One command to download, verify, and install WireHop on macOS or Linux. Build the exact install command for a laptop or a machine you want to reach, or fetch signed binaries from GitHub Releases or npm.">
+  <meta name="description" content="One command downloads the right binary for macOS or Linux, checks its signature, and puts hop on your path. Build the exact command for a laptop or a machine you want to reach, or fetch signed binaries by hand.">
   <link rel="canonical" href="https://wirehop.org/install.html">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
@@ -14,112 +14,13 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
   <style>
-    /* --- Install page overrides ---------------------------------------------- */
+    /* --- Install command builder (this page only) --------------------------- */
 
-    .hero { padding-bottom: 3rem; }
+    .builder { display: flex; flex-direction: column; gap: 0.85rem; margin-top: 1rem; }
+    .builder-row { display: flex; flex-direction: column; gap: 0.4rem; }
+    .builder-row > label { font-size: 0.8rem; color: var(--color-text-secondary); font-weight: 600; }
+    .builder .hint-tag { font-size: 0.7rem; color: var(--color-text-tertiary); font-weight: 400; margin-left: 0.4rem; }
 
-    .install-cmd {
-      width: 100%;
-      background: var(--color-surface);
-      border: 1px solid var(--color-border);
-      border-radius: 0.75rem;
-      padding: 1rem 1.25rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      transition: border-color 150ms;
-      cursor: pointer;
-    }
-
-    .install-cmd:hover { border-color: var(--color-border-hover); }
-
-    .install-cmd code {
-      font-family: var(--font-mono);
-      font-size: 0.875rem;
-      color: var(--color-text-secondary);
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-
-    .install-cmd code .prompt { color: var(--color-accent-green); }
-
-    .copy-btn {
-      background: none;
-      border: none;
-      color: var(--color-text-tertiary);
-      cursor: pointer;
-      padding: 0.25rem;
-      border-radius: 0.25rem;
-      transition: color 150ms;
-      flex-shrink: 0;
-    }
-
-    .copy-btn:hover { color: var(--color-text); }
-
-    .prose {
-      color: var(--color-text-secondary);
-      max-width: 46rem;
-      line-height: 1.8;
-    }
-
-    .prose code, .builder-hint code {
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      color: var(--color-accent-teal);
-    }
-
-    .prose a { text-decoration: none; }
-    .prose a:hover { text-decoration: underline; }
-
-    .platform-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }
-
-    .platform {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 1rem 1.25rem;
-    }
-
-    .platform-name { font-weight: 600; font-size: 0.9rem; }
-    .platform-arch { color: var(--color-text-tertiary); font-size: 0.8rem; }
-    .platform-emoji { font-size: 1.25rem; }
-
-    .subhead {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.25rem;
-      margin-bottom: 1rem;
-    }
-
-    /* --- Install command builder -------------------------------------------- */
-
-    .builder {
-      display: flex;
-      flex-direction: column;
-      gap: 0.85rem;
-      margin-top: 1rem;
-    }
-    .builder-row {
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-    .builder-row > label {
-      font-size: 0.8rem;
-      color: var(--color-text-secondary);
-      font-weight: 600;
-    }
-    .builder .hint-tag {
-      font-size: 0.7rem;
-      color: var(--color-text-tertiary);
-      font-weight: 400;
-      margin-left: 0.4rem;
-    }
     .seg {
       display: inline-flex;
       background: var(--color-bg);
@@ -140,14 +41,10 @@
       cursor: pointer;
       transition: background 150ms, color 150ms;
     }
-    .seg button.active {
-      background: var(--color-accent-teal);
-      color: #06201d;
-      font-weight: 600;
-    }
+    .seg button.active { background: var(--color-text); color: var(--color-bg); font-weight: 600; }
     .seg button:not(.active):hover { color: var(--color-text); }
-    .builder input[type="text"],
-    .builder select {
+
+    .builder input[type="text"], .builder select {
       font-family: var(--font-mono);
       font-size: 0.85rem;
       color: var(--color-text);
@@ -158,141 +55,57 @@
       width: 100%;
       transition: border-color 150ms;
     }
-    .builder input[type="text"]:focus,
-    .builder select:focus {
-      outline: none;
-      border-color: var(--color-accent-teal);
-    }
+    .builder input[type="text"]:focus, .builder select:focus { outline: none; border-color: var(--color-border-hover); }
 
-    .builder-advanced summary {
-      cursor: pointer;
-      font-size: 0.85rem;
-      color: var(--color-text-secondary);
-      padding: 0.4rem 0;
-      user-select: none;
-    }
-
-    .invite-preview {
-      margin: 0;
-      font-size: 0.82rem;
-      color: var(--color-accent-teal);
-    }
-
-    .builder-hint {
-      color: var(--color-text-tertiary);
-      font-size: 0.8rem;
-      margin-top: 0.75rem;
-      line-height: 1.6;
-    }
-
-    .verify-list {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-      margin-top: 1.25rem;
-    }
-
-    .verify-list li {
-      position: relative;
-      padding-left: 1.5rem;
-      color: var(--color-text-secondary);
-      font-size: 0.9rem;
-      line-height: 1.6;
-    }
-
-    .verify-list li::before {
-      content: "\2713";
-      position: absolute;
-      left: 0;
-      color: var(--color-accent-green);
-      font-weight: 700;
-    }
-
-    .verify-list a { text-decoration: none; }
-    .verify-list a:hover { text-decoration: underline; }
-
-    .verify-list code {
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      color: var(--color-accent-teal);
-    }
-
-    @media (max-width: 768px) {
-      .install-cmd { padding: 0.75rem 1rem; }
-      .install-cmd code { font-size: 0.75rem; }
-    }
+    .builder-advanced summary { cursor: pointer; font-size: 0.85rem; color: var(--color-text-secondary); padding: 0.4rem 0; user-select: none; }
+    .invite-preview { margin: 0; font-size: 0.82rem; color: var(--color-accent-teal); }
+    .builder-hint { margin-top: 0.75rem; }
   </style>
 </head>
 <body>
 
-  <!-- Nav -->
   <nav id="site-nav"></nav>
 
-  <!-- Hero -->
-  <div class="hero">
-    <div class="badge"><span class="dot"></span> Install</div>
-    <h1>One command,<br><span class="gradient">under a minute</span></h1>
-    <p>The installer downloads the right binary for your machine, checks its signature, and puts a single <code style="font-family: var(--font-mono); font-size: 0.9em; color: var(--color-accent-teal);">hop</code> on your path. No account, nothing to configure.</p>
-    <div class="hero-actions">
-      <a href="#builder" class="btn btn-primary">Build your command</a>
-      <a href="#verify" class="btn btn-ghost">Verify a download</a>
-    </div>
-  </div>
+  <div class="wrap">
 
-  <!-- Two kinds of install -->
-  <section id="which" style="padding-top: 2rem;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Two kinds of machine</h2>
-        <p>The same script installs both. One flag decides which.</p>
-      </div>
+    <header class="page-head">
+      <h1>Install</h1>
+      <p class="sub">One command downloads the right binary, checks its signature, and puts <code>hop</code> on your path. No account, nothing to configure.</p>
+      <div class="meta">macOS (Apple Silicon and Intel) &middot; Linux (x86_64, ARM64, ARMv7) &middot; about 5 MB</div>
+    </header>
 
-      <div class="grid grid-2">
-        <div class="card card-teal">
-          <h3>Your laptop: a client</h3>
-          <div class="install-cmd" onclick="copyText('curl -fsSL https://wirehop.org/install.sh | bash', 'copy-client')" style="margin-bottom: 1rem;">
-            <code><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-client">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            </button>
+    <section class="sec" id="which">
+      <h2>Two kinds of machine</h2>
+      <p class="lede">The same script installs both. One flag decides which.</p>
+
+      <div class="step-list">
+        <div class="stp">
+          <div class="stp-label">
+            <h3>Your laptop: a client</h3>
+            <p>Reaches the machines you are invited to. No sudo, no background service.</p>
           </div>
-          <p>Reaches the machines you are invited to. No sudo, no background service, no network interface. This is all a laptop needs to shell in, run commands and copy files.</p>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash</div>
         </div>
-
-        <div class="card card-amber">
-          <h3>A machine you want to reach: a host</h3>
-          <div class="install-cmd" onclick="copyText('curl -fsSL https://wirehop.org/install.sh | bash -s -- --host', 'copy-host')" style="margin-bottom: 1rem;">
-            <code><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash -s -- --host</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-host">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            </button>
+        <div class="stp">
+          <div class="stp-label">
+            <h3>A machine you want to reach: a host</h3>
+            <p>An always-on service (needs sudo), reachable across reboots, with a name like <code>myserver.hop</code>.</p>
           </div>
-          <p>Installs an always-on service (needs sudo) so the machine stays reachable across reboots, and puts it on your <a href="private-network.html">private network</a> with a name like <code style="font-family: var(--font-mono); font-size: 0.85em; color: var(--color-accent-teal);">myserver.hop</code>. Run <code style="font-family: var(--font-mono); font-size: 0.85em; color: var(--color-accent-teal);">hop invite</code> on it afterwards to let a machine in.</p>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
+hop invite" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash -s -- <span class="flag">--host</span>
+<span class="prompt">$</span> <span class="cmd">hop invite</span>                <span class="comment"># then let a machine in</span></div>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Builder -->
-  <section id="builder" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Build your install command</h2>
-        <p>Paste an invite and the command joins that machine's network on first run.</p>
-      </div>
+    <section class="sec" id="builder">
+      <h2>Build your command</h2>
+      <p class="lede">Paste an invite and the command joins that machine's network on first run.</p>
 
-      <div class="grid grid-2">
+      <div class="cols cols-top">
         <div>
-          <!-- Composed command -->
-          <div class="install-cmd" onclick="copyText(cmds['install-builder'], 'copy-install-builder')" style="align-items: flex-start;">
-            <code id="builder-cmd"><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash</code>
-            <button class="copy-btn" title="Copy to clipboard" id="copy-install-builder">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            </button>
-          </div>
+          <div class="cmdbox cmdbox-wrap" id="builder-box"><button class="copy-btn" title="Copy" id="copy-builder" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash" onclick="copyCmd(this)"></button><span id="builder-cmd"><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash</span></div>
 
-          <!-- Controls -->
           <div class="builder" oninput="buildInstallCmd()" onchange="buildInstallCmd()">
             <div class="builder-row">
               <label>This machine is&hellip;</label>
@@ -306,10 +119,9 @@
               <input id="b-invite" type="text" placeholder="paste invite token" autocomplete="off" spellcheck="false">
             </div>
             <div class="builder-row" id="invite-preview-row" style="display: none;">
-              <label></label>
               <p id="invite-preview" class="invite-preview"></p>
             </div>
-            <details class="builder-advanced" id="builder-advanced" style="margin-top: 0.5rem;">
+            <details class="builder-advanced" id="builder-advanced">
               <summary>Advanced options</summary>
               <div class="builder-row" style="margin-top: 0.75rem;">
                 <label>Private network <span class="hint-tag">on by default</span></label>
@@ -332,104 +144,69 @@
               </div>
             </details>
           </div>
-
-          <p id="builder-hint" class="builder-hint">
-            <strong>Client:</strong> reach hosts you're invited to, no sudo, no daemon, no private network. Join the network later with <code>hop connect &lt;invite&gt;</code>.
-          </p>
+          <p id="builder-hint" class="note builder-hint"><strong>Client:</strong> reach hosts you're invited to, no sudo, no daemon. Join the network later with <code>hop connect &lt;invite&gt;</code>.</p>
         </div>
 
-        <div>
-          <h3 class="subhead">Supported platforms</h3>
-          <div class="platform-list">
-            <div class="card platform">
-              <span class="platform-emoji">&#128187;</span>
-              <div>
-                <div class="platform-name">macOS</div>
-                <div class="platform-arch">Apple Silicon (arm64) &amp; Intel (x86_64)</div>
-              </div>
-            </div>
-            <div class="card platform">
-              <span class="platform-emoji">&#128039;</span>
-              <div>
-                <div class="platform-name">Linux</div>
-                <div class="platform-arch">x86_64, ARM64 &amp; ARMv7</div>
-              </div>
-            </div>
-            <div class="card platform">
-              <span class="platform-emoji">&#129513;</span>
-              <div>
-                <div class="platform-name">Windows</div>
-                <div class="platform-arch">As a client under WSL today. A native client is planned; a Windows host is not yet.</div>
-              </div>
-            </div>
+        <div class="rows">
+          <div class="row">
+            <h3>macOS</h3>
+            <p>Apple Silicon and Intel. Also available as a signed and notarized <code>.pkg</code>.</p>
+          </div>
+          <div class="row">
+            <h3>Linux</h3>
+            <p>x86_64, ARM64 and ARMv7. Static binaries, so the age of your distribution does not matter; the only floor is kernel 2.6.27. <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/overview.md#supported-platforms">Tested distributions</a>.</p>
+          </div>
+          <div class="row">
+            <h3>Windows</h3>
+            <p>As a client under WSL today. A native client is planned; a Windows host is not yet.</p>
           </div>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Other ways to install -->
-  <section id="verify" style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Prefer not to pipe a script into your shell?</h2>
-        <p>Every release is also published as plain, signed files.</p>
-      </div>
+    <section class="sec" id="verify">
+      <h2>Prefer not to pipe a script into your shell?</h2>
+      <p class="lede">Every release is also published as plain, signed files.</p>
 
-      <div class="grid grid-2" style="align-items: start;">
-        <div class="card card-green">
-          <h3>Where else to get it</h3>
-          <ul class="verify-list">
-            <li><a href="https://github.com/Keikai-Inc/wirehop/releases">GitHub Releases</a>: a plain binary per platform, with a <code>.sha256</code> and an RSA <code>.sig</code> beside each one.</li>
-            <li>A signed and notarized macOS <code>.pkg</code> on the same release.</li>
-            <li>npm: <code>npx -y @wirehop/wirehop</code>, which is also how AI tools usually run it.</li>
-          </ul>
+      <div class="rows">
+        <div class="row">
+          <h3>GitHub Releases</h3>
+          <p>A plain binary per platform, with a <code>.sha256</code> and an RSA <code>.sig</code> beside each one, plus the macOS <code>.pkg</code>. <a href="https://github.com/Keikai-Inc/wirehop/releases">Latest release</a>.</p>
         </div>
-
-        <div class="card card-teal">
-          <h3>Check a download by hand</h3>
-          <p style="margin-bottom: 1rem;">The installer verifies every download against the release key before it runs anything. To do the same yourself, the key is <a href="wirehop-release.pub">wirehop-release.pub</a>.</p>
-          <div class="code-block">
-            <div class="code-body" style="padding: 1rem 1.25rem; font-size: 0.78rem;">
-<span class="prompt">$</span> <span class="cmd">shasum</span> <span class="flag">-a 256 -c</span> hop-*.sha256
-<span class="prompt">$</span> <span class="cmd">openssl dgst</span> <span class="flag">-sha256 -verify</span> wirehop-release.pub \
-    <span class="flag">-signature</span> hop-*.sig hop-*
-            </div>
-          </div>
-          <p style="margin-top: 1rem;">The <a href="faq.html#verify">FAQ walks through it step by step</a>.</p>
+        <div class="row">
+          <h3>npm</h3>
+          <p><code>npx -y @wirehop/wirehop</code> downloads the same signed binary and verifies it before installing. This is also how AI tools usually run it.</p>
+        </div>
+        <div class="row">
+          <h3>Check it yourself</h3>
+          <p>The installer verifies every download against the release key before it runs anything. The key is <a href="wirehop-release.pub">wirehop-release.pub</a>; the same key is embedded in the install script.</p>
         </div>
       </div>
 
-      <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 3rem; justify-content: center;">
-        <a href="index.html#install" class="btn btn-primary">Back to the three steps</a>
-        <a href="faq.html#install" class="btn btn-ghost">Install questions in the FAQ</a>
-      </div>
-    </div>
-  </section>
+      <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64
+curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64.sig
+curl -fsSLO https://wirehop.org/wirehop-release.pub
+openssl dgst -sha256 -verify wirehop-release.pub -signature hop-linux-x86_64.sig hop-linux-x86_64" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64
+<span class="prompt">$</span> curl -fsSLO https://github.com/Keikai-Inc/wirehop/releases/latest/download/hop-linux-x86_64.sig
+<span class="prompt">$</span> curl -fsSLO https://wirehop.org/wirehop-release.pub
+<span class="prompt">$</span> <span class="cmd">openssl dgst</span> <span class="flag">-sha256 -verify</span> wirehop-release.pub <span class="flag">-signature</span> hop-linux-x86_64.sig hop-linux-x86_64
+<span class="output">Verified OK</span></div>
 
-  <!-- Footer -->
+      <div class="cta">
+        <a href="index.html#install" class="btn btn-solid">Back to the three steps</a>
+        <a href="faq.html#install" class="btn btn-ghost">Install questions</a>
+      </div>
+    </section>
+
+    <div class="spacer"></div>
+  </div>
+
   <footer id="site-footer"></footer>
 
   <script src="shared.js"></script>
   <script>
-    var cmds = {
-      'install-builder': 'curl -fsSL https://wirehop.org/install.sh | bash',
-    };
-
-    var COPY_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-    var DONE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';
-
-    function copyText(text, btnId) {
-      navigator.clipboard.writeText(text).then(function () {
-        var btn = document.getElementById(btnId);
-        btn.innerHTML = DONE_ICON;
-        setTimeout(function () { btn.innerHTML = COPY_ICON; }, 2000);
-      });
-    }
-
     /* --- Interactive install command builder ------------------------------- */
 
-    // Segmented controls: one active button per group.
     document.querySelectorAll('.seg').forEach(function (seg) {
       seg.addEventListener('click', function (e) {
         var btn = e.target.closest('button');
@@ -475,7 +252,6 @@
         }
         prev.innerHTML = msg;
         prevRow.style.display = '';
-        // A network-bearing invite implies the host tier; reflect it in the toggle.
         if (t !== 'client' && mode !== 'node') {
           var nodeBtn = document.querySelector('#seg-mode button[data-val="node"]');
           var clientBtn = document.querySelector('#seg-mode button[data-val="client"]');
@@ -489,9 +265,6 @@
         prevRow.style.display = 'none';
       }
 
-      // The advanced (host-only) options are hidden for the client tier. They
-      // live in a collapsed "Advanced options" expander that only appears once
-      // this machine is going to be reached.
       var adv = document.getElementById('builder-advanced');
       if (adv) {
         adv.style.display = isNode ? '' : 'none';
@@ -505,19 +278,17 @@
       if (isNode && tags) flags.push('--tag ' + shellQuote(tags));
       if (isNode && role && role !== 'member') flags.push('--default-role ' + role);
 
-      // Always one script, install.sh. --host opts into the always-on tier.
       var cmd = 'curl -fsSL https://wirehop.org/install.sh | bash';
       if (flags.length) cmd += ' -s -- ' + flags.join(' ');
 
-      cmds['install-builder'] = cmd;
-      var code = document.getElementById('builder-cmd');
-      if (code) code.innerHTML = '<span class="prompt">$</span> ' + escapeHtml(cmd);
+      document.getElementById('copy-builder').setAttribute('data-cmd', cmd);
+      document.getElementById('builder-cmd').innerHTML = '<span class="prompt">$</span> ' + escapeHtml(cmd);
 
       var hint = document.getElementById('builder-hint');
       if (hint) {
         hint.innerHTML = isNode
           ? "<strong>Going to be reached:</strong> an always-on service (sudo), a private address and a <code>name.hop</code> name, role-based reach. The private network is on by default (switch it Off for <code>--no-vpn</code>) and fail-safe. Nobody can reach the machine until you hand out invites."
-          : "<strong>Client:</strong> reach hosts you're invited to, no sudo, no daemon, no private network. Join the network later with <code>hop connect &lt;invite&gt;</code>.";
+          : "<strong>Client:</strong> reach hosts you're invited to, no sudo, no daemon. Join the network later with <code>hop connect &lt;invite&gt;</code>.";
       }
     }
 
@@ -533,8 +304,7 @@
       return null;
     }
 
-    // The invite's effective tier, mirroring InviteToken::effective_tier:
-    // an explicit `tier` wins; otherwise infer from legacy fields.
+    // The invite's effective tier, mirroring InviteToken::effective_tier.
     function inviteTier(inv) {
       if (inv.tier) return inv.tier;                 // client | warren_only | node | admin
       var isAdmin = inv.role === 'creator' || inv.role_name === 'admin';
@@ -542,7 +312,6 @@
       return 'client';
     }
 
-    // Quote a value for the shell if it contains spaces or shell-special chars.
     function shellQuote(v) {
       if (/^[A-Za-z0-9_,.:\/@%+=-]+$/.test(v)) return v;
       return "'" + v.replace(/'/g, "'\\''") + "'";
@@ -554,6 +323,5 @@
 
     document.addEventListener('DOMContentLoaded', buildInstallCmd);
   </script>
-
 </body>
 </html>

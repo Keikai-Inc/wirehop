@@ -13,442 +13,18 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
-  <style>
-    /* --- Landing page: one narrow column, lots of air --------------------- */
-
-    body { background-image: none; }
-
-    .wrap {
-      max-width: 56rem;
-      margin: 0 auto;
-      padding: 0 1.5rem;
-    }
-
-    /* --- Hero ---------------------------------------------------------------- */
-
-    .lp-hero {
-      padding: 10rem 0 0;
-      text-align: center;
-    }
-
-    .eyebrow {
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-      color: var(--color-text-tertiary);
-      margin-bottom: 1.25rem;
-    }
-
-    .eyebrow a {
-      color: var(--color-text-secondary);
-      text-decoration: none;
-      border-bottom: 1px solid var(--color-border-hover);
-    }
-
-    .eyebrow a:hover { color: var(--color-text); }
-
-    .lp-hero h1 {
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(2.25rem, 5.6vw, 3.5rem);
-      line-height: 1.05;
-      letter-spacing: -0.028em;
-    }
-
-    .lp-hero .sub {
-      max-width: 32rem;
-      margin: 1.25rem auto 0;
-      font-size: 1.1rem;
-      line-height: 1.55;
-      color: var(--color-text-secondary);
-    }
-
-    .lp-cta {
-      display: flex;
-      gap: 0.625rem;
-      justify-content: center;
-      flex-wrap: wrap;
-      margin-top: 2rem;
-    }
-
-    .btn svg { width: 15px; height: 15px; flex: none; }
-
-    .btn-solid {
-      background: var(--color-text);
-      color: var(--color-bg);
-    }
-
-    .btn-solid:hover { opacity: 0.86; color: var(--color-bg); }
-
-    .meta {
-      margin-top: 1rem;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--color-text-tertiary);
-    }
-
-    /* --- Product shot: a terminal ------------------------------------------- */
-
-    .shot { margin: 3.5rem 0 0; }
-
-    .term {
-      background: var(--color-surface);
-      border: 1px solid var(--color-border-hover);
-      border-radius: 0.85rem;
-      overflow: hidden;
-      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
-    }
-
-    .term-bar {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.7rem 1rem;
-      border-bottom: 1px solid var(--color-border);
-      background: var(--color-surface-elevated);
-    }
-
-    .term-title {
-      margin-left: auto;
-      margin-right: auto;
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      color: var(--color-text-tertiary);
-    }
-
-    .term-body {
-      padding: 1.25rem 1.5rem;
-      font-family: var(--font-mono);
-      font-size: 0.9rem;
-      line-height: 1.9;
-      white-space: pre;
-      overflow-x: auto;
-    }
-
-    .term-body .line { display: block; }
-    .term-body .prompt { color: var(--color-accent-green); }
-    .term-body .cmd { color: var(--color-accent-teal); }
-    .term-body .flag { color: var(--color-accent-amber); }
-    .term-body .output { color: var(--color-text-secondary); }
-    .term-body .comment { color: var(--color-text-tertiary); }
-
-    .cursor {
-      display: inline-block;
-      width: 0.55em;
-      height: 1.05em;
-      vertical-align: text-bottom;
-      background: var(--color-text);
-      animation: blink 1s steps(1) infinite;
-    }
-
-    @keyframes blink { 50% { opacity: 0; } }
-
-    /* Lines appear one after another, like a session being typed. */
-    .term-body .line {
-      opacity: 0;
-      animation: rise 0.35s ease forwards;
-      animation-delay: calc(var(--i) * 0.28s + 0.3s);
-    }
-
-    @keyframes rise { to { opacity: 1; } }
-
-    @media (prefers-reduced-motion: reduce) {
-      .term-body .line { animation: none; opacity: 1; }
-      .cursor { animation: none; }
-    }
-
-    .caption {
-      margin-top: 1.25rem;
-      text-align: center;
-      font-size: 0.85rem;
-      color: var(--color-text-tertiary);
-    }
-
-    /* --- Feature rows -------------------------------------------------------- */
-
-    .feats {
-      margin: 5.5rem 0 0;
-      border-top: 1px solid var(--color-border);
-    }
-
-    .row {
-      display: flex;
-      gap: 1.75rem;
-      padding: 1.2rem 0;
-      border-bottom: 1px solid var(--color-border);
-    }
-
-    .row h3 {
-      font-family: var(--font-display);
-      font-weight: 600;
-      font-size: 0.95rem;
-      letter-spacing: -0.01em;
-      width: 10rem;
-      flex: none;
-      color: var(--color-text);
-    }
-
-    .row p {
-      font-size: 0.925rem;
-      line-height: 1.55;
-      color: var(--color-text-secondary);
-    }
-
-    .row p code, .steps-lede code, .install-note code {
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      color: var(--color-accent-teal);
-    }
-
-    .row a { text-decoration: none; }
-    .row a:hover { text-decoration: underline; }
-
-    /* --- Install and use ------------------------------------------------------ */
-
-    .install { margin: 5.5rem 0 0; }
-
-    .install h2, .go h2 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.5rem;
-      letter-spacing: -0.02em;
-    }
-
-    .steps-lede, .go .lede {
-      margin-top: 0.4rem;
-      font-size: 0.95rem;
-      color: var(--color-text-secondary);
-    }
-
-    .step-list {
-      margin-top: 1.75rem;
-      display: flex;
-      flex-direction: column;
-      gap: 1.25rem;
-      counter-reset: step;
-    }
-
-    .stp {
-      display: grid;
-      grid-template-columns: 13rem 1fr;
-      gap: 1.5rem;
-      align-items: start;
-    }
-
-    .stp > * { min-width: 0; }
-
-    .stp-label {
-      counter-increment: step;
-      padding-top: 0.6rem;
-      display: grid;
-      grid-template-columns: 1.4rem 1fr;
-      column-gap: 0.6rem;
-      align-items: start;
-    }
-
-    .stp-label::before {
-      content: counter(step);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 1.4rem;
-      height: 1.4rem;
-      border-radius: 50%;
-      background: var(--color-primary);
-      color: white;
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 0.75rem;
-      margin-top: 0.1rem;
-    }
-
-    .stp-label h3 {
-      display: block;
-      line-height: 1.4;
-      font-family: var(--font-display);
-      font-weight: 600;
-      font-size: 0.95rem;
-      color: var(--color-text);
-    }
-
-    .stp-label p {
-      grid-column: 2;
-      margin-top: 0.35rem;
-      font-size: 0.825rem;
-      color: var(--color-text-tertiary);
-      line-height: 1.5;
-    }
-
-    .cmdbox {
-      position: relative;
-      background: var(--color-surface);
-      border: 1px solid var(--color-border);
-      border-radius: 0.65rem;
-      padding: 0.9rem 3rem 0.9rem 1.1rem;
-      font-family: var(--font-mono);
-      font-size: 0.85rem;
-      line-height: 1.85;
-      white-space: pre;
-      overflow-x: auto;
-      transition: border-color 150ms;
-    }
-
-    .cmdbox:hover { border-color: var(--color-border-hover); }
-    .cmdbox .prompt { color: var(--color-accent-green); }
-    .cmdbox .cmd { color: var(--color-accent-teal); }
-    .cmdbox .flag { color: var(--color-accent-amber); }
-    .cmdbox .output { color: var(--color-text-tertiary); }
-    .cmdbox .comment { color: var(--color-text-tertiary); }
-
-    .copy-btn {
-      position: absolute;
-      top: 0.6rem;
-      right: 0.6rem;
-      background: var(--color-surface);
-      border: 1px solid var(--color-border);
-      color: var(--color-text-tertiary);
-      cursor: pointer;
-      padding: 0.3rem;
-      border-radius: 0.3rem;
-      transition: color 150ms, background 150ms;
-    }
-
-    .copy-btn:hover { color: var(--color-text); background: rgba(255, 255, 255, 0.05); }
-
-    .install-note {
-      margin-top: 1.5rem;
-      font-size: 0.85rem;
-      line-height: 1.6;
-      color: var(--color-text-tertiary);
-    }
-
-    .install-note a { text-decoration: none; }
-    .install-note a:hover { text-decoration: underline; }
-
-    /* --- Private network blurb -------------------------------------------------- */
-
-    .net { margin: 5.5rem 0 0; }
-
-    .net-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 2.5rem;
-      align-items: center;
-      margin-top: 1.5rem;
-    }
-
-    .net-grid > * { min-width: 0; }
-
-    .net h2 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.5rem;
-      letter-spacing: -0.02em;
-    }
-
-    .net .lede {
-      margin-top: 0.4rem;
-      font-size: 0.95rem;
-      color: var(--color-text-secondary);
-    }
-
-    .net p.body {
-      font-size: 0.925rem;
-      line-height: 1.6;
-      color: var(--color-text-secondary);
-    }
-
-    .net p.body + p.body { margin-top: 0.75rem; }
-
-    .net p.body code {
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      color: var(--color-accent-teal);
-    }
-
-    .net a { text-decoration: none; }
-    .net a:hover { text-decoration: underline; }
-
-    /* --- Go further ------------------------------------------------------------ */
-
-    .go { margin: 5.5rem 0 0; }
-
-    .plans {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 0.85rem;
-      margin-top: 1.6rem;
-    }
-
-    .plan {
-      display: block;
-      background: var(--color-surface);
-      border: 1px solid var(--color-border);
-      border-radius: 0.85rem;
-      padding: 1.25rem 1.15rem;
-      color: inherit;
-      text-decoration: none;
-      transition: border-color 150ms;
-    }
-
-    .plan:hover { border-color: var(--color-border-hover); color: inherit; }
-
-    .plan h3 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.05rem;
-      letter-spacing: -0.01em;
-      color: var(--color-text);
-    }
-
-    .plan p {
-      margin-top: 0.35rem;
-      font-size: 0.85rem;
-      line-height: 1.5;
-      color: var(--color-text-secondary);
-    }
-
-    .plan .go-link {
-      display: block;
-      margin-top: 0.9rem;
-      font-size: 0.8rem;
-      font-weight: 600;
-      color: var(--color-link);
-    }
-
-    .spacer { height: 5rem; }
-
-    /* --- Responsive ------------------------------------------------------------ */
-
-    @media (max-width: 720px) {
-      .lp-hero { padding-top: 7rem; }
-      .lp-hero h1 { font-size: 2rem; }
-      .shot { margin-top: 2.5rem; }
-      .term-body { font-size: 0.72rem; padding: 1rem; }
-      .row { flex-direction: column; gap: 0.3rem; }
-      .row h3 { width: auto; }
-      .stp { grid-template-columns: 1fr; gap: 0.5rem; }
-      .stp-label { padding-top: 0; }
-      .cmdbox { font-size: 0.72rem; }
-      .plans { grid-template-columns: 1fr; }
-      .net-grid { grid-template-columns: 1fr; gap: 1.25rem; }
-      .lp-cta { flex-direction: column; align-items: stretch; }
-      .lp-cta .btn { justify-content: center; }
-    }
-  </style>
 </head>
 <body>
 
-  <!-- Nav -->
   <nav id="site-nav"></nav>
 
   <div class="wrap">
 
-    <!-- Hero -->
-    <header class="lp-hero">
+    <header class="page-head">
       <div class="eyebrow">open source, from <a href="https://keikai.ai">Keikai</a></div>
       <h1>Reach your machines<br>from anywhere</h1>
       <p class="sub">One binary. Shell in, run commands and copy files by name, through any NAT. No account, no server to host, no config.</p>
-      <div class="lp-cta">
+      <div class="cta">
         <a class="btn btn-solid" href="#install">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v13"/><path d="m6 11 6 6 6-6"/><path d="M4 21h16"/></svg>
           Install
@@ -461,11 +37,10 @@
       <div class="meta">free &middot; macOS and Linux &middot; MIT or Apache-2.0</div>
     </header>
 
-    <!-- Product shot -->
     <div class="shot">
       <div class="term" role="img" aria-label="A terminal session: hop myserver opens a shell on a remote machine by name; hop myserver -- uptime runs one command; hop cp copies a folder; hop tunnel brings a remote port to localhost.">
         <div class="term-bar">
-          <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
           <span class="term-title">laptop</span>
         </div>
         <div class="term-body" aria-hidden="true"><span class="line" style="--i:0"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span></span><span class="line" style="--i:1"><span class="prompt">myserver $</span> docker compose up -d</span><span class="line" style="--i:2"><span class="output"> ✔ Container api  Started</span></span><span class="line" style="--i:3"><span class="prompt">myserver $</span> exit</span><span class="line" style="--i:4"> </span><span class="line" style="--i:5"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> -- uptime</span><span class="line" style="--i:6"><span class="output"> 09:41  up 212 days, load 0.12</span></span><span class="line" style="--i:7"> </span><span class="line" style="--i:8"><span class="prompt">$</span> <span class="cmd">hop cp</span> <span class="flag">-r</span> ./site myserver:~/site</span><span class="line" style="--i:9"><span class="output"> 48 files, 1.2 MB, 0.4s</span></span><span class="line" style="--i:10"> </span><span class="line" style="--i:11"><span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 3000</span><span class="line" style="--i:12"><span class="output"> localhost:3000 is now myserver:3000</span></span><span class="line" style="--i:13"><span class="prompt">$</span> <span class="cursor"></span></span></div>
@@ -473,8 +48,7 @@
       <p class="caption">A laptop at a cafe. A server behind a home router. No port-forwarding, no public IP.</p>
     </div>
 
-    <!-- Features -->
-    <section class="feats" id="features">
+    <section class="rows sec" id="features">
       <div class="row">
         <h3>Direct</h3>
         <p>Your machines talk to each other, end-to-end encrypted, through any NAT. No port-forwarding, no public IP, no VPN appliance.</p>
@@ -497,10 +71,9 @@
       </div>
     </section>
 
-    <!-- Install and use -->
-    <section class="install" id="install">
+    <section class="sec" id="install">
       <h2>Install and use</h2>
-      <p class="steps-lede">Two machines, three steps, under a minute.</p>
+      <p class="lede">Two machines, three steps, under a minute.</p>
 
       <div class="step-list">
         <div class="stp">
@@ -509,7 +82,7 @@
             <p>Installs WireHop as an always-on service and prints a one-time invite.</p>
           </div>
           <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
-hop invite" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash -s -- <span class="flag">--host</span>
+hop invite" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash -s -- <span class="flag">--host</span>
 <span class="prompt">$</span> <span class="cmd">hop invite</span>
 <span class="output">Invite: eyJ0eX...</span></div>
         </div>
@@ -520,7 +93,7 @@ hop invite" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 
             <p>Redeem the invite once. The machine is saved under its name.</p>
           </div>
           <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash
-hop connect <invite>" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash
+hop connect <invite>" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | bash
 <span class="prompt">$</span> <span class="cmd">hop connect</span> <span class="flag">eyJ0eX...</span>
 <span class="output">Saved as known host: myserver</span></div>
         </div>
@@ -533,14 +106,14 @@ hop connect <invite>" onclick="copyCmd(this)"><svg width="16" height="16" viewBo
           <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop myserver
 hop myserver -- uptime
 hop cp ./file myserver:~
-hop tunnel myserver 3000" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>                  <span class="comment"># open a shell</span>
+hop tunnel myserver 3000" onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span>                  <span class="comment"># open a shell</span>
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> -- uptime        <span class="comment"># run one command</span>
 <span class="prompt">$</span> <span class="cmd">hop cp</span> ./file myserver:~      <span class="comment"># copy files</span>
 <span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 3000      <span class="comment"># its port 3000, at localhost:3000</span></div>
         </div>
       </div>
 
-      <p class="install-note">
+      <p class="note">
         macOS (Apple Silicon and Intel) and Linux (x86_64, ARM64, ARMv7). Also on
         <a href="https://github.com/Keikai-Inc/wirehop/releases">GitHub Releases</a> as signed binaries and a macOS <code>.pkg</code>,
         and on npm as <code>npx -y @wirehop/wirehop</code>.
@@ -548,19 +121,18 @@ hop tunnel myserver 3000" onclick="copyCmd(this)"><svg width="16" height="16" vi
       </p>
     </section>
 
-    <!-- Private network -->
-    <section class="net" id="network">
+    <section class="sec" id="network">
       <h2>Your own private network</h2>
       <p class="lede">Every machine you invite is also on a VPN your machines run themselves. We call it a warren.</p>
-      <div class="net-grid">
+      <div class="cols">
         <div>
-          <p class="body">Each machine gets a private address and a name like <code>myserver.hop</code>, reachable from anywhere by any other machine you invited. No coordination server, no port-forwarding, no config files. The tools you already use just work: screen-share into your desktop over VNC, ssh and scp by name, open a web UI on a box behind a home router.</p>
-          <p class="body">Bridge a printer, a NAS or a whole LAN through one machine that sits on it. <a href="private-network.html">How the private network works</a>.</p>
+          <p class="prose">Each machine gets a private address and a name like <code>myserver.hop</code>, reachable from anywhere by any other machine you invited. No coordination server, no port-forwarding, no config files. The tools you already use just work: screen-share into your desktop over VNC, ssh and scp by name, open a web UI on a box behind a home router.</p>
+          <p class="prose">Bridge a printer, a NAS or a whole LAN through one machine that sits on it. <a href="private-network.html">How the private network works</a>.</p>
         </div>
         <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="open vnc://myserver.hop
 ssh myserver.hop
 scp report.pdf myserver.hop:~
-open http://myserver.hop:8080" onclick="copyCmd(this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="comment"># screen-share into your desktop</span>
+open http://myserver.hop:8080" onclick="copyCmd(this)"></button><span class="comment"># screen-share into your desktop</span>
 <span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span>
 
 <span class="comment"># the usual tools, by name</span>
@@ -570,8 +142,7 @@ open http://myserver.hop:8080" onclick="copyCmd(this)"><svg width="16" height="1
       </div>
     </section>
 
-    <!-- Go further -->
-    <section class="go" id="more">
+    <section class="sec" id="more">
       <h2>Go further</h2>
       <p class="lede">The same install, invite, connect. More machines, more hands.</p>
       <div class="plans">
@@ -596,21 +167,8 @@ open http://myserver.hop:8080" onclick="copyCmd(this)"><svg width="16" height="1
     <div class="spacer"></div>
   </div>
 
-  <!-- Footer -->
   <footer id="site-footer"></footer>
 
   <script src="shared.js"></script>
-  <script>
-    var COPY_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-    var DONE_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';
-
-    function copyCmd(btn) {
-      navigator.clipboard.writeText(btn.getAttribute('data-cmd')).then(function () {
-        btn.innerHTML = DONE_ICON;
-        setTimeout(function () { btn.innerHTML = COPY_ICON; }, 1800);
-      });
-    }
-  </script>
-
 </body>
 </html>

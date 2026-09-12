@@ -224,3 +224,78 @@ When the hop daemon runs as root:
 This ensures that even though the daemon listens as root, all user-facing operations run with minimal privileges. The username binding is set at invite time and cannot be changed by the connecting peer.
 
 *Last updated: v0.6.33*
+
+---
+
+## Everything an invite can restrict
+
+Set these when you mint the token. They travel with it and cannot be widened by
+the recipient; a client can only ask for *more* restriction at connect time.
+
+| Flag | Effect |
+|---|---|
+| `--tier client` | Reach this one machine only. No membership in the warren. |
+| `--tier warren-only` | On the warren (virtual IP and name), but refused a shell on the host. |
+| `--tier node` | Full member: reachable, with a virtual address and a name. |
+| `--tier admin` | Member, plus the ability to mint invites and grant roles. Give this sparingly. |
+| `--role <name>` | The named role, which decides which tags (machines) the peer can reach. |
+| `--user <name>` | The Unix user every session runs as. Fixed at mint time. |
+| `--read-only` | No writes, deletes, or modifications to the filesystem. |
+| `--no-network` | No outbound network from anything the session runs. |
+| `--scope <path>` | Only these paths are visible. Repeatable. |
+| `--allow-command <cmd>` | Only these commands may run. Repeatable. |
+| `--preset monitor\|audit\|deploy` | Ready-made bundles of the above for common jobs. |
+| `--expiry <secs>` | How long the token stays redeemable. Default 900 (15 minutes). |
+| `--max-uses <n>` | How many machines may redeem it. Default 1. |
+
+## Identity, transport, and the binary itself
+
+**Identity is a keypair.** Each machine has an Ed25519 key generated on first
+run and stored with owner-only permissions. There is no account to phish and no
+password to reuse. Losing the key is losing the identity, which is the point.
+
+**Encrypted end to end.** Connections are QUIC with TLS 1.3 between your
+machines. When a direct path can't be punched through NAT, a relay forwards
+*encrypted* packets it cannot read. The default relays are run by Keikai, the
+company behind WireHop; `hop host --relay` runs a relay of your own that admits
+only your machines (see [run-your-own-relay.md](run-your-own-relay.md)). A relay
+sees that two machines are talking, never what they say.
+
+**Signed releases.** Every published binary carries a SHA-256 checksum and an
+RSA signature. The installer verifies both against a key embedded in it and
+refuses to install on a mismatch. macOS packages are signed and notarized with
+Apple. To check a download by hand, the key is published at
+<https://wirehop.org/wirehop-release.pub>.
+
+Invite secrets are hashed before storage, so the host keeps a verifier rather
+than the secret, and a used invite token grants nothing. Stored secrets are
+encrypted with ChaCha20-Poly1305. The implementation is public and permissively
+licensed, so none of this has to be taken on faith.
+
+## What this does not protect you from
+
+- **An agent acting badly within its limits.** Scoping bounds the blast radius;
+  it does not make an agent's judgment good. If you grant write access to a
+  directory, an agent that decides to delete the wrong file in that directory
+  can. Scope to what the job needs and read the audit log.
+- **A compromised machine.** If an attacker already has root on one of your
+  machines, they have that machine's identity, and WireHop will treat them as
+  that machine. Revoke it with `hop fleet prune` or an admin revoke.
+- **An invite you hand to the wrong party.** A token is a bearer credential
+  until it is redeemed or expires. Short expiries and single use limit the
+  window; they do not close it. Treat an unredeemed invite like a password.
+- **Sharing with people outside your control.** WireHop is built for machines
+  you own. It has no multi-tenant model, no per-customer isolation, and no SSO.
+  If you need those, it is the wrong tool.
+- **Traffic analysis at a relay.** A relay cannot read your traffic, but it can
+  observe that two nodes exchanged packets and roughly how much. If that
+  matters to you, run your own relay.
+- **An unaudited codebase.** WireHop has not had a third-party security audit.
+  The code is public and the threat model is written down, which is not the
+  same thing as an audit. The standing source-level self-audit is in
+  [../technical/security.md](../technical/security.md).
+
+Found something? Report it privately through GitHub's security advisories on
+the repository (see [SECURITY.md](../../SECURITY.md)). We aim to acknowledge
+within 72 hours and will credit you in the release notes unless you'd rather we
+didn't.

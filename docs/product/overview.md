@@ -108,7 +108,42 @@ skipped and shell/exec/transfer are unaffected. See [warren.md](warren.md).
 
 ## Supported platforms
 
-macOS and Linux. Windows via WSL only.
+macOS (Apple Silicon and Intel) and Linux (x86_64, arm64, armv7). Windows via
+WSL only: it works under WSL2, which is a Linux install. Native Windows would
+need a different network layer and is not on the roadmap.
+
+### Linux distributions
+
+The Linux builds are static, so the distribution's age does not matter; only the
+kernel does (see the floor below). **tested** means the release binary was
+executed in that distribution and printed its version. **yes** means the kernel
+is above the floor and nothing else is required, but we have not run it there.
+Kernel numbers are the distribution's shipped default; a newer kernel is also
+fine.
+
+| Distribution | Kernel | Works | Notes |
+|---|---|---|---|
+| Ubuntu 20.04 / 22.04 / 24.04 | 5.4 - 6.8 | tested | All three verified |
+| Debian 11 / 12 | 5.10 / 6.1 | tested | |
+| Alpine 3.18 / 3.20 | any | tested | No glibc needed; static build |
+| Rocky Linux 9 / AlmaLinux 9 | 5.14 | tested | RHEL 9 equivalents |
+| Fedora 40 | 6.8 | tested | |
+| openSUSE Leap 15.6 | 6.4 | tested | |
+| Amazon Linux 2023 | 6.1 | tested | |
+| RHEL / CentOS 8, Rocky 8 | 4.18 | yes | Well above the floor |
+| RHEL / CentOS 7 | 3.10 | yes | Current releases run directly; see the `-uncompressed` note below for releases up to v0.9.33 |
+| RHEL / CentOS 6 | 2.6.32 | yes | Just above the 2.6.27 floor. Untested |
+| Raspberry Pi OS (32 and 64 bit) | 5.x / 6.x | yes | Use armv7 for 32 bit, arm64 for 64 bit |
+| Arch, Manjaro, NixOS, Gentoo | current | yes | Rolling releases are always well above the floor |
+| Synology DSM, OpenWrt, QNAP | varies | untested | Should work if the kernel is 2.6.27+ and the CPU matches |
+
+Docker and unusual VPS kernels: reaching machines, running commands and copying
+files all work. The warren VPN needs a TUN device (`/dev/net/tun`), which
+containers only have if you grant it; without one, hop logs that the network
+could not start and keeps everything else working.
+
+CPU architectures: x86_64, arm64 (aarch64), and armv7 for 32-bit ARM such as
+older Raspberry Pi. There is no 32-bit x86, RISC-V, or MIPS build.
 
 ### Linux kernel floor
 

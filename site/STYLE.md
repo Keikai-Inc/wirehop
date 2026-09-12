@@ -48,10 +48,10 @@ They do not know our vocabulary and they will not read carefully; they scan.
    "based on", "inspired by", or "the X idea"; describe what it does on its own
    terms.
 
-7. **Progressive disclosure.** Hero (what it is + the install command), then why,
-   then the three jobs, then the deeper material (always-on daemon, AI, fleet).
-   Advanced options and jargon live later, or behind an "Advanced" disclosure.
-   Don't make the first screen carry concepts the reader hasn't earned yet.
+7. **Progressive disclosure.** Page head (what it is), the product in use,
+   the feature rows, then the commands, then links out. Advanced options and
+   jargon live in the docs, or behind an "Advanced" disclosure. Don't make the
+   first screen carry concepts the reader hasn't earned yet.
 
 8. **No em-dashes.** Don't use em-dashes (`—`) or `&mdash;` anywhere on the site.
    Use a colon when one part explains or lists the other ("One binary: install,
@@ -74,23 +74,55 @@ They do not know our vocabulary and they will not read carefully; they scan.
      anchors (`a.card`, `a.btn`, `a.nav-brand`) inherit instead of colouring
      their contents. If you add a new container-anchor pattern, add it there.
 
-## The landing page is the short version
+## The design system: every page is built from the same parts
 
-`index.html` is deliberately brief: hero, a terminal showing the product in use,
-five one-line features, the three install-and-use steps, and three links out.
-It should read in under a minute. Anything that explains *options*, *mechanism*,
-or *comparison* belongs on a secondary page, not the landing page:
+The whole site is one narrow centred column (`.wrap`, 56rem) with a lot of
+air and very little copy. It reads like a product page, not a manual. Every
+page uses only these parts, all defined in `shared.css`:
 
-- install options, the command builder, platforms, verifying a download:
-  `install.html`
+- `.page-head`: an `h1` (two lines at most), a one- or two-sentence `.sub`,
+  optionally a `.cta` row of buttons (`.btn-solid` for the one primary action,
+  `.btn-ghost` for the rest) and a `.meta` line in mono.
+- `.shot`: the product in use, straight under the head. A `.term` terminal
+  with `.line` elements that fade in (`style="--i:N"`), or an SVG diagram.
+  One per page, and only if it shows the product doing the thing.
+- `.rows` of `.row`: a short bold label and one or two sentences. This is the
+  feature list. Four or five rows, never more than two sentences each.
+- `.sec` with an `h2` and a `.lede`: a section. Inside, use `.step-list` of
+  `.stp` (numbered label plus `.cmdbox`), `.cols` for text beside a `.cmdbox`,
+  `.plans` for link cards, `.tbl` for a comparison, `.qa` for questions.
+- `.cmdbox`: a copyable command. Write the copy button empty
+  (`<button class="copy-btn" data-cmd="..." onclick="copyCmd(this)"></button>`);
+  `shared.js` fills in the icon.
+- `.note`: small tertiary text, usually holding the link to the docs.
+
+Do not add page-local CSS except for a genuinely one-off control (the install
+command builder is the only case today). Do not bring back hero badges,
+gradient text, icon cards, or a grid background.
+
+## Site pages describe; docs explain
+
+A site page says what the thing does and shows the commands. It never explains
+mechanism, lists every option, or argues a case at length. That material lives
+in `docs/product/` and the page links to it from a `.note`. When a page needs
+more than one screen of prose, move the prose to the matching doc and leave a
+sentence and a link:
+
+- install options, platforms, verifying a download: `install.html`, with the
+  distro table in `docs/product/overview.md`
 - the private network, names, bridging a LAN, port forwarding:
-  `private-network.html`
-- the comparison table: `faq.html#compare`
-- AI agents: `agents.html`; fleet: `fleet.html`; scheduled work:
-  `orchestration.html`; threat model: `security.html`
+  `private-network.html`, with the design in `docs/product/warren.md`
+- AI agents: `agents.html`, with the bootstrap rationale and the cold-start
+  eval in `docs/product/ai-and-scripting.md`
+- fleet: `fleet.html`, with roles, sandboxes and scale in
+  `docs/product/warren.md` and `docs/product/security.md`
+- scheduled work: `orchestration.html`, with capabilities and scripts in
+  `docs/product/data-and-automation.md`
+- threat model: `security.html`, with the invite reference, crypto and the
+  honest limits in `docs/product/security.md`
+- the comparison table: `faq.html#compare`; the long form is `vs-tailscale.html`
 
-If a landing-page edit adds a paragraph, ask which secondary page it belongs on
-instead.
+If a page edit adds a paragraph, ask which doc it belongs in instead.
 
 ## Quick self-check before shipping a site change
 

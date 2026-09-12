@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WireHop vs Tailscale for AI agents</title>
+  <title>WireHop vs Tailscale</title>
   <meta name="description" content="An honest comparison. Tailscale has the bigger ecosystem, an admin console, SSO and Windows support. WireHop has no account and no coordination server, which is why an AI agent can set it up without a human.">
   <link rel="canonical" href="https://wirehop.org/vs-tailscale.html">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
@@ -13,256 +13,132 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
-  <style>
-    /* --- Comparison page overrides -------------------------------------------- */
-
-    .vs {
-      margin-top: 2.5rem;
-      border: 1px solid var(--color-border);
-      border-radius: 0.75rem;
-      overflow: hidden;
-    }
-
-    .vs-row {
-      display: grid;
-      grid-template-columns: 15rem 1fr 1fr;
-      border-bottom: 1px solid var(--color-border);
-    }
-
-    .vs-row:last-child { border-bottom: none; }
-    .vs-row > div { padding: 1rem 1.25rem; font-size: 0.9rem; line-height: 1.6; min-width: 0; }
-
-    .vs-head {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 0.95rem;
-      background: rgba(255, 255, 255, 0.02);
-    }
-
-    .vs-label {
-      color: var(--color-text);
-      font-weight: 500;
-      background: rgba(255, 255, 255, 0.02);
-      border-right: 1px solid var(--color-border);
-    }
-
-    .vs-ours { color: var(--color-text-secondary); border-right: 1px solid var(--color-border); }
-    .vs-theirs { color: var(--color-text-secondary); }
-
-    .vs-win { color: var(--color-accent-green); font-weight: 500; }
-    .vs-lose { color: var(--color-accent-amber); font-weight: 500; }
-
-    /* --- Verdict panels -------------------------------------------------------- */
-
-    .verdicts {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5rem;
-      margin-top: 2.5rem;
-    }
-
-    .verdicts > * { min-width: 0; }
-
-    .verdict {
-      border-radius: 0.75rem;
-      padding: 1.75rem 2rem;
-      border: 1px solid var(--color-border);
-      background: var(--color-surface);
-    }
-
-    .verdict h3 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.05rem;
-      margin-bottom: 1rem;
-    }
-
-    .verdict ul { list-style: none; display: flex; flex-direction: column; gap: 0.75rem; }
-
-    .verdict li {
-      color: var(--color-text-secondary);
-      font-size: 0.925rem;
-      line-height: 1.6;
-      padding-left: 1.25rem;
-      position: relative;
-    }
-
-    .verdict li::before {
-      content: "\2192";
-      position: absolute;
-      left: 0;
-      color: var(--color-text-tertiary);
-    }
-
-    .verdict-them { border-color: rgba(245, 158, 11, 0.25); background: rgba(245, 158, 11, 0.05); }
-    .verdict-them h3 { color: var(--color-accent-amber); }
-    .verdict-us { border-color: rgba(46, 196, 182, 0.25); background: rgba(46, 196, 182, 0.05); }
-    .verdict-us h3 { color: var(--color-accent-teal); }
-
-    @media (max-width: 900px) {
-      .vs-row { grid-template-columns: 1fr; }
-      .vs-label, .vs-ours { border-right: none; border-bottom: 1px solid var(--color-border); }
-      .vs-row.vs-header-row { display: none; }
-      .vs-ours::before { content: "WireHop: "; color: var(--color-accent-teal); font-weight: 600; }
-      .vs-theirs::before { content: "Tailscale: "; color: var(--color-text-tertiary); font-weight: 600; }
-      .verdicts { grid-template-columns: 1fr; }
-    }
-  </style>
 </head>
 <body>
 
-  <!-- Nav -->
   <nav id="site-nav"></nav>
 
-  <!-- Hero -->
-  <div class="hero">
-    <div class="badge"><span class="dot"></span> Comparison</div>
-    <h1>WireHop vs Tailscale<br><span class="gradient">for AI agents</span></h1>
-    <p>Tailscale is a good product with a bigger ecosystem, a real admin console, and years more polish. If you want a managed control plane and single sign-on, use it. This page is about the one thing it can't do, and why that matters if your agents are doing the work.</p>
-    <div class="hero-actions">
-      <a href="#difference" class="btn btn-primary">The actual difference</a>
-      <a href="#tailscale-wins" class="btn btn-ghost">Where Tailscale is better</a>
-    </div>
-  </div>
+  <div class="wrap">
 
-  <!-- The difference -->
-  <section id="difference">
-    <div class="container">
-      <div class="section-header">
-        <h2>One architectural difference</h2>
-        <p>Everything else on this page follows from it.</p>
+    <header class="page-head">
+      <h1>WireHop vs Tailscale</h1>
+      <p class="sub">Tailscale is a good product with a bigger ecosystem, a real admin console, and years more polish. This page is about the one thing it can't do, and who should pick which.</p>
+      <div class="cta">
+        <a href="#table" class="btn btn-solid">Side by side</a>
+        <a href="#pick" class="btn btn-ghost">Pick the right one</a>
       </div>
+    </header>
 
-      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8;">
-        Tailscale runs a <strong>coordination server</strong>: a hosted service that knows your devices, holds your account, and hands out the keys that let machines find each other. Your traffic is end-to-end encrypted and doesn't flow through it, but your <em>membership</em> does, and getting a device onto the network means authenticating to it.
-      </p>
+    <section class="sec">
+      <h2>One architectural difference</h2>
+      <p class="lede">Everything else on this page follows from it.</p>
+      <p class="prose" style="margin-top: 1.25rem;">Tailscale runs a <strong>coordination server</strong>: a hosted service that knows your devices, holds your account, and hands out the keys that let machines find each other. Your traffic doesn't flow through it, but your membership does, and getting a device on means authenticating to it. WireHop has no such service: a machine proves who it is with a key it generated, and the roster of who belongs is replicated between your own machines. Joining means redeeming a token minted by a machine you already control.</p>
+      <p class="prose">For a person that is mostly philosophical. For an agent it is the difference between finishing and stopping: <strong>an account is a step only a human can complete.</strong></p>
+    </section>
 
-      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 1.25rem;">
-        WireHop has no such service. A machine proves who it is with a key it generated itself, and the roster of who belongs is replicated directly between your own machines. Joining means redeeming a token minted by a machine you already control.
-      </p>
+    <section class="sec" id="table">
+      <h2>Side by side</h2>
+      <p class="lede">Green marks a real advantage, amber a real disadvantage. Both columns have both.</p>
 
-      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 1.25rem;">
-        For a person, that difference is mostly philosophical. For an agent, it's the difference between finishing and stopping: <strong>an account is a step only a human can complete.</strong>
-      </p>
-    </div>
-  </section>
-
-  <!-- The table -->
-  <section id="table" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Side by side</h2>
-        <p>Green marks a real advantage, amber a real disadvantage. Both columns have both.</p>
-      </div>
-
-      <div class="vs">
-        <div class="vs-row vs-header-row">
-          <div class="vs-head vs-label"></div>
-          <div class="vs-head vs-ours" style="color: var(--color-accent-teal);">WireHop</div>
-          <div class="vs-head vs-theirs">Tailscale</div>
+      <div class="tbl" style="--cols: 12rem 1fr 1fr;">
+        <div class="tbl-row tbl-head">
+          <div class="tbl-cell"></div>
+          <div class="tbl-cell">WireHop</div>
+          <div class="tbl-cell">Tailscale</div>
         </div>
-
-        <div class="vs-row">
-          <div class="vs-label">Account required</div>
-          <div class="vs-ours"><span class="vs-win">None.</span> Identity is a keypair on disk</div>
-          <div class="vs-theirs">Yes, via an identity provider</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Account required</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">None.</span> Identity is a keypair on disk</div>
+          <div class="tbl-cell" data-col="Tailscale">Yes, via an identity provider</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Coordination server</div>
-          <div class="vs-ours"><span class="vs-win">None.</span> Membership replicates between your machines</div>
-          <div class="vs-theirs">Hosted, or self-host the open-source Headscale</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Coordination server</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">None.</span> Membership replicates between your machines</div>
+          <div class="tbl-cell" data-col="Tailscale">Hosted, or self-host the open-source Headscale</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Agent can set it up alone</div>
-          <div class="vs-ours"><span class="vs-win">Yes</span>, and we publish a test that measures it</div>
-          <div class="vs-theirs">No: account creation and key issuance need a person</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Agent can set it up alone</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">Yes</span>, and we publish a test that measures it</div>
+          <div class="tbl-cell" data-col="Tailscale">No: account creation and key issuance need a person</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Access control</div>
-          <div class="vs-ours">Assign a role, reach follows from it</div>
-          <div class="vs-theirs">Write a policy file in the console. More expressive, more to author</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Access control</div>
+          <div class="tbl-cell" data-col="WireHop">Assign a role, reach follows from it</div>
+          <div class="tbl-cell" data-col="Tailscale">Write a policy file in the console. More expressive, more to author</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">NAT traversal</div>
-          <div class="vs-ours">Direct where possible, relay as fallback</div>
-          <div class="vs-theirs"><span class="vs-lose">More mature.</span> Years of DERP infrastructure and edge cases</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">NAT traversal</div>
+          <div class="tbl-cell" data-col="WireHop">Direct where possible, relay as fallback</div>
+          <div class="tbl-cell" data-col="Tailscale"><span class="bad">More mature.</span> Years of DERP infrastructure and edge cases</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Platforms</div>
-          <div class="vs-ours"><span class="vs-lose">macOS and Linux.</span> Windows via WSL only</div>
-          <div class="vs-theirs">Windows, macOS, Linux, iOS, Android, plus appliances</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Platforms</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="bad">macOS and Linux.</span> Windows via WSL only</div>
+          <div class="tbl-cell" data-col="Tailscale">Windows, macOS, Linux, iOS, Android, plus appliances</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Admin console</div>
-          <div class="vs-ours"><span class="vs-lose">None.</span> Command line and JSON</div>
-          <div class="vs-theirs">Full web console, device approval, key expiry management</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Admin console</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="bad">None.</span> Command line and JSON</div>
+          <div class="tbl-cell" data-col="Tailscale">Full web console, device approval, key expiry management</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">SSO and user management</div>
-          <div class="vs-ours"><span class="vs-lose">None.</span> Built for your own machines, not an org of people</div>
-          <div class="vs-theirs">SSO, SCIM provisioning, user groups</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">SSO and user management</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="bad">None.</span> Built for your own machines, not an org of people</div>
+          <div class="tbl-cell" data-col="Tailscale">SSO, SCIM provisioning, user groups</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Remote shell and file copy</div>
-          <div class="vs-ours"><span class="vs-win">Built in.</span> Shell, exec, rsync-style sync, port forward</div>
-          <div class="vs-theirs">Tailscale SSH and Taildrop; otherwise bring your own</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Remote shell and file copy</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">Built in.</span> Shell, exec, rsync-style sync, port forward</div>
+          <div class="tbl-cell" data-col="Tailscale">Tailscale SSH and Taildrop; otherwise bring your own</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Run one command fleet-wide</div>
-          <div class="vs-ours"><span class="vs-win">Built in</span>, selected by role or tag</div>
-          <div class="vs-theirs">Not a feature; use your own tooling over the network</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">One command fleet-wide</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">Built in</span>, selected by role or tag</div>
+          <div class="tbl-cell" data-col="Tailscale">Not a feature; use your own tooling over the network</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Scheduled work on a machine</div>
-          <div class="vs-ours"><span class="vs-win">Built in</span>, survives your disconnect</div>
-          <div class="vs-theirs">Not a feature</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Scheduled work on a machine</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">Built in</span>, survives your disconnect</div>
+          <div class="tbl-cell" data-col="Tailscale">Not a feature</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Audit log</div>
-          <div class="vs-ours">Per machine, local, no central collector</div>
-          <div class="vs-theirs">Centralized in the console, with streaming to a SIEM</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Audit log</div>
+          <div class="tbl-cell" data-col="WireHop">Per machine, local, no central collector</div>
+          <div class="tbl-cell" data-col="Tailscale">Centralized in the console, with streaming to a SIEM</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Source and licence</div>
-          <div class="vs-ours"><span class="vs-win">Fully open source</span> under MIT or Apache-2.0. Permissive: ship it in a closed-source product if you like</div>
-          <div class="vs-theirs">Client is open source (BSD-3); the hosted coordination server is not. Headscale is a separate community reimplementation</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Source and licence</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="good">Fully open source</span>, MIT or Apache-2.0. Ship it inside a closed-source product if you like</div>
+          <div class="tbl-cell" data-col="Tailscale">Client is open source (BSD-3); the hosted coordination server is not</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Third-party security audit</div>
-          <div class="vs-ours"><span class="vs-lose">None yet.</span> Source is public</div>
-          <div class="vs-theirs">Yes, published</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Third-party security audit</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="bad">None yet.</span> Source is public</div>
+          <div class="tbl-cell" data-col="Tailscale">Yes, published</div>
         </div>
-        <div class="vs-row">
-          <div class="vs-label">Maturity</div>
-          <div class="vs-ours"><span class="vs-lose">Young.</span> Smaller ecosystem, fewer integrations</div>
-          <div class="vs-theirs">Widely deployed, large community, many integrations</div>
+        <div class="tbl-row">
+          <div class="tbl-cell">Maturity</div>
+          <div class="tbl-cell" data-col="WireHop"><span class="bad">Young.</span> Smaller ecosystem, fewer integrations</div>
+          <div class="tbl-cell" data-col="Tailscale">Widely deployed, large community, many integrations</div>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Where Tailscale wins -->
-  <section id="tailscale-wins" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Pick the right one</h2>
-        <p>We would rather you use the tool that fits than churn a setup that already works.</p>
-      </div>
-
-      <div class="verdicts">
-        <div class="verdict verdict-them">
+    <section class="sec" id="pick">
+      <h2>Pick the right one</h2>
+      <p class="lede">We would rather you use the tool that fits than churn a setup that already works.</p>
+      <div class="plans plans-2">
+        <div class="plan plan-other">
           <h3>Use Tailscale if</h3>
           <ul>
-            <li>You're connecting <strong>people</strong> in an organization and want SSO, groups, and provisioning</li>
-            <li>You need <strong>Windows</strong>, iOS, or Android clients</li>
+            <li>You're connecting <strong>people</strong> in an organization and want SSO, groups and provisioning</li>
+            <li>You need <strong>Windows</strong>, iOS or Android clients</li>
             <li>Someone needs a <strong>web console</strong> to see and approve devices</li>
-            <li>You want centralized audit streamed into a SIEM</li>
-            <li>You want a published third-party security audit</li>
+            <li>You want centralized audit streamed into a SIEM, or a published third-party audit</li>
             <li>Your NAT situation is unusual and you want the most battle-tested traversal</li>
           </ul>
         </div>
-
-        <div class="verdict verdict-us">
+        <div class="plan plan-good">
           <h3>Use WireHop if</h3>
           <ul>
             <li>You want an <strong>AI agent</strong> to build and operate the network without you</li>
@@ -273,28 +149,17 @@
           </ul>
         </div>
       </div>
+      <p class="note">They also coexist. WireHop notices when the <code>100.64.0.0/10</code> range is already claimed by another interface and skips bringing up its own network rather than fighting over it. Reaching machines, running commands and copying files keep working either way.</p>
 
-      <p style="color: var(--color-text-secondary); max-width: 46rem; line-height: 1.8; margin-top: 2.5rem;">
-        They also coexist. WireHop notices when the <code style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-accent-teal);">100.64.0.0/10</code> address range is already claimed by another interface and skips bringing up its own network rather than fighting over it. Reaching machines, running commands, and copying files keep working either way.
-      </p>
-    </div>
-  </section>
-
-  <!-- Try -->
-  <section style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div style="text-align: center; padding: 3rem 2rem; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem;">
-        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Try it in under a minute</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Nothing to sign up for, so there's nothing to undo if you don't like it.</p>
-        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
-          <a href="install.html" class="btn btn-primary">Install WireHop</a>
-          <a href="agents.html" class="btn btn-ghost">Give it to an agent</a>
-        </div>
+      <div class="cta">
+        <a href="install.html" class="btn btn-solid">Try it in under a minute</a>
+        <a href="agents.html" class="btn btn-ghost">Give it to an agent</a>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Footer -->
+    <div class="spacer"></div>
+  </div>
+
   <footer id="site-footer"></footer>
 
   <script src="shared.js"></script>

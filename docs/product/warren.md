@@ -408,6 +408,22 @@ A fleet in hop is just your **[warren](warren.md)**, managed at scale. Any `hop 
 
 The warren federates across hosts via a join ticket (carried by `node`/`admin` invites; `--join` / `HOP_VPN_JOIN_TICKET`), with **additive-only reconcile** so no host can revoke another's entries. Roles drive both host access (RBAC) **and** warren VPN reach. Writes are gated by an admin/owner author binding (C1; see [Security Internals](../technical/security.md) and [Warren Internals](../technical/warren-internals.md)): author validation defaults to **enforce** once a founder trust anchor is known (new/founder-anchored warrens reject forged admin and `vpn/ip/name` entries), and stays in **observe** for legacy joins with no anchor so they can't be partitioned. `HOP_NETDOC_VALIDATION` (`off`/`observe`/`enforce`) overrides.
 
+### Scale
+
+The same tool works at every size, because there is no infrastructure beyond
+hop itself. A small team (5 to 50 machines) is the warren plus a `roles.json`
+you can commit. A growing one (50 to 500) is the same warren: roles keep access
+organized, and membership replicates to every node automatically, so nothing is
+kept in sync by hand. Past that, there is no central server to bottleneck or
+shard: the warren replicates peer-to-peer and data flows directly between
+machines.
+
+Sandbox policies flow through three layers and the result is always the
+strictest combination: the role sets the baseline, the invite can further
+restrict, and the client can self-restrict at connect time. Restrictions only
+tighten, never loosen. Presets (`monitor`, `audit`, `deploy`) and the individual
+flags are in [security.md](security.md#sandbox-system).
+
 ### Architecture
 
 Membership and policy live in the replicated warren document — every node sees the same view, with no central registry:

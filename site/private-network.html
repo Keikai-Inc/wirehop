@@ -13,71 +13,24 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
-  <style>
-    /* --- Private network page overrides -------------------------------------- */
-
-    .prose {
-      color: var(--color-text-secondary);
-      line-height: 1.8;
-    }
-
-    .prose + .prose { margin-top: 1rem; }
-
-    .prose code, .job-note code {
-      font-family: var(--font-mono);
-      font-size: 0.85em;
-      color: var(--color-accent-teal);
-    }
-
-    .prose a { text-decoration: none; font-weight: 500; }
-    .prose a:hover { text-decoration: underline; }
-
-    .subhead {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.25rem;
-      margin-bottom: 1rem;
-    }
-
-    .diagram {
-      max-width: 760px;
-      margin: 0 auto 3.5rem;
-    }
-
-    .diagram svg { width: 100%; height: auto; display: block; }
-
-    .job-note {
-      color: var(--color-text-tertiary);
-      font-size: 0.85rem;
-      line-height: 1.6;
-      margin-top: 1rem;
-    }
-
-    .job-note a { text-decoration: none; }
-    .job-note a:hover { text-decoration: underline; }
-  </style>
 </head>
 <body>
 
-  <!-- Nav -->
   <nav id="site-nav"></nav>
 
-  <!-- Hero -->
-  <div class="hero">
-    <div class="badge"><span class="dot"></span> Private network</div>
-    <h1>Your machines,<br><span class="gradient">reachable by name</span></h1>
-    <p>Invite a machine and it answers as <code style="font-family: var(--font-mono); font-size: 0.9em; color: var(--color-accent-teal);">myserver.hop</code> from anywhere, on a private address only <em>your</em> machines can reach. Setting up a VPN should be as easy as SSH or scp, so it is.</p>
-    <div class="hero-actions">
-      <a href="#join" class="btn btn-primary">Put a machine on it</a>
-      <a href="#bridge" class="btn btn-ghost">Reach things that can't run WireHop</a>
-    </div>
-  </div>
+  <div class="wrap">
 
-  <!-- What it is -->
-  <section id="what" style="padding-top: 2rem;">
-    <div class="container">
-      <div class="diagram">
-        <svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" font-family="Inter, system-ui, sans-serif">
+    <header class="page-head">
+      <h1>Your machines,<br>reachable by name</h1>
+      <p class="sub">Invite a machine and it answers as <code>myserver.hop</code> from anywhere, on a private address only your machines can reach. A VPN should be as easy as SSH, so it is.</p>
+      <div class="cta">
+        <a href="#join" class="btn btn-solid">Put a machine on it</a>
+        <a href="#bridge" class="btn btn-ghost">Reach things that can't run WireHop</a>
+      </div>
+    </header>
+
+    <div class="shot">
+      <svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" font-family="Inter, system-ui, sans-serif">
           <title>Your private network: your machines connected peer-to-peer</title>
           <desc>Three machines (a laptop, a server, and a Raspberry Pi) reach each other by name over direct encrypted peer-to-peer links with no central server. The Pi bridges a home LAN (printer and NAS) that cannot run WireHop.</desc>
 
@@ -164,110 +117,94 @@
             <text x="230" y="436">LAN bridge</text>
           </g>
         </svg>
-      </div>
-
-      <div class="grid grid-3">
-        <div class="card card-teal">
-          <h3>No port-forwarding</h3>
-          <p>Machines find each other directly through NAT. When a direct path is blocked, a relay forwards encrypted packets it cannot read, and you can run your own with one flag.</p>
-        </div>
-        <div class="card card-green">
-          <h3>No coordination server</h3>
-          <p>Who is on the network is a document your machines replicate between themselves. Nothing of ours has to be up for your machines to find each other.</p>
-        </div>
-        <div class="card card-amber">
-          <h3>The role is the access</h3>
-          <p>You never write firewall rules. Invite someone as a <em>developer</em> and the network already knows what a developer can reach.</p>
-        </div>
-      </div>
-
-      <p class="prose" style="max-width: 46rem; margin: 2.5rem auto 0; text-align: center; color: var(--color-text-tertiary); font-size: 0.9rem;">
-        Underneath, this is a peer-to-peer VPN. We call one of these networks a <strong>warren</strong>, and a machine that lives on it a <strong>node</strong>; you will see both words in the command output.
-      </p>
+      <p class="caption">Underneath, this is a peer-to-peer VPN. We call one of these networks a warren, and a machine on it a node.</p>
     </div>
-  </section>
 
-  <!-- Join -->
-  <section id="join" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Put a machine on it</h2>
-        <p>The first machine you install with <code style="font-family: var(--font-mono); font-size: 0.9em; color: var(--color-accent-teal);">--host</code> creates the network. Every invite after that grows it.</p>
+    <section class="rows sec">
+      <div class="row">
+        <h3>No port-forwarding</h3>
+        <p>Machines find each other directly through NAT. When a direct path is blocked, a relay forwards encrypted packets it cannot read, and you can run your own with one flag.</p>
       </div>
+      <div class="row">
+        <h3>No coordination server</h3>
+        <p>Who is on the network is a document your machines replicate between themselves. Nothing of ours has to be up for your machines to find each other.</p>
+      </div>
+      <div class="row">
+        <h3>The role is the access</h3>
+        <p>You never write firewall rules. Invite someone as a <em>developer</em> and the network already knows what a developer can reach. Everything else is default-deny.</p>
+      </div>
+      <div class="row">
+        <h3>Your tools, unchanged</h3>
+        <p>ssh, scp, VNC, a browser, a database client: anything that takes a hostname takes <code>myserver.hop</code>. DNS is set up for you on each machine.</p>
+      </div>
+    </section>
 
-      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
-        <div>
-          <h3 class="subhead">Invite, join, done</h3>
-          <p class="prose">Make an invite on any machine that is already on the network. Install on the new machine with that invite, or redeem it with <code>hop connect</code> if WireHop is already there. The network interface and the name come up on their own; nothing to configure on the router, no DNS to edit.</p>
-          <p class="prose">From then on the tools you already use (SSH, scp, VNC, a browser) reach the machine by name, from any network.</p>
-        </div>
+    <section class="sec" id="join">
+      <h2>Put a machine on it</h2>
+      <p class="lede">The first machine you install with <code>--host</code> creates the network. Every invite after that grows it.</p>
 
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Terminal</span>
+      <div class="step-list">
+        <div class="stp">
+          <div class="stp-label">
+            <h3>On a machine already on the network</h3>
+            <p>Any member can mint an invite. It is single-use and expires in 15 minutes.</p>
           </div>
-          <div class="code-body">
-<span class="comment"># On a machine that's already on your network</span>
-<span class="prompt">$</span> <span class="cmd">hop invite</span>
-<span class="output">Invite: eyJ0eX...</span>
-
-<span class="comment"># On the new machine: install and join in one go</span>
-<span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | \
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop invite" onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">hop invite</span>
+<span class="output">Invite: eyJ0eX...</span></div>
+        </div>
+        <div class="stp">
+          <div class="stp-label">
+            <h3>On the new machine</h3>
+            <p>Install and join in one go. The network interface, the address and the name come up on their own.</p>
+          </div>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="curl -fsSL https://wirehop.org/install.sh | bash -s -- --host --invite <invite>" onclick="copyCmd(this)"></button><span class="prompt">$</span> curl -fsSL https://wirehop.org/install.sh | \
     bash -s -- <span class="flag">--host --invite</span> eyJ0eX...
-<span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span>
-
-<span class="comment"># Now your machines answer by name, from anywhere</span>
-<span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">myserver.hop</span>
-<span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">myserver.hop</span>:~
-<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span>
+<span class="output">Joined. You are 100.64.3.12 (laptop.hop)</span></div>
+        </div>
+        <div class="stp">
+          <div class="stp-label">
+            <h3>From anywhere</h3>
+            <p>Every machine on the network answers by name, on any network, with the tools you already use.</p>
           </div>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="ssh myserver.hop
+scp report.pdf myserver.hop:~
+open vnc://myserver.hop" onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">ssh</span> <span class="flag">myserver.hop</span>
+<span class="prompt">$</span> <span class="cmd">scp</span> report.pdf <span class="flag">myserver.hop</span>:~
+<span class="prompt">$</span> <span class="cmd">open</span> <span class="flag">vnc://myserver.hop</span></div>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Bridge -->
-  <section id="bridge" style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Reach the things that can't run WireHop</h2>
-        <p>A printer, a NAS, a camera, a whole home or office LAN. One machine that is on that LAN carries the rest.</p>
-      </div>
+    <section class="sec" id="bridge">
+      <h2>Reach the things that can't run WireHop</h2>
+      <p class="lede">A printer, a NAS, a camera, a whole home or office LAN. One machine that is on that LAN carries the rest.</p>
 
-      <div class="grid grid-2" style="align-items: start; gap: 3rem;">
+      <div class="cols cols-top">
         <div>
-          <h3 class="subhead">One port, like <code style="font-family: var(--font-mono); font-size: 0.9em; color: var(--color-accent-teal);">ssh -L</code></h3>
-          <div class="code-block">
-            <div class="code-body" style="padding: 1rem 1.25rem;">
-<span class="comment"># myserver's port 3000, at localhost:3000</span>
+          <p class="prose"><strong>One port</strong>, like <code>ssh -L</code>. Works with a plain client install too. The tunnel ends at the machine's own loopback, so it reaches services running on that machine.</p>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop tunnel myserver 3000
+hop tunnel myserver 8080:3000" onclick="copyCmd(this)"></button><span class="comment"># its port 3000, at localhost:3000</span>
 <span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 3000
 
 <span class="comment"># ...or at localhost:8080 instead</span>
-<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 8080:3000
-            </div>
-          </div>
-          <p class="job-note">Works with a plain client install too, no private network needed. The tunnel ends at the machine's own loopback, so it only reaches services running on that machine.</p>
+<span class="prompt">$</span> <span class="cmd">hop tunnel</span> <span class="flag">myserver</span> 8080:3000</div>
         </div>
-
         <div>
-          <h3 class="subhead">A whole LAN, through one machine</h3>
-          <p class="prose">Put WireHop on one machine that sits on the LAN (a Pi is plenty) and let it advertise the LAN's address range. Every other machine on your network can then reach the printer or the NAS by its ordinary LAN address, from anywhere.</p>
-          <p class="job-note">Advertising a route is a one-line setting on the bridging machine. <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/warren.md">How to set it up</a>, in the docs.</p>
+          <p class="prose"><strong>A whole LAN</strong>, through one machine. Put WireHop on any machine that sits on the LAN (a Pi is plenty) and let it advertise the LAN's address range. Every other machine on your network then reaches the printer or the NAS by its ordinary LAN address, from anywhere.</p>
+          <p class="note">Advertising a route is a one-line setting on the bridging machine. <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/warren.md">How to set it up</a>, in the docs.</p>
         </div>
       </div>
 
-      <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 3rem; justify-content: center;">
-        <a href="install.html" class="btn btn-primary">Install WireHop</a>
+      <div class="cta">
+        <a href="install.html" class="btn btn-solid">Install WireHop</a>
         <a href="fleet.html" class="btn btn-ghost">Roles, tags and fleets</a>
         <a href="security.html" class="btn btn-ghost">What the network protects</a>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Footer -->
+    <div class="spacer"></div>
+  </div>
+
   <footer id="site-footer"></footer>
 
   <script src="shared.js"></script>

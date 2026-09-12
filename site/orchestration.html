@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WireHop, Personal Cloud Automation</title>
-  <meta name="description" content="Schedule recurring AI jobs on your own machine. WireHop turns any machine into an always-on automation backend: cron jobs, encrypted credentials, external APIs, and an AI tool that can manage it all.">
+  <title>WireHop automation</title>
+  <meta name="description" content="Any machine you reach is also an always-on automation backend: scheduled scripts, encrypted secrets, HTTP calls to any API, managed from your laptop or your AI tool.">
   <link rel="canonical" href="https://wirehop.org/orchestration.html">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
@@ -13,435 +13,120 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
-  <style>
-    /* --- Orchestration page overrides ---------------------------------------- */
-
-    .steps-4 { grid-template-columns: repeat(4, 1fr); }
-
-    /* --- Capability cards ---------------------------------------------------- */
-
-    .cap-card {
-      position: relative;
-    }
-
-    .cap-card .cap-schedule {
-      display: inline-block;
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-      color: var(--color-text-tertiary);
-      margin-top: 0.75rem;
-      padding: 0.25rem 0.625rem;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--color-border);
-      border-radius: 0.375rem;
-    }
-
-    /* --- Secrets grid (reuses daemon-grid pattern) --------------------------- */
-
-    .secrets-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 2rem;
-      align-items: start;
-    }
-
-    .secrets-grid > * { min-width: 0; }
-
-    .secrets-info h3 {
-      font-family: var(--font-display);
-      font-weight: 700;
-      font-size: 1.25rem;
-      margin-bottom: 1rem;
-    }
-
-    .secrets-info p {
-      color: var(--color-text-secondary);
-      font-size: 0.9rem;
-      line-height: 1.65;
-      margin-bottom: 1.5rem;
-    }
-
-    .secrets-list {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }
-
-    .secrets-list li {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-      color: var(--color-text-secondary);
-      font-size: 0.9rem;
-      overflow-wrap: anywhere;
-    }
-
-    .secrets-list li::before {
-      content: "\2713";
-      color: var(--color-accent-green);
-      font-weight: 700;
-      flex-shrink: 0;
-      margin-top: 0.1rem;
-    }
-
-    /* --- Orchestration responsive -------------------------------------------- */
-
-    @media (max-width: 768px) {
-      .steps-4 { grid-template-columns: 1fr; }
-      .secrets-grid { grid-template-columns: 1fr; }
-    }
-  </style>
 </head>
 <body>
 
-  <!-- Nav -->
   <nav id="site-nav"></nav>
 
-  <!-- Hero -->
-  <div class="hero">
-    <div class="badge"><span class="dot"></span> Personal Cloud Automation</div>
-    <h1>Automate anything,<br><span class="gradient">from anywhere</span></h1>
-    <p>Turn any machine into an always-on automation backend. Schedule cron jobs, store encrypted credentials, call external APIs, and let AI manage it all through a single binary.</p>
-    <div class="hero-actions">
-      <a href="#setup" class="btn btn-primary">Get Started</a>
-      <a href="#capabilities" class="btn btn-ghost">See Capabilities</a>
+  <div class="wrap">
+
+    <header class="page-head">
+      <h1>Automate anything,<br>from anywhere</h1>
+      <p class="sub">Any machine you reach is also an always-on automation backend. Schedule a script, keep its credentials encrypted on that machine, call any API, and manage it all from your laptop or your AI tool.</p>
+      <div class="cta">
+        <a href="#briefing" class="btn btn-solid">Morning briefing in three commands</a>
+        <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/data-and-automation.md" class="btn btn-ghost">The scripting docs</a>
+      </div>
+    </header>
+
+    <div class="shot">
+      <div class="term" role="img" aria-label="From a laptop: store a secret on myserver, enable the email-monitor capability, check status, and list its cron jobs.">
+        <div class="term-bar">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="term-title">laptop</span>
+        </div>
+        <div class="term-body" aria-hidden="true"><span class="line" style="--i:0"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> secrets set ANTHROPIC_API_KEY sk-ant-...</span><span class="line" style="--i:1"><span class="output">OK</span></span><span class="line" style="--i:2"> </span><span class="line" style="--i:3"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap enable email-monitor</span><span class="line" style="--i:4"><span class="output">Enabled: email-monitor (daily 7 AM)</span></span><span class="line" style="--i:5"> </span><span class="line" style="--i:6"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap status</span><span class="line" style="--i:7"><span class="output">  health-monitor     enabled    last run: 2m ago     OK</span></span><span class="line" style="--i:8"><span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span></span><span class="line" style="--i:9"> </span><span class="line" style="--i:10"><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron list</span><span class="line" style="--i:11"><span class="output">  health-monitor      */5 * * * *     enabled</span></span><span class="line" style="--i:12"><span class="output">  email-monitor       0 7 * * *       enabled</span></span><span class="line" style="--i:13"><span class="prompt">$</span> <span class="cursor"></span></span></div>
+      </div>
+      <p class="caption">Every command works on a remote machine. The name comes first.</p>
     </div>
-  </div>
 
-  <!-- The Story -->
-  <section id="story">
-    <div class="container">
-      <div class="section-header">
-        <h2>Morning briefing in 60 seconds</h2>
-        <p>From zero to AI-powered email triage in three commands.</p>
+    <section class="rows sec">
+      <div class="row">
+        <h3>Scheduled</h3>
+        <p>A job runs on a machine you own, on a schedule you set, whether or not your laptop is open. The daemon runs it, not your terminal.</p>
       </div>
-
-      <div class="steps">
-        <div class="step">
-          <h3>Store credentials</h3>
-          <p>Encrypt your API key on the remote host. ChaCha20-Poly1305 at rest, accessible from CLI, JS runtime, and MCP.</p>
-          <div style="margin-top: 0.75rem;"><code>hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
-        </div>
-        <div class="step">
-          <h3>Enable the capability</h3>
-          <p>One command registers the cron schedule, wires up the script, and starts the automation.</p>
-          <div style="margin-top: 0.75rem;"><code>hop cap enable email-monitor</code></div>
-        </div>
-        <div class="step">
-          <h3>Wake up to a briefing</h3>
-          <p>Every morning: AI triages your inbox, sends a summary, and marks routine messages as read.</p>
-        </div>
+      <div class="row">
+        <h3>Secrets stay put</h3>
+        <p>API keys and tokens are encrypted at rest on the machine that uses them, keyed from its own identity. Readable from the command line, from scripts, and by your AI tool, never in plaintext on disk.</p>
       </div>
-
-      <div style="margin-top: 3rem;">
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">email-monitor capability (condensed)</span>
-          </div>
-          <div class="code-body">
-<span class="comment">// Runs daily at 7 AM via hop cron</span>
-<span class="cmd">var</span> key = hop.secrets.get(<span class="flag">"ANTHROPIC_API_KEY"</span>);
-<span class="cmd">var</span> gmail = hop.secrets.get(<span class="flag">"GMAIL_TOKEN"</span>);
-
-<span class="comment">// Fetch unread messages</span>
-<span class="cmd">var</span> msgs = hop.http.get(<span class="flag">"https://gmail.googleapis.com/gmail/v1/users/me/messages"</span>, {
-    bearer: gmail, params: { q: <span class="flag">"is:unread"</span> }
-});
-
-<span class="comment">// Claude classifies each as URGENT / ACTION / FYI</span>
-<span class="cmd">var</span> triage = hop.http.post(<span class="flag">"https://api.anthropic.com/v1/messages"</span>, {
-    headers: { <span class="flag">"x-api-key"</span>: key, <span class="flag">"anthropic-version"</span>: <span class="flag">"2023-06-01"</span> },
-    json: { model: <span class="flag">"claude-sonnet-4-20250514"</span>, messages: [
-        { role: <span class="flag">"user"</span>, content: <span class="flag">"Classify as URGENT/ACTION/FYI: "</span> + JSON.stringify(msgs) }
-    ]}
-});
-
-<span class="comment">// Send briefing email to your inbox</span>
-hop.http.post(<span class="flag">"https://gmail.googleapis.com/.../messages/send"</span>, {
-    bearer: gmail, json: { raw: base64url(summary) }
-});
-
-<span class="comment">// Mark FYI messages as read (urgent + action stay unread)</span>
-hop.http.post(<span class="flag">"https://gmail.googleapis.com/.../messages/batchModify"</span>, {
-    bearer: gmail, json: { ids: fyiIds, removeLabelIds: [<span class="flag">"UNREAD"</span>] }
-});
-
-<span class="comment">// Archive briefing for later retrieval</span>
-hop.kv.set(<span class="flag">"briefings"</span>, today, { summary: summary, urgent: urgent.length });
-          </div>
-        </div>
+      <div class="row">
+        <h3>Calls any API</h3>
+        <p>Scripts get a fetch-style HTTP client with bearer tokens pulled straight from the secrets store. No curl, no dependencies, no third-party automation service holding your keys.</p>
       </div>
-    </div>
-  </section>
-
-  <!-- Capabilities -->
-  <section id="capabilities">
-    <div class="container">
-      <div class="section-header">
-        <h2>Built-in capabilities</h2>
-        <p>Self-contained automation units. Enable with one command, disable with another.</p>
+      <div class="row">
+        <h3>Capabilities</h3>
+        <p>Ready-made jobs you switch on with one command: a health monitor, a security baseline, fleet-wide log search, Gmail triage with a morning briefing. <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/data-and-automation.md#built-in-capabilities">The list</a>.</p>
       </div>
+      <div class="row">
+        <h3>Keeps its own state</h3>
+        <p>A key-value store and time series on every machine, so a job can remember what it saw last time and you can query the result later.</p>
+      </div>
+    </section>
 
-      <div class="grid grid-2">
-        <div class="card card-green cap-card">
-          <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+    <section class="sec" id="briefing">
+      <h2>Morning briefing in three commands</h2>
+      <p class="lede">From zero to AI-triaged email, every morning, on a machine you own.</p>
+
+      <div class="step-list">
+        <div class="stp">
+          <div class="stp-label">
+            <h3>Store the credentials</h3>
+            <p>Encrypted on the remote machine. They never leave it in plaintext.</p>
           </div>
-          <h3>Health Monitor</h3>
-          <p>CPU, memory, disk, and uptime. Stores metrics in the local datastore and alerts on thresholds.</p>
-          <span class="cap-schedule">Every 5 min</span>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop myserver secrets set ANTHROPIC_API_KEY sk-ant-..." onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> secrets set ANTHROPIC_API_KEY sk-ant-...</div>
         </div>
-
-        <div class="card card-teal cap-card">
-          <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <div class="stp">
+          <div class="stp-label">
+            <h3>Switch it on</h3>
+            <p>Registers the schedule, wires up the script, and starts it.</p>
           </div>
-          <h3>Log Search</h3>
-          <p>Search logs across your fleet. Grep through syslog, journald, and application logs from one command.</p>
-          <span class="cap-schedule">On-demand</span>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop myserver cap enable email-monitor" onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap enable email-monitor
+<span class="output">Enabled: email-monitor (daily 7 AM)</span></div>
         </div>
-
-        <div class="card card-red cap-card">
-          <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        <div class="stp">
+          <div class="stp-label">
+            <h3>Wake up to a briefing</h3>
+            <p>Unread mail sorted into urgent, action and FYI. Routine mail marked read. Or run it now.</p>
           </div>
-          <h3>Security Baseline</h3>
-          <p>Audit SUID binaries, open ports, auth logs, and SSH key hygiene. Flags drift from a known-good baseline.</p>
-          <span class="cap-schedule">Daily 3 AM</span>
-        </div>
-
-        <div class="card card-amber cap-card">
-          <div class="card-icon card-icon-amber">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-          </div>
-          <h3>Email Monitor</h3>
-          <p>Gmail triage powered by Claude. Summarizes unread mail, marks routine as read, and stores a daily briefing.</p>
-          <span class="cap-schedule">Daily 7 AM</span>
+          <div class="cmdbox"><button class="copy-btn" title="Copy" data-cmd="hop myserver cap run email-monitor" onclick="copyCmd(this)"></button><span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap run email-monitor
+<span class="output">Briefing sent. 23 emails: 2 urgent, 5 action, 16 marked as read.</span></div>
         </div>
       </div>
 
-      <div style="margin-top: 3rem;">
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Terminal, Managing capabilities</span>
-          </div>
-          <div class="code-body">
-<span class="comment"># List all available capabilities</span>
-<span class="prompt">$</span> <span class="cmd">hop cap list</span>
-<span class="output">  health-monitor     CPU, memory, disk, uptime        every 5m</span>
-<span class="output">  log-search         Search logs across fleet          on-demand</span>
-<span class="output">  security-baseline  SUID, ports, auth, SSH keys       daily 3 AM</span>
-<span class="output">  email-monitor      Gmail triage + AI briefing        daily 7 AM</span>
+      <p class="note">The Gmail side needs a one-time OAuth setup. The walkthrough and the script itself are in the docs: <a href="https://github.com/Keikai-Inc/wirehop/blob/main/docs/product/data-and-automation.md#email-monitor-setup">email monitor setup</a>.</p>
+    </section>
 
-<span class="comment"># Enable a capability</span>
-<span class="prompt">$</span> <span class="cmd">hop cap enable</span> <span class="flag">health</span>
-<span class="output">Enabled: health-monitor (every 5m)</span>
-
-<span class="comment"># Check status</span>
-<span class="prompt">$</span> <span class="cmd">hop cap status</span>
-<span class="output">  health-monitor     enabled    last run: 2m ago     OK</span>
-<span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span>
-
-<span class="comment"># Run a capability manually</span>
-<span class="prompt">$</span> <span class="cmd">hop cap run</span> <span class="flag">email-monitor</span>
-<span class="output">Briefing sent. 23 emails: 2 urgent, 5 action, 16 marked as read.</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Secrets & HTTP -->
-  <section id="secrets">
-    <div class="container">
-      <div class="section-header">
-        <h2>Encrypted secrets and native HTTP</h2>
-        <p>Store credentials safely. Call any API directly from automation scripts.</p>
-      </div>
-
-      <div class="secrets-grid">
-        <div class="secrets-info">
-          <h3>Secrets that stay secret</h3>
-          <p>API keys, OAuth tokens, and credentials are encrypted at rest with ChaCha20-Poly1305, keyed from your Ed25519 identity. Access them from the CLI, JS runtime, or MCP, never exposed in plaintext on disk.</p>
-          <h3>Native HTTP client</h3>
-          <p>Call any REST API directly from JS scripts. Bearer token auth, JSON request/response, and full header control, no curl, no external dependencies.</p>
-          <ul class="secrets-list">
-            <li><strong>ChaCha20-Poly1305</strong> encryption at rest</li>
-            <li><strong>CLI + JS + MCP</strong> access to secrets</li>
-            <li><strong>fetch-like API</strong> for HTTP requests</li>
-            <li><strong>Bearer tokens</strong> injected from secrets store</li>
-            <li><strong>JSON</strong> request and response handling</li>
-          </ul>
-        </div>
-
+    <section class="sec" id="ai">
+      <h2>From your AI tool</h2>
+      <p class="lede">Work that keeps running on your own machine after you close the laptop.</p>
+      <div class="cols">
         <div>
-          <div class="code-block">
-            <div class="code-header">
-              <span class="code-dot"></span>
-              <span class="code-dot"></span>
-              <span class="code-dot"></span>
-              <span class="code-title">Terminal, Secrets + HTTP</span>
-            </div>
-            <div class="code-body">
-<span class="prompt">$</span> <span class="cmd">hop secrets set</span> <span class="flag">API_KEY</span> sk-ant-...
-<span class="output">OK</span>
-
-<span class="comment">// In a cron job:</span>
-<span class="cmd">var</span> key = hop.secrets.get(<span class="flag">"API_KEY"</span>);
-<span class="cmd">var</span> resp = hop.http.post(<span class="flag">"https://api.example.com"</span>, {
-    bearer: key,
-    json: { query: <span class="flag">"hello"</span> }
-});
-hop.log(resp.status);  <span class="comment">// 200</span>
-            </div>
-          </div>
+          <p class="prose">A scheduled job runs on a machine you own, on a schedule you set, using credentials that never leave it. It can call a model, act on the answer, and store the result, without a session open and without a third-party service holding your keys. Your AI tool can create, inspect and change schedules directly.</p>
+          <p class="note"><a href="agents.html">How agents get set up</a>.</p>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Remote Management -->
-  <section id="remote">
-    <div class="container">
-      <div class="section-header">
-        <h2>Manage from anywhere</h2>
-        <p>Every command works on remote hosts. The host name always comes first.</p>
-      </div>
-
-      <div style="max-width: 48rem; margin: 0 auto;">
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Terminal, Remote management from your laptop</span>
-          </div>
-          <div class="code-body">
-<span class="comment"># From your laptop to your cloud server</span>
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> secrets set <span class="flag">API_KEY</span> value
-<span class="output">OK</span>
-
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap enable <span class="flag">email-monitor</span>
-<span class="output">Enabled: email-monitor (daily 7 AM)</span>
-
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cap status
-<span class="output">  health-monitor     enabled    last run: 2m ago     OK</span>
-<span class="output">  email-monitor      enabled    last run: 7:00 AM    OK</span>
-
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> kv get <span class="flag">briefings</span> 2026-03-30
-<span class="output">  3 urgent, 12 routine, 5 archived</span>
-<span class="output">  Urgent: AWS bill spike, deploy approval, security alert...</span>
-
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron list
-<span class="output">  health-monitor      */5 * * * *     enabled</span>
-<span class="output">  security-baseline   0 3 * * *       enabled</span>
-<span class="output">  email-monitor       0 7 * * *       enabled</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Scheduling AI jobs -->
-  <section id="ai-jobs" style="padding-top: 0;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Schedule recurring AI jobs</h2>
-        <p>Work that keeps running on your own machine after you close the laptop.</p>
-      </div>
-
-      <div class="grid grid-2" style="align-items: center; gap: 3rem;">
-        <div>
-          <p style="color: var(--color-text-secondary); margin-bottom: 1.25rem;">A scheduled job here runs on a machine you own, on a schedule you set, using credentials that never leave it. It can call a model, act on the answer, and store the result, all without a session open and without a third-party automation service holding your keys.</p>
-          <ul class="daemon-features">
-            <li>Survives disconnects: the daemon runs it, not your terminal</li>
-            <li>Credentials stay encrypted on the machine that uses them</li>
-            <li>Your AI tool can create, inspect, and change schedules directly</li>
-            <li>Output is kept on the machine, queryable later</li>
-          </ul>
-          <a href="agents.html" class="btn btn-ghost" style="margin-top: 1.75rem;">How agents get set up &rarr;</a>
-        </div>
-
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
-            <span class="code-title">Your AI tool</span>
-          </div>
-          <div class="code-body">
-<span class="output">"every morning at 7, check the</span>
-<span class="output"> backup logs and email me anything</span>
-<span class="output"> that failed"</span>
+        <div class="cmdbox"><span class="said">"every morning at 7, check the</span>
+<span class="said"> backup logs and email me anything</span>
+<span class="said"> that failed"</span>
 
 <span class="comment"># what it creates</span>
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron create backup-check \
-    <span class="flag">--schedule</span> <span class="output">"0 7 * * *"</span>
+    <span class="flag">--schedule</span> "0 7 * * *"
 
 <span class="output">&rarr; runs on myserver, not your laptop</span>
-<span class="output">&rarr; keeps running after you disconnect</span>
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> cron list
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Setup -->
-  <section id="setup" style="padding-bottom: 8rem;">
-    <div class="container">
-      <div class="section-header">
-        <h2>Get started</h2>
-        <p>Four steps from bare metal to automated cloud.</p>
+<span class="output">&rarr; keeps running after you disconnect</span></div>
       </div>
 
-      <div class="steps steps-4">
-        <div class="step">
-          <h3>Install WireHop on your server</h3>
-          <p>One command installs WireHop as a persistent daemon that starts at boot.</p>
-          <div style="margin-top: 0.75rem;"><code>curl -fsSL https://wirehop.org/install.sh | bash</code></div>
-        </div>
-        <div class="step">
-          <h3>Connect from your laptop</h3>
-          <p>Redeem the invite token to save the server as a known host.</p>
-          <div style="margin-top: 0.75rem;"><code>hop connect &lt;invite-token&gt;</code></div>
-        </div>
-        <div class="step">
-          <h3>Store credentials</h3>
-          <p>Encrypt your API keys on the remote host. They never leave the machine in plaintext.</p>
-          <div style="margin-top: 0.75rem;"><code>hop myserver secrets set ANTHROPIC_API_KEY sk-ant-...</code></div>
-        </div>
-        <div class="step">
-          <h3>Enable automation</h3>
-          <p>Turn on a capability and it runs on schedule, unattended.</p>
-          <div style="margin-top: 0.75rem;"><code>hop myserver cap enable email-monitor</code></div>
-        </div>
+      <div class="cta">
+        <a href="install.html" class="btn btn-solid">Install WireHop</a>
+        <a href="fleet.html" class="btn btn-ghost">Run it across the fleet</a>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- CTA -->
-  <section style="padding-top: 0; padding-bottom: 8rem;">
-    <div class="container">
-      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
-        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to automate?</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Automation features are built into WireHop. Install the daemon, store your credentials, and enable a capability.</p>
-        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
-          <a href="install.html" class="btn btn-primary">Install WireHop</a>
-        </div>
-      </div>
-    </div>
-  </section>
+    <div class="spacer"></div>
+  </div>
 
-  <!-- Footer -->
   <footer id="site-footer"></footer>
 
   <script src="shared.js"></script>
-
 </body>
 </html>

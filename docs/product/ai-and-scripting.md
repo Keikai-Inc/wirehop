@@ -865,3 +865,95 @@ if (targets.length === 0) {
 ```
 
 *Last updated: v0.6.33*
+
+---
+
+## Why an agent can bootstrap alone
+
+Most remote-access tools need a human somewhere in the setup. The same task,
+side by side:
+
+| A hosted mesh VPN | WireHop |
+|---|---|
+| 1. Install the client | 1. Install on the machine to be reached |
+| 2. **Create an account in a browser** | 2. Mint an invite (single-use, time-limited) |
+| 3. **Verify an email** | 3. Install on the other machine |
+| 4. **Open the admin console** | 4. Redeem the invite |
+| 5. **Generate an auth key and paste it** | |
+| 6. Bring up the network | |
+
+Four of the hosted tool's six steps can only be done by a person. An agent
+stops at step two and asks you to finish, which is the opposite of why you gave
+it the task. WireHop has no handoffs: nothing to sign up for, nothing to click,
+nobody to wait on.
+
+This is not an accident of packaging. WireHop has **no coordination server and
+no accounts by design**: identity is a keypair written to disk on first run, and
+membership is a document your machines replicate among themselves. There is no
+console to click through because there is nothing to click through to.
+
+The whole bootstrap, as an agent runs it:
+
+```bash
+# On the machine to be reached
+curl -fsSL https://wirehop.org/install.sh | bash -s -- --host
+hop invite --json
+# {"token":"eyJ0eX...","expires_in":900,"max_uses":1}
+
+# On the machine doing the reaching
+curl -fsSL https://wirehop.org/install.sh | bash
+hop connect eyJ0eX...
+# Joined. You are 100.64.3.12 (laptop.hop)
+
+# From either machine
+hop exec myserver -- systemctl status api
+hop fleet exec production -- uptime
+hop fleet list --json
+```
+
+Every command takes `--json`, so an agent never scrapes output. Errors are
+structured too: a failure prints one JSON envelope with a `code`, a `retryable`
+flag, and a hint, so an agent can decide whether waiting will help instead of
+guessing from a string (see [cli-reference.md](cli-reference.md#structured-errors)).
+
+### The cold-start eval
+
+"An agent can set it up alone" is checkable, so it is a test that runs against
+every build: `tests/e2e/agent-coldstart.sh`.
+
+Two bare Linux containers, no WireHop installed, no human reachable. A real
+language model gets exactly one tool, "run a shell command on machine X", and
+is asked for a working private network plus one command that runs across it.
+Then the harness throws away whatever the agent claimed and **inspects the
+containers itself**:
+
+- **install**: is the binary really there?
+- **reach**: does a command issued on one machine really execute on the other?
+- **private network**: do both hold a virtual address, and does a packet really
+  cross between them?
+- **fleet command**: does a fleet-wide command really come back?
+
+It scores by capability rather than by name, because the agent picks its own
+hostnames and roles. An agent that declares victory over a dead network scores
+zero. The harness is in the repository, so you can run it against your own
+model rather than take our word for the result.
+
+### Scoping an invite for an agent
+
+An agent holds exactly one thing: the invite it was issued. Give it the least
+invite that does the job:
+
+```bash
+# A monitoring agent: read-only, two commands, one machine, one hour
+hop invite --tier client --read-only \
+    --allow-command df --allow-command uptime --expiry 3600
+
+# A deploy agent: scoped to one directory, no network egress
+hop invite --preset deploy --scope /var/www --no-network
+
+# See what it actually did, on the machine it did it to
+hop audit --since 1h
+```
+
+The full list of restrictions is in
+[security.md](security.md#everything-an-invite-can-restrict).

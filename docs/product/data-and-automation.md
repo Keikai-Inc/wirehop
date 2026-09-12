@@ -483,6 +483,48 @@ audit log), or a file path. Connect tier (network) because `hop.claude` needs it
 the per-node search is read-only (grep/journalctl/cat only). Without an Anthropic
 credential it still returns the raw per-host aggregation, just no AI summary.
 
+#### email-monitor.js (condensed)
+
+The shape of the built-in email monitor, trimmed to the calls that matter. It
+runs daily at 7 AM via `hop cron` once enabled.
+
+```javascript
+var key   = hop.secrets.get("ANTHROPIC_API_KEY");
+var gmail = hop.secrets.get("gmail_access_token");
+
+// Fetch unread messages
+var msgs = hop.http.get("https://gmail.googleapis.com/gmail/v1/users/me/messages", {
+    bearer: gmail, params: { q: "is:unread" }
+});
+
+// Claude classifies each as URGENT / ACTION / FYI
+var triage = hop.http.post("https://api.anthropic.com/v1/messages", {
+    headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+    json: { model: "claude-sonnet-5", messages: [
+        { role: "user", content: "Classify as URGENT/ACTION/FYI: " + JSON.stringify(msgs) }
+    ]}
+});
+
+// Send the briefing to your own inbox
+hop.http.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    bearer: gmail, json: { raw: base64url(summary) }
+});
+
+// Mark FYI messages as read (urgent + action stay unread)
+hop.http.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify", {
+    bearer: gmail, json: { ids: fyiIds, removeLabelIds: ["UNREAD"] }
+});
+
+// Archive the briefing for later retrieval
+hop.kv.set("briefings", today, { summary: summary, urgent: urgent.length });
+```
+
+Secrets are encrypted at rest with ChaCha20-Poly1305, keyed from the machine's
+own Ed25519 identity, and are readable from the CLI, the JS runtime, and MCP
+without ever being written to disk in plaintext. The HTTP client is fetch-like:
+bearer-token auth, JSON request and response, full header control, no curl and
+no external dependencies.
+
 ### Email Monitor Setup
 
 #### Prerequisites
