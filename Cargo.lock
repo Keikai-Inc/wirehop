@@ -2676,8 +2676,6 @@ dependencies = [
 [[package]]
 name = "iroh-docs"
 version = "0.97.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57871fef17af23122fd3013719c9d7cacd4ac77d60b2d9463ebc8505dbc3495c"
 dependencies = [
  "anyhow",
  "async-channel",

@@ -120,6 +120,7 @@ order) and used only on hop/4 connections; an older host never sees them.
 | Zombie `claude` children | `hop-mcp/src/js/bindings.rs` | `kill()` without `wait()` on timeout left a `<defunct>` child for the daemon's lifetime (observed on RexMundi). Reaped now. |
 | Unbounded audit queue | `audit.rs` | A reconnect storm records a `session.start` per resume (13k for one session in the incident log). The queue is bounded at 8192; overflow is dropped and counted (`audit::dropped`), logged once per power of two. |
 | Per-host semaphore map | `agent.rs` | Cleared on pool flush. |
+| Docs actor `JoinSet` never drained | `vendor/iroh-docs/src/actor.rs` (2026-09-19) | Every netdoc query left a finished reply task in the actor's `JoinSet`; at the host's query rate that was ~20 KB/s, 1.6 GB after a day. Backported the 0.101 `join_next` arm; see `iroh-fork.md`. |
 
 Still open, from the incident review: memory-pressure awareness in the
 daemon, a `hop status` for hosts (the counters exist in `net::health`), and

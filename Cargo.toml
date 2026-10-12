@@ -118,6 +118,13 @@ iroh-relay = { git = "https://github.com/thedracle/iroh.git", branch = "hop-rela
 # it an inline TinyVec (no per-packet heap alloc for the common 1-2 path case), so
 # multipath can be re-enabled without the bleed. See vendor/noq-proto.
 noq-proto = { path = "vendor/noq-proto" }
+# iroh-docs 0.97.0 vendored + patched: the docs actor spawned a reply-streamer
+# task into a JoinSet for every ListAuthors/ListReplicas/GetMany query and never
+# join_next'd it, so each finished task's cell stayed allocated for the life of
+# the daemon (~20 KB/s on a host that polls its netdoc, 1.6 GB/day). Upstream
+# fixed it in 0.101 (which needs iroh 1.x); this is that one-arm backport. See
+# vendor/iroh-docs/src/actor.rs (`join_next`) and docs/technical/iroh-fork.md.
+iroh-docs = { path = "vendor/iroh-docs" }
 
 [profile.release]
 # opt-level "s" optimizes for size (still keeps most speed opts, unlike "z").

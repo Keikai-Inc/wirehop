@@ -53,6 +53,24 @@ and `iroh-relay` together. `iroh-docs`/`gossip`/`blobs` pull `iroh-base` and
 `iroh_base` versions and a `PublicKey` type mismatch. Cargo patches a whole git
 workspace, so all three move as a unit.
 
+## Vendored `iroh-docs` (0.97.0 + one backport)
+
+`vendor/iroh-docs` is a copy of the published `iroh-docs` 0.97.0 with one
+change in `src/actor.rs`: the docs actor's `run_async` loop gains a
+`self.tasks.join_next()` arm. Every streaming query (`ListAuthors`,
+`ListReplicas`, `GetMany`) spawns a reply task into that `JoinSet`; 0.97 never
+reaped finished ones, so each query left its task cell allocated for the life
+of the actor. A host polls its netdoc a few times a second (VPN peer-IP
+refresh, admin-author refresh, DNS lookups, per-connection revocation
+checks), which came out to roughly 20 KB/s of growth, or 1.6 GB per day,
+on RexMundi (2026-09-19). Upstream fixed it in iroh-docs 0.101
+(`actor_tasks_joinset_drain` test), but 0.101 needs iroh 1.x, so the fix is
+backported here and goes away with the 1.1 migration below. Run its test with:
+
+```
+cargo test --manifest-path vendor/iroh-docs/Cargo.toml --lib actor_tasks_joinset_drain
+```
+
 ## Branches on the fork (`github.com/thedracle/iroh`, public)
 
 | Branch | SHA | Base | Purpose |
@@ -140,7 +158,8 @@ it is ordinary 1.0-cleanup churn plus two relocations.
 | type mismatch in closure arguments | 1 | follows from AccessControl change |
 | function takes 0 args but 1 supplied | 1 | signature change |
 
-Also required: bump `iroh-docs` 0.97 -> 0.101, `iroh-gossip` 0.97 -> 0.101,
+Also required: bump `iroh-docs` 0.97 -> 0.101 (and drop `vendor/iroh-docs`,
+whose only patch is already in 0.101), `iroh-gossip` 0.97 -> 0.101,
 `iroh-blobs` 0.99 -> 0.103, and `hop-core`'s own direct `iroh-relay` pin
 (0.97 -> 1.1, otherwise `ed25519-dalek` conflicts: iroh 1.1 wants `>=3.0.0-rc.0`
 while iroh-base 0.97 pins `=3.0.0-pre.1`).
