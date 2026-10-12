@@ -275,6 +275,29 @@ pub async fn authenticate_client(
                 }
                 peers.save(config_dir)?;
 
+                // Clear any stale revocation FIRST: a node that was removed and is
+                // now redeeming a fresh invite must come back. The tombstone
+                // outlives the local entry by design (it overrides peers.json in
+                // the authorization order above), so without this the re-invited
+                // peer lands in peers.json, reports "authorized", and is then
+                // rejected on every single connection it opens.
+                if let Some(nd) = netdoc
+                    && nd.is_revoked(&remote_id.to_string()).await.unwrap_or(false)
+                {
+                    match nd.clear_revocation(&remote_id.to_string()).await {
+                        Ok(()) => tracing::info!(
+                            "Cleared revocation for {} — re-admitted by invite",
+                            remote_id.fmt_short()
+                        ),
+                        // Keep going: peers.json still authorizes on a host whose
+                        // doc write failed, and the next redemption retries.
+                        Err(e) => tracing::warn!(
+                            "netdoc: clearing revocation for {} failed: {e:#}",
+                            remote_id.fmt_short()
+                        ),
+                    }
+                }
+
                 // Dual-write to the network document (best-effort) so the new
                 // peer replicates to other nodes. `admit_peer` also allocates the
                 // member's vIP (`peer/N.vip`, the addr→owner authority the data

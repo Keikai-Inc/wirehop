@@ -3462,6 +3462,45 @@ impl NetDoc {
         Ok(())
     }
 
+    /// Re-admit a member that a `RemovePeer` or a prune revoked — the inverse of
+    /// [`revoke`](Self::revoke), and the repair path for a peer that was removed
+    /// and then re-invited (the invite re-adds it to `peers.json`, but a
+    /// revocation overrides the local entry, so the peer stays locked out until
+    /// the tombstone goes).
+    ///
+    /// `node_id_prefix` resolves against `peers.json`, because the roster entry is
+    /// what authorizes the peer once the tombstone is gone: a node that is in
+    /// neither the local roster nor the doc cannot be re-admitted from a node-id
+    /// alone (there is no username/role to restore) and needs a fresh invite.
+    /// Returns the resolved `(node_id, name)`.
+    pub async fn readmit_member(
+        &self,
+        config_dir: &std::path::Path,
+        node_id_prefix: &str,
+    ) -> Result<(String, String)> {
+        let local = crate::config::PeersStore::load(config_dir)
+            .map(|p| p.peers)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|p| p.node_id.starts_with(node_id_prefix));
+        let peer = match local {
+            Some(p) => p,
+            None => anyhow::bail!(
+                "no peer in this host's roster matches '{node_id_prefix}' — \
+                 a peer removed from peers.json needs a fresh invite (which now \
+                 clears the revocation itself)"
+            ),
+        };
+        // Order matters: `admit_peer` → `put_peer` writes the roster entry that
+        // `revoke` tombstoned, and the clear must land first so a concurrent
+        // reader never sees a live entry that `is_revoked` still overrides.
+        self.clear_revocation(&peer.node_id).await?;
+        self.admit_peer(&peer).await?;
+        self.refresh_admin_authors().await;
+        crate::fleet::export_warren_snapshot(self, config_dir).await;
+        Ok((peer.node_id.clone(), peer.name.clone()))
+    }
+
     /// Propagate a local admin mutation (RemovePeer / grant / role / rename / …)
     /// to the warren — the canonical "after an admin write, push it to the doc"
     /// sequence shared by the network admin path AND the local self-admin (datastore
@@ -4235,6 +4274,41 @@ mod tests {
         // Re-admit now succeeds (reconcile no longer skips it as revoked).
         net.reconcile(&[sample_peer("victimNODE01", "v")], &[]).await.unwrap();
         assert!(net.get_peer("victimNODE01").await.unwrap().is_some(), "re-admitted after clear");
+    }
+
+    #[tokio::test]
+    async fn readmit_member_restores_a_removed_then_reinvited_peer() {
+        // The 2026-09-23 lockout: a peer is removed (tombstone + roster entry
+        // deleted), then rejoins by invite so it is back in peers.json — but the
+        // revocation overrides the local entry, so every connection is refused.
+        // `readmit_member` is the repair: tombstone gone, doc entry back.
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetDoc::spawn(test_endpoint().await, dir.path(), Bootstrap::Create)
+            .await
+            .expect("spawn netdoc");
+        net.record_founder_anchor(None);
+
+        let peer = sample_peer("dadsNODE0001", "dad-laptop");
+        net.put_peer(&peer).await.unwrap();
+        net.revoke(&peer.node_id, "admin removal", &now_timestamp()).await.unwrap();
+        assert!(net.is_revoked(&peer.node_id).await.unwrap());
+        assert!(net.get_peer(&peer.node_id).await.unwrap().is_none(), "revoke drops the entry");
+
+        // The invite put it back in peers.json only — the doc still rejects it.
+        crate::config::PeersStore { peers: vec![peer.clone()] }.save(dir.path()).unwrap();
+        assert!(net.is_revoked(&peer.node_id).await.unwrap(), "rejoining does not clear it");
+
+        let (id, name) = net.readmit_member(dir.path(), "dadsNODE").await.unwrap();
+        assert_eq!(id, peer.node_id);
+        assert_eq!(name, "dad-laptop");
+        assert!(!net.is_revoked(&peer.node_id).await.unwrap(), "tombstone cleared");
+        assert!(net.get_peer(&peer.node_id).await.unwrap().is_some(), "roster entry restored");
+
+        // A node in neither the roster nor the doc can't be conjured up.
+        assert!(
+            net.readmit_member(dir.path(), "strangerNODE").await.is_err(),
+            "unknown node needs a fresh invite, not a readmit"
+        );
     }
 
     #[tokio::test]

@@ -469,7 +469,7 @@ hop warren leave
 >   current warren (backed up to `.warren-backup-*`) and joins the new one.
 >   Running both at once (multi-home) is planned.
 
-### `hop peers [remove|rename]`
+### `hop peers [remove|rename|readmit]`
 
 List authorized peers or known hosts.
 
@@ -478,12 +478,31 @@ List authorized peers or known hosts.
 | *(none)* | List all peers/known hosts |
 | `remove <id>` | Remove an authorized peer by NodeId |
 | `rename <id> <name>` | Rename a peer or known host |
+| `readmit <id>` | Undo a removal/prune: clear the peer's replicated revocation and restore its roster entry |
 
 ```bash
 hop peers
 hop peers remove abc123
 hop peers rename abc123 my-server
+hop peers readmit abc123
 ```
+
+**When to use `readmit`.** `remove` and `hop fleet prune` write a revocation
+tombstone into the warren document, and that tombstone **overrides the local
+`peers.json` entry on every host** — that is what makes a removal stick warren-wide.
+So a peer that was removed and then re-invited on an older build appears in
+`hop peers` yet is refused on every connection, with this in the host log:
+
+```
+WARN hop_core::auth: Peer <id> rejected: revoked in network document (overrides local entry)
+```
+
+`hop peers readmit <id>` clears the tombstone and puts the roster entry back.
+Redeeming a fresh invite now clears it too, so `readmit` is for the case where you
+do **not** want to spend an invite. It needs the host daemon running (the
+revocation lives in the replicated document) and resolves `<id>` against this
+host's `peers.json`; a peer that is no longer in the roster at all needs a new
+invite instead.
 
 ### `hop admin <target> <action>`
 

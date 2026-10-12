@@ -270,6 +270,10 @@ pub enum AdminRequest {
     CheckpointSessions,
     /// Start every session in the checkpoint file again (daemon socket only).
     RestoreSessions { dry_run: bool },
+    /// Re-admit a peer that a `RemovePeer`/prune revoked: clear the replicated
+    /// revocation tombstone and put the roster entry back. Needs async netdoc
+    /// access, so the daemon socket handles it out-of-band like `PruneMembers`.
+    ReadmitPeer { node_id_prefix: String },
 }
 
 /// A single metric point pushed from a remote host.
@@ -343,6 +347,8 @@ pub enum AdminResponse {
     Checkpointed(Vec<crate::shell::checkpoint::SessionCheckpoint>),
     /// What `RestoreSessions` did, one entry per checkpointed session.
     Restored(Vec<RestoreOutcome>),
+    /// A revoked peer was re-admitted (`ReadmitPeer`).
+    PeerReadmitted { node_id: String, name: String },
 }
 
 /// One checkpointed session's fate on restore.

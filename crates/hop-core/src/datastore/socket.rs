@@ -228,6 +228,19 @@ async fn handle_connection(
             _ => None,
         };
 
+        // Re-admit (clearing a revocation + restoring the roster entry) writes to
+        // the doc, so it needs the same async netdoc access as prune and
+        // self-exports the snapshot.
+        let readmit: Option<String> = match &req {
+            DsRequest::Admin(a) => match a.as_ref() {
+                crate::proto::AdminRequest::ReadmitPeer { node_id_prefix } => {
+                    Some(node_id_prefix.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
         // Session listing, checkpoint and restore need the registry actor
         // (async), like prune.
         enum SessionOp { List, Checkpoint, Restore { dry_run: bool } }
@@ -283,6 +296,24 @@ async fn handle_connection(
                     message: "warren not active (no netdoc) — cannot prune".to_string(),
                 })),
             }
+        } else if let Some(prefix) = readmit.as_deref() {
+            match netdoc.get() {
+                Some(nd) => match nd.readmit_member(&config_dir, prefix).await {
+                    Ok((node_id, name)) => {
+                        crate::admin::log_admin_action(&config_dir, "readmit_peer", &node_id);
+                        DsResponse::Admin(Box::new(crate::proto::AdminResponse::PeerReadmitted {
+                            node_id,
+                            name,
+                        }))
+                    }
+                    Err(e) => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Error {
+                        message: format!("{e:#}"),
+                    })),
+                },
+                None => DsResponse::Admin(Box::new(crate::proto::AdminResponse::Error {
+                    message: "warren not active (no netdoc) — nothing to re-admit from".to_string(),
+                })),
+            }
         } else {
             // Dispatch (blocking) on a thread pool — both datastore ops and the
             // operator-admin handler are sync.
@@ -299,6 +330,7 @@ async fn handle_connection(
         // Prune self-propagates, so it's excluded.
         if is_admin
             && prune.is_none()
+            && readmit.is_none()
             && !matches!(&resp, DsResponse::Admin(b) if matches!(b.as_ref(), crate::proto::AdminResponse::Error { .. }))
             && let Some(nd) = netdoc.get()
         {

@@ -177,6 +177,16 @@ removal are layered on top:
   `hop admin self`), so the sole admin can prune its own warren; `--dry-run` returns
   the would-prune set without mutating. An optional `prune_after_secs` HostConfig
   TTL makes the founder's daemon auto-evict on its sweep.
+- **Re-admission.** A revocation outranks `peers.json` in the authorization order
+  (`auth/mod.rs` step 0), by design: removal must take effect on every host without
+  each one first deleting its local entry. The consequence is that re-inviting a
+  removed peer is *not* enough on its own — the redeemer lands back in `peers.json`,
+  reports authorized, and is then rejected on every connection. Two paths clear the
+  tombstone: invite redemption calls `clear_revocation` before `admit_peer`, and
+  `NetDoc::readmit_member` (`hop peers readmit <id>`, over the local operator socket
+  like prune) clears it and re-`put_peer`s the roster entry without spending an
+  invite. `readmit_member` resolves its prefix against `peers.json`, since a node in
+  neither the roster nor the doc has no username/role to restore and needs an invite.
 - **Source of duplicates.** A *new* roster node-id is only ever admitted at invite
   redemption (`auth/mod.rs`, recording the redeemer's `remote_id`); there is no guard
   that it's a daemon vs a transient client endpoint. The protection is the unified

@@ -90,6 +90,11 @@ pub fn handle_admin_request(
         AdminRequest::PruneMembers { .. } => AdminResponse::Error {
             message: "prune requires the warren netdoc (handled by the daemon socket)".to_string(),
         },
+        // Re-admit clears a replicated revocation, so it needs the netdoc too and
+        // is intercepted by the daemon socket exactly like prune.
+        AdminRequest::ReadmitPeer { .. } => AdminResponse::Error {
+            message: "readmit requires the warren netdoc (handled by the daemon socket)".to_string(),
+        },
         AdminRequest::SetPeerRole { node_id_prefix, role_name } => {
             handle_set_peer_role(config_dir, &node_id_prefix, &role_name)
         }
@@ -535,7 +540,7 @@ fn handle_status(config_dir: &Path) -> AdminResponse {
 }
 
 /// Append an entry to admin_log.json for audit trail.
-fn log_admin_action(config_dir: &Path, action: &str, details: &str) {
+pub(crate) fn log_admin_action(config_dir: &Path, action: &str, details: &str) {
     let path = config_dir.join("admin_log.json");
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

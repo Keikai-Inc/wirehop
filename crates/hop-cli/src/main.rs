@@ -4480,6 +4480,9 @@ fn display_admin_response(_action: &AdminAction, resp: AdminResponse) {
         AdminResponse::Restored(outcomes) => {
             println!("{} session(s) started.", outcomes.iter().filter(|o| o.new_session_id.is_some()).count())
         }
+        AdminResponse::PeerReadmitted { node_id, name } => {
+            println!("Re-admitted {name} ({}).", &node_id[..10.min(node_id.len())]);
+        }
         AdminResponse::Error { message } => {
             eprintln!("Error: {message}");
         }
@@ -7857,6 +7860,42 @@ fn cmd_peers(action: Option<PeersAction>, host_config_dir: &std::path::Path, use
                 }
             }
             Ok(())
+        }
+        Some(PeersAction::Readmit { id }) => {
+            use hop_core::datastore::protocol::{DsRequest, DsResponse};
+            use hop_core::datastore::socket::DaemonConnection;
+            // Must go through the daemon: clearing the revocation is a write to
+            // the replicated netdoc, which only the running host holds open.
+            let conn = DaemonConnection::connect(host_config_dir).context(
+                "connect to the daemon socket — `hop peers readmit` needs the host running, \
+                 since the revocation lives in the warren document",
+            )?;
+            match conn.request(&DsRequest::Admin(Box::new(
+                hop_core::proto::AdminRequest::ReadmitPeer {
+                    node_id_prefix: id.clone(),
+                },
+            )))? {
+                DsResponse::Admin(r) => match *r {
+                    hop_core::proto::AdminResponse::PeerReadmitted { node_id, name } => {
+                        if agent_out::json_mode() {
+                            agent_out::emit(&serde_json::json!({
+                                "readmitted": true,
+                                "node_id": node_id,
+                                "name": name,
+                            }));
+                        } else {
+                            println!("Re-admitted {name} ({}).", &node_id[..10.min(node_id.len())]);
+                            println!("The revocation is cleared warren-wide; it can connect again.");
+                        }
+                        Ok(())
+                    }
+                    hop_core::proto::AdminResponse::Error { message } => {
+                        anyhow::bail!("readmit failed: {message}")
+                    }
+                    other => anyhow::bail!("unexpected daemon response: {other:?}"),
+                },
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
         }
     }
 }

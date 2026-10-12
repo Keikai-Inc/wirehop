@@ -1219,6 +1219,15 @@ pub enum PeersAction {
         /// New name
         name: String,
     },
+
+    /// Re-admit a peer that was removed or pruned: clears the replicated
+    /// revocation that keeps rejecting it and restores its roster entry.
+    /// Use this when a peer is listed by `hop peers` but every connection it
+    /// makes is refused with "revoked in network document"
+    Readmit {
+        /// NodeId (or unambiguous prefix) of the peer to re-admit
+        id: String,
+    },
 }
 
 /// Manage pending invites on this host.
