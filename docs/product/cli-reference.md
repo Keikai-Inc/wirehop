@@ -1089,6 +1089,13 @@ pipeline, with no restart. Answers three operational questions:
   Zero = the pipe keeps up.
 - **How long do we hold a packet?** — a log2 histogram of per-packet handling
   latency (TUN→send on egress, recv→TUN on ingress) with p50/p99.
+- **Can we reach each peer at all?** — a `VPN DIALS` section: dials completed and
+  failed, and per peer VPN endpoint either `ok` with the age of the last dial or
+  `FAILING` with the streak length, how long it has lasted, and the last error.
+  A failed dial is also counted under `DROP no route/endpoint`; this section says
+  which peer and why. The daemon also logs a WARN on the first failure of a
+  streak and every 5 min while it lasts (`vpn: dial to <peer> failed …`), and an
+  INFO when it recovers. Omitted when the running daemon predates it.
 
 The counters are always-on, lock-free atomics in the worker (no measurable cost),
 served over the daemon socket. An operator-group user can read them **without
@@ -1098,7 +1105,7 @@ sudo** (the socket is group-restricted, like other operator-admin ops).
 |---|---|
 | `--watch` | Refresh continuously, showing per-second rates (Ctrl-C to stop) |
 | `--interval <N>` | Seconds between refreshes in `--watch` mode (default: 2) |
-| `--json` | Emit the raw snapshot as JSON instead of the formatted report |
+| `--json` | Emit the raw snapshot as JSON instead of the formatted report; the dial health is under `vpn_dials` |
 
 ```bash
 hop debug net-stats              # one-shot totals + latency histograms

@@ -456,6 +456,7 @@ fn dispatch_request(
         DsRequest::SecretsList { username } => {
             DsResponse::SecretNames(ds.secrets_list(&username)?)
         }
+        DsRequest::Health => DsResponse::Health(crate::health::snapshot_json()),
         DsRequest::NetStats => {
             DsResponse::NetStats(Box::new(crate::netstats::NET_STATS.snapshot()))
         }
@@ -555,6 +556,28 @@ mod tests {
                 assert_eq!(s.in_lat.len(), crate::netstats::LAT_BUCKETS);
             }
             other => panic!("expected NetStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_roundtrip_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let _listener = spawn_listener(dir.path(), ds, iroh::SecretKey::from_bytes(&[7u8; 32]).public(), std::sync::Arc::new(tokio::sync::OnceCell::new()), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        crate::health::note_vpn_dial_failed("sock-health", "timed out");
+
+        let conn = DaemonConnection::connect(dir.path()).unwrap();
+        match conn.request(&DsRequest::Health).unwrap() {
+            DsResponse::Health(json) => {
+                let h: crate::health::HealthSnapshot = serde_json::from_str(&json).unwrap();
+                assert_eq!(h.vpn_peers["sock-health"].consecutive_failures, 1);
+                assert!(h.vpn_dial_failed >= 1);
+            }
+            other => panic!("expected Health, got {other:?}"),
         }
     }
 

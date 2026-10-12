@@ -54,7 +54,7 @@ A laptop member and the RexMundi founder, both on 0.9.40.
 |---|---|
 | Health registry | One in-process registry (`hop-core::health`): per component (host endpoint, netdoc endpoint, each VPN peer, each agent connection, relay) the last real success, RTT/loss where known, and a recovery-action log. The existing `net::health` counters move into it. |
 | `hop status` / `hop doctor` | Read the registry over the daemon socket (host) and agent socket (client). Listed as open in host-resilience.md. |
-| VPN dial failures | Rate-limited WARN with the error; a separate `DROP dial failed` counter in `hop debug net-stats` instead of folding it into `no route/endpoint`. |
+| VPN dial failures (shipped) | `crate::health` records every VPN dial outcome per peer. First failure of a streak and then every 5 min: WARN with the error; recovery: INFO. `hop debug net-stats` shows a `VPN DIALS` section (`vpn_dials` in `--json`), read over a new `DsRequest::Health` whose payload is JSON so the registry can grow across versions. The drop stays counted under `no route/endpoint` so existing dashboards keep their totals. |
 | Agent connection status | `hop agent status` shows, per host connection: age, direct/relay, RTT, loss, last ping/pong. |
 | `hop fleet list` hint | When every other member is offline from this node, say so and name the likely component (this node's netdoc endpoint). |
 | Symbolicated samples | Release builds keep a split debug-info artifact (`split-debuginfo = "packed"`, `.dSYM` / `.debug` published next to each release) so `sample` / `gdb` output from a wedged field binary can be symbolized. |

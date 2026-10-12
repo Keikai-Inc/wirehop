@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hop_core::datastore::protocol::{DsRequest, DsResponse};
 use hop_core::datastore::socket::DaemonConnection;
+use hop_core::health::HealthSnapshot;
 use hop_core::netstats::{LAT_BUCKETS, NetStatsSnapshot, lat_bucket_upper};
 
 pub fn run(config_dir: &std::path::Path, watch: bool, interval: u64, json: bool) -> Result<()> {
@@ -29,13 +30,20 @@ pub fn run(config_dir: &std::path::Path, watch: bool, interval: u64, json: bool)
 
     if json && !watch {
         let snap = fetch(&conn)?;
-        println!("{}", serde_json::to_string_pretty(&snap)?);
+        let mut out = serde_json::to_value(&snap)?;
+        if let (Some(h), Some(obj)) = (fetch_health(&conn), out.as_object_mut()) {
+            obj.insert("vpn_dials".into(), serde_json::to_value(&h)?);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
     if !watch {
         let snap = fetch(&conn)?;
         print_totals(&snap);
+        if let Some(h) = fetch_health(&conn) {
+            print_dials(&h);
+        }
         print_histograms(&snap);
         return Ok(());
     }
@@ -63,6 +71,41 @@ fn fetch(conn: &DaemonConnection) -> Result<NetStatsSnapshot> {
         DsResponse::NetStats(s) => Ok(*s),
         DsResponse::Error(e) => anyhow::bail!("daemon error: {e}"),
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// The daemon's health registry, or `None` from a daemon that predates it
+/// (its socket closes on the unknown request), so net-stats keeps working
+/// against an older running daemon after the CLI is upgraded.
+fn fetch_health(conn: &DaemonConnection) -> Option<HealthSnapshot> {
+    match conn.request(&DsRequest::Health) {
+        Ok(DsResponse::Health(json)) => serde_json::from_str(&json).ok(),
+        _ => None,
+    }
+}
+
+/// VPN dial outcomes. A dial failure is also counted under "no route/endpoint"
+/// above; this section says which peer and why.
+fn print_dials(h: &HealthSnapshot) {
+    println!("\nVPN DIALS (this host → peer VPN endpoints)");
+    row("dials completed", h.vpn_dial_ok);
+    println!("    {:<28} {}", "dials failed", warn_count(h.vpn_dial_failed));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ago = |ms: u64| human_dur_ns(now_ms.saturating_sub(ms).saturating_mul(1_000_000));
+    for (peer, p) in &h.vpn_peers {
+        if p.consecutive_failures > 0 {
+            let since = p.failing_since_ms.map(ago).unwrap_or_else(|| "?".into());
+            println!(
+                "    {peer}  FAILING  {} in a row, for {since}: {}",
+                p.consecutive_failures,
+                p.last_error.as_deref().unwrap_or("?")
+            );
+        } else if let Some(ok) = p.last_success_ms {
+            println!("    {peer}  ok  last dial {} ago", ago(ok));
+        }
     }
 }
 

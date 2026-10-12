@@ -53,6 +53,9 @@ pub enum DsRequest {
     /// exactly the audience that needs it: the operator whose only path to
     /// the host *was* hop. Appended last.
     Restart,
+    /// Read the health registry (`crate::health`). Answered with
+    /// `DsResponse::Health`. Appended last.
+    Health,
 }
 
 /// Response from the daemon's datastore to a client.
@@ -74,4 +77,8 @@ pub enum DsResponse {
     NetStats(Box<crate::netstats::NetStatsSnapshot>),
     AuditEvents(Vec<crate::audit::AuditEvent>),
     CronRuns(Vec<CronRun>),
+    /// `crate::health::HealthSnapshot` as JSON, so the snapshot can gain
+    /// fields without breaking a CLI that is newer or older than the daemon.
+    /// Appended last.
+    Health(String),
 }

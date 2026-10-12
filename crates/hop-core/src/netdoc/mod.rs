@@ -3065,11 +3065,18 @@ impl NetDoc {
                                     });
                                 }
                                 conns.insert(pubkey, (c.clone(), std::time::Instant::now()));
+                                crate::health::note_vpn_dial_ok(&pubkey.fmt_short().to_string());
                                 c
                             }
                             Err(e) => {
                                 NET_STATS.eg_drop_noroute.fetch_add(1, Relaxed);
-                                tracing::debug!("vpn: dial {pubkey} failed: {e}");
+                                // WARN (rate-limited) via the health registry: a
+                                // dial that never succeeds once looked exactly like
+                                // an idle peer for weeks (2026-10-12).
+                                crate::health::note_vpn_dial_failed(
+                                    &pubkey.fmt_short().to_string(),
+                                    &format!("{e:#}"),
+                                );
                                 continue;
                             }
                         }
