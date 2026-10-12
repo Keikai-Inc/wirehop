@@ -563,10 +563,21 @@ fn is_dial_timeout(e: &anyhow::Error) -> bool {
     format!("{e:#}").to_lowercase().contains("timed out")
 }
 
-/// Connect to a host via QUIC. Tries hop/3 (compressed) first; falls back to
-/// hop/2 ONLY when hop/3 was REJECTED (a pre-0.9.28 host refusing the ALPN) —
-/// a TIMEOUT means the path is dead and hop/2 would hang identically, doubling
-/// the stall for nothing. Runs in a spawned task — never blocks the actor loop.
+/// True if the host refused the ALPN itself: TLS alert 120
+/// (`no_application_protocol`), which noq reports as "the cryptographic
+/// handshake failed: error 120" and rustls as "peer doesn't support any known
+/// protocol". Only this means "older host, try an older protocol".
+fn is_alpn_rejection(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("error 120") || msg.contains("doesn't support any known protocol")
+}
+
+/// Connect to a host via QUIC. Tries hop/4 first and steps down ONLY when the
+/// host REJECTED the ALPN (an older host). Any other failure — a timeout, a
+/// handshake aborted on a flaky path — is returned as is: stepping down on it
+/// would pin the pooled connection to an older protocol for its whole life,
+/// which also switches off the hop/4-only `Ping` liveness check. Runs in a
+/// spawned task — never blocks the actor loop.
 async fn do_connect(
     endpoint: &Endpoint,
     host_id: PublicKey,
@@ -604,13 +615,17 @@ async fn do_connect(
                 spawn_zombie_watchdog(conn.clone(), host_id);
                 return Ok(conn);
             }
-            Err(e) if is_dial_timeout(&e) => {
-                tracing::debug!("do_connect: {label} dial to {} timed out — dead path, NOT falling back", host_id.fmt_short());
-                return Err(e);
-            }
-            Err(e) => {
+            Err(e) if is_alpn_rejection(&e) => {
                 tracing::debug!("{label} not supported by {}, trying an older protocol", host_id.fmt_short());
                 last_err = Some(e);
+            }
+            Err(e) => {
+                if is_dial_timeout(&e) {
+                    tracing::debug!("do_connect: {label} dial to {} timed out — dead path, NOT falling back", host_id.fmt_short());
+                } else {
+                    tracing::debug!("do_connect: {label} dial to {} failed ({e:#}) — not an ALPN refusal, NOT falling back", host_id.fmt_short());
+                }
+                return Err(e);
             }
         }
     }
@@ -1181,6 +1196,22 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_alpn_refusal_steps_the_protocol_down() {
+        use super::{is_alpn_rejection, is_dial_timeout};
+        let refused = anyhow::anyhow!(
+            "Failed to connect to host: aborted by peer: the cryptographic handshake failed: error 120: peer doesn't support any known protocol"
+        );
+        assert!(is_alpn_rejection(&refused));
+        let aborted = anyhow::anyhow!(
+            "Failed to connect to host: aborted by peer: the application or application protocol caused the connection to be closed during the handshake"
+        );
+        assert!(!is_alpn_rejection(&aborted));
+        let timed_out = anyhow::anyhow!("Connection timed out after 10s. The host may be offline");
+        assert!(!is_alpn_rejection(&timed_out));
+        assert!(is_dial_timeout(&timed_out));
+    }
+
     use super::*;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};

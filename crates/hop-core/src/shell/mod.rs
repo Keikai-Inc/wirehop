@@ -324,47 +324,10 @@ pub async fn host_shell_session(
     }
 
     // --- Read initial setup messages from the client (WindowSize, SetEnv) ---
-    let mut initial_size = PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    let mut env_vars = HashMap::new();
-    let mut leftover_msg: Option<ClientMessage> = None;
-
-    for _ in 0..2 {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            proto::read_message::<ClientMessage>(&mut recv),
-        )
-        .await
-        {
-            Ok(Ok(ClientMessage::WindowSize {
-                cols,
-                rows,
-                pixel_width,
-                pixel_height,
-            })) => {
-                initial_size.cols = cols;
-                initial_size.rows = rows;
-                initial_size.pixel_width = pixel_width;
-                initial_size.pixel_height = pixel_height;
-            }
-            Ok(Ok(ClientMessage::SetEnv { vars })) => {
-                env_vars = vars;
-            }
-            Ok(Ok(other)) => {
-                // Non-setup message — save it and break out
-                leftover_msg = Some(other);
-                break;
-            }
-            Ok(Err(_)) | Err(_) => {
-                // Read error or timeout — old client or done sending setup
-                break;
-            }
-        }
-    }
+    // Through the same cancel-safe reader the I/O loop below uses (see
+    // `read_setup_messages`).
+    let mut framed = proto::FramedReader::new(&mut recv);
+    let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut framed).await;
 
     // Use the target user's login shell, not the daemon's $SHELL.
     #[cfg(unix)]
@@ -474,10 +437,9 @@ pub async fn host_shell_session(
     // Main loop: multiplex between PTY output, client input, and child exit
     let compress = protocol_version >= 3;
     let mut clean_exit = false;
-    // Cancellation-safe reader (legacy V0 shell path) — same fix as the persistent
-    // loop: a bare `read_message` select! branch loses bytes if `output_rx` cancels
-    // it mid-frame under a flood, desyncing the stream.
-    let mut framed = proto::FramedReader::new(&mut recv);
+    // `framed` (built for the setup read above) is the cancellation-safe reader
+    // for this legacy V0 loop too: a bare `read_message` select! branch loses
+    // bytes if `output_rx` cancels it mid-frame under a flood, desyncing the stream.
     loop {
         tokio::select! {
             // PTY output -> send to client
@@ -599,9 +561,30 @@ pub fn check_shell_security(username: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Read initial WindowSize and SetEnv setup messages from the client (up to 2s timeout each).
-async fn read_setup_messages(
-    recv: &mut RecvStream,
+/// Budget for the client's setup messages (WindowSize, SetEnv), which it sends
+/// right behind the session request.
+const SETUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Read initial WindowSize and SetEnv setup messages from the client.
+///
+/// Reads through the session's own [`proto::FramedReader`], which the caller
+/// then hands to the attached loop. That is the point: this used to run the
+/// non-cancel-safe `proto::read_message` under a per-message timeout, and a
+/// timeout that fired mid-frame (a SetEnv split across packets on a slow path)
+/// threw away the bytes already read. The attached loop then parsed the rest of
+/// that frame as a length and swallowed every keystroke and heartbeat until the
+/// 75 s read deadline: stdout fine, stdin dead. On RexMundi 267 of 355 "No data
+/// from client for 75s" detaches were exactly 75 s after a resume. A partial
+/// frame now stays in the reader and the loop finishes it.
+async fn read_setup_messages<R: AsyncReadExt + Unpin>(
+    framed: &mut proto::FramedReader<R>,
+) -> (PtySize, HashMap<String, String>, Option<ClientMessage>) {
+    read_setup_messages_within(framed, SETUP_DEADLINE).await
+}
+
+async fn read_setup_messages_within<R: AsyncReadExt + Unpin>(
+    framed: &mut proto::FramedReader<R>,
+    budget: std::time::Duration,
 ) -> (PtySize, HashMap<String, String>, Option<ClientMessage>) {
     let mut initial_size = PtySize {
         rows: 24,
@@ -612,13 +595,9 @@ async fn read_setup_messages(
     let mut env_vars = HashMap::new();
     let mut leftover_msg: Option<ClientMessage> = None;
 
+    let deadline = tokio::time::Instant::now() + budget;
     for _ in 0..2 {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            proto::read_message::<ClientMessage>(recv),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(deadline, framed.next::<ClientMessage>()).await {
             Ok(Ok(ClientMessage::WindowSize {
                 cols,
                 rows,
@@ -1059,9 +1038,9 @@ fn spawn_persistent_pty(
 /// Returns `Exited(code)` if the shell exits, or `Disconnected` if the client
 /// disconnects (allowing the session to be preserved for reconnection).
 #[allow(clippy::too_many_arguments)]
-async fn run_attached_loop(
+async fn run_attached_loop<R: AsyncReadExt + Unpin>(
     send: SendStream,
-    recv: &mut RecvStream,
+    framed: &mut proto::FramedReader<R>,
     input_tx: &mpsc::UnboundedSender<Vec<u8>>,
     output_rx: &mut mpsc::Receiver<Vec<u8>>,
     resize_tx: &watch::Sender<PtySize>,
@@ -1130,10 +1109,10 @@ async fn run_attached_loop(
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
     tokio::pin!(read_deadline);
 
-    // Cancellation-safe framed reader — the symmetric half of the client fix. The
-    // always-ready `output_rx` branch would otherwise cancel a mid-frame client
-    // read during a flood, desyncing the stream and disconnecting the session.
-    let mut framed = proto::FramedReader::new(&mut *recv);
+    // `framed` is the cancellation-safe reader the setup read already used (so a
+    // frame it left half-read is finished here). The always-ready `output_rx`
+    // branch would otherwise cancel a mid-frame client read during a flood,
+    // desyncing the stream and disconnecting the session.
 
     let outcome = loop {
         tokio::select! {
@@ -1243,7 +1222,8 @@ pub async fn host_view_session(
     registry: RegistryHandle,
     protocol_version: u8,
 ) -> Result<()> {
-    let (size, _env, _leftover) = read_setup_messages(&mut recv).await;
+    let mut framed = proto::FramedReader::new(&mut recv);
+    let (size, _env, _leftover) = read_setup_messages(&mut framed).await;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
     let view = match registry.attach_view(session_id, peer_id.to_string(), is_admin, tx.clone()).await {
         Ok(v) => v,
@@ -1262,7 +1242,6 @@ pub async fn host_view_session(
     let repaint = view.screen.lock().unwrap().render(size.rows, size.cols, hop_vt::Prelude::Initial);
     write_host_message(&mut send, &HostMessage::Output(repaint), compress).await?;
     let mut exit_rx = view.exit_rx.clone();
-    let mut framed = proto::FramedReader::new(&mut recv);
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result: Result<()> = loop {
@@ -1341,7 +1320,9 @@ pub async fn host_shell_session_persistent(
         .user_opt(username),
     );
 
-    let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut recv).await;
+    // One cancel-safe reader for the whole attachment: setup, then the loop.
+    let mut framed = proto::FramedReader::new(&mut recv);
+    let (initial_size, env_vars, leftover_msg) = read_setup_messages(&mut framed).await;
 
     // Channel for receiving routed PTY output during this attachment.
     let (client_output_tx, mut client_output_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -1567,7 +1548,7 @@ pub async fn host_shell_session_persistent(
     // it and flushes finish() on a clean exit.
     let outcome = run_attached_loop(
         send,
-        &mut recv,
+        &mut framed,
         &input_tx,
         &mut client_output_rx,
         &resize_tx,
@@ -2470,6 +2451,50 @@ mod pty_write_tests {
         // Every byte lands in order — crucially the closing ESC[201~, whose loss
         // is what left the remote terminal stuck in bracketed-paste mode.
         assert_eq!(w.out, data);
+    }
+}
+
+#[cfg(test)]
+mod setup_read_tests {
+    use super::*;
+
+    /// A setup frame split across a pause longer than the setup budget must not
+    /// desync the stream: the reader keeps the half it has, the attached loop's
+    /// next read completes that frame, and the keystroke after it arrives intact.
+    #[tokio::test]
+    async fn setup_timeout_mid_frame_keeps_the_stream_in_sync() {
+        let (mut client, host) = tokio::io::duplex(4096);
+
+        let mut env = HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        let mut set_env = Vec::new();
+        proto::write_message(&mut set_env, &ClientMessage::SetEnv { vars: env }).await.unwrap();
+        let mut input = Vec::new();
+        proto::write_message(&mut input, &ClientMessage::Input(b"ls\n".to_vec())).await.unwrap();
+
+        // Half of SetEnv, then a pause past the budget, then the rest + a keystroke.
+        let half = set_env.len() / 2;
+        client.write_all(&set_env[..half]).await.unwrap();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            client.write_all(&set_env[half..]).await.unwrap();
+            client.write_all(&input).await.unwrap();
+            client
+        });
+
+        let mut framed = proto::FramedReader::new(host);
+        let (_, env_vars, leftover) =
+            read_setup_messages_within(&mut framed, std::time::Duration::from_millis(100)).await;
+        assert!(env_vars.is_empty(), "SetEnv had not fully arrived inside the budget");
+        assert!(leftover.is_none());
+
+        // What the attached loop reads next: the rest of SetEnv, then the keystroke.
+        assert!(matches!(framed.next::<ClientMessage>().await.unwrap(), ClientMessage::SetEnv { .. }));
+        match framed.next::<ClientMessage>().await.unwrap() {
+            ClientMessage::Input(bytes) => assert_eq!(bytes, b"ls\n"),
+            other => panic!("keystroke lost to a desynced stream: {other:?}"),
+        }
+        let _ = writer.await;
     }
 }
 
