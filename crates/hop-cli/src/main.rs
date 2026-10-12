@@ -974,7 +974,12 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                         // `AuthResultV2`, after the secret verified). Persist it
                         // here so `grant_for_tier` can read it; the creator
                         // invite itself no longer carries the write ticket.
-                        let _ = config::write_secret_file(&cfg.join("netdoc-founder.author"), &net.author_hex());
+                        // Founder only: an admin member also holds a write
+                        // ticket, and overwriting its anchor with its own author
+                        // made it reject the founder's entries after a restart.
+                        if !net.is_federated() {
+                            let _ = config::write_secret_file(&cfg.join("netdoc-founder.author"), &net.author_hex());
+                        }
                         let ci_path = cfg.join("creator_invite");
                         if let Ok(tok_str) = std::fs::read_to_string(&ci_path)
                             && let Ok(mut tok) = hop_core::invite::decode_invite(tok_str.trim())

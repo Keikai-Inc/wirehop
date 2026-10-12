@@ -555,6 +555,12 @@ impl NetDoc {
         self.namespace
     }
 
+    /// Whether this node joined the namespace from another host, i.e. is not the
+    /// founder. Only the founder may publish its author as the C1 trust anchor.
+    pub fn is_federated(&self) -> bool {
+        self.federated
+    }
+
     /// This node's netdoc/VPN endpoint id — the identity the iroh-docs sync stack
     /// AND the VPN data plane run on (distinct from the main host node-id;
     /// `own_vpn_endpoint_value` advertises it). A member-only BYO relay must admit
@@ -581,7 +587,23 @@ impl NetDoc {
             // The host that created the namespace is the founder/admin.
             Some(self.author)
         } else {
-            from_invite_hex.and_then(parse_author_hex)
+            match from_invite_hex.and_then(parse_author_hex) {
+                // A federated node is never the founder. Its own author here means
+                // the anchor file was overwritten by a build that wrote it on every
+                // host with a write ticket (admin members included). Trusting it
+                // would reject every founder-authored entry under enforce, VPN
+                // endpoints included, and cut the node off from the warren after
+                // its next restart. Ignore it; observe is the safe no-anchor state.
+                Some(a) if a == self.author => {
+                    tracing::warn!(
+                        "netdoc C1: the persisted founder author is this node's own author \
+                         (written by an older build) — ignoring it and staying in observe; \
+                         re-join with a warren invite to restore enforce"
+                    );
+                    None
+                }
+                other => other,
+            }
         };
         if let Some(a) = resolved {
             *self.founder_author.lock().unwrap() = Some(a);
@@ -4794,6 +4816,33 @@ mod tests {
 
         // A malformed self-doc ticket is rejected.
         assert!(a.record_peer_self_doc(&b_id, "not-a-ticket").await.is_err());
+    }
+
+    /// A federated node whose persisted anchor is its OWN author (older builds
+    /// overwrote `netdoc-founder.author` on admin members) must not anchor on
+    /// itself — that rejected every founder entry after a restart (vpn-e2e
+    /// REBOOT TEST). The real founder author still enables enforce.
+    #[tokio::test]
+    async fn federated_node_ignores_its_own_author_as_anchor() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = NetDoc::spawn(test_endpoint().await, dir_a.path(), Bootstrap::Create)
+            .await
+            .expect("spawn A");
+        let ticket = a.write_ticket().await.unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = NetDoc::spawn(test_endpoint().await, dir_b.path(), Bootstrap::Import(Box::new(ticket)))
+            .await
+            .expect("spawn B");
+        assert!(b.is_federated());
+
+        b.record_founder_anchor(Some(&b.author_hex()));
+        assert!(b.founder_author().is_none());
+        assert_eq!(b.validation_mode(), ValidationMode::Observe);
+
+        b.record_founder_anchor(Some(&a.author_hex()));
+        assert_eq!(b.founder_author(), Some(a.author));
+        assert_eq!(b.validation_mode(), ValidationMode::Enforce);
     }
 
     /// #3b Phase 2: egress resolution (`lookup_vpn_endpoint`) resolves a

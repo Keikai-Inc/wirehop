@@ -26,6 +26,14 @@ A laptop member and the RexMundi founder, both on 0.9.40.
 | Client stuck forever after the host restarted | An await with no deadline in the client/agent reconnect path (sample: all threads parked, stdin reader in `read`) | `kill` | Stripped release binary; no deadline |
 | Worker exited 10 s after a restart (`endpoint driver … internal error`) | Unknown | privsep monitor respawn (fast failure 1/3) | Worked as designed; cause still open |
 
+Found while gating the first fix: `vpn-e2e.sh`'s REBOOT TEST had been failing on
+every build including 0.9.40, and `run.sh` does not run it, so nothing noticed.
+An admin member that restarts anchored C1 on its own author and lost the VPN for
+good (fixed; see "The founder-author anchor" in warren-internals.md). The new
+dial WARN named the cause on its first run. Its Phase 4 checks had not run
+since `73ae567` moved the warren grant out of the invite token; the read-scope
+check now reads the member's stored ticket instead.
+
 ## What the incident says about the design
 
 1. **Health was inferred from proxies.** Datagrams arriving, relay HTTPS up, endpoint bound: all green for weeks while the VPN and the shell path were useless.
@@ -111,6 +119,7 @@ Rules for every probe:
 | Member-side failure, not only founder | Who has to restart |
 | Client across a host restart, asserting no stuck client | The unbounded-await case |
 | Worker crash shortly after start | Monitor backoff |
+| `vpn-e2e.sh` in the standard gate (`run.sh` or CI): it is the only suite with a real TUN, and a failure in it went unnoticed across releases | VPN regressions |
 | Long soak, 24–72 h, randomized faults, nightly | Slow rot; asserts **zero manual steps** — a run that needed `hop recover` fails |
 | Embedded/container profile | Low memory cap, no supervisor, read-only root, clock jumps, sleep/wake, containers living under a minute |
 

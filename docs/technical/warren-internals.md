@@ -1201,6 +1201,25 @@ install page leads with the intent choice rather than burying either tier.
 > [Install & Invite Tiers §10](#install-model--invite-capability-tiers-design) Phase 0b. It
 > supersedes the "read-ticket members + admin-writes-on-behalf" approach.
 
+### The founder-author anchor (`netdoc-founder.author`)
+
+Enforce validates every admin-scoped entry against one anchor: the founder's
+iroh-docs author. `NetDoc::record_founder_anchor` picks it at every boot.
+
+| Node | Anchor | Written by |
+|---|---|---|
+| Founder (`federated = false`) | its own author | `hop host` at startup (founder only) |
+| Federated member | `netdoc-founder.author`, from the warren grant it joined with | the join path (`write_join_primers`) |
+| Federated member whose file holds its **own** author | none: WARN, stay in Observe | — |
+
+Before 2026-10-12 the startup code wrote the file on **every** node that could
+mint a write ticket, which includes admin members. An admin member therefore
+replaced the founder's author with its own on first boot, and after its next
+restart anchored on itself, rejected every founder-authored `peer/`/`role/`
+entry (VPN endpoints included) and dialled peers' node ids with `hop/vpn/1`
+(TLS alert 120, `no_application_protocol`). `vpn-e2e.sh`'s REBOOT TEST
+reproduces it; the third row repairs nodes that already carry the bad file.
+
 ### Motivation
 
 Today the warren is **one iroh-docs namespace every member can write** (members

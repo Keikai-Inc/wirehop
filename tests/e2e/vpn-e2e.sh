@@ -15,6 +15,14 @@ VOL=hop-vpn-e2e-shared
 
 cleanup() {
     echo "--- cleanup ---"
+    # HOP_DUMP_LOGS=<dir>: keep each node's full daemon log (the failure path
+    # prints only a tail, which is mostly netdoc C1 lines).
+    if [ -n "${HOP_DUMP_LOGS:-}" ]; then
+        mkdir -p "$HOP_DUMP_LOGS"
+        for c in hop-vpn-a hop-vpn-b hop-vpn-c; do
+            docker exec "$c" cat /cfg/log >"$HOP_DUMP_LOGS/$c.log" 2>/dev/null || true
+        done
+    fi
     docker rm -f hop-vpn-a hop-vpn-b hop-vpn-c >/dev/null 2>&1 || true
     docker volume rm "$VOL" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
@@ -374,11 +382,8 @@ if [ "$RC" = "0" ]; then
         RC=1
     else
         READ_TICKET=$(docker exec hop-vpn-a cat /cfg/netdoc-read.ticket 2>/dev/null | tr -d '[:space:]' || true)
-        TOK_TICKET=$(python3 -c "import base64,json,sys; t=sys.argv[1]; t+='='*(-len(t)%4); print(json.loads(base64.urlsafe_b64decode(t)).get('warren_ticket',''))" "$INVITE_C" 2>/dev/null || true)
-        if [ -n "$READ_TICKET" ] && [ "$TOK_TICKET" = "$READ_TICKET" ]; then
-            echo "READ-SCOPE PASSED: the node-tier invite carries the admin doc's READ ticket."
-        else
-            echo "PHASE 4 FAILED: node-tier invite does not carry the read ticket."
+        if [ -z "$READ_TICKET" ]; then
+            echo "PHASE 4 FAILED: host-a has no admin-doc read ticket to grant."
             RC=1
         fi
     fi
@@ -407,6 +412,16 @@ if [ "$RC" = "0" ]; then
         else
             VIP_C=$(docker exec hop-vpn-c cat /shared/vip-c | tr -d '[:space:]')
             echo "host-c virtual IP: ${VIP_C:-<empty!>}"
+            # The warren grant arrives after auth, not inside the invite token
+            # (73ae567), so check what host-c actually stored: a node-tier member
+            # must hold the admin doc's READ ticket, never the write ticket.
+            C_TICKET=$(docker exec hop-vpn-c cat /cfg/netdoc-join.ticket 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$C_TICKET" = "$READ_TICKET" ]; then
+                echo "READ-SCOPE PASSED: the node-tier member was granted the admin doc's READ ticket."
+            else
+                echo "PHASE 4 FAILED: host-c's stored warren ticket is not host-a's read ticket."
+                RC=1
+            fi
             # 3rd-node convergence settle (a,b,c must cross-import self-docs).
             # Privsep adds monitor-spawn startup latency, so give it longer than
             # the non-privsep baseline before declaring a routing failure.
