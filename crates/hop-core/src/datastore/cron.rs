@@ -13,6 +13,87 @@ use super::tables::{CRON_RUNS_TABLE, CRON_TABLE};
 use super::types::{CronJob, CronRun, CronRunStatus};
 use super::Datastore;
 
+/// Decode a stored `CronJob`, accepting records written by older builds.
+///
+/// bincode is not self-describing and ignores `#[serde(default)]`, so each
+/// field appended to `CronJob` since the first release leaves records written
+/// before it one field short: a plain decode fails with `UnexpectedEnd` and
+/// the job looks corrupt (0.9.38 lost every existing job this way). So on
+/// failure decode the original layout, then each appended field only while
+/// bytes remain. Returns the job and whether it used an older layout (so the
+/// caller can rewrite it). A new field appended to `CronJob` needs one more
+/// `tail` line here, in field order.
+fn decode_job(bytes: &[u8]) -> Result<(CronJob, bool)> {
+    let cfg = bincode::config::standard();
+    if let Ok((job, _)) = bincode::serde::decode_from_slice::<CronJob, _>(bytes, cfg) {
+        return Ok((job, false));
+    }
+    let (v0, mut pos): (legacy::CronJobV0, usize) =
+        bincode::serde::decode_from_slice(bytes, cfg)?;
+    let targets = legacy::tail(bytes, &mut pos)?;
+    let catalog_id = legacy::tail(bytes, &mut pos)?;
+    let sandbox = legacy::tail(bytes, &mut pos)?;
+    let run_as_user = legacy::tail(bytes, &mut pos)?;
+    let timeout_secs = legacy::tail(bytes, &mut pos)?;
+    if pos != bytes.len() {
+        anyhow::bail!(
+            "cron record has {} trailing byte(s) after every known field",
+            bytes.len() - pos
+        );
+    }
+    Ok((
+        CronJob {
+            id: v0.id,
+            name: v0.name,
+            schedule: v0.schedule,
+            script: v0.script,
+            enabled: v0.enabled,
+            last_run: v0.last_run,
+            next_run: v0.next_run,
+            created_at: v0.created_at,
+            tags: v0.tags,
+            targets,
+            catalog_id,
+            sandbox,
+            run_as_user,
+            timeout_secs,
+        },
+        true,
+    ))
+}
+
+mod legacy {
+    use anyhow::Result;
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+
+    /// `CronJob` as first shipped; every later field was appended after `tags`.
+    #[derive(Deserialize)]
+    pub(super) struct CronJobV0 {
+        pub id: String,
+        pub name: String,
+        pub schedule: String,
+        pub script: String,
+        pub enabled: bool,
+        pub last_run: Option<u64>,
+        pub next_run: u64,
+        pub created_at: u64,
+        pub tags: Vec<String>,
+    }
+
+    /// Decode the next appended field at `pos`, or its default once the
+    /// record is exhausted (the record predates the field).
+    pub(super) fn tail<T: DeserializeOwned + Default>(bytes: &[u8], pos: &mut usize) -> Result<T> {
+        if *pos >= bytes.len() {
+            return Ok(T::default());
+        }
+        let (value, n) =
+            bincode::serde::decode_from_slice(&bytes[*pos..], bincode::config::standard())?;
+        *pos += n;
+        Ok(value)
+    }
+}
+
 /// Keys we have already warned about decoding (one warn per daemon lifetime
 /// per key). Prevents log spam when the scheduler polls every 15s.
 fn warned_corrupt_keys() -> &'static Mutex<HashSet<String>> {
@@ -53,6 +134,18 @@ impl Datastore {
             let mut table = txn.open_table(CRON_TABLE)?;
             table.remove(id)?.is_some()
         };
+        if existed {
+            // Drop its run history in the same transaction: the runs table is
+            // Local-only, so a remote `hop cron delete` has no other way.
+            let mut runs = txn.open_table(CRON_RUNS_TABLE)?;
+            let started: Vec<u64> = runs
+                .range((id, 0u64)..(id, u64::MAX))?
+                .map(|item| item.map(|(k, _)| k.value().1))
+                .collect::<Result<_, _>>()?;
+            for ts in started {
+                runs.remove((id, ts))?;
+            }
+        }
         txn.commit()?;
         Ok(existed)
     }
@@ -77,17 +170,14 @@ impl Datastore {
             let (key_guard, val_guard) = item?;
             let key = key_guard.value();
             let bytes = val_guard.value();
-            match bincode::serde::decode_from_slice::<CronJob, _>(
-                bytes,
-                bincode::config::standard(),
-            ) {
+            match decode_job(bytes) {
                 Ok((job, _)) => jobs.push(job),
                 Err(e) => {
                     let mut warned = warned_corrupt_keys().lock().unwrap();
                     if warned.insert(key.to_string()) {
                         tracing::warn!(
                             "Corrupt cron entry '{key}' skipped: {e}. \
-                             Remove it with `hop cron remove {key}` or call \
+                             Remove it with `hop cron delete {key}` or call \
                              `Datastore::cron_purge_corrupt`.",
                         );
                     }
@@ -117,12 +207,7 @@ impl Datastore {
                 let (key_guard, val_guard) = item?;
                 let key = key_guard.value().to_string();
                 let bytes = val_guard.value();
-                if bincode::serde::decode_from_slice::<CronJob, _>(
-                    bytes,
-                    bincode::config::standard(),
-                )
-                .is_err()
-                {
+                if decode_job(bytes).is_err() {
                     corrupt.push(key);
                 }
             }
@@ -142,6 +227,42 @@ impl Datastore {
         Ok(corrupt)
     }
 
+    /// Rewrite every record still in an older `CronJob` layout in the current
+    /// one, so later reads take the fast path and a future field append only
+    /// has one layout to bridge. Local only: the daemon runs it when it opens
+    /// the datastore. Returns the ids rewritten.
+    pub fn cron_migrate_legacy(&self) -> Result<Vec<String>> {
+        let mut rewrite: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let txn = self.local_db().begin_read()?;
+            let table = match txn.open_table(CRON_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
+            for item in table.iter()? {
+                let (key_guard, val_guard) = item?;
+                if let Ok((job, true)) = decode_job(val_guard.value()) {
+                    let bytes =
+                        bincode::serde::encode_to_vec(&job, bincode::config::standard())?;
+                    rewrite.push((key_guard.value().to_string(), bytes));
+                }
+            }
+        }
+        if rewrite.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.local_db().begin_write()?;
+        {
+            let mut table = txn.open_table(CRON_TABLE)?;
+            for (key, bytes) in &rewrite {
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(rewrite.into_iter().map(|(k, _)| k).collect())
+    }
+
     /// Get a cron job by ID.
     pub fn cron_get(&self, id: &str) -> Result<Option<CronJob>> {
         remote_dispatch!(self,
@@ -156,9 +277,7 @@ impl Datastore {
         };
         match table.get(id)? {
             Some(guard) => {
-                let bytes = guard.value();
-                let (job, _): (CronJob, _) =
-                    bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+                let (job, _) = decode_job(guard.value())?;
                 Ok(Some(job))
             }
             None => Ok(None),
@@ -202,9 +321,7 @@ impl Datastore {
             let guard = table
                 .get(id)?
                 .ok_or_else(|| anyhow::anyhow!("Cron job not found: {id}"))?;
-            let bytes = guard.value();
-            let (mut job, _): (CronJob, _) =
-                bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+            let (mut job, _) = decode_job(guard.value())?;
             drop(guard);
 
             job.last_run = Some(timestamp);
@@ -317,12 +434,6 @@ impl Datastore {
         };
         txn.commit()?;
         Ok(removed)
-    }
-
-    /// Remove every run of `job_id` (when the job is deleted).
-    pub fn cron_runs_clear(&self, job_id: &str) -> Result<()> {
-        let _ = self.cron_runs_prune(job_id, 0)?;
-        Ok(())
     }
 
     /// Mark runs still `Running` as `Interrupted`: called once when the
@@ -556,8 +667,154 @@ mod tests {
         let long = "x".repeat(2000);
         ds.cron_run_finish("j2", 5000, 6001, CronRunStatus::Error, &long).unwrap();
         assert!(ds.cron_runs("j2", 1).unwrap()[0].message.chars().count() <= CRON_RUN_MESSAGE_MAX + 1);
-        ds.cron_runs_clear("j2").unwrap();
+        assert_eq!(ds.cron_runs_prune("j2", 0).unwrap(), 1);
         assert!(ds.cron_runs("j2", 1).unwrap().is_empty());
     }
 
+    /// `CronJob` as written by 0.9.37 and earlier: everything but `timeout_secs`.
+    #[derive(serde::Serialize)]
+    struct CronJobBefore0938 {
+        id: String,
+        name: String,
+        schedule: String,
+        script: String,
+        enabled: bool,
+        last_run: Option<u64>,
+        next_run: u64,
+        created_at: u64,
+        tags: Vec<String>,
+        targets: Option<String>,
+        catalog_id: Option<String>,
+        sandbox: Option<crate::sandbox::SandboxPolicy>,
+        run_as_user: Option<String>,
+    }
+
+    fn insert_raw(ds: &Datastore, id: &str, bytes: &[u8]) {
+        let txn = ds.local_db().begin_write().unwrap();
+        {
+            let mut table = txn.open_table(CRON_TABLE).unwrap();
+            table.insert(id, bytes).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn raw_decodes_as_current(ds: &Datastore, id: &str) -> bool {
+        let txn = ds.local_db().begin_read().unwrap();
+        let table = txn.open_table(CRON_TABLE).unwrap();
+        let guard = table.get(id).unwrap().unwrap();
+        bincode::serde::decode_from_slice::<CronJob, _>(guard.value(), bincode::config::standard())
+            .is_ok()
+    }
+
+    #[test]
+    fn cron_reads_records_written_before_fields_were_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        let cfg = bincode::config::standard();
+
+        // 0.9.37 layout: one field short of the current struct.
+        let v2 = CronJobBefore0938 {
+            id: "mail".into(),
+            name: "cap:email-monitor".into(),
+            schedule: "0 0 * * * *".into(),
+            script: "return 'mail'".into(),
+            enabled: true,
+            last_run: Some(5),
+            next_run: 10,
+            created_at: 1,
+            tags: vec!["t".into()],
+            targets: None,
+            catalog_id: Some("cat".into()),
+            sandbox: None,
+            run_as_user: Some("jason".into()),
+        };
+        insert_raw(&ds, "mail", &bincode::serde::encode_to_vec(&v2, cfg).unwrap());
+        // First-release layout: nothing after `tags`.
+        let v0 = (
+            "old".to_string(),
+            "Relay Health".to_string(),
+            "0 */5 * * * *".to_string(),
+            "return 1".to_string(),
+            true,
+            None::<u64>,
+            20u64,
+            2u64,
+            Vec::<String>::new(),
+        );
+        insert_raw(&ds, "old", &bincode::serde::encode_to_vec(&v0, cfg).unwrap());
+        // Real garbage must still be rejected, not mis-read as a job.
+        insert_raw(&ds, "bad", b"\x01\x02");
+
+        assert!(!raw_decodes_as_current(&ds, "mail"));
+        assert!(!raw_decodes_as_current(&ds, "old"));
+
+        let mut jobs = ds.cron_list().unwrap();
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, "mail");
+        assert_eq!(jobs[0].run_as_user.as_deref(), Some("jason"));
+        assert_eq!(jobs[0].catalog_id.as_deref(), Some("cat"));
+        assert_eq!(jobs[0].timeout_secs, None);
+        assert_eq!(jobs[1].id, "old");
+        assert_eq!(jobs[1].next_run, 20);
+        assert_eq!(jobs[1].run_as_user, None);
+
+        assert_eq!(ds.cron_get("mail").unwrap().unwrap().name, "cap:email-monitor");
+        assert_eq!(ds.cron_get_due(15).unwrap().len(), 1);
+        ds.cron_update_last_run("old", 21, 30).unwrap();
+        assert_eq!(ds.cron_get("old").unwrap().unwrap().next_run, 30);
+
+        // Purge removes only what no layout can decode.
+        assert_eq!(ds.cron_purge_corrupt().unwrap(), vec!["bad".to_string()]);
+        assert_eq!(ds.cron_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cron_legacy_records_are_rewritten_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let cfg = bincode::config::standard();
+        {
+            let ds = Datastore::open(&path).unwrap();
+            let v2 = CronJobBefore0938 {
+                id: "mail".into(),
+                name: "mail".into(),
+                schedule: "0 0 * * * *".into(),
+                script: "return 1".into(),
+                enabled: true,
+                last_run: None,
+                next_run: 10,
+                created_at: 1,
+                tags: vec![],
+                targets: None,
+                catalog_id: None,
+                sandbox: None,
+                run_as_user: Some("jason".into()),
+            };
+            insert_raw(&ds, "mail", &bincode::serde::encode_to_vec(&v2, cfg).unwrap());
+            ds.cron_add(&make_job("fresh", "0 * * * * *", true, 1)).unwrap();
+            assert!(!raw_decodes_as_current(&ds, "mail"));
+        }
+        // Reopening (what the daemon does on start) migrates in place.
+        let ds = Datastore::open(&path).unwrap();
+        assert!(raw_decodes_as_current(&ds, "mail"));
+        assert!(raw_decodes_as_current(&ds, "fresh"));
+        assert_eq!(ds.cron_migrate_legacy().unwrap(), Vec::<String>::new());
+        let mail = ds.cron_get("mail").unwrap().unwrap();
+        assert_eq!(mail.run_as_user.as_deref(), Some("jason"));
+        assert_eq!(mail.timeout_secs, None);
+    }
+
+    #[test]
+    fn cron_remove_drops_run_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Datastore::open(&dir.path().join("test.redb")).unwrap();
+        ds.cron_add(&make_job("j", "0 * * * * *", true, 1)).unwrap();
+        ds.cron_run_start("j", 100).unwrap();
+        ds.cron_run_finish("j", 100, 110, CronRunStatus::Ok, "fine").unwrap();
+        assert_eq!(ds.cron_runs("j", 10).unwrap().len(), 1);
+        assert!(ds.cron_remove("j").unwrap());
+        assert!(ds.cron_runs("j", 10).unwrap().is_empty());
+        assert!(!ds.cron_remove("j").unwrap());
+    }
 }

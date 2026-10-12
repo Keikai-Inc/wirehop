@@ -5758,7 +5758,6 @@ fn cmd_cron(config_dir: &std::path::Path, action: CronAction) -> Result<()> {
         }
         CronAction::Delete { id } => {
             if ds.cron_remove(&id)? {
-                let _ = ds.cron_runs_clear(&id);
                 println!("Deleted cron job: {id}");
             } else {
                 anyhow::bail!("Cron job '{id}' not found");

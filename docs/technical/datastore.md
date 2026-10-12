@@ -61,6 +61,8 @@ const AUDIT_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("a
 
 Most values are stored as `&[u8]` (bincode-encoded). Tables are created lazily on first write. Reads on non-existent tables return empty results via `TableDoesNotExist` error handling. **Exception:** `AUDIT_TABLE` values are **JSON**-encoded (not bincode) so the audit-event schema can gain fields across upgrades without breaking old records — bincode is non-self-describing and would fail to decode an older record once a field is added. See `crate::audit` (the OTel-aligned schema) and `datastore::audit` (`audit_append` / `audit_query` / `audit_purge_before`).
 
+**Appending fields to bincode-stored structs.** bincode ignores `#[serde(default)]`, so a field appended to a stored struct makes every record written before it undecodable (`UnexpectedEnd { additional: 1 }`). `CronJob` has gained five fields since its first release and 0.9.38 reported every existing job as corrupt because of the last one. `datastore::cron::decode_job` therefore decodes the first-release layout and then each appended field only while bytes remain; `cron_migrate_legacy()` runs when the daemon opens the datastore and rewrites such records in the current layout. Appending another field to `CronJob` needs one more `tail` line in `decode_job`, in field order. `CronRun`, `KvEntry`, `MetricPoint` and `SealedSecret` have no such shim: a field appended to them needs the same treatment, a new table, or a JSON encoding like the audit log.
+
 ## Data Types
 
 Defined in `crates/hop-core/src/datastore/types.rs`:

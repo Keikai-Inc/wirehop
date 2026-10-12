@@ -112,9 +112,22 @@ impl Datastore {
             }
         }
 
-        Ok(Self {
+        let ds = Self {
             inner: Arc::new(DatastoreInner::Local { db, secrets_key }),
-        })
+        };
+
+        // Bring cron records written by older builds up to the current layout
+        // (see `cron::decode_job`). Best effort: the lenient decode still
+        // serves them if the rewrite fails.
+        match ds.cron_migrate_legacy() {
+            Ok(ids) if !ids.is_empty() => {
+                tracing::info!("Migrated {} cron job(s) to the current record layout: {}", ids.len(), ids.join(", "));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Could not migrate legacy cron records: {e:#}"),
+        }
+
+        Ok(ds)
     }
 
     /// Open (create) the redb database, riding out a brief lock hand-off.
