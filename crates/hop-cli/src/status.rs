@@ -25,6 +25,32 @@ const LEAK_MIN_HOURS: f64 = 3.0;
 
 /// Inbound handshakes stalling counts as a problem only past this many.
 const INBOUND_TIMEOUTS_WARN: u64 = 3;
+/// A warren-update refusal for a future timestamp counts while this recent.
+const CLOCK_REFUSAL_RECENT_MS: u64 = 30 * 60 * 1000;
+/// No real clock reads earlier than this (2026-01-01): a node that does booted
+/// without a real-time clock and has not synced yet.
+const CLOCK_FLOOR_MS: u64 = 1_767_225_600_000;
+
+/// A problem with this node's own clock, judged from `now_ms` alone (pure).
+pub fn clock_problem(now_ms: u64) -> Option<Problem> {
+    (now_ms < CLOCK_FLOOR_MS).then(|| Problem {
+        component: "clock",
+        detail: format!(
+            "this node's clock reads about the year {} — it booted without a real-time clock and has not \
+             synced; warren updates from peers are refused until it does (enable NTP)",
+            1970 + now_ms / 31_557_600_000
+        ),
+    })
+}
+
+fn human_secs(s: u64) -> String {
+    match s {
+        0..=119 => format!("{s}s"),
+        120..=7199 => format!("{}m", s / 60),
+        7200..=172_799 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
 
 /// Judge the snapshots. Pure, for tests: `now_ms` is the current Unix ms.
 pub fn assess(host: Option<&HealthSnapshot>, agent: Option<&HealthSnapshot>, now_ms: u64) -> Vec<Problem> {
@@ -79,6 +105,21 @@ pub fn assess(host: Option<&HealthSnapshot>, agent: Option<&HealthSnapshot>, now
             });
         }
     }
+    if let Some(h) = host
+        && h.netdoc_future_refused > 0
+        && h.netdoc_future_last_ms > 0
+        && now_ms.saturating_sub(h.netdoc_future_last_ms) < CLOCK_REFUSAL_RECENT_MS
+    {
+        out.push(Problem {
+            component: "clock",
+            detail: format!(
+                "{} warren update(s) refused for timestamps up to {} ahead of this node's clock — this \
+                 clock is behind or a peer's is ahead; those updates wait until the clocks agree (check NTP)",
+                h.netdoc_future_refused,
+                human_secs(h.netdoc_future_max_lead_secs)
+            ),
+        });
+    }
     for (src, snap) in [("daemon mux", host), ("agent", agent)] {
         let Some(s) = snap else { continue };
         for (peer, c) in &s.agent_conns {
@@ -101,14 +142,14 @@ enum HostHealth {
     NoDaemon,
     /// The daemon answers its socket but predates the health registry.
     TooOld,
-    Health(HealthSnapshot),
+    Health(Box<HealthSnapshot>),
 }
 
 fn fetch_host_health(host_dir: &Path) -> HostHealth {
     let Ok(conn) = DaemonConnection::connect(host_dir) else { return HostHealth::NoDaemon };
     match conn.request(&DsRequest::Health) {
         Ok(DsResponse::Health(json)) => match serde_json::from_str(&json) {
-            Ok(h) => HostHealth::Health(h),
+            Ok(h) => HostHealth::Health(Box::new(h)),
             Err(_) => HostHealth::TooOld,
         },
         _ => HostHealth::TooOld,
@@ -137,6 +178,7 @@ pub fn remedy_for(p: &Problem) -> Remedy {
         "vpn" | "memory" => Remedy::RestartDaemon,
         "connection" if p.detail.starts_with("agent ") => Remedy::RestartAgent,
         "connection" => Remedy::RestartDaemon, // the daemon's own mux pool
+        "clock" => Remedy::Advice("set this node's clock (enable NTP); restarting hop does not help"),
         _ => Remedy::Advice("watch it; if it persists, `hop recover`"),
     }
 }
@@ -162,7 +204,7 @@ pub fn doctor(
         HostHealth::Health(_) => {}
     }
     let host = match &host_state {
-        HostHealth::Health(h) => Some(h.clone()),
+        HostHealth::Health(h) => Some((**h).clone()),
         _ => None,
     };
     let agent = if user_dir != host_dir { read_agent_health(user_dir) } else { None };
@@ -170,7 +212,8 @@ pub fn doctor(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let problems = assess(host.as_ref(), agent.as_ref(), now_ms);
+    let mut problems = assess(host.as_ref(), agent.as_ref(), now_ms);
+    problems.extend(clock_problem(now_ms));
     if problems.is_empty() {
         println!("No problems found.");
         return Ok(true);
@@ -219,7 +262,7 @@ Could not stop the client agent: {e:#}"),
 pub fn run(host_dir: &Path, user_dir: &Path, json: bool) -> Result<bool> {
     let host_state = fetch_host_health(host_dir);
     let host = match &host_state {
-        HostHealth::Health(h) => Some(h.clone()),
+        HostHealth::Health(h) => Some((**h).clone()),
         _ => None,
     };
     let agent = if user_dir != host_dir { read_agent_health(user_dir) } else { None };
@@ -227,7 +270,8 @@ pub fn run(host_dir: &Path, user_dir: &Path, json: bool) -> Result<bool> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let problems = assess(host.as_ref(), agent.as_ref(), now_ms);
+    let mut problems = assess(host.as_ref(), agent.as_ref(), now_ms);
+    problems.extend(clock_problem(now_ms));
     let healthy = problems.is_empty();
 
     if json {
@@ -341,6 +385,24 @@ mod tests {
         let p = assess(Some(&h), None, 120_000);
         assert_eq!(p.iter().filter(|p| p.component == "vpn").count(), 3);
         assert!(p.iter().any(|p| p.detail.contains("for 120s")));
+    }
+
+    #[test]
+    fn a_wrong_clock_is_flagged() {
+        assert!(clock_problem(1_000).is_some_and(|p| p.detail.contains("year 1970")));
+        assert!(clock_problem(1_790_000_000_000).is_none());
+        let now = 1_790_000_000_000;
+        let h = HealthSnapshot {
+            netdoc_future_refused: 12,
+            netdoc_future_max_lead_secs: 3 * 3600,
+            netdoc_future_last_ms: now - 60_000,
+            ..Default::default()
+        };
+        let p = assess(Some(&h), None, now);
+        assert!(p.iter().any(|p| p.component == "clock" && p.detail.contains("up to 3h")), "{p:?}");
+        // Long ago (the clock was fixed since): no longer a problem.
+        let old = HealthSnapshot { netdoc_future_last_ms: now - 2 * 3600 * 1000, ..h };
+        assert!(assess(Some(&old), None, now).is_empty());
     }
 
     #[test]

@@ -990,7 +990,10 @@ health over its socket and the client agent's `agent-health.json`.
 Problems it reports: a peer that is up but refuses this node's VPN; VPN dials
 failing; the VPN self-repair ladder climbing; a pooled connection judged slow or
 unanswered; memory growing steadily faster than 20 MB/h for 3 h or more; three
-or more stalled inbound handshakes. **Exit status 1 when there is a problem**,
+or more stalled inbound handshakes; a wrong clock — this node's reads before
+2026 (booted without a real-time clock, not yet synced), or warren updates were
+refused in the last 30 min for timestamps more than 10 minutes ahead of it
+(this clock is behind, or a peer's is ahead; fix NTP — `hop doctor` cannot). **Exit status 1 when there is a problem**,
 so it works as a container `HEALTHCHECK` or a cron/monitoring probe. `--json`
 gives `{healthy, problems, host, host_daemon, agent}`. A daemon older than the
 health registry reports "too old to report its health".

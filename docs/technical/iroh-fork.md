@@ -53,10 +53,21 @@ and `iroh-relay` together. `iroh-docs`/`gossip`/`blobs` pull `iroh-base` and
 `iroh_base` versions and a `PublicKey` type mismatch. Cargo patches a whole git
 workspace, so all three move as a unit.
 
-## Vendored `iroh-docs` (0.97.0 + one backport)
+## Vendored `iroh-docs` (0.97.0 + one backport + one fix)
 
-`vendor/iroh-docs` is a copy of the published `iroh-docs` 0.97.0 with one
-change in `src/actor.rs`: the docs actor's `run_async` loop gains a
+`vendor/iroh-docs` is a copy of the published `iroh-docs` 0.97.0 with two
+changes. The second, in `src/sync.rs`, is hop's own:
+
+| Change | Why |
+|---|---|
+| `MAX_TIMESTAMP_FUTURE_SHIFT` is ten minutes in **microseconds** | Entry timestamps and `system_time_now` are µs, but the constant was built with `as_millis`: 600 000 µs = 0.6 s, not the documented 10 min. An entry from a peer whose clock ran > 0.6 s ahead failed validation and was dropped silently — a gossiped update then waited for the next full re-sync (hop runs one every 5 min), or forever if the skew exceeded that |
+| `REJECTED_TOO_FAR_IN_FUTURE`, `REJECTED_MAX_LEAD_MICROS`, `REJECTED_LAST_AT_MICROS` | Counted in `validate_entry`; hop's `Health` carries them and `hop status` reports a `clock` problem while refusals are recent (a node > 10 min behind refuses everything newer; one ahead is refused by everyone) |
+
+Test: `hop-core` `health::tests::warren_entries_from_a_fast_clock_within_ten_minutes_are_accepted`
+(runs in the workspace, unlike the vendored crate's own tests). Check upstream
+for the same unit mismatch before the 1.1 migration drops this copy.
+
+The first change is in `src/actor.rs`: the docs actor's `run_async` loop gains a
 `self.tasks.join_next()` arm. Every streaming query (`ListAuthors`,
 `ListReplicas`, `GetMany`) spawns a reply task into that `JoinSet`; 0.97 never
 reaped finished ones, so each query left its task cell allocated for the life

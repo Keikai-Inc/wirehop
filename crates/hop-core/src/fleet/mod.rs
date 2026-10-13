@@ -55,12 +55,25 @@ pub struct WarrenMemberInfo {
 /// cadence (announce/redial/keepalive) so a live-but-idle node isn't mislabeled.
 pub const DEFAULT_LIVENESS_WINDOW_SECS: u64 = 15 * 60;
 
+/// How far in the future a `last_seen` may be and still count. `last_seen` is
+/// written with whichever node's clock saw the member; a little skew is normal,
+/// but a stamp far ahead (a clock set wrong, then corrected) would otherwise read
+/// as "seen just now" until real time caught up — online for months.
+pub const MAX_FUTURE_SKEW_SECS: u64 = 10 * 60;
+
+/// Parse a `last_seen` epoch-seconds stamp, discarding one implausibly far ahead
+/// of `now` (unknown liveness, like a missing stamp).
+pub fn parse_last_seen(raw: Option<&str>, now: u64) -> Option<u64> {
+    let ls = raw?.trim().parse::<u64>().ok()?;
+    (ls <= now.saturating_add(MAX_FUTURE_SKEW_SECS)).then_some(ls)
+}
+
 impl WarrenMemberInfo {
     /// Seconds since this member was last seen, if `last_seen` parses as an
     /// epoch-seconds timestamp (the format the daemon writes). `None` when there's
     /// no timestamp or it's unparseable (unknown liveness).
     pub fn last_seen_age_secs(&self, now: u64) -> Option<u64> {
-        let ls = self.last_seen.as_deref()?.trim().parse::<u64>().ok()?;
+        let ls = parse_last_seen(self.last_seen.as_deref(), now)?;
         Some(now.saturating_sub(ls))
     }
 
@@ -151,7 +164,8 @@ pub async fn build_warren_snapshot(netdoc: &crate::netdoc::NetDoc) -> Result<War
         if let Some(ep) = p.vpn_endpoint.as_deref()
             && let Some(vpn_seen) = netdoc.vpn_last_rx_epoch(ep, now).await
         {
-            let cp = p.last_seen.as_deref().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            // A far-future control-plane stamp must not outrank real VPN traffic.
+            let cp = parse_last_seen(p.last_seen.as_deref(), now).unwrap_or(0);
             if vpn_seen > cp {
                 p.last_seen = Some(vpn_seen.to_string());
             }
@@ -1064,6 +1078,11 @@ mod tests {
         assert!(!member_seen(Some("not-a-number")).is_online(now, 900));
         // Future timestamp (clock skew) → age 0 → online.
         assert!(member_seen(Some(&(now + 50).to_string())).is_online(now, 900));
+        // Far in the future (a clock set wrong) → unknown → offline, not
+        // "seen just now" for months.
+        let far = member_seen(Some(&(now + 90 * 86400).to_string()));
+        assert!(!far.is_online(now, 900));
+        assert_eq!(far.last_seen_age_secs(now), None);
     }
 
     fn peer(node_id: &str, name: &str, role_name: Option<&str>, vip: Option<&str>) -> crate::config::Peer {

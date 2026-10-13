@@ -124,6 +124,8 @@ noq-proto = { path = "vendor/noq-proto" }
 # the daemon (~20 KB/s on a host that polls its netdoc, 1.6 GB/day). Upstream
 # fixed it in 0.101 (which needs iroh 1.x); this is that one-arm backport. See
 # vendor/iroh-docs/src/actor.rs (`join_next`) and docs/technical/iroh-fork.md.
+# Also hop's fix to MAX_TIMESTAMP_FUTURE_SHIFT (0.6 s, not 10 min: a ms value
+# compared with µs timestamps) plus refusal counters, in src/sync.rs.
 iroh-docs = { path = "vendor/iroh-docs" }
 
 [profile.release]

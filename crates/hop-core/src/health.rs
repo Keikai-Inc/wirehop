@@ -96,6 +96,16 @@ pub struct HealthSnapshot {
     pub rss_slope_mb_per_hour: Option<f64>,
     #[serde(default)]
     pub rss_window_hours: Option<f64>,
+    /// Warren (netdoc) entries refused because their timestamp was more than
+    /// ten minutes ahead of this node's clock: this clock is behind, or the
+    /// author's is ahead. Also the largest lead seen (s) and this node's clock
+    /// (Unix ms) at the latest refusal.
+    #[serde(default)]
+    pub netdoc_future_refused: u64,
+    #[serde(default)]
+    pub netdoc_future_max_lead_secs: u64,
+    #[serde(default)]
+    pub netdoc_future_last_ms: u64,
 }
 
 /// One peer in the last VPN probe round.
@@ -291,17 +301,25 @@ pub fn resident_bytes() -> Option<u64> {
     }
 }
 
+/// Milliseconds on a monotonic clock (since first use). The RSS trend is timed
+/// with it, not wall time: a device that boots at 1970 and then syncs its clock,
+/// or an NTP step, would otherwise stretch, squash or invert the slope.
+fn mono_ms() -> u64 {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 /// Record a resident-memory sample (the daemon calls this every 5 minutes).
 pub fn sample_rss() {
     let Some(bytes) = resident_bytes() else { return };
     let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
-    reg.rss.push_back((now_ms(), bytes));
+    reg.rss.push_back((mono_ms(), bytes));
     while reg.rss.len() > RSS_SAMPLES {
         reg.rss.pop_front();
     }
 }
 
-/// Least-squares slope of `samples` (Unix ms, bytes) in MB/h, and the hours it
+/// Least-squares slope of `samples` (monotonic ms, bytes) in MB/h, and the hours it
 /// spans. `None` with fewer than 3 samples or no time span.
 pub fn rss_slope(samples: &[(u64, u64)]) -> Option<(f64, f64)> {
     if samples.len() < 3 {
@@ -355,6 +373,10 @@ pub fn snapshot() -> HealthSnapshot {
         rss_mb: reg.rss.back().map(|(_, b)| *b as f64 / 1_048_576.0),
         rss_slope_mb_per_hour: rss_slope(&reg.rss.iter().copied().collect::<Vec<_>>()).map(|(s, _)| s),
         rss_window_hours: rss_slope(&reg.rss.iter().copied().collect::<Vec<_>>()).map(|(_, h)| h),
+        netdoc_future_refused: iroh_docs::REJECTED_TOO_FAR_IN_FUTURE.load(std::sync::atomic::Ordering::Relaxed),
+        netdoc_future_max_lead_secs: iroh_docs::REJECTED_MAX_LEAD_MICROS.load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000_000,
+        netdoc_future_last_ms: iroh_docs::REJECTED_LAST_AT_MICROS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
     }
 }
 
@@ -366,6 +388,48 @@ pub fn snapshot_json() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_entry(
+        ns: &iroh_docs::NamespaceSecret,
+        author: &iroh_docs::Author,
+        key: &[u8],
+        timestamp: u64,
+    ) -> iroh_docs::SignedEntry {
+        let record = iroh_docs::Record::new(iroh_blobs::Hash::new(key), 1, timestamp);
+        iroh_docs::SignedEntry::from_parts(ns, author, key, record)
+    }
+
+    /// The vendored iroh-docs fix: a peer whose clock is a few seconds fast is
+    /// accepted (the stock 0.6 s tolerance dropped its gossip), one an hour fast
+    /// is refused and shows up in the health counters.
+    #[tokio::test]
+    async fn warren_entries_from_a_fast_clock_within_ten_minutes_are_accepted() {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(iroh_docs::MAX_TIMESTAMP_FUTURE_SHIFT, 600_000_000, "ten minutes in µs");
+        let mut rng = rand::rng();
+        let ns = iroh_docs::NamespaceSecret::new(&mut rng);
+        let author = iroh_docs::Author::new(&mut rng);
+        let mut store = iroh_docs::store::Store::memory();
+        let mut replica = store.new_replica(ns.clone()).unwrap();
+        let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+        let fast = remote_entry(&ns, &author, b"fast", now_us + 5_000_000);
+        replica
+            .insert_remote_entry(fast, [7u8; 32], iroh_docs::ContentStatus::Complete)
+            .await
+            .expect("an entry 5 s ahead must be accepted");
+        let before = iroh_docs::REJECTED_TOO_FAR_IN_FUTURE.load(Relaxed);
+        let far = remote_entry(&ns, &author, b"far", now_us + 3_600_000_000);
+        assert!(
+            replica
+                .insert_remote_entry(far, [7u8; 32], iroh_docs::ContentStatus::Complete)
+                .await
+                .is_err()
+        );
+        let s = snapshot();
+        assert!(s.netdoc_future_refused > before);
+        assert!(s.netdoc_future_max_lead_secs >= 3000);
+        assert!(s.netdoc_future_last_ms > 0);
+    }
 
     // The registry is process-global, so each test uses its own peer key and
     // reads only that peer's entry.

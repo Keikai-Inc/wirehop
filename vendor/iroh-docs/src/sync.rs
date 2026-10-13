@@ -39,8 +39,23 @@ pub type ProtocolMessage = crate::ranger::Message<SignedEntry>;
 pub type PeerIdBytes = [u8; 32];
 
 /// Max time in the future from our wall clock time that we accept entries for.
-/// Value is 10 minutes.
-pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_millis() as u64;
+/// Value is 10 minutes, in MICROSECONDS — the unit of entry timestamps and of
+/// `system_time_now`.
+///
+/// hop patch: upstream computes this with `as_millis`, which in microseconds
+/// is 0.6 s. Any peer whose clock ran more than 0.6 s ahead then had its
+/// gossiped entries silently dropped, arriving only on a later full sync.
+pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_micros() as u64;
+
+/// hop patch: entries refused for a timestamp beyond [`MAX_TIMESTAMP_FUTURE_SHIFT`]
+/// (this node's clock is behind, or the author's is ahead), the largest lead
+/// seen (µs), and this node's clock (µs) at the latest refusal. A wrong clock
+/// otherwise stops sync without a word; hop reports these in its health.
+pub static REJECTED_TOO_FAR_IN_FUTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// See [`REJECTED_TOO_FAR_IN_FUTURE`].
+pub static REJECTED_MAX_LEAD_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// See [`REJECTED_TOO_FAR_IN_FUTURE`].
+pub static REJECTED_LAST_AT_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Callback that may be set on a replica to determine the availability status for a content hash.
 pub type ContentStatusCallback =
@@ -629,6 +644,10 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
 
     // Verify that the timestamp of the entry is not too far in the future.
     if entry.timestamp() > now + MAX_TIMESTAMP_FUTURE_SHIFT {
+        use std::sync::atomic::Ordering::Relaxed;
+        REJECTED_TOO_FAR_IN_FUTURE.fetch_add(1, Relaxed);
+        REJECTED_MAX_LEAD_MICROS.fetch_max(entry.timestamp() - now, Relaxed);
+        REJECTED_LAST_AT_MICROS.store(now, Relaxed);
         return Err(ValidationFailure::TooFarInTheFuture);
     }
     Ok(())
