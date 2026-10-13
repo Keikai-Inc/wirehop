@@ -75,8 +75,10 @@ cleanup() {
 }
 
 # --- build ----------------------------------------------------------------
-BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/hop"
-if [ "${REBUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; then
+# HOP_BIN: a Linux binary for the containers' architecture built elsewhere (the
+# nightly soak builds natively on an arm64 runner); skips the cross-build.
+BIN="${HOP_BIN:-$ROOT/target/aarch64-unknown-linux-gnu/release/hop}"
+if [ -z "${HOP_BIN:-}" ] && { [ "${REBUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; }; then
   say "cross-building aarch64 linux binary"
   (cd "$ROOT" && AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target aarch64-unknown-linux-gnu -p hop-cli)
 fi

@@ -49,13 +49,15 @@ cargo test                    # all workspace tests
 **Run the gate before merging changes** that touch networking (`hop-core/src/net/`),
 auth, protocol (`hop-core/src/proto/`), shell/exec, transfer, sandbox, MCP/JS
 bindings, agent/mux, fleet, VPN/netdoc, privsep, or CLI dispatch. `gate.sh` runs
-three suites and fails if any fails:
+these suites and fails if any fails:
 
 | Suite | Covers |
 |---|---|
 | `run.sh` | the connection/auth/exec/transfer/fleet surface (55 tests) |
 | `vpn-e2e.sh` | the only suite with a real TUN: routing, reboot, read-ticket members, VPN self-repair |
-| `session-resilience.sh` | interactive-session recovery SLA through the daemon mux (net flap, zombie path, host and worker restart, degraded path, relay-pinned) |
+| `session-resilience.sh` | interactive-session recovery SLA through the daemon mux (net flap, zombie path, host and worker restart, degraded path, relay-pinned, paste across a restart) |
+| `privsep-e2e.sh` | privilege split, TUN handoff, non-root operator IPC, the monitor's crash-loop fallback |
+| `embedded-profile.sh` | hop as an unsupervised PID 1 in a read-only, memory-capped container: re-exec restarts, VPN self-repair, short-lived members |
 
 `run.sh` alone is not enough: `vpn-e2e.sh`'s reboot stage failed on every build
 up to 0.9.40 unnoticed because only `run.sh` was in this gate.
@@ -74,6 +76,11 @@ secrets**, so it runs green on fork PRs:
 | `shell scripts` | `bash -n` over every tracked `.sh`, plus `shellcheck -S error` |
 | `workflow lint` | actionlint |
 | `site style` | `./site/check-style.sh` |
+
+`.github/workflows/soak.yml` runs `tests/e2e/long-soak.sh` nightly (4 h of
+randomized faults on a native arm64 runner, no secrets); a failure there is a
+recovery that is slow or broken only sometimes. Its results and logs are kept
+as a run artifact.
 
 Run the same checks locally before pushing:
 
