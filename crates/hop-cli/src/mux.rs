@@ -49,6 +49,14 @@ pub fn agent_sock_path(config_dir: &Path) -> PathBuf {
     config_dir.join("agent.sock")
 }
 
+/// The host daemon's mux socket. Deliberately not `agent.sock`: when a client
+/// shares its config dir with the daemon (containers, single-config installs)
+/// a user agent and the daemon raced for that one path, and whichever bound
+/// last left the other listening on an unlinked, unreachable socket.
+pub fn daemon_mux_sock_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("mux.sock")
+}
+
 /// Path to the agent PID file.
 pub fn agent_pid_path(config_dir: &Path) -> PathBuf {
     config_dir.join("agent.pid")
@@ -110,12 +118,20 @@ pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
     // SECOND endpoint under the same node-id — which the relay prunes against
     // the daemon every few seconds (the identity collision that destabilizes
     // both client sessions and the VPN). Falls through if no daemon is serving.
+    // Order: a daemon serving this config dir, then the system daemon (its
+    // `mux.sock`, or `agent.sock` for a daemon older than `mux.sock`).
+    let mut daemon_socks = vec![daemon_mux_sock_path(config_dir)];
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let daemon_sock = hop_core::config::system_config_dir().join("agent.sock");
-        if daemon_sock != sock
-            && let Ok(stream) = UnixStream::connect(&daemon_sock).await
-        {
+        let sys = hop_core::config::system_config_dir();
+        daemon_socks.push(daemon_mux_sock_path(&sys));
+        let legacy = agent_sock_path(&sys);
+        if legacy != sock {
+            daemon_socks.push(legacy);
+        }
+    }
+    for path in &daemon_socks {
+        if let Ok(stream) = UnixStream::connect(path).await {
             return Ok(stream);
         }
     }
@@ -123,6 +139,27 @@ pub async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
     // Try existing (user) agent
     if let Ok(stream) = UnixStream::connect(&sock).await {
         return Ok(stream);
+    }
+
+    // A host daemon serving THIS config dir (containers, single-config
+    // installs) has its `mux.sock` here. If it is briefly not answering — the
+    // daemon is still starting — wait for it rather than spawn a user agent,
+    // which would be a second endpoint under the same node id.
+    // (An older daemon, or one whose mux listener failed to bind, never
+    // answers: after ~4 s fall through to a user agent so the client works.)
+    #[cfg(unix)]
+    if UnixStream::connect(config_dir.join("daemon.sock")).await.is_ok() {
+        let mux = daemon_mux_sock_path(config_dir);
+        for i in 0..20u64 {
+            tokio::time::sleep(Duration::from_millis(50 * (i + 1).min(5))).await;
+            if let Ok(stream) = UnixStream::connect(&mux).await {
+                return Ok(stream);
+            }
+        }
+        tracing::warn!(
+            "the hop daemon serving {} has no mux socket; starting a user agent",
+            config_dir.display()
+        );
     }
 
     // Start the user agent — unless one is already coming up. A live agent.pid
@@ -447,17 +484,23 @@ pub async fn finish_auth_and_request(
 /// Kill a wedged USER agent (the one this client spawned) so the next dial
 /// starts a fresh one — the automated form of the `killall hop` users have had
 /// to run by hand when the agent gets stuck storm-redialing. Only ever touches
-/// the per-user `agent.pid`/socket in `config_dir`; never the system daemon's
-/// mux (a host machine has no user `agent.pid`, so this is a safe no-op there).
+/// a user agent recorded in `config_dir`'s `agent.pid`; with no such agent it
+/// is a no-op. In particular it must not remove `agent.sock` then: when the
+/// client shares its config dir with the host daemon (containers, single-config
+/// installs) that socket is the daemon's mux, and deleting it sent every later
+/// connect to a freshly spawned user agent with a second endpoint under the
+/// same node id.
 pub fn restart_user_agent(config_dir: &Path) {
     let pid_path = agent_pid_path(config_dir);
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
-        && let Ok(pid) = pid_str.trim().parse::<i32>()
-    {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+    let Ok(pid) = std::fs::read_to_string(&pid_path)
+        .map_err(|_| ())
+        .and_then(|s| s.trim().parse::<i32>().map_err(|_| ()))
+    else {
+        return; // no user agent of ours: leave whatever serves the socket alone
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
     }
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(agent_sock_path(config_dir));
@@ -529,6 +572,17 @@ async fn open_agent_stream(
 
 #[cfg(test)]
 mod tests {
+    /// No user agent recorded: the socket is someone else's (the host daemon's
+    /// mux when client and daemon share a config dir) and must survive.
+    #[test]
+    fn restart_user_agent_leaves_a_socket_it_does_not_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = super::agent_sock_path(dir.path());
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        super::restart_user_agent(dir.path());
+        assert!(sock.exists(), "the daemon's mux socket was deleted");
+    }
+
     use super::*;
     use tokio::io::AsyncWriteExt;
 

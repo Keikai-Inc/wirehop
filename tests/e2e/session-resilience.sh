@@ -14,13 +14,19 @@
 #   zombie_path  traffic to founder+relay DROPped 25s with NO interface change
 #                (exercises rx-stall zombie detection, not just redial)
 #   host_restart founder daemon SIGKILL + restart (PTY lost -> fresh session)
+#   degraded_path member's link up but bad (netem 600ms delay, 10% loss) for 60s:
+#                no blackout, so no idle timeout or zombie watchdog — the
+#                2026-10-12 case. Also fails on agent churn (>1 replacement).
+#   relay_pinned direct UDP to the founder dropped 30s (relay still reachable),
+#                then allowed: the session must ride the relay, and the pooled
+#                connection must be direct again within RELAY_BACK_BUDGET_MS.
 #
 # Budgets (SRT ms, from RESTORE; truthful FAIL rows allowed):
 #   net_flap ≤ 10000 · zombie_path ≤ 12000 · host_restart ≤ 20000
 # zombie_path's budget is the detection proof: without rx-stall detection the
 # session waits out QUIC's 60s idle and SRT lands ~35-45s.
 #
-# Env: CYCLES (default 6), REBUILD=1 (cross-build first), HOP_DUMP_LOGS=<dir>
+# Env: CYCLES (default 10), REBUILD=1 (cross-build first), HOP_DUMP_LOGS=<dir>
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,11 +35,14 @@ IMG=hop-sessres-e2e
 NET=hop-sessres-net
 FOUNDER=hop-sessres-founder
 MEMBER=hop-sessres-member
-CYCLES="${CYCLES:-6}"
+CYCLES="${CYCLES:-10}"
 BACKSTOP_MS=90000
 
 BUDGET_net_flap=10000
 BUDGET_zombie_path=12000
+BUDGET_degraded_path=10000
+BUDGET_relay_pinned=10000
+RELAY_BACK_BUDGET_MS=120000
 BUDGET_host_restart=20000
 
 say() { echo "=== $* ==="; }
@@ -41,10 +50,17 @@ trap 'cleanup' EXIT
 cleanup() {
   say "cleanup"
   if [ -n "${HOP_DUMP_LOGS:-}" ]; then
+    mkdir -p "$HOP_DUMP_LOGS"
+    # The interactive client dials through its own agent process, not the
+    # member daemon's mux, so its pool decisions are only in agent.log.
+    docker exec "$MEMBER" cat /cfg/agent.log >"${HOP_DUMP_LOGS}/agent.log" 2>/dev/null || true
     docker exec "$MEMBER" cat /cfg/log >"${HOP_DUMP_LOGS}/member.log" 2>/dev/null || true
     docker exec "$MEMBER" cat /cfg/session.log >"${HOP_DUMP_LOGS}/session.log" 2>/dev/null || true
+    docker exec "$MEMBER" cat /cfg/session.raw >"${HOP_DUMP_LOGS}/session.raw" 2>/dev/null || true
     docker exec "$FOUNDER" cat /cfg/log >"${HOP_DUMP_LOGS}/founder.log" 2>/dev/null || true
   fi
+  # HOP_KEEP_CONTAINERS=1: leave both containers running for inspection.
+  if [ "${HOP_KEEP_CONTAINERS:-0}" = 1 ]; then echo "keeping $FOUNDER $MEMBER"; return; fi
   docker rm -f "$FOUNDER" "$MEMBER" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -f "$SCRIPT_DIR/hop"
@@ -70,7 +86,8 @@ DOCKERFILE
 
 COMMON_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun
         -e HOP_VPN=1 -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1
-        -e RUST_LOG="${SESS_LOG:-hop=info,hop_core=warn}" --user root)
+        -e RUST_LOG="${SESS_LOG:-hop=info,hop_core=warn}" --user root
+        -e HOP_AGENT_PROBE_SECS="${HOP_AGENT_PROBE_SECS:-}")
 
 start_daemon() { docker exec -d "$1" bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'; }
 stop_daemon()  { docker exec "$1" pkill -9 -f 'hop host' >/dev/null 2>&1 || true; }
@@ -144,6 +161,22 @@ while True:
         last_tx = now
 PYEOF
 
+# Prints the pooled connection's on_relay (True/False/None) for host $1 from
+# whichever health files exist (net-stats JSON with "health", or agent-health.json).
+docker exec -i "$MEMBER" sh -c 'cat > /cfg/on_relay.py' <<'PYEOF'
+import json, sys
+host, on = sys.argv[1], None
+for path in sys.argv[2:]:
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    c = d.get("health", d).get("agent_conns", {}).get(host)
+    if c is not None:
+        on = c.get("on_relay")
+print(on)
+PYEOF
+
 start_session() {
   docker exec "$MEMBER" sh -c ": > /cfg/session.log; : > /cfg/session.raw"
   docker exec -d "$MEMBER" sh -c "python3 /cfg/driver.py '$FOUNDER_ID' >/cfg/driver.err 2>&1"
@@ -208,11 +241,63 @@ r_zombie_path()  {
   docker exec "$MEMBER" sh -c "iptables -D OUTPUT -d $FOUNDER_IP -j DROP; iptables -D INPUT -s $FOUNDER_IP -j DROP" >/dev/null 2>&1 || true
   [ -n "$RELAY_IP" ] && docker exec "$MEMBER" sh -c "iptables -D OUTPUT -d $RELAY_IP -j DROP; iptables -D INPUT -s $RELAY_IP -j DROP" >/dev/null 2>&1 || true
 }
+# degraded_path: the member's link stays up but turns bad (tc netem: 600 ms
+# delay, 10 % loss) for DEGRADE_SECS. Not a blackout, so neither QUIC's idle
+# timeout nor the rx-stall zombie watchdog fires — the 2026-10-12 case. Measures
+# recovery once the link is good again, and counts the agent's replacement
+# decisions during the window: a fresh connection over the same bad link is no
+# better, so the agent must keep its connection (at most one "no better"
+# decision per 2 min), never churn it.
+DEGRADE_SECS="${DEGRADE_SECS:-60}"
+d_degraded_path() {
+  REPL_BEFORE=$(docker exec "$MEMBER" sh -c "grep -ac 'replaced degraded connection' /cfg/log /cfg/agent.log 2>/dev/null | awk -F: '{s+=\$NF} END{print s+0}'")
+  docker exec "$MEMBER" tc qdisc add dev eth0 root netem delay 600ms loss 10% >/dev/null 2>&1
+  sleep "$DEGRADE_SECS"
+}
+r_degraded_path() {
+  docker exec "$MEMBER" tc qdisc del dev eth0 root >/dev/null 2>&1 || true
+  local after
+  after=$(docker exec "$MEMBER" sh -c "grep -ac 'replaced degraded connection' /cfg/log /cfg/agent.log 2>/dev/null | awk -F: '{s+=\$NF} END{print s+0}'")
+  local churn=$((after - REPL_BEFORE))
+  echo "    degraded_path: $churn replacement(s) during ${DEGRADE_SECS}s of 600ms/10% loss"
+  # Same bad link either way: replacing is churn, not recovery.
+  [ "$churn" -le 1 ] || echo "CHURN" >>"$RDIR/degraded_path.churn"
+}
+
+# relay_pinned: direct UDP between member and founder is dropped for 30 s (the
+# relay stays reachable), so the connection moves to the relay; then direct is
+# allowed again. The session must survive throughout (SRT tiny), and the
+# connection must not stay on the relay afterwards.
+d_relay_pinned() {
+  docker exec "$MEMBER" sh -c "iptables -I OUTPUT -d $FOUNDER_IP -p udp -j DROP; iptables -I INPUT -s $FOUNDER_IP -p udp -j DROP" >/dev/null 2>&1
+  sleep 30
+}
+r_relay_pinned() {
+  docker exec "$MEMBER" sh -c "iptables -D OUTPUT -d $FOUNDER_IP -p udp -j DROP; iptables -D INPUT -s $FOUNDER_IP -p udp -j DROP" >/dev/null 2>&1 || true
+}
+
+# After relay_pinned: ms until the member daemon's pooled connection to the
+# founder reports a direct path again (health.agent_conns.<id>.on_relay).
+measure_back_to_direct() {
+  local restore_ms="$1" out="$2" short="${FOUNDER_ID:0:10}"
+  docker exec "$MEMBER" sh -c '
+    restore='"$restore_ms"'; ceil='"$RELAY_BACK_BUDGET_MS"'
+    while :; do
+      # The pool is the daemon mux (health over its socket) or, if a user agent
+      # serves the client, that agent (agent-health.json).
+      hop --config /cfg --json debug net-stats >/tmp/ns.json 2>/dev/null
+      r=$(python3 /cfg/on_relay.py '"$short"' /tmp/ns.json /cfg/agent-health.json 2>/dev/null)
+      if [ "$r" = "False" ]; then echo $(($(date +%s%3N) - restore)); exit 0; fi
+      [ $(($(date +%s%3N) - restore)) -gt "$ceil" ] && { echo TIMEOUT; exit 0; }
+      sleep 2
+    done' >"$out"
+}
+
 d_host_restart() { stop_daemon "$FOUNDER"; sleep 3; }
 r_host_restart() { start_daemon "$FOUNDER"; }
 
 # PERTS env: space-separated subset for targeted soaks (default all).
-if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart); fi
+if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart degraded_path relay_pinned); fi
 RDIR=$(mktemp -d)
 
 say "SESSION SOAK: $CYCLES cycles"
@@ -231,6 +316,9 @@ for c in $(seq 1 "$CYCLES"); do
   restore_ms=$(now_ms)
   "r_$name"
 
+  if [ "$name" = relay_pinned ]; then
+    measure_back_to_direct "$restore_ms" "$RDIR/direct.$c" &
+  fi
   vpnfile="$RDIR/vpn.$c"
   measure_vpn_ttr "$restore_ms" "$vpnfile" &
   vpid=$!
@@ -305,6 +393,35 @@ for name in "${PERTS[@]}"; do
   verdict="PASS"; [ "$max" -gt "$budget" ] && { verdict="**FAIL**"; FAILED=1; }
   echo "  $name: SRT p50=${p50}ms max=${max}ms parity_p50=${dp50}ms budget=${budget}ms $verdict"
   echo "| $name | ${p50}ms | ${max}ms | ${dp50}ms | ${budget}ms | $verdict |" >>"$ART"
+done
+# Topology: the member's client shares /cfg with the member daemon, so every
+# session must go through the daemon's mux (mux.sock). A user agent here is a
+# second endpoint under the same node id — the harness then tests the wrong
+# path (it did, unnoticed, until 2026-10-12).
+USER_AGENTS=$(docker exec "$MEMBER" sh -c "ps -eo args | grep -c '^/usr/local/bin/hop agent --daemon'" 2>/dev/null || echo "?")
+echo "  topology: $USER_AGENTS user agent(s) on the member (want 0)"
+if [ "$USER_AGENTS" != 0 ]; then
+  echo "| topology: user agents on member | | $USER_AGENTS | | 0 | **FAIL** |" >>"$ART"
+  FAILED=1
+fi
+
+# Extra assertions for the new perturbations.
+if [ -s "$RDIR/degraded_path.churn" ]; then
+  echo "  degraded_path: agent replaced its connection more than once in a window -> FAIL"
+  echo "| degraded_path churn | | | | ≤1 / window | **FAIL** |" >>"$ART"
+  FAILED=1
+fi
+wait 2>/dev/null || true
+for f in "$RDIR"/direct.*; do
+  [ -e "$f" ] || continue
+  v=$(cat "$f")
+  echo "  relay_pinned: back on a direct path after ${v}ms (budget ${RELAY_BACK_BUDGET_MS}ms)"
+  if [ "$v" = TIMEOUT ]; then
+    echo "| relay_pinned back-to-direct | | TIMEOUT | | ${RELAY_BACK_BUDGET_MS}ms | **FAIL** |" >>"$ART"
+    FAILED=1
+  else
+    echo "| relay_pinned back-to-direct | ${v}ms | | | ${RELAY_BACK_BUDGET_MS}ms | PASS |" >>"$ART"
+  fi
 done
 echo "artifact: $ART"
 

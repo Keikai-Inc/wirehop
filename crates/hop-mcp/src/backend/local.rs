@@ -185,10 +185,26 @@ async fn read_ipc<T: for<'de> serde::Deserialize<'de>>(stream: &mut UnixStream) 
 
 /// Connect to a running agent, or start one.
 async fn ensure_agent(config_dir: &Path) -> Result<UnixStream> {
+    // A host daemon serving this config dir listens on `mux.sock` (its mux,
+    // the one endpoint for this node id). Inside the daemon — cron, MCP — that
+    // is always the right socket; never spawn a user agent beside it.
+    let mux = config_dir.join("mux.sock");
+    if let Ok(stream) = UnixStream::connect(&mux).await {
+        return Ok(stream);
+    }
     let sock = config_dir.join("agent.sock");
 
     if let Ok(stream) = UnixStream::connect(&sock).await {
         return Ok(stream);
+    }
+    if UnixStream::connect(config_dir.join("daemon.sock")).await.is_ok() {
+        // The daemon is up but its mux is not answering yet: wait for it.
+        for i in 0..20u64 {
+            tokio::time::sleep(std::time::Duration::from_millis(50 * (i + 1).min(5))).await;
+            if let Ok(stream) = UnixStream::connect(&mux).await {
+                return Ok(stream);
+            }
+        }
     }
 
     let exe = std::env::current_exe().context("could not determine hop executable path")?;

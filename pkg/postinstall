@@ -112,6 +112,7 @@ sleep 0.5
 # Remove stale Unix sockets and lock files.
 rm -f "$SYSTEM_CONFIG/daemon.sock"
 rm -f "$SYSTEM_CONFIG/agent.sock"
+rm -f "$SYSTEM_CONFIG/mux.sock"
 
 # --- Load and start the new daemon ---
 STARTED=false

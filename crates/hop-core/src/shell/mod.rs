@@ -475,6 +475,10 @@ pub async fn host_shell_session(
                         });
                         let _ = proto::write_message(&mut send, &HostMessage::WindowSizeAck).await;
                     }
+                    // Heartbeat echo: see the client loop's `echo_armed`.
+                    Ok(ClientMessage::Ping) => {
+                        let _ = proto::write_message(&mut send, &HostMessage::Pong).await;
+                    }
                     Ok(_) => {
                         tracing::warn!("Unexpected message during shell session");
                     }
@@ -1160,6 +1164,11 @@ async fn run_attached_loop<R: AsyncReadExt + Unpin>(
                         let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
                         let _ = host_tx.send(HostMessage::WindowSizeAck);
                     }
+                    // Heartbeat echo: proves to the client that its messages
+                    // still reach us (see the client loop's `echo_armed`).
+                    Ok(ClientMessage::Ping) => {
+                        let _ = host_tx.send(HostMessage::Pong);
+                    }
                     Ok(_) => {
                         tracing::warn!("Unexpected message during shell session");
                     }
@@ -1275,6 +1284,9 @@ pub async fn host_view_session(
                     if let Err(e) = write_host_message(&mut send, &HostMessage::Output(bytes), compress).await {
                         break Err(e);
                     }
+                }
+                Ok(ClientMessage::Ping) => {
+                    let _ = proto::write_message(&mut send, &HostMessage::Pong).await;
                 }
                 Ok(_) => {}
                 Err(_) => break Ok(()), // client went away
@@ -1893,6 +1905,11 @@ where
     // Heartbeat: periodic empty Input to probe the connection
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Heartbeat echo state (see the heartbeat branch below).
+    const ONE_WAY_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut echo_armed = false;
+    let mut echo_probes_left: u32 = 3;
+    let mut last_pong = tokio::time::Instant::now();
 
     // Read deadline: backstop for cases where QUIC fails to report a dead connection
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
@@ -1958,10 +1975,13 @@ where
                     Ok(HostMessage::SessionInfo { .. }) => {
                         // Late SessionInfo — ignore
                     }
+                    Ok(HostMessage::Pong) => {
+                        echo_armed = true;
+                        last_pong = tokio::time::Instant::now();
+                    }
                     Ok(HostMessage::AdminResponse(_))
                     | Ok(HostMessage::PeerResponse(_))
-                    | Ok(HostMessage::NetdocAuthorAck { .. })
-                    | Ok(HostMessage::Pong) => {
+                    | Ok(HostMessage::NetdocAuthorAck { .. }) => {
                         // Unexpected admin/peer response during shell session — ignore
                     }
                     Ok(HostMessage::SessionError(msg)) => {
@@ -1990,6 +2010,29 @@ where
             // writer does the actual write; if it fails, writer_err_rx fires.
             _ = heartbeat.tick() => {
                 let _ = send_tx.send(ClientMessage::Input(vec![]));
+                // Heartbeat echo. Host output and heartbeats arriving prove only
+                // the host→client direction; the client→host direction can stall
+                // on its own (a session stream whose data stayed on a dead path
+                // while the connection moved: the host saw no input for 75 s
+                // while this loop, still receiving, never noticed). A host that
+                // answers `Ping` with `Pong` arms the check; then no `Pong` for
+                // ONE_WAY_STALL means our messages are not getting through, and a
+                // fresh stream (reconnect) is the fix. An older host never answers,
+                // so after a few unanswered probes we stop sending them (it logs
+                // each one as unexpected).
+                if echo_armed {
+                    if last_pong.elapsed() >= ONE_WAY_STALL {
+                        tracing::info!(
+                            "Host has not answered a heartbeat for {}s while its output still arrives; reconnecting",
+                            last_pong.elapsed().as_secs()
+                        );
+                        break Ok(SessionOutcome::Disconnected);
+                    }
+                    let _ = send_tx.send(ClientMessage::Ping);
+                } else if echo_probes_left > 0 {
+                    echo_probes_left -= 1;
+                    let _ = send_tx.send(ClientMessage::Ping);
+                }
             }
             // Read deadline: no data from host for too long
             () = &mut read_deadline => {

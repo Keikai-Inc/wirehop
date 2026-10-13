@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auth;
 pub mod peer_ops;
 pub mod config;
+pub mod conn_quality;
 pub mod datastore;
 pub mod extensions;
 pub mod fleet;

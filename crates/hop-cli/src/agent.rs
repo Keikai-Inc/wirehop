@@ -89,6 +89,7 @@ pub fn agent_status(config_dir: &Path) -> Result<()> {
         if sock_path.exists() {
             println!("  Socket: {}", sock_path.display());
         }
+        print_agent_health(config_dir);
     } else {
         println!("Agent PID file exists but process {pid} is not running.");
         // Clean up stale files
@@ -96,6 +97,39 @@ pub fn agent_status(config_dir: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&sock_path);
     }
     Ok(())
+}
+
+/// Per-host connection quality from the running agent's `agent-health.json`.
+fn print_agent_health(config_dir: &Path) {
+    let Ok(json) = std::fs::read_to_string(agent_health_path(config_dir)) else {
+        return; // an agent that predates the probe, or no hop/4 connection yet
+    };
+    let Ok(h) = serde_json::from_str::<hop_core::health::HealthSnapshot>(&json) else {
+        return;
+    };
+    if h.agent_conns.is_empty() {
+        return;
+    }
+    println!("  Connections (probed every ~{}s):", quality_probe_every().as_secs());
+    for (host, c) in &h.agent_conns {
+        let rtt = c.last_rtt_ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "no answer".into());
+        let base = c.baseline_ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "?".into());
+        let path = match c.on_relay {
+            Some(true) => "relay",
+            Some(false) => "direct",
+            None => "?",
+        };
+        println!(
+            "    {host}  rtt {rtt} (baseline {base}), {path}, {}",
+            c.last_verdict.as_deref().unwrap_or("?")
+        );
+        if let Some(ev) = &c.last_event {
+            println!("      last action: {ev}");
+        }
+    }
+    if h.agent_replacements > 0 {
+        println!("  Degraded connections replaced: {}", h.agent_replacements);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +163,16 @@ enum AgentCommand {
     ForceRemoveConnection {
         host_id: PublicKey,
         stable_id: usize,
+    },
+    /// The quality probe dialed a better connection to replace a degraded one.
+    /// Swapped in only if `old_stable_id` is still the pooled connection (else
+    /// something already replaced it); the old one is then closed so its
+    /// sessions resume on the new one. Replies whether the swap happened.
+    ReplaceConnection {
+        host_id: PublicKey,
+        old_stable_id: usize,
+        new: Connection,
+        reply: oneshot::Sender<bool>,
     },
     /// A pooled connection answered a `Ping`: refresh its verified timestamp.
     NotePoolVerified {
@@ -194,6 +238,20 @@ impl AgentHandle {
             .tx
             .send(AgentCommand::ForceRemoveConnection { host_id, stable_id })
             .await;
+    }
+
+    /// Swap `new` in for the degraded pooled connection `old_stable_id`.
+    async fn replace_connection(&self, host_id: PublicKey, old_stable_id: usize, new: Connection) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReplaceConnection { host_id, old_stable_id, new, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Record that the pooled connection with this `stable_id` answered a ping.
@@ -346,7 +404,16 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 let endpoint = state.endpoint.clone();
                 let tx = state.tx.clone();
                 tokio::spawn(async move {
-                    let result = do_connect(&endpoint, host_id, relay_url).await;
+                    let result = do_connect(&endpoint, host_id, relay_url.clone()).await;
+                    if let Ok(conn) = &result {
+                        spawn_quality_probe(
+                            conn.clone(),
+                            host_id,
+                            relay_url,
+                            endpoint.clone(),
+                            AgentHandle { tx: tx.clone() },
+                        );
+                    }
                     let _ = tx
                         .send(AgentCommand::ConnectDone {
                             host_id,
@@ -407,6 +474,26 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 } else {
                     tracing::debug!("actor: skip evicting connection for {} — {} active session(s) still using it", host_id.fmt_short(), state.active.get(&host_id).copied().unwrap_or(0));
                 }
+            }
+
+            AgentCommand::ReplaceConnection { host_id, old_stable_id, new, reply } => {
+                let current = state
+                    .connections
+                    .get(&host_id)
+                    .map(|c| c.stable_id() == old_stable_id)
+                    .unwrap_or(false);
+                if !current {
+                    let _ = reply.send(false);
+                    continue;
+                }
+                if let Some(old) = state.connections.insert(host_id, new) {
+                    // Closing errors the old connection's proxied streams, so its
+                    // sessions reconnect now — onto the replacement, which is
+                    // already pooled — instead of limping on the degraded path.
+                    old.close(0u32.into(), b"replaced-degraded");
+                }
+                state.verified.insert(host_id, Instant::now());
+                let _ = reply.send(true);
             }
 
             AgentCommand::NotePoolVerified { host_id, stable_id } => {
@@ -516,6 +603,178 @@ fn spawn_zombie_watchdog(conn: Connection, host_id: PublicKey) {
                 );
                 conn.close(0u32.into(), b"zombie-stall");
                 return;
+            }
+        }
+    });
+}
+
+/// How often each pooled hop/4 connection is probed (jittered ±20 %), whether
+/// or not a session is using it, so a degraded path is found and replaced
+/// before the next keystroke rather than by it. `HOP_AGENT_PROBE_SECS` overrides.
+const QUALITY_PROBE_EVERY: Duration = Duration::from_secs(15);
+/// At most one replacement attempt per connection this often.
+const REPLACE_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// Where the client agent publishes its health snapshot for `hop agent status`
+/// (set by `run_agent`; the host daemon's mux service leaves it unset and
+/// serves the same registry over its daemon socket instead).
+static AGENT_HEALTH_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn agent_health_path(config_dir: &Path) -> std::path::PathBuf {
+    config_dir.join("agent-health.json")
+}
+
+fn write_agent_health() {
+    if let Some(path) = AGENT_HEALTH_PATH.get() {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, hop_core::health::snapshot_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn quality_probe_every() -> Duration {
+    let base = std::env::var("HOP_AGENT_PROBE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(QUALITY_PROBE_EVERY);
+    // ±20 % jitter from the clock's sub-second noise: a fleet of agents must
+    // not line their probes up on the relay.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let pct = 80 + (nanos % 41); // 80..=120
+    base * pct / 100
+}
+
+fn verdict_label(v: &hop_core::conn_quality::Verdict) -> String {
+    use hop_core::conn_quality::Verdict;
+    match v {
+        Verdict::Good => "Good".into(),
+        Verdict::Unanswered => "Unanswered".into(),
+        Verdict::Slow { rtt, baseline } => {
+            format!("Slow ({} ms vs {} ms baseline)", rtt.as_millis(), baseline.as_millis())
+        }
+        Verdict::StuckOnRelay => "StuckOnRelay".into(),
+    }
+}
+
+/// Probe one pooled hop/4 connection for as long as it lives, and replace it
+/// when it degrades (`docs/technical/self-healing.md`, "Pre-emptive
+/// detection"). The 2026-10-12 incident: a pooled connection on a bad path
+/// kept its keepalives flowing, so `spawn_zombie_watchdog` never fired, and
+/// every session on it crawled until the operator ran `hop agent stop`.
+///
+/// Replace before tearing down: the replacement is dialed and pinged first and
+/// swapped in only if it is clearly better (or the old one stopped answering).
+/// If it is no better the path itself is slow, so the old connection is kept
+/// and its baseline restarted — no redial loop on a path that is just slow.
+fn spawn_quality_probe(
+    conn: Connection,
+    host_id: PublicKey,
+    relay_url: Option<String>,
+    endpoint: Endpoint,
+    handle: AgentHandle,
+) {
+    use hop_core::conn_quality::{QualityTracker, replacement_is_better};
+    if conn.alpn() != hop_core::proto::ALPN_V4 {
+        return; // `Ping` is hop/4-only
+    }
+    tokio::spawn(async move {
+        let host = host_id.fmt_short().to_string();
+        let mut conn = conn;
+        let mut q = QualityTracker::default();
+        let mut last_attempt: Option<Instant> = None;
+        let mut last_rx = conn.stats().udp_rx.datagrams;
+        loop {
+            tokio::time::sleep(quality_probe_every()).await;
+            if conn.close_reason().is_some() {
+                return;
+            }
+            // Nothing received since the last probe (5 s keepalives make that
+            // impossible on a live path) means the path is blacked out: that is
+            // `spawn_zombie_watchdog`'s case. Probing into it only adds lost
+            // stream data on top of the keepalives, and with it the probe
+            // stretched recovery after a blackout from ~2 s to 24-30 s in 3 of
+            // 17 session-resilience zombie_path cycles (0 of 13 without it).
+            let rx = conn.stats().udp_rx.datagrams;
+            if rx == last_rx {
+                continue;
+            }
+            last_rx = rx;
+            let rtt = check_pooled_liveness(&conn).await.ok();
+            if conn.close_reason().is_some() {
+                return; // evicted or replaced while the probe was in flight
+            }
+            let on_relay = conn.to_info().selected_path().map(|p| p.is_relay());
+            let verdict = q.record(rtt, on_relay).clone();
+            hop_core::health::note_agent_conn(
+                &host,
+                hop_core::health::AgentConnSnapshot {
+                    last_rtt_ms: rtt.map(|d| d.as_millis() as u64),
+                    baseline_ms: q.baseline().map(|d| d.as_millis() as u64),
+                    on_relay,
+                    consecutive_bad: q.consecutive_bad(),
+                    last_verdict: Some(verdict_label(&verdict)),
+                    ..Default::default()
+                },
+            );
+            write_agent_health();
+
+            if !q.degraded() || last_attempt.is_some_and(|t| t.elapsed() < REPLACE_COOLDOWN) {
+                continue;
+            }
+            last_attempt = Some(Instant::now());
+            let why = verdict_label(&verdict);
+            let fresh = match do_connect(&endpoint, host_id, relay_url.clone()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("mux: connection to {host} degraded ({why}); replacement dial failed: {e:#}");
+                    hop_core::health::note_agent_event(&host, format!("degraded ({why}); replacement dial failed"), false);
+                    write_agent_health();
+                    continue;
+                }
+            };
+            let fresh_rtt = if fresh.alpn() == hop_core::proto::ALPN_V4 {
+                check_pooled_liveness(&fresh).await.ok()
+            } else {
+                None
+            };
+            match fresh_rtt {
+                Some(new_rtt) if replacement_is_better(q.last_rtt(), new_rtt) => {
+                    if !handle.replace_connection(host_id, conn.stable_id(), fresh.clone()).await {
+                        // Already replaced or evicted; whatever is pooled now has
+                        // its own probe.
+                        fresh.close(0u32.into(), b"replacement-superseded");
+                        return;
+                    }
+                    let event = format!(
+                        "replaced degraded connection ({why}); new one answered in {} ms",
+                        new_rtt.as_millis()
+                    );
+                    tracing::warn!("mux: {host}: {event}");
+                    hop_core::health::note_agent_event(&host, event, true);
+                    write_agent_health();
+                    conn = fresh;
+                    last_rx = conn.stats().udp_rx.datagrams;
+                    q = QualityTracker::default();
+                    q.record(Some(new_rtt), conn.to_info().selected_path().map(|p| p.is_relay()));
+                    last_attempt = None;
+                }
+                _ => {
+                    fresh.close(0u32.into(), b"replacement-no-better");
+                    q.rebase();
+                    let event = format!(
+                        "degraded ({why}) but a fresh connection was no better ({}); keeping it as the new normal",
+                        fresh_rtt.map(|d| format!("{} ms", d.as_millis())).unwrap_or_else(|| "no answer".into())
+                    );
+                    tracing::info!("mux: {host}: {event}");
+                    hop_core::health::note_agent_event(&host, event, false);
+                    write_agent_health();
+                }
             }
         }
     });
@@ -1048,44 +1307,53 @@ fn spawn_pool_flush_watchers(
 /// watchers, or the pool it serves is never flushed on a network change.
 pub fn spawn_mux_listener(
     endpoint: Endpoint,
-    sock_path: std::path::PathBuf,
+    sock_paths: &[std::path::PathBuf],
 ) -> Result<tokio::sync::mpsc::Sender<()>> {
-    if sock_path.exists() {
-        let _ = std::fs::remove_file(&sock_path);
+    let mut listeners = Vec::new();
+    for sock_path in sock_paths {
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(sock_path);
+        }
+        let listener = UnixListener::bind(sock_path)
+            .with_context(|| format!("bind mux socket {}", sock_path.display()))?;
+        // Local-trust: let the logged-in user's `hop connect` reach the daemon's
+        // socket (the daemon may run as _hop/root). Single-user posture; multi-user
+        // hosts should group-scope this rather than world-rw (tracked follow-up).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o666));
+        }
+        tracing::info!("daemon mux service listening on {}", sock_path.display());
+        listeners.push(listener);
     }
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("bind mux socket {}", sock_path.display()))?;
-    // Local-trust: let the logged-in user's `hop connect` reach the daemon's
-    // socket (the daemon may run as _hop/root). Single-user posture; multi-user
-    // hosts should group-scope this rather than world-rw (tracked follow-up).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
-    }
+    // One actor (one pool, one probe per connection) behind every socket.
     let handle = spawn_agent_actor(endpoint.clone());
     let flush_tx = spawn_pool_flush_watchers(endpoint, handle.clone());
     let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let h = handle.clone();
-                    let sessions = active_sessions.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, h, sessions).await {
-                            tracing::debug!("daemon mux client error: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("daemon mux accept error: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+    for listener in listeners {
+        let handle = handle.clone();
+        let active_sessions = active_sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let h = handle.clone();
+                        let sessions = active_sessions.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(stream, h, sessions).await {
+                                tracing::debug!("daemon mux client error: {e:#}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("daemon mux accept error: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
-        }
-    });
-    tracing::info!("daemon mux service listening on {}", sock_path.display());
+        });
+    }
     Ok(flush_tx)
 }
 
@@ -1093,8 +1361,22 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
     let sock_path = mux::agent_sock_path(config_dir);
     let pid_path = mux::agent_pid_path(config_dir);
 
-    // Remove stale socket if present
+    // A socket that still answers belongs to a live agent or to the host
+    // daemon's mux service: do not unlink it from under them. That made a
+    // second agent orphan the first (still holding its connections and
+    // probes), and an agent steal the daemon's mux socket when both serve the
+    // same config dir. Only a socket nobody answers on is stale.
     if sock_path.exists() {
+        if UnixStream::connect(&sock_path).await.is_ok() {
+            if !daemon {
+                eprintln!("An agent (or the host daemon) is already serving {}", sock_path.display());
+            }
+            tracing::info!(
+                "agent: {} is already served; not starting a second agent",
+                sock_path.display()
+            );
+            return Ok(());
+        }
         let _ = std::fs::remove_file(&sock_path);
     }
 
@@ -1117,9 +1399,13 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
     let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .context("failed to register SIGUSR1 handler")?;
     let mut debug_enabled = false;
+    let mut yield_check = tokio::time::interval(Duration::from_secs(5));
+    yield_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let secret_key = config::load_or_generate_identity(config_dir)?;
     let endpoint = net::create_client_endpoint(secret_key).await?;
+    let _ = std::fs::remove_file(agent_health_path(config_dir));
+    let _ = AGENT_HEALTH_PATH.set(agent_health_path(config_dir));
     let handle = spawn_agent_actor(endpoint.clone());
     let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1181,6 +1467,19 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
                 tracing::info!("Agent idle timeout reached, shutting down");
                 break;
             }
+            _ = yield_check.tick() => {
+                // A host daemon now serves this config dir: its mux is the one
+                // endpoint for this node id, and clients prefer it. A user agent
+                // beside it is a second endpoint (one the relay prunes against
+                // the daemon); bow out once nothing is using us. Covers an agent
+                // a client started a moment before the daemon came up.
+                if active_sessions.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && UnixStream::connect(mux::daemon_mux_sock_path(config_dir)).await.is_ok()
+                {
+                    tracing::info!("Host daemon serves this config dir; user agent exiting");
+                    break;
+                }
+            }
         }
     }
 
@@ -1188,14 +1487,90 @@ async fn run_agent(config_dir: &Path, daemon: bool, reload_handle: ReloadHandle)
     handle.flush_all().await;
     drop(handle);
     endpoint.close().await;
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
+    // Remove our socket and PID file — only if they are still ours. Another
+    // agent may have bound `agent.sock` or written `agent.pid` since; removing
+    // those unconditionally left that agent running on an unlinked socket
+    // (alive, holding an endpoint, unreachable).
+    drop(listener);
+    if UnixStream::connect(&sock_path).await.is_err() {
+        let _ = std::fs::remove_file(&sock_path);
+    }
+    let ours = std::fs::read_to_string(&pid_path)
+        .map(|p| p.trim() == std::process::id().to_string())
+        .unwrap_or(false);
+    if ours {
+        let _ = std::fs::remove_file(&pid_path);
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// A local hop/4 "host" that answers `Ping` on every stream, as the real
+    /// host does (`hop-cli/src/main.rs`, before session dispatch).
+    async fn ping_host() -> iroh::Endpoint {
+        use hop_core::proto::{self, ClientMessage, HostMessage};
+        let host = iroh::endpoint::Builder::empty()
+            .alpns(vec![hop_core::proto::ALPN_V4.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let h = host.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = h.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        tokio::spawn(async move {
+                            if let Ok(ClientMessage::Ping) = proto::read_message(&mut recv).await {
+                                let _ = proto::write_message(&mut send, &HostMessage::Pong).await;
+                                let _ = send.finish();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        host
+    }
+
+    /// The quality probe's swap: only the connection it measured may be
+    /// replaced, the replacement is what the pool hands out next, and the
+    /// degraded one is closed so its sessions resume on the new one.
+    #[tokio::test]
+    async fn replace_connection_swaps_only_the_measured_connection() {
+        let host = ping_host().await;
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let host_id = host.id();
+        let alpn = hop_core::proto::ALPN_V4;
+        let old = client.connect(host.addr(), alpn).await.unwrap();
+        let new = client.connect(host.addr(), alpn).await.unwrap();
+        let stranger = client.connect(host.addr(), alpn).await.unwrap();
+
+        let handle = spawn_agent_actor(client.clone());
+        handle
+            .tx
+            .send(AgentCommand::ConnectDone { host_id, result: Ok(old.clone()) })
+            .await
+            .unwrap();
+
+        // Not the pooled connection: refused, pool untouched.
+        assert!(!handle.replace_connection(host_id, stranger.stable_id(), new.clone()).await);
+        let (pooled, _, _) = handle.get_connection(host_id, None).await.unwrap();
+        assert_eq!(pooled.stable_id(), old.stable_id());
+
+        // The measured one: swapped, and the old one is closed.
+        assert!(handle.replace_connection(host_id, old.stable_id(), new.clone()).await);
+        let (pooled, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
+        assert_eq!(pooled.stable_id(), new.stable_id());
+        assert!(!needs_check, "a replacement was just pinged; no second check");
+        tokio::time::timeout(Duration::from_secs(5), old.closed()).await.unwrap();
+
+        // And the replacement carries stream data.
+        check_pooled_liveness(&pooled).await.unwrap();
+    }
+
     #[test]
     fn only_an_alpn_refusal_steps_the_protocol_down() {
         use super::{is_alpn_rejection, is_dial_timeout};

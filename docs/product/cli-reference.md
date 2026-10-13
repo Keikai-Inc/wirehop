@@ -1012,7 +1012,7 @@ Manage the connection multiplexer agent.
 |---|---|
 | *(none)* | Start the agent |
 | `stop` | Stop the running agent |
-| `status` | Check agent status |
+| `status` | Check agent status, and the quality of each pooled host connection |
 
 | Flag | Description |
 |---|---|
@@ -1024,6 +1024,28 @@ hop agent --daemon
 hop agent status
 hop agent stop
 ```
+
+**Connection quality.** The agent probes every pooled hop/4 connection about
+every 15 s (`HOP_AGENT_PROBE_SECS`, jittered ±20 %), in use or idle, with a
+`Ping` round trip through the host, and notes whether the path is direct or via
+the relay. Each probe is judged against that connection's own best recent round
+trip. Three bad probes in a row (no answer; at least 3× the baseline and 250 ms
+over it; or on the relay after a direct path worked) mark it degraded. The agent
+then dials a fresh connection and pings it. If it is clearly better it replaces
+the old one, whose sessions resume on the new one within seconds; if not, the
+path itself is slow and the old one is kept as the new normal. At most one
+attempt per host every 2 min. `hop agent status` shows it:
+
+```
+Agent is running (PID 93539).
+  Connections (probed every ~15s):
+    b6b6f845b1  rtt 48 ms (baseline 41 ms), direct, Good
+      last action: replaced degraded connection (Slow (1450 ms vs 41 ms baseline)); new one answered in 52 ms
+  Degraded connections replaced: 1
+```
+
+The agent logs a WARN for each replacement (`mux: <host>: replaced degraded
+connection …`). This is what `hop agent stop` used to be needed for.
 
 ---
 
@@ -1105,7 +1127,7 @@ sudo** (the socket is group-restricted, like other operator-admin ops).
 |---|---|
 | `--watch` | Refresh continuously, showing per-second rates (Ctrl-C to stop) |
 | `--interval <N>` | Seconds between refreshes in `--watch` mode (default: 2) |
-| `--json` | Emit the raw snapshot as JSON instead of the formatted report; the dial health is under `vpn_dials` |
+| `--json` | Emit the raw snapshot as JSON instead of the formatted report; the health registry (VPN dials, the daemon mux pool's connection quality) is under `health` |
 
 ```bash
 hop debug net-stats              # one-shot totals + latency histograms

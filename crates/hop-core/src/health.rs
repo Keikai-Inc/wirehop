@@ -27,6 +27,8 @@ struct Registry {
     vpn_dial_ok: u64,
     vpn_dial_failed: u64,
     vpn_peers: HashMap<String, PeerDial>,
+    agent_conns: HashMap<String, AgentConnSnapshot>,
+    agent_replacements: u64,
 }
 
 #[derive(Default)]
@@ -54,6 +56,34 @@ pub struct HealthSnapshot {
     /// Per peer VPN endpoint (short id), sorted for stable output.
     #[serde(default)]
     pub vpn_peers: BTreeMap<String, PeerDialSnapshot>,
+    /// Client agent: per host (short id), its pooled connection's quality.
+    #[serde(default)]
+    pub agent_conns: BTreeMap<String, AgentConnSnapshot>,
+    /// Client agent: degraded connections replaced since the agent started.
+    #[serde(default)]
+    pub agent_replacements: u64,
+}
+
+/// One pooled agent connection, as its quality probe last saw it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentConnSnapshot {
+    #[serde(default)]
+    pub last_rtt_ms: Option<u64>,
+    #[serde(default)]
+    pub baseline_ms: Option<u64>,
+    #[serde(default)]
+    pub on_relay: Option<bool>,
+    /// Bad probes in a row (unanswered, slow vs baseline, or stuck on relay).
+    #[serde(default)]
+    pub consecutive_bad: u32,
+    /// `Good`, `Unanswered`, `Slow`, `StuckOnRelay`.
+    #[serde(default)]
+    pub last_verdict: Option<String>,
+    #[serde(default)]
+    pub last_probe_ms: Option<u64>,
+    /// The last replace decision for this host, human-readable.
+    #[serde(default)]
+    pub last_event: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -126,6 +156,26 @@ pub fn note_vpn_dial_failed(peer: &str, err: &str) {
     }
 }
 
+/// The agent's quality probe for `host` reports its latest state.
+pub fn note_agent_conn(host: &str, mut conn: AgentConnSnapshot) {
+    let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    conn.last_probe_ms = Some(now_ms());
+    let prev_event = reg.agent_conns.get(host).and_then(|c| c.last_event.clone());
+    if conn.last_event.is_none() {
+        conn.last_event = prev_event;
+    }
+    reg.agent_conns.insert(host.to_string(), conn);
+}
+
+/// The agent replaced (or declined to replace) `host`'s connection.
+pub fn note_agent_event(host: &str, event: String, replaced: bool) {
+    let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    if replaced {
+        reg.agent_replacements += 1;
+    }
+    reg.agent_conns.entry(host.to_string()).or_default().last_event = Some(event);
+}
+
 /// A copy of the registry at one instant.
 pub fn snapshot() -> HealthSnapshot {
     let reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
@@ -149,6 +199,8 @@ pub fn snapshot() -> HealthSnapshot {
                 )
             })
             .collect(),
+        agent_conns: reg.agent_conns.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        agent_replacements: reg.agent_replacements,
     }
 }
 

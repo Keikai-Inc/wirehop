@@ -32,7 +32,7 @@ pub fn run(config_dir: &std::path::Path, watch: bool, interval: u64, json: bool)
         let snap = fetch(&conn)?;
         let mut out = serde_json::to_value(&snap)?;
         if let (Some(h), Some(obj)) = (fetch_health(&conn), out.as_object_mut()) {
-            obj.insert("vpn_dials".into(), serde_json::to_value(&h)?);
+            obj.insert("health".into(), serde_json::to_value(&h)?);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());

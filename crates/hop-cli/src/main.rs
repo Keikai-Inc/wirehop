@@ -817,7 +817,14 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // channel: the daemon owns the mux pool now, so a network change has to flush
     // it. Without that, the next `hop connect` after a move gets handed a pooled
     // connection whose path died with the old network and stalls on `open_bi`.
-    let mux_flush = match agent::spawn_mux_listener(endpoint.clone(), config_dir.join("agent.sock"))
+    // `mux.sock` always. `agent.sock` too, but only in the system config dir:
+    // clients older than `mux.sock` look for it there, and no user agent ever
+    // runs in the system dir. Anywhere else `agent.sock` is a user agent's.
+    let mut mux_socks = vec![mux::daemon_mux_sock_path(config_dir)];
+    if config_dir == hop_core::config::system_config_dir() {
+        mux_socks.push(config_dir.join("agent.sock"));
+    }
+    let mux_flush = match agent::spawn_mux_listener(endpoint.clone(), &mux_socks)
     {
         Ok(tx) => Some(tx),
         Err(e) => {

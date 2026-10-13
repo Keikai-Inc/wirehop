@@ -260,7 +260,8 @@ Messages are length-prefixed bincode over the Unix socket. After `Ready`, the so
 
 | Path | Description |
 |---|---|
-| `<config>/agent.sock` | Unix domain socket for IPC |
+| `<config>/agent.sock` | A user agent's IPC socket (and, in the system config dir only, the host daemon's mux for older clients) |
+| `<config>/mux.sock` | The host daemon's mux socket: clients sharing this config dir (or using the system daemon) connect here instead of starting their own agent |
 | `<config>/agent.pid` | PID file for the daemon |
 | `<config>/agent.log` | Log file |
 

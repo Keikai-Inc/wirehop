@@ -392,12 +392,21 @@ The agent process (`crates/hop-cli/src/agent.rs`) owns a single iroh Endpoint an
 ~/.config/hop/agent.log    # stderr log
 ```
 
-1. Client calls `ensure_agent(config_dir)`:
-   - Try `UnixStream::connect(agent.sock)` -- if success, agent is running
-   - If not, spawn `hop agent --daemon --config <dir>` with stderr redirected to `agent.log`
-   - Retry connect with linear backoff: 50ms, 100ms, 150ms, ..., up to 20 attempts
-2. Agent writes its PID to `agent.pid` on startup
+1. Client calls `ensure_agent(config_dir)`, first connect wins:
+   - `<config>/mux.sock` — a host daemon serving this config dir
+   - `<system dir>/mux.sock`, then `<system dir>/agent.sock` (a daemon older than `mux.sock`)
+   - `<config>/agent.sock` — a running user agent
+   - If `<config>/daemon.sock` answers, wait up to ~4 s for its `mux.sock` instead of spawning
+   - Otherwise spawn `hop agent --daemon --config <dir>` (stderr to `agent.log`) and retry
+     connect with linear backoff: 50ms, 100ms, 150ms, ..., up to 20 attempts
+2. Agent writes its PID to `agent.pid` on startup. An agent that finds `agent.sock`
+   answering exits instead of unlinking it (only a socket nobody answers on is stale).
 3. Agent removes socket and PID file on shutdown
+
+The host daemon's mux never binds `<config>/agent.sock` outside the system config dir.
+When a client shared its config dir with the daemon, a user agent and the daemon raced
+for that one path and whichever bound last left the other unreachable — a second
+endpoint under the same node id, and a daemon mux nothing could reach.
 
 #### Idle Timeout
 
