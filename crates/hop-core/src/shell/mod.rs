@@ -1827,7 +1827,7 @@ pub async fn client_shell_session(
 
     // v1 has no reconnect, so paste/lost-chunk state is local and discarded.
     let mut replay = InputReplay::default();
-    let result = client_shell_loop(send, &mut recv, stdin_rx, &mut replay, false).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, &mut replay, false, Vec::new()).await;
 
     // Always restore terminal
     let _ = terminal::disable_raw_mode();
@@ -1933,7 +1933,7 @@ pub async fn client_session(
     // Raw mode is owned by the caller (cmd_connect) for the whole interactive
     // lifecycle, so it stays enabled continuously across reconnects — see
     // RawModeGuard. Don't toggle it here.
-    let result = client_shell_loop(send, &mut recv, stdin_rx, replay, view_only).await;
+    let result = client_shell_loop(send, &mut recv, stdin_rx, replay, view_only, Vec::new()).await;
 
     match result {
         Ok(outcome) => Ok((session_id, outcome)),
@@ -1947,7 +1947,7 @@ pub async fn client_session(
 /// Used on reconnect paths where the reconnect function has already sent
 /// WindowSize/SetEnv and consumed the SessionInfo response.
 pub async fn client_shell_loop_resumed(
-    mut send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    send: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     mut recv: impl tokio::io::AsyncRead + Unpin,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
@@ -1958,20 +1958,9 @@ pub async fn client_shell_loop_resumed(
     // held continuously across reconnects so the stdin reader never drops to
     // cooked mode. Don't toggle it here.
     // Replay any input the reconnect logic decided to carry across (the lost
-    // in-flight chunk, and/or buffered paste content) before resuming live I/O.
-    if !to_send.is_empty() {
-        let msg = ClientMessage::Input(to_send);
-        if proto::write_message(&mut send, &msg).await.is_err() {
-            if let ClientMessage::Input(data) = msg {
-                replay.unsent = data;
-            }
-            return Ok(SessionOutcome::Disconnected);
-        }
-        if let ClientMessage::Input(data) = &msg {
-            replay.observe(data);
-        }
-    }
-    client_shell_loop(send, &mut recv, stdin_rx, replay, view_only).await
+    // in-flight chunk, and/or buffered paste content): the loop hands it to its
+    // writer task first, under the loop's deadlines.
+    client_shell_loop(send, &mut recv, stdin_rx, replay, view_only, to_send).await
 }
 
 /// Detect sleep/wake by observing wall-clock time jumps.
@@ -1999,6 +1988,7 @@ async fn client_shell_loop<S>(
     input_rx: &mut mpsc::Receiver<Vec<u8>>,
     replay: &mut InputReplay,
     view_only: bool,
+    replay_first: Vec<u8>,
 ) -> Result<SessionOutcome>
 where
     S: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2102,6 +2092,16 @@ where
     // interactive sessions drop under heavy output (scrolling tmux) while plain
     // exec — a bare read loop — was fine.
     let mut framed = proto::FramedReader::new(&mut *recv);
+
+    // Input carried across a reconnect goes through the writer task like any
+    // keystroke. It used to be written inline before this loop existed, with no
+    // deadline and nobody reading: a large replay filled the socket while the
+    // agent waited to hand us the host's repaint and the host stopped reading
+    // input — a deadlock that left the client parked with every thread idle.
+    if !replay_first.is_empty() && !view_only {
+        replay.observe(&replay_first);
+        let _ = send_tx.send(ClientMessage::Input(replay_first));
+    }
 
     let outcome = loop {
         tokio::select! {

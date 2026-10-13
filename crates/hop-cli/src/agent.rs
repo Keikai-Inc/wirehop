@@ -814,6 +814,9 @@ fn spawn_quality_probe(
     });
 }
 
+/// Budget for opening a session stream on a pooled connection.
+const OPEN_BI_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A network-change flush leaves connections dialed more recently than this.
 const FLUSH_SPARES_YOUNGER_THAN: Duration = Duration::from_secs(5);
 
@@ -1085,8 +1088,21 @@ async fn handle_client(
         }
     };
 
-    // 5. Open bi-stream (fast on live connection)
-    let (quic_send, quic_recv) = match conn.open_bi().await {
+    // 5. Open bi-stream (fast on live connection). Bounded and raced against
+    // the client leaving: it runs while holding the per-host semaphore, so an
+    // open that never completes (stream limit on a wedged connection) queued
+    // every later reconnect to this host behind it.
+    let opened = tokio::select! {
+        r = tokio::time::timeout(OPEN_BI_TIMEOUT, conn.open_bi()) => match r {
+            Ok(r) => r.map_err(|e| anyhow::anyhow!("{e}")),
+            Err(_) => Err(anyhow::anyhow!("open_bi did not complete within {}s", OPEN_BI_TIMEOUT.as_secs())),
+        },
+        _ = wait_for_ipc_close(&mut ipc_read) => {
+            tracing::debug!("IPC client disconnected while opening a stream ({})", host_id.fmt_short());
+            return Ok(());
+        }
+    };
+    let (quic_send, quic_recv) = match opened {
         Ok(pair) => {
             tracing::debug!("handle_client: open_bi succeeded for {}", host_id.fmt_short());
             pair

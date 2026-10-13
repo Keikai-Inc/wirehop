@@ -20,6 +20,9 @@
 #   worker_restart `hop recover` on the founder: the privsep worker restarts,
 #                the monitor stays. The session must come back as the SAME live
 #                shell (adopted by the new worker), not a fresh one.
+#   paste_restart host_restart with a 64 KB paste typed while the host is down:
+#                the reconnect replays it. A replay written outside the session
+#                loop could deadlock the client for good (nobody reading).
 #   relay_pinned direct UDP to the founder dropped 30s (relay still reachable),
 #                then allowed: the session must ride the relay, and the pooled
 #                connection must be direct again within RELAY_BACK_BUDGET_MS.
@@ -38,7 +41,7 @@ IMG=hop-sessres-e2e
 NET=hop-sessres-net
 FOUNDER=hop-sessres-founder
 MEMBER=hop-sessres-member
-CYCLES="${CYCLES:-12}"
+CYCLES="${CYCLES:-14}"
 BACKSTOP_MS=90000
 
 BUDGET_net_flap=10000
@@ -48,6 +51,7 @@ BUDGET_relay_pinned=10000
 BUDGET_worker_restart=15000
 RELAY_BACK_BUDGET_MS=120000
 BUDGET_host_restart=20000
+BUDGET_paste_restart=20000
 
 say() { echo "=== $* ==="; }
 trap 'cleanup' EXIT
@@ -154,6 +158,15 @@ while True:
         raw.write(data)
         if b"#" in data:
             log.write(f"MRX {int(now)}\n")
+    # paste_restart: a 64 KB paste typed while the host is down, replayed on
+    # reconnect. Ctrl-U afterwards so the shell line doesn't grow unbounded.
+    if os.path.exists("/cfg/paste-now"):
+        try:
+            os.remove("/cfg/paste-now")
+            os.write(fd, b"x" * 65536)
+            os.write(fd, b"\x15")
+        except OSError:
+            pass
     if now - last_tx >= 300:
         try:
             os.write(fd, b"#")
@@ -321,10 +334,12 @@ r_worker_restart() {
 }
 
 d_host_restart() { stop_daemon "$FOUNDER"; sleep 3; }
+d_paste_restart() { stop_daemon "$FOUNDER"; docker exec "$MEMBER" touch /cfg/paste-now; sleep 3; }
+r_paste_restart() { start_daemon "$FOUNDER"; }
 r_host_restart() { start_daemon "$FOUNDER"; }
 
 # PERTS env: space-separated subset for targeted soaks (default all).
-if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart degraded_path relay_pinned worker_restart); fi
+if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart degraded_path relay_pinned worker_restart paste_restart); fi
 RDIR=$(mktemp -d)
 
 say "SESSION SOAK: $CYCLES cycles"
