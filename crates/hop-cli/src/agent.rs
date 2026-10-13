@@ -210,7 +210,7 @@ impl AgentHandle {
         &self,
         host_id: PublicKey,
         relay_url: Option<String>,
-    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>, bool)> {
+    ) -> Result<(Connection, Arc<tokio::sync::Semaphore>, Option<Duration>)> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(AgentCommand::GetConnection {
@@ -296,7 +296,9 @@ impl AgentHandle {
 /// Reply type for GetConnection: a live connection + per-host semaphore +
 /// whether it still needs a liveness check (pooled, and not verified within
 /// `POOL_VERIFY_WINDOW`). A freshly dialed connection never does.
-type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>, bool)>>;
+/// The pooled connection, its host semaphore, and — if it must be pinged before
+/// use — the budget for that ping.
+type ConnectReply = oneshot::Sender<Result<(Connection, Arc<tokio::sync::Semaphore>, Option<Duration>)>>;
 
 
 /// Mutable state owned exclusively by the actor task.
@@ -387,7 +389,8 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                             .get(&host_id)
                             .map(|t| t.elapsed() >= POOL_VERIFY_WINDOW)
                             .unwrap_or(true);
-                        let _ = reply.send(Ok((conn.clone(), sem, needs_check)));
+                        let budget = needs_check.then(|| liveness_budget(state.active.get(&host_id).copied().unwrap_or(0)));
+                        let _ = reply.send(Ok((conn.clone(), sem, budget)));
                         continue;
                     }
                     // Dead connection — remove it
@@ -447,7 +450,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                             .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
                             .clone();
                         for reply in waiters {
-                            let _ = reply.send(Ok((conn.clone(), sem.clone(), false)));
+                            let _ = reply.send(Ok((conn.clone(), sem.clone(), None)));
                         }
                     }
                     Err(e) => {
@@ -752,7 +755,7 @@ fn spawn_quality_probe(
                 continue;
             }
             last_rx = rx;
-            let rtt = check_pooled_liveness(&conn).await.ok();
+            let rtt = check_pooled_liveness(&conn, POOL_LIVENESS_TIMEOUT).await.ok();
             if conn.close_reason().is_some() {
                 return; // evicted or replaced while the probe was in flight
             }
@@ -804,7 +807,7 @@ fn spawn_quality_probe(
                 }
             };
             let fresh_rtt = if fresh.alpn() == hop_core::proto::ALPN_V4 {
-                check_pooled_liveness(&fresh).await.ok()
+                check_pooled_liveness(&fresh, POOL_LIVENESS_TIMEOUT).await.ok()
             } else {
                 None
             };
@@ -860,6 +863,19 @@ const FLUSH_SPARES_YOUNGER_THAN: Duration = Duration::from_secs(5);
 /// reconnect burst had one ping time out, evict the shared connection, drop
 /// every other session, and start the next burst.
 const POOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The liveness budget when no session uses the connection. The generous one
+/// above protects the OTHER sessions on a shared connection from a false
+/// eviction; with none, a false eviction costs only a fresh dial, while a dud
+/// (a connection whose data goes nowhere) is found 5 s sooner — the difference
+/// between recovering inside the 12 s session budget and not (long-soak.sh).
+const POOL_LIVENESS_TIMEOUT_IDLE: Duration = Duration::from_secs(3);
+
+/// How long to give a pooled connection's liveness ping, given how many
+/// sessions are using it.
+fn liveness_budget(active_sessions: usize) -> Duration {
+    if active_sessions == 0 { POOL_LIVENESS_TIMEOUT_IDLE } else { POOL_LIVENESS_TIMEOUT }
+}
 /// How long a fresh dial or a successful `Ping` vouches for a pooled
 /// connection. Sessions reconnecting together (a laptop waking, a network
 /// change) arrive within a second of each other; they must share one check
@@ -872,7 +888,7 @@ const POOL_VERIFY_WINDOW: Duration = Duration::from_secs(20);
 /// the rx-stall watchdog only see the transport; on 2026-09-11 a pooled
 /// connection kept QUIC keepalives flowing for 20 minutes while no stream
 /// data reached the host, and every `hop connect` was handed that connection.
-async fn check_pooled_liveness(conn: &Connection) -> Result<Duration> {
+async fn check_pooled_liveness(conn: &Connection, budget: Duration) -> Result<Duration> {
     use hop_core::proto::{self, ClientMessage, HostMessage};
     let started = Instant::now();
     let probe = async {
@@ -882,9 +898,9 @@ async fn check_pooled_liveness(conn: &Connection) -> Result<Duration> {
         anyhow::ensure!(matches!(reply, HostMessage::Pong), "unexpected reply to ping: {reply:?}");
         Ok::<_, anyhow::Error>(())
     };
-    tokio::time::timeout(POOL_LIVENESS_TIMEOUT, probe)
+    tokio::time::timeout(budget, probe)
         .await
-        .map_err(|_| anyhow::anyhow!("no pong within {}s", POOL_LIVENESS_TIMEOUT.as_secs()))??;
+        .map_err(|_| anyhow::anyhow!("no pong within {}s", budget.as_secs()))??;
     Ok(started.elapsed())
 }
 
@@ -1067,7 +1083,7 @@ async fn handle_client(
     tracing::debug!("handle_client: getting connection for {}", host_id.fmt_short());
     let relay_url = req.relay_url;
     let (conn, sem) = loop {
-        let (conn, sem, needs_check) = tokio::select! {
+        let (conn, sem, check_budget) = tokio::select! {
             result = handle.get_connection(host_id, relay_url.clone()) => {
                 match result {
                     Ok(triple) => {
@@ -1088,8 +1104,10 @@ async fn handle_client(
                 return Ok(());
             }
         };
-        if needs_check && conn.alpn() == hop_core::proto::ALPN_V4 {
-            match check_pooled_liveness(&conn).await {
+        if let Some(budget) = check_budget
+            && conn.alpn() == hop_core::proto::ALPN_V4
+        {
+            match check_pooled_liveness(&conn, budget).await {
                 Ok(rtt) => {
                     tracing::debug!("handle_client: pooled connection to {} answered ping in {} ms", host_id.fmt_short(), rtt.as_millis());
                     handle.note_pool_verified(host_id, conn.stable_id()).await;
@@ -1724,13 +1742,16 @@ mod tests {
             .send(AgentCommand::ConnectDone { host_id, result: Ok(conn.clone()) })
             .await
             .unwrap();
-        let (_, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
-        assert!(!needs_check, "a fresh dial vouches for itself");
+        let (_, _, check) = handle.get_connection(host_id, None).await.unwrap();
+        assert_eq!(check, None, "a fresh dial vouches for itself");
         handle.session_started(host_id).await;
         handle.remove_connection(host_id).await; // skipped: a session is active
-        let (pooled, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
+        let (pooled, _, check) = handle.get_connection(host_id, None).await.unwrap();
         assert_eq!(pooled.stable_id(), conn.stable_id(), "not evicted");
-        assert!(needs_check, "but no longer vouched for");
+        assert_eq!(check, Some(POOL_LIVENESS_TIMEOUT), "no longer vouched for; a session uses it, so the long budget");
+        // With no session on it, a false eviction harms nobody: the short budget.
+        assert_eq!(liveness_budget(0), POOL_LIVENESS_TIMEOUT_IDLE);
+        assert_eq!(liveness_budget(2), POOL_LIVENESS_TIMEOUT);
     }
 
     /// The quality probe's swap: only the connection it measured may be
@@ -1760,13 +1781,13 @@ mod tests {
 
         // The measured one: swapped, and the old one is closed.
         assert!(handle.replace_connection(host_id, old.stable_id(), new.clone()).await);
-        let (pooled, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
+        let (pooled, _, check) = handle.get_connection(host_id, None).await.unwrap();
         assert_eq!(pooled.stable_id(), new.stable_id());
-        assert!(!needs_check, "a replacement was just pinged; no second check");
+        assert_eq!(check, None, "a replacement was just pinged; no second check");
         tokio::time::timeout(Duration::from_secs(5), old.closed()).await.unwrap();
 
         // And the replacement carries stream data.
-        check_pooled_liveness(&pooled).await.unwrap();
+        check_pooled_liveness(&pooled, POOL_LIVENESS_TIMEOUT).await.unwrap();
     }
 
     /// A network-change flush must not close a connection dialed moments ago:

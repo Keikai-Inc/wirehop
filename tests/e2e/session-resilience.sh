@@ -381,6 +381,7 @@ for c in $(seq 1 "$CYCLES"); do
 
   if [ "$name" = relay_pinned ]; then
     measure_back_to_direct "$restore_ms" "$RDIR/direct.$c" &
+    DIRECT_PID=$!
   fi
   vpnfile="$RDIR/vpn.$c"
   measure_vpn_ttr "$restore_ms" "$vpnfile" &
@@ -413,6 +414,14 @@ for c in $(seq 1 "$CYCLES"); do
     echo "$srt" >>"$RDIR/$name"
     case "$delta" in (*[!0-9-]*) ;; (*) echo "$delta" >>"$RDIR/$name.delta";; esac
   fi
+  # Randomized soak: let a pin's back-to-direct measurement finish before the
+  # next perturbation. Otherwise the next cycle (a blackout, a restart, another
+  # pin) knocks the path off direct again and the 120 s budget measures that,
+  # not the recovery (the first randomized soaks reported such TIMEOUTs).
+  if [ "${SOAK_RANDOM:-0}" = 1 ] && [ -n "${DIRECT_PID:-}" ]; then
+    wait "$DIRECT_PID" 2>/dev/null || true
+  fi
+  DIRECT_PID=""
 done
 
 # --- report + artifact ------------------------------------------------------
