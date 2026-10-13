@@ -315,6 +315,9 @@ struct AgentState {
     /// cache hit inside `POOL_VERIFY_WINDOW` of that skips the ping, so a burst
     /// of sessions reconnecting together runs one check, not one each.
     verified: HashMap<PublicKey, Instant>,
+    /// When each pooled connection was dialed (or swapped in). A network-change
+    /// flush spares connections younger than `FLUSH_SPARES_YOUNGER_THAN`.
+    dialed: HashMap<PublicKey, Instant>,
     /// Self-sender for spawned connect tasks to send ConnectDone back.
     tx: mpsc::Sender<AgentCommand>,
     last_activity: Instant,
@@ -353,6 +356,7 @@ fn spawn_agent_actor(endpoint: Endpoint) -> AgentHandle {
         active: HashMap::new(),
         pending: HashMap::new(),
         verified: HashMap::new(),
+        dialed: HashMap::new(),
         tx: tx.clone(),
         last_activity: Instant::now(),
     };
@@ -429,6 +433,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                 match result {
                     Ok(conn) => {
                         state.connections.insert(host_id, conn.clone());
+                        state.dialed.insert(host_id, Instant::now());
                         // A completed handshake is proof enough for now.
                         state.verified.insert(host_id, Instant::now());
                         tracing::debug!("actor: connect succeeded for {} (alpn: {}, pool size: {}, notifying {} waiters)",
@@ -493,6 +498,7 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                     old.close(0u32.into(), b"replaced-degraded");
                 }
                 state.verified.insert(host_id, Instant::now());
+                state.dialed.insert(host_id, Instant::now());
                 let _ = reply.send(true);
             }
 
@@ -535,15 +541,43 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
             }
 
             AgentCommand::FlushAll => {
-                tracing::debug!("actor: flushing all connections ({} pooled)", state.connections.len());
-                for (_, conn) in state.connections.drain() {
-                    conn.close(0u32.into(), b"flush");
-                }
+                // A connection dialed in the last few seconds was dialed after
+                // the change that triggered this flush (netmon debounces ~2 s
+                // before signalling), so it is already on the current network.
+                // Closing it dropped sessions that had just recovered — 2-3 s
+                // after every reconnect, which tripped flap backoff and pushed
+                // net_flap recovery to the 30 s read deadline.
+                let young: Vec<PublicKey> = state
+                    .dialed
+                    .iter()
+                    .filter(|(_, t)| t.elapsed() < FLUSH_SPARES_YOUNGER_THAN)
+                    .map(|(h, _)| *h)
+                    .collect();
+                tracing::debug!(
+                    "actor: flushing connections ({} pooled, sparing {} dialed <{}s ago)",
+                    state.connections.len(),
+                    young.len(),
+                    FLUSH_SPARES_YOUNGER_THAN.as_secs()
+                );
+                let spared: HashMap<PublicKey, Connection> = state
+                    .connections
+                    .drain()
+                    .filter_map(|(h, conn)| {
+                        if young.contains(&h) && conn.close_reason().is_none() {
+                            Some((h, conn))
+                        } else {
+                            conn.close(0u32.into(), b"flush");
+                            None
+                        }
+                    })
+                    .collect();
+                state.connections = spared;
+                state.dialed.retain(|h, _| state.connections.contains_key(h));
                 // Per-host semaphores are recreated on demand; a handle_client
                 // mid-connect keeps its own Arc. Dropping them here keeps the
                 // map from growing with every host ever dialed.
                 state.semaphores.clear();
-                state.verified.clear();
+                state.verified.retain(|h, _| state.connections.contains_key(h));
             }
 
             AgentCommand::TouchActivity => {
@@ -779,6 +813,9 @@ fn spawn_quality_probe(
         }
     });
 }
+
+/// A network-change flush leaves connections dialed more recently than this.
+const FLUSH_SPARES_YOUNGER_THAN: Duration = Duration::from_secs(5);
 
 /// Budget for the pooled-connection liveness check. A dead connection never
 /// answers, so the only cost of a generous budget is how long the rare zombie
@@ -1569,6 +1606,26 @@ mod tests {
 
         // And the replacement carries stream data.
         check_pooled_liveness(&pooled).await.unwrap();
+    }
+
+    /// A network-change flush must not close a connection dialed moments ago:
+    /// it is already on the current network, and closing it dropped sessions
+    /// 2-3 s after every reconnect (net_flap's 30 s outliers).
+    #[tokio::test]
+    async fn flush_spares_a_freshly_dialed_connection() {
+        let host = ping_host().await;
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let conn = client.connect(host.addr(), hop_core::proto::ALPN_V4).await.unwrap();
+        let handle = spawn_agent_actor(client.clone());
+        handle
+            .tx
+            .send(AgentCommand::ConnectDone { host_id: host.id(), result: Ok(conn.clone()) })
+            .await
+            .unwrap();
+        handle.flush_all().await;
+        let (pooled, _, _) = handle.get_connection(host.id(), None).await.unwrap();
+        assert_eq!(pooled.stable_id(), conn.stable_id());
+        assert!(conn.close_reason().is_none());
     }
 
     #[test]
