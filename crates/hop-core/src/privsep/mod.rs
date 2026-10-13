@@ -142,6 +142,12 @@ pub enum MonitorReply {
     Fds { count: u32 },
 }
 
+/// Exit status of a daemon that found another live `hop host` holding its
+/// config's datastore lock. Not a crash: a monitor seeing it from its worker
+/// exits too (with an error) instead of respawning, counting it toward the
+/// crash-loop fallback, and eventually dropping privilege separation.
+pub const EXIT_ALREADY_RUNNING: i32 = 75;
+
 /// The capability a monitor advertises (in `HOP_PRIVSEP_CAPS`) when it keeps
 /// session PTY masters across worker restarts and answers `AdoptSessions`.
 pub const CAP_ADOPT_SESSIONS: &str = "adopt-sessions";
@@ -1818,6 +1824,13 @@ pub fn run_monitor(
     // Counting those as fast failures pushed three quick operator restarts
     // into the crash-loop fallback, which drops privilege separation.
     let requested_restart = status.success();
+    if status.code() == Some(EXIT_ALREADY_RUNNING) {
+        tracing::error!(
+            "another hop host already serves {}; this one exits (a duplicate start, not a crash)",
+            config_dir.display()
+        );
+        anyhow::bail!("another hop host is already running for {}", config_dir.display());
+    }
     if uptime < HEALTHY_UPTIME && !requested_restart {
         fast_failures += 1;
         tracing::warn!(

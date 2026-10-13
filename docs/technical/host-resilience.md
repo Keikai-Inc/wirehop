@@ -79,6 +79,16 @@ privsep, or across a full daemon restart, they come back through the
 checkpoint/restore path. A requested restart (worker exit 0) is not counted as
 a fast failure, so repeated self-restarts never trip the crash-loop fallback.
 
+A **duplicate start** — a second `hop host` on a config dir whose daemon is
+alive — is not a crash either. Its worker waits out the usual 10 s lock
+hand-off, then exits with status 75 (`privsep::EXIT_ALREADY_RUNNING`) when the
+datastore lock is still held; its monitor sees that status, logs "another hop
+host already serves …", and exits 1 instead of respawning. Before this, the
+duplicate's monitor counted three lock refusals as a crash loop and fell back
+to a non-privsep root daemon, which kept failing next to the live one.
+`session-resilience.sh` starts a duplicate on its founder and requires a clean
+refusal, no crash-loop line, and the live daemon still answering.
+
 ---
 
 ## `hop recover` without root

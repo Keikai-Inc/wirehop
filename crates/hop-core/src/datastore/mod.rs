@@ -209,9 +209,30 @@ impl Datastore {
     }
 }
 
+/// Whether opening a datastore failed because another live process holds its
+/// lock (as opposed to a missing, corrupt or unreadable file).
+pub fn is_already_open(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| matches!(c.downcast_ref::<redb::DatabaseError>(), Some(redb::DatabaseError::DatabaseAlreadyOpen)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_lock_is_told_apart_from_other_open_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.redb");
+        let _held = redb::Database::create(&path).unwrap();
+        let err = redb::Database::create(&path)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+            .context("Failed to open datastore")
+            .unwrap_err();
+        assert!(is_already_open(&err));
+        assert!(!is_already_open(&anyhow::anyhow!("some other failure")));
+    }
 
     #[test]
     fn open_and_reopen() {

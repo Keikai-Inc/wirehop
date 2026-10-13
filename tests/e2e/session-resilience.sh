@@ -98,7 +98,10 @@ COMMON_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun
         -e HOP_AGENT_PROBE_SECS="${HOP_AGENT_PROBE_SECS:-}")
 
 start_daemon() { docker exec -d "$1" bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'; }
-stop_daemon()  { docker exec "$1" pkill -9 -f 'hop host' >/dev/null 2>&1 || true; }
+# The whole daemon: the monitor runs as `hop --config /cfg host`, its worker as
+# `hop host --config /cfg` — a pattern matching only the latter left the monitor
+# up, and every "restart" then started a second daemon next to it.
+stop_daemon()  { docker exec "$1" pkill -9 -f 'hop (--config [^ ]+ )?host' >/dev/null 2>&1 || true; }
 
 say "starting containers"
 docker network create "$NET" >/dev/null
@@ -116,6 +119,20 @@ FOUNDER_IP=$(docker exec "$FOUNDER" hostname -i | awk '{print $1}')
 INVITE=$(docker exec "$FOUNDER" cat /cfg/creator_invite 2>/dev/null)
 echo "founder vIP=$FOUNDER_VIP id=${FOUNDER_ID:0:10} ip=$FOUNDER_IP invite_len=${#INVITE}"
 [ -n "$FOUNDER_VIP" ] && [ -n "$INVITE" ] && [ -n "$FOUNDER_ID" ] || { echo "FAIL: founder facts missing"; exit 1; }
+
+say "a duplicate start exits cleanly and leaves the live daemon alone"
+DUP_RC=0
+docker exec "$FOUNDER" timeout 40 hop --config /cfg host --quiet >/dev/null 2>&1 || DUP_RC=$?
+if [ "$DUP_RC" != 1 ] && [ "$DUP_RC" != 75 ]; then
+  echo "FAIL: a second hop host on the same config exited $DUP_RC (want a clean refusal)"; exit 1
+fi
+if docker exec "$FOUNDER" grep -aq "crash-looped" /cfg/log; then
+  echo "FAIL: the duplicate start was treated as a crash loop"; exit 1
+fi
+DUP_HOST=$(docker exec "$FOUNDER" hop --config /cfg --json status 2>/dev/null \
+  | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("host") else "no")' 2>/dev/null || echo no)
+[ "$DUP_HOST" = yes ] || { echo "FAIL: the live daemon stopped answering over its socket after the duplicate start"; exit 1; }
+echo "  refused with status $DUP_RC; the live daemon still answers"
 
 say "member joins + daemon up (client routes through daemon mux — real topology)"
 docker exec "$MEMBER" sh -c "hop --config /cfg connect '$INVITE' --warren >/cfg/join.log 2>&1" || true

@@ -724,15 +724,29 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // netdoc sync and black-holes the VPN until a human restarts. The lock is what
     // guarantees exactly one worker owns the node-id, so it must come first.
     let ds_path = config_dir.join("datastore.redb");
-    let datastore = hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key)
-        .with_context(|| {
-            format!(
-                "could not open datastore at {} — another hop host is already running and holds \
-                 the lock. Refusing to start a second worker (it would collide this machine's \
-                 node-id at the relay). If no daemon is running, remove a stale lock and retry.",
+    let datastore = match hop_core::datastore::Datastore::open_with_secrets(&ds_path, secrets_key) {
+        Ok(ds) => ds,
+        Err(e) if hop_core::datastore::is_already_open(&e) => {
+            // A distinct status, so a privsep monitor stops here instead of
+            // treating a duplicate start as a crash (see EXIT_ALREADY_RUNNING).
+            tracing::error!(
+                "another hop host is already running on {} and holds its datastore lock; \
+                 refusing to start a second one (it would collide this machine's node-id at \
+                 the relay). If no daemon is running, remove a stale lock and retry.",
+                config_dir.display()
+            );
+            eprintln!(
+                "Error: another hop host is already running on {} (it holds {}). Refusing to \
+                 start a second one. If no daemon is running, remove a stale lock and retry.",
+                config_dir.display(),
                 ds_path.display()
-            )
-        })?;
+            );
+            std::process::exit(hop_core::privsep::EXIT_ALREADY_RUNNING);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("could not open datastore at {}", ds_path.display()));
+        }
+    };
 
     // Per-node audit & flow log (G4): install the global audit sink so the deep
     // hook points (auth, shell, transfer, reach) can record with one non-blocking
