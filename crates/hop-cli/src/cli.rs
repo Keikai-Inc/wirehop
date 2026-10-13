@@ -337,6 +337,12 @@ pub enum Command {
     /// Print this node's identity (NodeId)
     Id,
 
+    /// Is this node healthy? Summarizes the host daemon's health (inbound
+    /// reachability, VPN peers, its self-repair, connection quality) and the
+    /// client agent's, and lists anything wrong. Exits 1 when it finds a
+    /// problem, so it works as a container or cron health check.
+    Status,
+
     /// Manage the connection multiplexer agent
     Agent {
         #[command(subcommand)]

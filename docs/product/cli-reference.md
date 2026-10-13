@@ -676,7 +676,7 @@ Fleet management (host-side).
 | Subcommand | Description |
 |---|---|
 | `status` | Show fleet registration status |
-| `list [group]` | List warren members (node-id, name, role, **online/offline**, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. |
+| `list [group]` | List warren members (node-id, name, role, **online/offline**, vIP) + known hosts. Members show their **hostname**; this node is marked `(this node)`. When every other member looks offline, a note points at `hop status`: that is more often this node's own warren link than all of them at once. |
 | `search <group> [pattern]` | **Federated log search** — interactive fzf-style filter in a TTY, one-shot/JSON when piped. Defaults to the **OS system logs** (see below) |
 | `sources [group]` | **Discover** what logs are searchable on each machine (resolved per-OS) |
 | `exec <group> -- <command...>` | Execute a command on all **online** hosts in a group |
@@ -973,6 +973,31 @@ Print this node's identity (NodeId).
 
 ```bash
 hop id
+```
+
+### `hop status [--json]`
+
+Is this node healthy, and if not, which part is broken. Reads the host daemon's
+health over its socket and the client agent's `agent-health.json`.
+
+| Line | Meaning |
+|---|---|
+| `inbound` | When a client last reached this host, and handshakes ok / aborted / stalled since start |
+| `vpn` | Warren peers reachable over the VPN, and the last VPN probe round (self-repair ladder) |
+| `mux pool` / `Client agent` | Pooled connections and how many degraded ones were replaced |
+| `memory` | Resident memory and its growth rate over the last 24 h of 5-minute samples |
+
+Problems it reports: a peer that is up but refuses this node's VPN; VPN dials
+failing; the VPN self-repair ladder climbing; a pooled connection judged slow or
+unanswered; memory growing steadily faster than 20 MB/h for 3 h or more; three
+or more stalled inbound handshakes. **Exit status 1 when there is a problem**,
+so it works as a container `HEALTHCHECK` or a cron/monitoring probe. `--json`
+gives `{healthy, problems, host, host_daemon, agent}`. A daemon older than the
+health registry reports "too old to report its health".
+
+```bash
+hop status
+hop status --json | jq .problems
 ```
 
 ### `hop recover [--quiet]`

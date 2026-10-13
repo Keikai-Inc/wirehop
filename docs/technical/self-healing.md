@@ -77,12 +77,12 @@ check now reads the member's stored ticket instead.
 | Item | Detail |
 |---|---|
 | Health registry | One in-process registry (`hop-core::health`): per component (host endpoint, netdoc endpoint, each VPN peer, each agent connection, relay) the last real success, RTT/loss where known, and a recovery-action log. The existing `net::health` counters move into it. |
-| `hop status` / `hop doctor` | Read the registry over the daemon socket (host) and agent socket (client). Listed as open in host-resilience.md. |
+| `hop status` (**shipped**) | `status.rs`: host health over the daemon socket + the agent's `agent-health.json`, a problem list (`assess`, unit-tested), exit 1 on any problem. `hop doctor` (guided repair) remains Planned. |
 | VPN dial failures (shipped) | `crate::health` records every VPN dial outcome per peer. First failure of a streak and then every 5 min: WARN with the error; recovery: INFO. `hop debug net-stats` shows a `VPN DIALS` section (`health` in `--json`), read over a new `DsRequest::Health` whose payload is JSON so the registry can grow across versions. The drop stays counted under `no route/endpoint` so existing dashboards keep their totals. |
 | Agent connection status | `hop agent status` shows, per host connection: age, direct/relay, RTT, loss, last ping/pong. |
-| `hop fleet list` hint | When every other member is offline from this node, say so and name the likely component (this node's netdoc endpoint). |
+| `hop fleet list` hint (**shipped**) | When every other member is offline from this node, a note points at `hop status`. |
 | Symbolicated samples | Release builds keep a split debug-info artifact (`split-debuginfo = "packed"`, `.dSYM` / `.debug` published next to each release) so `sample` / `gdb` output from a wedged field binary can be symbolized. |
-| Memory trend | `ts` series of worker RSS (and footprint where readable) recorded by the daemon itself; `hop status` reports the slope. A leak shows as a line, a cause shows as steps. |
+| Memory trend (**shipped**) | The daemon samples its own RSS every 5 min into the health registry (24 h ring; `/proc/self/status` on Linux, `proc_pidinfo` on macOS); `hop status` shows the least-squares slope and flags ≥ 20 MB/h over ≥ 3 h. In memory only, so the trend restarts with the worker. |
 
 ## Pre-emptive detection
 

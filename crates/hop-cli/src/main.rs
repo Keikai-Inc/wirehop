@@ -13,6 +13,7 @@ mod oauth;
 mod mux;
 mod progress_ui;
 mod reconnect;
+mod status;
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -319,6 +320,17 @@ async fn real_main() -> Result<()> {
                 limit,
                 agent_out::json_mode(),
             )
+        }
+        Command::Status => {
+            let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            let user_dir = match cli.config.as_deref() {
+                Some(dir) => dir.to_path_buf(),
+                None => config::default_config_dir()?,
+            };
+            if !status::run(&host_dir, &user_dir, agent_out::json_mode())? {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Command::Id => {
             // Print the *host* node id. Ask the running daemon first (privsep §6:
@@ -1421,6 +1433,16 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         Some(registry.clone()),
     )
     .await?;
+
+    // Resident-memory trend for `hop status` (health registry): a sample now
+    // and every 5 minutes, 24 h kept.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            hop_core::health::sample_rss();
+        }
+    });
 
     // Session checkpoint: every minute and on a clean shutdown, so
     // `hop sessions restore` can bring sessions back after a restart.
@@ -4700,6 +4722,8 @@ async fn cmd_fleet(
             if let Some(ns) = &snap.namespace {
                 println!("warren {} — {} member(s)", &ns[..8.min(ns.len())], snap.members.len());
             }
+            let mut others = 0usize;
+            let mut others_online = 0usize;
             for m in &snap.members {
                 let matches = group.as_ref().map(|g| m.tags.iter().any(|t| t == g)).unwrap_or(true);
                 if !matches { continue; }
@@ -4711,8 +4735,23 @@ async fn cmd_fleet(
                 let me = if is_self { "  (this node)" } else { "" };
                 // This node is always online; others from last_seen staleness.
                 let status = if is_self || m.is_online(now, window) { "online" } else { "offline" };
+                if !is_self {
+                    others += 1;
+                    if status == "online" {
+                        others_online += 1;
+                    }
+                }
                 println!("  {id}  {}  role={}  {status}{vip}{tags}{me}", m.name, m.role);
                 any = true;
+            }
+            // Every other member offline at once is more often this node's
+            // own warren link than all of them (2026-10-12: each side showed
+            // the other offline while both were up). Point at the check.
+            if others >= 1 && others_online == 0 && group.is_none() {
+                println!(
+                    "  note: every other member looks offline from here — if they are up, this node's \
+                     warren link may be the broken one; `hop status` shows its VPN probe and self-repair"
+                );
             }
 
             // 2. KnownHostsStore (user's known_hosts) — hosts you've connected to

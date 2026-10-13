@@ -31,7 +31,12 @@ struct Registry {
     agent_replacements: u64,
     vpn_probes: HashMap<String, VpnProbeSnapshot>,
     vpn_ladder: Option<String>,
+    /// (Unix ms, resident bytes), oldest first; at most `RSS_SAMPLES`.
+    rss: std::collections::VecDeque<(u64, u64)>,
 }
+
+/// 24 h of 5-minute resident-memory samples.
+const RSS_SAMPLES: usize = 288;
 
 #[derive(Default)]
 struct PeerDial {
@@ -70,6 +75,27 @@ pub struct HealthSnapshot {
     /// VPN peer probe: the escalation ladder's state, human-readable.
     #[serde(default)]
     pub vpn_ladder: Option<String>,
+    /// Host endpoint: completed / aborted / timed-out inbound handshakes since
+    /// start, and when the last one completed (Unix ms, 0 = never). From
+    /// `net::health`; the inbound probe counts as one.
+    #[serde(default)]
+    pub inbound_ok: u64,
+    #[serde(default)]
+    pub inbound_aborted: u64,
+    #[serde(default)]
+    pub inbound_timed_out: u64,
+    #[serde(default)]
+    pub inbound_last_ok_ms: u64,
+    /// This process's resident memory at the last sample (MB).
+    #[serde(default)]
+    pub rss_mb: Option<f64>,
+    /// Least-squares growth of resident memory over the sampled window (MB/h),
+    /// and how many hours that window covers. A leak shows as a steady slope
+    /// (the 2026-09 iroh-docs actor leak was ~65 MB/h); one-off work as steps.
+    #[serde(default)]
+    pub rss_slope_mb_per_hour: Option<f64>,
+    #[serde(default)]
+    pub rss_window_hours: Option<f64>,
 }
 
 /// One peer in the last VPN probe round.
@@ -230,6 +256,71 @@ pub fn clear_fault_vpn_wedge() {
     }
 }
 
+/// This process's resident set size in bytes, if the platform tells us.
+pub fn resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kb: u64 = status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Record a resident-memory sample (the daemon calls this every 5 minutes).
+pub fn sample_rss() {
+    let Some(bytes) = resident_bytes() else { return };
+    let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    reg.rss.push_back((now_ms(), bytes));
+    while reg.rss.len() > RSS_SAMPLES {
+        reg.rss.pop_front();
+    }
+}
+
+/// Least-squares slope of `samples` (Unix ms, bytes) in MB/h, and the hours it
+/// spans. `None` with fewer than 3 samples or no time span.
+pub fn rss_slope(samples: &[(u64, u64)]) -> Option<(f64, f64)> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let t0 = samples[0].0 as f64;
+    let xs: Vec<f64> = samples.iter().map(|(t, _)| (*t as f64 - t0) / 3_600_000.0).collect();
+    let ys: Vec<f64> = samples.iter().map(|(_, b)| *b as f64 / 1_048_576.0).collect();
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+    if sxx <= 0.0 {
+        return None;
+    }
+    let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+    Some((sxy / sxx, xs.last().copied().unwrap_or(0.0)))
+}
+
 /// A copy of the registry at one instant.
 pub fn snapshot() -> HealthSnapshot {
     let reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,6 +348,13 @@ pub fn snapshot() -> HealthSnapshot {
         agent_replacements: reg.agent_replacements,
         vpn_probes: reg.vpn_probes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         vpn_ladder: reg.vpn_ladder.clone(),
+        inbound_ok: crate::net::health::inbound_counters().0,
+        inbound_aborted: crate::net::health::inbound_counters().1,
+        inbound_timed_out: crate::net::health::inbound_counters().2,
+        inbound_last_ok_ms: crate::net::health::inbound_counters().3,
+        rss_mb: reg.rss.back().map(|(_, b)| *b as f64 / 1_048_576.0),
+        rss_slope_mb_per_hour: rss_slope(&reg.rss.iter().copied().collect::<Vec<_>>()).map(|(s, _)| s),
+        rss_window_hours: rss_slope(&reg.rss.iter().copied().collect::<Vec<_>>()).map(|(_, h)| h),
     }
 }
 
@@ -291,6 +389,22 @@ mod tests {
         assert_eq!(p.total_failures, 2);
         assert!(p.failing_since_ms.is_none());
         assert!(p.last_success_ms.is_some());
+    }
+
+    #[test]
+    fn rss_slope_tells_a_leak_from_a_step() {
+        let h = 3_600_000u64;
+        let mb = 1_048_576u64;
+        // 65 MB/h, the 2026-09 netdoc leak.
+        let leak: Vec<(u64, u64)> = (0..12).map(|i| (i * h / 4, (100 + 65 * i / 4) * mb)).collect();
+        let (slope, hours) = rss_slope(&leak).unwrap();
+        assert!((slope - 65.0).abs() < 5.0, "{slope}");
+        assert!(hours > 2.5);
+        // Flat with one 4 MB step: a small slope, nowhere near a leak.
+        let step: Vec<(u64, u64)> = (0..12).map(|i| (i * h / 4, if i < 6 { 120 } else { 124 } * mb)).collect();
+        assert!(rss_slope(&step).unwrap().0 < 5.0);
+        assert!(rss_slope(&leak[..2]).is_none());
+        assert!(resident_bytes().is_some_and(|b| b > 0));
     }
 
     #[test]
