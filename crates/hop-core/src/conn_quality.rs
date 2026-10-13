@@ -29,6 +29,19 @@ pub enum Verdict {
     Slow { rtt: Duration, baseline: Duration },
     /// Traffic is on the relay although a direct path worked on this connection.
     StuckOnRelay,
+    /// The probe answered, but the path lost this share of what was sent since
+    /// the last probe — interactive use suffers long before the RTT shows it.
+    Lossy { loss_pct: u32 },
+}
+
+/// Loss over a probe interval counts as bad from this share...
+pub const LOSSY_FRACTION: f64 = 0.30;
+/// ...and only once this many packets were sent (a quiet path proves nothing).
+pub const LOSS_MIN_SENT: u64 = 50;
+
+/// The loss over a probe interval as a fraction, if enough was sent to judge.
+pub fn loss_fraction(lost_delta: u64, sent_delta: u64) -> Option<f64> {
+    (sent_delta >= LOSS_MIN_SENT).then(|| lost_delta as f64 / sent_delta as f64)
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +74,11 @@ impl QualityTracker {
     /// Record one probe: `rtt` is `None` when it went unanswered; `on_relay`
     /// is whether the connection's selected path is the relay (if known).
     pub fn record(&mut self, rtt: Option<Duration>, on_relay: Option<bool>) -> &Verdict {
+        self.record_with_loss(rtt, on_relay, None)
+    }
+
+    /// `record`, plus the path's loss over the interval (see `loss_fraction`).
+    pub fn record_with_loss(&mut self, rtt: Option<Duration>, on_relay: Option<bool>, loss: Option<f64>) -> &Verdict {
         if on_relay == Some(false) {
             self.ever_direct = true;
         }
@@ -72,6 +90,9 @@ impl QualityTracker {
                     Verdict::Slow { rtt, baseline: base }
                 }
                 _ if on_relay == Some(true) && self.ever_direct => Verdict::StuckOnRelay,
+                _ if loss.is_some_and(|l| l >= LOSSY_FRACTION) => Verdict::Lossy {
+                    loss_pct: (loss.unwrap_or(0.0) * 100.0).round() as u32,
+                },
                 _ => Verdict::Good,
             },
         };
@@ -305,6 +326,21 @@ mod tests {
         q.rebase();
         assert!(!q.degraded());
         assert_eq!(q.record(Some(ms(950)), Some(false)), &Verdict::Good);
+    }
+
+    #[test]
+    fn heavy_loss_is_bad_light_or_unmeasured_loss_is_not() {
+        let mut q = QualityTracker::default();
+        q.record(Some(ms(40)), Some(false));
+        assert_eq!(q.record_with_loss(Some(ms(45)), Some(false), Some(0.10)), &Verdict::Good);
+        assert!(matches!(
+            q.record_with_loss(Some(ms(45)), Some(false), Some(0.40)),
+            Verdict::Lossy { loss_pct: 40 }
+        ));
+        assert_eq!(q.consecutive_bad(), 1);
+        // Too little sent to judge: no verdict from loss.
+        assert_eq!(loss_fraction(30, 40), None);
+        assert_eq!(loss_fraction(20, 100), Some(0.2));
     }
 
     #[test]

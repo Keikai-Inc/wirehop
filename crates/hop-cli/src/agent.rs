@@ -693,6 +693,7 @@ fn verdict_label(v: &hop_core::conn_quality::Verdict) -> String {
             format!("Slow ({} ms vs {} ms baseline)", rtt.as_millis(), baseline.as_millis())
         }
         Verdict::StuckOnRelay => "StuckOnRelay".into(),
+        Verdict::Lossy { loss_pct } => format!("Lossy ({loss_pct}% of packets lost)"),
     }
 }
 
@@ -723,6 +724,7 @@ fn spawn_quality_probe(
         let mut q = QualityTracker::default();
         let mut last_attempt: Option<Instant> = None;
         let mut last_rx = conn.stats().udp_rx.datagrams;
+        let mut last_path = None;
         loop {
             tokio::time::sleep(quality_probe_every()).await;
             if conn.close_reason().is_some() {
@@ -743,8 +745,23 @@ fn spawn_quality_probe(
             if conn.close_reason().is_some() {
                 return; // evicted or replaced while the probe was in flight
             }
-            let on_relay = conn.to_info().selected_path().map(|p| p.is_relay());
-            let verdict = q.record(rtt, on_relay).clone();
+            let path = conn.to_info().selected_path();
+            let on_relay = path.as_ref().map(|p| p.is_relay());
+            // Loss on the selected path since the last probe (reset when the
+            // selected path changes: its counters are per path).
+            let loss = path.as_ref().and_then(|p| {
+                let s = p.stats()?;
+                let now = (p.id(), s.lost_packets, s.udp_tx.datagrams);
+                let prev = last_path.replace(now);
+                match prev {
+                    Some((id, lost, sent)) if id == now.0 => hop_core::conn_quality::loss_fraction(
+                        now.1.saturating_sub(lost),
+                        now.2.saturating_sub(sent),
+                    ),
+                    _ => None,
+                }
+            });
+            let verdict = q.record_with_loss(rtt, on_relay, loss).clone();
             hop_core::health::note_agent_conn(
                 &host,
                 hop_core::health::AgentConnSnapshot {
@@ -794,6 +811,7 @@ fn spawn_quality_probe(
                     write_agent_health();
                     conn = fresh;
                     last_rx = conn.stats().udp_rx.datagrams;
+                    last_path = None;
                     q = QualityTracker::default();
                     q.record(Some(new_rtt), conn.to_info().selected_path().map(|p| p.is_relay()));
                     last_attempt = None;

@@ -1072,7 +1072,8 @@ every 15 s (`HOP_AGENT_PROBE_SECS`, jittered ±20 %), in use or idle, with a
 `Ping` round trip through the host, and notes whether the path is direct or via
 the relay. Each probe is judged against that connection's own best recent round
 trip. Three bad probes in a row (no answer; at least 3× the baseline and 250 ms
-over it; or on the relay after a direct path worked) mark it degraded. The agent
+over it; on the relay after a direct path worked; or 30 % or more of the packets
+sent since the last probe lost) mark it degraded. The agent
 then dials a fresh connection and pings it. If it is clearly better it replaces
 the old one, whose sessions resume on the new one within seconds; if not, the
 path itself is slow and the old one is kept as the new normal. At most one
