@@ -44,6 +44,10 @@ pub fn sudo_user() -> Option<String> {
         .filter(|u| !u.is_empty() && u != "root")
 }
 
+/// Lowest uid of a regular (human) account: 500 on macOS, 1000 on Linux. The
+/// privsep monitor refuses sessions for anything below it.
+pub const MIN_REGULAR_UID: u32 = if cfg!(target_os = "macos") { 500 } else { 1000 };
+
 /// Returns the first regular user (UID >= 500 on macOS, >= 1000 on Linux)
 /// with a valid login shell.
 ///
@@ -79,7 +83,7 @@ fn first_regular_user_from_passwd() -> Option<String> {
             Err(_) => continue,
         };
         let shell = fields[6];
-        if uid >= 500
+        if uid >= MIN_REGULAR_UID
             && !username.is_empty()
             && username != "nobody"
             && !shell.ends_with("/nologin")

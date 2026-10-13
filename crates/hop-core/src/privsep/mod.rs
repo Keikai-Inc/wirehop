@@ -525,7 +525,7 @@ fn validate_spawn_session(argv: &[String], username: Option<&str>) -> Result<()>
 /// accounts (`root`, `daemon`, `_www`, the `_hop` service user itself, …) — the
 /// highest-value escalation targets for a compromised worker. macOS regular
 /// accounts start at 500, Linux at 1000.
-const MIN_SPAWNABLE_UID: u32 = if cfg!(target_os = "macos") { 500 } else { 1000 };
+const MIN_SPAWNABLE_UID: u32 = crate::unix_user::MIN_REGULAR_UID;
 
 /// The root-owned allowlist of spawnable users, set by [`run_monitor`]. When
 /// present and valid, it is the authoritative bound-user list — see
