@@ -81,7 +81,7 @@ check now reads the member's stored ticket instead.
 | Item | Detail |
 |---|---|
 | Health registry | One in-process registry (`hop-core::health`): per component (host endpoint, netdoc endpoint, each VPN peer, each agent connection, relay) the last real success, RTT/loss where known, and a recovery-action log. The existing `net::health` counters move into it. |
-| `hop status` (**shipped**) | `status.rs`: host health over the daemon socket + the agent's `agent-health.json`, a problem list (`assess`, unit-tested), exit 1 on any problem. `hop doctor` (guided repair) remains Planned. |
+| `hop status` (**shipped**) | `status.rs`: host health over the daemon socket + the agent's `agent-health.json`, a problem list (`assess`, unit-tested), exit 1 on any problem. `hop doctor [--fix]` (**shipped**): each problem with its remedy (`status::remedy_for`, unit-tested); `--fix` stops a degraded client agent and/or asks the daemon to restart over its socket. |
 | VPN dial failures (shipped) | `crate::health` records every VPN dial outcome per peer. First failure of a streak and then every 5 min: WARN with the error; recovery: INFO. `hop debug net-stats` shows a `VPN DIALS` section (`health` in `--json`), read over a new `DsRequest::Health` whose payload is JSON so the registry can grow across versions. The drop stays counted under `no route/endpoint` so existing dashboards keep their totals. |
 | Agent connection status | `hop agent status` shows, per host connection: age, direct/relay, RTT, loss, last ping/pong. |
 | `hop fleet list` hint (**shipped**) | When every other member is offline from this node, a note points at `hop status`. |

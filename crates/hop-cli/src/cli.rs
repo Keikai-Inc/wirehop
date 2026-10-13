@@ -337,6 +337,16 @@ pub enum Command {
     /// Print this node's identity (NodeId)
     Id,
 
+    /// What is wrong on this node and what to do about it: `hop status`'s
+    /// findings, each with its remedy. `--fix` applies the safe ones (restart
+    /// the client agent, ask the host daemon to restart itself — shells
+    /// survive it).
+    Doctor {
+        /// Apply the remedies instead of only listing them
+        #[arg(long)]
+        fix: bool,
+    },
+
     /// Is this node healthy? Summarizes the host daemon's health (inbound
     /// reachability, VPN peers, its self-repair, connection quality) and the
     /// client agent's, and lists anything wrong. Exits 1 when it finds a

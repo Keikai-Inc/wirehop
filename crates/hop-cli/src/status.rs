@@ -120,6 +120,101 @@ fn read_agent_health(user_dir: &Path) -> Option<HealthSnapshot> {
     serde_json::from_str(&json).ok()
 }
 
+/// What `hop doctor` would do about a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remedy {
+    /// Ask the host daemon to restart itself (rootless, over its socket).
+    RestartDaemon,
+    /// Stop the client agent; the next connection starts a fresh one.
+    RestartAgent,
+    /// Nothing safe to do automatically; the advice says what to do.
+    Advice(&'static str),
+}
+
+/// The remedy for one problem (pure, for tests).
+pub fn remedy_for(p: &Problem) -> Remedy {
+    match p.component {
+        "vpn" | "memory" => Remedy::RestartDaemon,
+        "connection" if p.detail.starts_with("agent ") => Remedy::RestartAgent,
+        "connection" => Remedy::RestartDaemon, // the daemon's own mux pool
+        _ => Remedy::Advice("watch it; if it persists, `hop recover`"),
+    }
+}
+
+/// `hop doctor`: what `hop status` finds, what to do about each, and with
+/// `fix` do the safe ones. Returns whether anything is still wrong afterwards.
+pub fn doctor(
+    host_dir: &Path,
+    user_dir: &Path,
+    fix: bool,
+    restart_daemon: impl Fn() -> Result<()>,
+    restart_agent: impl Fn() -> Result<()>,
+) -> Result<bool> {
+    let host_state = fetch_host_health(host_dir);
+    match &host_state {
+        HostHealth::NoDaemon => println!(
+            "No host daemon serves {} — nothing to heal there (start one with `hop host`, or install it).",
+            host_dir.display()
+        ),
+        HostHealth::TooOld => println!(
+            "The host daemon is too old to report its health or heal itself: upgrade it, then `hop recover`."
+        ),
+        HostHealth::Health(_) => {}
+    }
+    let host = match &host_state {
+        HostHealth::Health(h) => Some(h.clone()),
+        _ => None,
+    };
+    let agent = if user_dir != host_dir { read_agent_health(user_dir) } else { None };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let problems = assess(host.as_ref(), agent.as_ref(), now_ms);
+    if problems.is_empty() {
+        println!("No problems found.");
+        return Ok(true);
+    }
+    let mut want_daemon = false;
+    let mut want_agent = false;
+    for p in &problems {
+        let r = remedy_for(p);
+        let what = match r {
+            Remedy::RestartDaemon => {
+                want_daemon = true;
+                "restart the host daemon (`hop recover`)"
+            }
+            Remedy::RestartAgent => {
+                want_agent = true;
+                "restart the client agent (`hop agent stop`; the next connection starts a fresh one)"
+            }
+            Remedy::Advice(a) => a,
+        };
+        println!("[{}] {}
+    → {what}", p.component, p.detail);
+    }
+    if !fix {
+        println!("
+Run `hop doctor --fix` to apply the restarts above.");
+        return Ok(false);
+    }
+    if want_agent {
+        match restart_agent() {
+            Ok(()) => println!("
+Client agent stopped; the next connection starts a fresh one."),
+            Err(e) => println!("
+Could not stop the client agent: {e:#}"),
+        }
+    }
+    if want_daemon {
+        match restart_daemon() {
+            Ok(()) => println!("Host daemon asked to restart (shells survive it; give it a few seconds)."),
+            Err(e) => println!("Could not restart the host daemon: {e:#} (try `sudo hop recover`)"),
+        }
+    }
+    Ok(false)
+}
+
 /// `hop status`. Returns whether the node is healthy (the caller exits 1 if not).
 pub fn run(host_dir: &Path, user_dir: &Path, json: bool) -> Result<bool> {
     let host_state = fetch_host_health(host_dir);
@@ -246,6 +341,16 @@ mod tests {
         let p = assess(Some(&h), None, 120_000);
         assert_eq!(p.iter().filter(|p| p.component == "vpn").count(), 3);
         assert!(p.iter().any(|p| p.detail.contains("for 120s")));
+    }
+
+    #[test]
+    fn doctor_picks_the_right_remedy() {
+        let p = |c: &'static str, d: &str| Problem { component: c, detail: d.into() };
+        assert_eq!(remedy_for(&p("vpn", "peer x refuses")), Remedy::RestartDaemon);
+        assert_eq!(remedy_for(&p("memory", "grown")), Remedy::RestartDaemon);
+        assert_eq!(remedy_for(&p("connection", "agent connection to x: Slow")), Remedy::RestartAgent);
+        assert_eq!(remedy_for(&p("connection", "daemon mux connection to x: Slow")), Remedy::RestartDaemon);
+        assert!(matches!(remedy_for(&p("host", "stalled")), Remedy::Advice(_)));
     }
 
     #[test]

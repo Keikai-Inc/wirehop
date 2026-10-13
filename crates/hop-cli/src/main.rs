@@ -326,6 +326,26 @@ async fn real_main() -> Result<()> {
                 agent_out::json_mode(),
             )
         }
+        Command::Doctor { fix } => {
+            let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
+            let user_dir = match cli.config.as_deref() {
+                Some(dir) => dir.to_path_buf(),
+                None => config::default_config_dir()?,
+            };
+            let cfg = cli.config.clone();
+            let agent_dir = user_dir.clone();
+            let ok = status::doctor(
+                &host_dir,
+                &user_dir,
+                fix,
+                move || request_daemon_restart_via_socket(cfg.as_deref()),
+                move || agent::stop_agent(&agent_dir),
+            )?;
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Status => {
             let host_dir = config::resolve_host_config_dir(cli.config.as_deref())?;
             let user_dir = match cli.config.as_deref() {

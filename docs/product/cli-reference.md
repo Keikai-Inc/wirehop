@@ -1000,6 +1000,23 @@ hop status
 hop status --json | jq .problems
 ```
 
+### `hop doctor [--fix]`
+
+`hop status`'s findings, each with what to do about it. With `--fix` it applies
+the safe remedies itself:
+
+| Problem | Remedy |
+|---|---|
+| This node's VPN refused by reachable peers, self-repair climbing | restart the host daemon (as `hop recover`, over its socket; shells survive it) |
+| A client agent connection judged slow / unanswered | stop the client agent; the next connection starts a fresh one |
+| A connection in the daemon's own mux pool degraded | restart the host daemon |
+| Daemon memory climbing steadily | restart the host daemon |
+| Host daemon too old to report health | advice only: upgrade it, then `hop recover` |
+
+Exit status 1 while anything is wrong. A current daemon repairs the VPN and
+connection cases on its own within minutes; `doctor` is for doing it now, or
+for a daemon too old to heal itself.
+
 ### `hop recover [--quiet]`
 
 Unwedge hop on this machine: kill stray user agents, remove their stale
