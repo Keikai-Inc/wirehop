@@ -7535,19 +7535,33 @@ async fn do_warren_join(
                         "this invite is reach-only (client tier); ask for a node or admin invite to join the warren"
                     );
                     println!("Joining warren — redeeming invite for membership...");
-                    match exec_remote(&tok, config_dir, &["true".to_string()], hop_core::sandbox::SandboxPolicy::default())
+                    // The grant arrives with the auth result; the `true` exec
+                    // only carries the redemption. Its outcome is not the
+                    // verdict: a host that won't run commands as the invite's
+                    // bound user (a service account, uid < 1000) still granted
+                    // membership, and failing the join on that left the node in
+                    // a warren of its own (privsep-e2e, every build to 0.9.40).
+                    let redeemed = exec_remote(&tok, config_dir, &["true".to_string()], hop_core::sandbox::SandboxPolicy::default())
                         .await
-                        .context("invite redemption failed")?
-                    {
-                        SessionOutcome::Exited(_) => {}
-                        SessionOutcome::Disconnected => anyhow::bail!("connection lost while redeeming the invite"),
-                    }
+                        .context("invite redemption failed");
                     // The redeem started a mux agent (it holds this config dir's
                     // datastore lock). Stop it so the node daemon we're about to
                     // bring up can acquire the datastore.
                     let _ = agent::stop_agent(config_dir);
-                    let grant = mux::take_invite_grant(config_dir)
-                        .context("the host accepted the invite but granted no warren (is it running hop 0.9.38 or newer with a warren?)")?;
+                    let grant = match (mux::take_invite_grant(config_dir), redeemed) {
+                        (Some(grant), Ok(_)) => grant,
+                        (Some(grant), Err(e)) => {
+                            tracing::warn!("invite redeemed, but the host would not run the redemption command: {e:#}");
+                            grant
+                        }
+                        (None, Err(e)) => return Err(e),
+                        (None, Ok(SessionOutcome::Disconnected)) => {
+                            anyhow::bail!("connection lost while redeeming the invite")
+                        }
+                        (None, Ok(SessionOutcome::Exited(_))) => anyhow::bail!(
+                            "the host accepted the invite but granted no warren (is it running hop 0.9.38 or newer with a warren?)"
+                        ),
+                    };
                     let t = grant.warren_ticket.context(
                         "this invite does not carry a warren — the host has no VPN/warren enabled",
                     )?;

@@ -859,6 +859,79 @@ fn is_dial_timeout(e: &anyhow::Error) -> bool {
     format!("{e:#}").to_lowercase().contains("timed out")
 }
 
+/// Start another, fresh dial if the previous one has not completed after this.
+const DIAL_HEDGE_AFTER: Duration = Duration::from_secs(3);
+
+/// Dial with hedging: if the dial has not completed after `DIAL_HEDGE_AFTER`,
+/// start a fresh one alongside it (and another after twice that), and take
+/// whichever completes first, all inside `total`. A dial started during an
+/// outage sends handshake packets that are lost, and QUIC backs off their
+/// retransmission (0.9 s, 1.8 s, 3.6 s, …); when the path returns mid-dial that
+/// handshake is still asleep in its backoff and runs to the timeout. A fresh
+/// handshake after the path is back completes in well under a second — this
+/// took `zombie_path` recovery after a `net_flap` from 21–23 s (3 of 6) down.
+async fn hedged_dial(
+    endpoint: &Endpoint,
+    host_id: PublicKey,
+    relay: Option<&iroh::RelayUrl>,
+    alpn: &'static [u8],
+    total: Duration,
+) -> Result<Connection> {
+    let started = Instant::now();
+    let mut dials = tokio::task::JoinSet::new();
+    let mut launched = 0u32;
+    let mut last_err: Option<anyhow::Error> = None;
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= total {
+            break;
+        }
+        if launched < 3 && elapsed >= DIAL_HEDGE_AFTER * launched {
+            let ep = endpoint.clone();
+            let relay = relay.cloned();
+            let budget = total - elapsed;
+            dials.spawn(async move {
+                net::connect_to_host_with_alpn_timeout(&ep, host_id, relay.as_ref(), alpn, budget)
+                    .await
+                    .map(|(c, _)| c)
+            });
+            launched += 1;
+            if launched > 1 {
+                tracing::debug!("do_connect: dial to {} not done after {:?}; hedging (dial {launched})", host_id.fmt_short(), elapsed);
+            }
+        }
+        let next_hedge = if launched < 3 {
+            (DIAL_HEDGE_AFTER * launched).saturating_sub(started.elapsed())
+        } else {
+            total.saturating_sub(started.elapsed())
+        };
+        tokio::select! {
+            joined = dials.join_next(), if !dials.is_empty() => match joined {
+                Some(Ok(Ok(conn))) => return Ok(conn), // dropping the set aborts the rest
+                Some(Ok(Err(e))) => {
+                    // A refused ALPN is an answer, not a slow path: no hedging.
+                    if is_alpn_rejection(&e) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                    if dials.is_empty() && launched >= 3 {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => {}
+            },
+            _ = tokio::time::sleep(next_hedge) => {}
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "Connection timed out after {}s. The host may be offline, behind a strict firewall, \
+             or unable to reach the relay.",
+            total.as_secs()
+        )
+    }))
+}
+
 /// True if the host refused the ALPN itself: TLS alert 120
 /// (`no_application_protocol`), which noq reports as "the cryptographic
 /// handshake failed: error 120" and rustls as "peer doesn't support any known
@@ -897,16 +970,8 @@ async fn do_connect(
         (hop_core::proto::ALPN_V3, "hop/3"),
         (hop_core::proto::ALPN_V2, "hop/2"),
     ] {
-        match net::connect_to_host_with_alpn_timeout(
-            endpoint,
-            host_id,
-            relay.as_ref(),
-            alpn,
-            MUX_DIAL_TIMEOUT,
-        )
-        .await
-        {
-            Ok((conn, _)) => {
+        match hedged_dial(endpoint, host_id, relay.as_ref(), alpn, MUX_DIAL_TIMEOUT).await {
+            Ok(conn) => {
                 tracing::debug!("do_connect: {label} connected to {}", host_id.fmt_short());
                 spawn_zombie_watchdog(conn.clone(), host_id);
                 return Ok(conn);

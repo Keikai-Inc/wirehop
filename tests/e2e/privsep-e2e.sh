@@ -21,6 +21,15 @@ VOL=hop-privsep-e2e-shared
 
 cleanup() {
     echo "--- cleanup ---"
+    # HOP_DUMP_LOGS=<dir>: keep both nodes' daemon logs (the failure path
+    # prints only host-a's tail).
+    if [ -n "${HOP_DUMP_LOGS:-}" ]; then
+        mkdir -p "$HOP_DUMP_LOGS"
+        for c in hop-ps-a hop-ps-b; do
+            docker exec "$c" cat /cfg/log >"$HOP_DUMP_LOGS/$c.log" 2>/dev/null || true
+            docker exec "$c" cat /cfg/join.log >"$HOP_DUMP_LOGS/$c.join.log" 2>/dev/null || true
+        done
+    fi
     docker rm -f hop-ps-a hop-ps-b >/dev/null 2>&1 || true
     docker volume rm "$VOL" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
