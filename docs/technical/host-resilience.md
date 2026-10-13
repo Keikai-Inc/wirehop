@@ -116,6 +116,18 @@ order) and used only on hop/4 connections; an older host never sees them.
 
 ---
 
+## Symbolizing a stuck process
+
+Release binaries are stripped, but every release publishes the symbols of the
+exact binary it ships (`profile.dist`, split in `release.yml`):
+
+| Platform | Symbols asset | Use |
+|---|---|---|
+| macOS | `hop-darwin-<arch>.dSYM.zip` | Unzip it next to the binary (or anywhere Spotlight indexes): `sample <pid> 5` then names every frame with file:line. For one address: `atos -o hop-darwin-arm64.dSYM/Contents/Resources/DWARF/hop -arch arm64 -l <load address> <addr>` |
+| Linux | `hop-linux-<arch>.debug` | `gdb` finds it through the binary's debuglink when it sits beside the binary; for raw addresses `llvm-symbolizer --obj=hop-linux-arm64.debug <offset>` |
+
+Take the sample *before* killing a wedged process — the stack is the evidence.
+
 ## Resource leaks fixed in the same change
 
 | Leak | Where | Fix |

@@ -121,15 +121,29 @@ jobs:
         # All three targets go through cross against an image built above, so
         # there is one code path rather than a special case per arch. Uses
         # --release (full LTO) rather than the local release-cross profile:
-        # QEMU segfaults on aws-lc-sys assembly under thin-LTO rebuilds.
-        run: cross build --release --target ${{ matrix.target }} -p hop-cli
+        # QEMU segfaults on aws-lc-sys assembly under thin-LTO rebuilds. The
+        # `dist` profile is release + line tables, unstripped: the next step
+        # splits the symbols out before stripping (see Cargo.toml).
+        run: cross build --profile dist --target ${{ matrix.target }} -p hop-cli
+
+      # llvm-objcopy handles every ELF architecture; the host `strip` cannot
+      # touch an aarch64/armv7 binary (it used to fail silently here).
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
 
       - name: Stage + compress
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hop" "dist/${{ matrix.name }}"
-          strip "dist/${{ matrix.name }}" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/dist/hop" "dist/${{ matrix.name }}"
+          # Ship the symbols beside the binary they came from, so a stack
+          # sample from a wedged field binary can be symbolized
+          # (`llvm-symbolizer --obj=hop-linux-arm64.debug <addr>`, or gdb picks
+          # it up through the debuglink).
+          OBJCOPY="$(find "$(rustc --print sysroot)" -name llvm-objcopy -type f | head -1)"
+          test -x "$OBJCOPY"
+          "$OBJCOPY" --only-keep-debug "dist/${{ matrix.name }}" "dist/${{ matrix.name }}.debug"
+          "$OBJCOPY" --strip-all --add-gnu-debuglink="dist/${{ matrix.name }}.debug" "dist/${{ matrix.name }}"
           # Keep an unpacked copy BEFORE upx. The UPX stub unpacks via
           # memfd_create(2) = Linux 3.17+, so the packed binary cannot start on
           # RHEL/CentOS 7 (3.10) at all. install.sh checks `uname -r` and fetches
@@ -247,10 +261,15 @@ jobs:
             arm64)  TARGET=aarch64-apple-darwin; NAME=hop-darwin-arm64 ;;
             x86_64) TARGET=x86_64-apple-darwin;  NAME=hop-darwin-x86_64 ;;
           esac
-          cargo build --release --target "$TARGET" -p hop-cli
+          cargo build --profile dist --target "$TARGET" -p hop-cli
           mkdir -p dist
-          cp "target/$TARGET/release/hop" "dist/$NAME"
-          strip "dist/$NAME" 2>/dev/null || true
+          cp "target/$TARGET/dist/hop" "dist/$NAME"
+          # Symbols beside the binary (see Cargo.toml `profile.dist`): `sample`
+          # and `atos` use the .dSYM to name frames in a wedged process.
+          dsymutil "dist/$NAME" -o "dist/$NAME.dSYM"
+          ditto -c -k --keepParent "dist/$NAME.dSYM" "dist/$NAME.dSYM.zip"
+          rm -rf "dist/$NAME.dSYM"
+          strip "dist/$NAME"
 
       # Fail fast and legibly. Without this, a missing secret surfaces as an
       # opaque `security import` or "no identity found" error several minutes

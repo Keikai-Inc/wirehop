@@ -138,6 +138,17 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# What the release workflow ships: release, plus line tables, not stripped at
+# link. The workflow splits the symbols out (dsymutil on macOS, llvm-objcopy
+# --only-keep-debug on Linux), strips the binary and publishes both, so a
+# `sample`/`gdb` stack from a wedged field binary can be symbolized. On
+# 2026-10-12 a frozen client's sample was all `???` because release binaries
+# kept no symbols anywhere.
+[profile.dist]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 # Faster profile for Linux cross-compilation (QEMU + native arm64 Docker).
 # Thin LTO allows parallel codegen, reducing emulated build times significantly.
 # ~5% larger binaries than full LTO — acceptable tradeoff for CLI tools.
