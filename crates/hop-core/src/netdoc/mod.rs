@@ -3632,15 +3632,14 @@ impl NetDoc {
             let Some((vpn_pk, relay)) = parse_vpn_endpoint_value(val.as_bytes()) else { continue };
             let Ok(host_pk) = peer.node_id.parse::<iroh::PublicKey>() else { continue };
             let short = host_pk.fmt_short().to_string();
-            #[cfg(unix)]
-            let fresh = self
-                .vpn_last_rx
+            // Data actually delivered, not `vpn_last_rx` (which an inbound
+            // accept seeds): a peer redialing us while nothing gets through
+            // must still be probed.
+            let fresh = crate::vpn::LAST_DATAGRAM
                 .read()
-                .await
-                .get(&vpn_pk.to_string())
+                .ok()
+                .and_then(|m| m.get(&vpn_pk.to_string()).copied())
                 .is_some_and(|t| t.elapsed() < FRESH);
-            #[cfg(not(unix))]
-            let fresh = false;
             if fresh {
                 crate::health::note_vpn_probe(
                     &short,

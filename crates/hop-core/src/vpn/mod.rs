@@ -598,6 +598,27 @@ impl VpnInbound {
 /// dies. Shared by `VpnInbound::accept` and the outbound forwarder's dialed
 /// connections, so replies sent back over the *same* connection a peer dialed
 /// are actually read — the old accept-only pump silently discarded them.
+/// Per peer (remote VPN endpoint id): when a datagram from it was last actually
+/// delivered here. Unlike `VpnLastRx` it is never seeded by an inbound accept,
+/// so it is proof of data, not of a handshake — what the VPN peer probe uses to
+/// decide a peer needs no dial (a peer that keeps redialing us without any data
+/// getting through must not look healthy). Written at most once a second per
+/// peer to stay off the per-packet path's cost.
+pub static LAST_DATAGRAM: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn note_datagram(remote: &str) {
+    let now = std::time::Instant::now();
+    let stale = LAST_DATAGRAM
+        .read()
+        .map(|m| m.get(remote).is_none_or(|t| now.duration_since(*t) >= std::time::Duration::from_secs(1)))
+        .unwrap_or(true);
+    if stale && let Ok(mut m) = LAST_DATAGRAM.write() {
+        m.insert(remote.to_string(), now);
+    }
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub async fn pump_vpn_datagrams(
@@ -624,6 +645,7 @@ pub async fn pump_vpn_datagrams(
         // alive right now. The outbound forwarder uses this to tell a working
         // pooled connection from a silently-dead one and recover from the latter.
         last_rx.write().await.insert(remote.clone(), std::time::Instant::now());
+        note_datagram(&remote);
         // Keepalive heartbeat: it already served its purpose (the `last_rx`
         // update above proves the path is live). Don't try to parse it as an IP
         // packet — skip cleanly so it never triggers a spurious refresh or TUN

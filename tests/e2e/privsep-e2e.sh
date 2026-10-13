@@ -70,7 +70,9 @@ docker volume create "$VOL" >/dev/null
 # HOP_VPN=1 opts into the warren VPN; the containers grant TUN + NET_ADMIN.
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
         -v "$VOL:/shared" -e RUST_LOG="${HOP_E2E_LOG:-hop=info,hop_core=info}"
-        -e HOP_VPN=1 -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1 --user root)
+        -e HOP_VPN=1 -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1 --user root
+        # Test-only: the crash-loop stage below; inert while the file is absent.
+        -e HOP_FAULT_WORKER_CRASH_FILE=/cfg/fault-worker-crash)
 
 echo "=== starting host-a (warren owner, privsep) ==="
 docker run -d --name hop-ps-a "${COMMON[@]}" "$IMG" bash -c '
@@ -197,9 +199,46 @@ else
   RC=1
 fi
 
+# ── Crash loop: host-b's privsep worker now dies at startup (test-only fault).
+#    The monitor must fall back to a non-privsep daemon after its fast-failure
+#    limit, so the node stays reachable without a human — the anti-lockout path,
+#    which nothing exercised before. A requested restart (`hop recover`, exit 0)
+#    must NOT count toward that limit; the crashes (exit != 0) must.
 if [ "$RC" = "0" ]; then
   echo ""
-  echo "PRIVSEP E2E PASSED: split + TUN handoff + routing + non-root operator IPC all verified."
+  echo "=== TEST: worker crash-loop → monitor falls back, node stays reachable ==="
+  docker exec hop-ps-b touch /cfg/fault-worker-crash
+  docker exec hop-ps-b hop --config /cfg recover --quiet >/dev/null 2>&1 || true
+  FELL_BACK=0
+  for _ in $(seq 1 60); do
+    if docker exec hop-ps-b grep -aq "crash-looped" /cfg/log 2>/dev/null; then FELL_BACK=1; break; fi
+    sleep 1
+  done
+  docker exec hop-ps-b rm -f /cfg/fault-worker-crash
+  if [ "$FELL_BACK" != 1 ]; then
+    echo "CRASH-LOOP FAILED: the monitor never fell back. privsep lines:"
+    docker exec hop-ps-b sh -c "grep -aE 'privsep|fault' /cfg/log | tail -12" || true
+    RC=1
+  else
+    echo "  monitor fell back to a non-privsep daemon after the crash loop"
+    BACK=0
+    for _ in $(seq 1 12); do
+      if docker exec hop-ps-b ping -c 2 -W 3 "$VIP_A" >/dev/null 2>&1; then BACK=1; break; fi
+      sleep 5
+    done
+    if [ "$BACK" = 1 ]; then
+      echo "CRASH-LOOP PASSED: host-b crash-looped, fell back, and routes to host-a again."
+    else
+      echo "CRASH-LOOP FAILED: host-b fell back but cannot reach $VIP_A"
+      docker exec hop-ps-b sh -c "tail -20 /cfg/log" || true
+      RC=1
+    fi
+  fi
+fi
+
+if [ "$RC" = "0" ]; then
+  echo ""
+  echo "PRIVSEP E2E PASSED: split + TUN handoff + routing + non-root operator IPC + crash-loop fallback all verified."
 else
   echo ""
   echo "PRIVSEP E2E FAILED (see assertions above)."

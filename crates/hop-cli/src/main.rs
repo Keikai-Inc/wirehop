@@ -129,7 +129,12 @@ async fn real_main() -> Result<()> {
             // the privileged primitives (TUN, :53) and spawns this same binary
             // as the unprivileged worker. Off by default; the worker re-enters
             // here with HOP_PRIVSEP_WORKER set and falls through to the daemon.
-            if std::env::var_os("HOP_PRIVSEP").is_some()
+            // `HOP_PRIVSEP=0` (or false/off/no/empty) means off: presence alone
+            // used to turn privsep ON, so writing `=0` to disable it enabled it.
+            let privsep_on = std::env::var("HOP_PRIVSEP")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no"))
+                .unwrap_or(false);
+            if privsep_on
                 && std::env::var_os("HOP_PRIVSEP_WORKER").is_none()
                 && hop_core::unix_user::is_running_as_root()
             {
@@ -677,6 +682,16 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     // monitor die, shut down promptly so the datastore lock + TUN are released
     // (otherwise a stranded worker wedges every restart). No-op otherwise.
     hop_core::privsep::spawn_monitor_liveness_watcher();
+    install_restart_panic_guard();
+    // Test-only fault (`privsep-e2e.sh`): while the file named by
+    // HOP_FAULT_WORKER_CRASH_FILE exists, a privsep worker dies right after
+    // starting, so the monitor's crash-loop fallback can be exercised. The
+    // fallback daemon is not a worker and is unaffected. Inert when unset.
+    if hop_core::privsep::is_privsep_worker()
+        && std::env::var_os("HOP_FAULT_WORKER_CRASH_FILE").is_some_and(|p| std::path::Path::new(&p).exists())
+    {
+        anyhow::bail!("injected fault: privsep worker crash at startup (HOP_FAULT_WORKER_CRASH_FILE)");
+    }
     let public_key = secret_key.public();
     let secrets_key = hop_core::datastore::derive_secrets_key(&secret_key.to_bytes());
 
@@ -1485,6 +1500,7 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         .context("failed to register SIGUSR2 handler")?;
     let mut debug_enabled = false;
 
+    let mut restart_requested = false;
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -1556,6 +1572,8 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
             Some(reason) = restart_rx.recv() => {
                 tracing::warn!("Restarting daemon: {reason}");
                 checkpoint_sessions_on_exit(&registry, config_dir).await;
+                restart_requested = true;
+                RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
             _ = sigterm.recv() => {
@@ -1585,7 +1603,79 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     }
 
     endpoint.close().await;
+
+    // A requested restart (self-repair, `hop recover`) relies on something
+    // starting us again (finish_requested_restart). Under privsep the monitor does; otherwise — a
+    // container's PID 1, an embedded device with no init, a plain `hop host` —
+    // nothing would, and a self-repair restart would end the daemon for good.
+    // Re-execute in place instead: same pid (so launchd/systemd see nothing
+    // change), the binary on disk now (so an upgrade takes effect), and every
+    // fd hop opened is close-on-exec (datastore lock, TUN, sockets).
+    if restart_requested {
+        finish_requested_restart();
+    }
     Ok(())
+}
+
+/// Set once the daemon is shutting down for a requested restart.
+static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Complete a requested restart. A privsep worker just returns (exit 0): its
+/// monitor starts the next one and does not count it as a crash. Anything else
+/// re-executes itself in place: nothing else would start it again — a
+/// container's PID 1, an embedded device with no init, a plain `hop host` — and
+/// a self-repair restart would otherwise end the daemon for good. Same pid (so
+/// launchd/systemd see nothing change), the binary on disk now (an upgrade takes
+/// effect), and every fd hop opened is close-on-exec (datastore lock, TUN,
+/// sockets). Only returns for a privsep worker.
+fn finish_requested_restart() {
+    #[cfg(unix)]
+    if !hop_core::privsep::is_privsep_worker() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let Ok(exe) = std::env::current_exe() else { std::process::exit(0) };
+        // eprintln, not tracing: this also runs from the restart panic guard,
+        // where the subscriber may not be usable.
+        eprintln!("hop: no supervisor restarts this process; re-executing {} in place", exe.display());
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // Not every fd is close-on-exec: the TUN device's is not, so each
+        // re-exec left the old tun0 (and its 100.64/10 route) alive in the new
+        // image, unread — a black hole that took routing with it. Mark every fd
+        // above stdio close-on-exec so the new image starts clean.
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max_fd = if max_fd > 0 { (max_fd as i32).min(65_536) } else { 4096 };
+        for fd in 3..max_fd {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+        let err = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+        eprintln!("hop: re-executing {} failed: {err}", exe.display());
+        std::process::exit(1);
+    }
+}
+
+/// While shutting down for a requested restart, a panic in teardown must not
+/// turn the restart into a crash. iroh's `Endpoint::close` can panic there
+/// (`JoinSet::join_all` in its relay actor sees a cancelled task: "task N was
+/// cancelled"), and with `panic = "abort"` that made the worker die of SIGABRT,
+/// which the privsep monitor counted as a fast failure toward its crash-loop
+/// fallback — three self-repairs in a row would have dropped privsep. Any other
+/// panic keeps the default behaviour.
+fn install_restart_panic_guard() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("hop: panic during restart teardown ({info}); completing the restart");
+            finish_requested_restart();
+            std::process::exit(0);
+        }
+        default(info);
+    }));
 }
 
 /// RAII guard that calls `Connection::close` on drop. Ensures the explicit
