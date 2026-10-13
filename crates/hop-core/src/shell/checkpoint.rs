@@ -44,6 +44,12 @@ pub struct CheckpointFile {
     #[serde(default)]
     pub daemon_boot: u64,
     pub sessions: Vec<SessionCheckpoint>,
+    /// session id → PTY slave name (`/dev/pts/3`, `/dev/ttys004`). How a new
+    /// privsep worker matches the PTY masters the monitor hands it
+    /// (`AdoptSessions`) back to their sessions. Kept out of
+    /// `SessionCheckpoint`, which also crosses the daemon socket as bincode.
+    #[serde(default)]
+    pub ttys: std::collections::BTreeMap<String, String>,
 }
 
 impl CheckpointFile {
@@ -69,6 +75,10 @@ impl CheckpointFile {
 /// daemon's non-empty checkpoint alone, so it is still there to restore.
 pub async fn write(registry: &super::session_registry::RegistryHandle, config_dir: &Path) -> anyhow::Result<usize> {
     let inputs = registry.checkpoint_inputs().await;
+    let ttys: std::collections::BTreeMap<String, String> = inputs
+        .iter()
+        .filter_map(|i| i.tty.clone().map(|t| (i.session_id.clone(), t)))
+        .collect();
     let sessions = tokio::task::spawn_blocking(move || build(&inputs)).await?;
     let n = sessions.len();
     if n == 0
@@ -78,7 +88,7 @@ pub async fn write(registry: &super::session_registry::RegistryHandle, config_di
     {
         return Ok(0);
     }
-    CheckpointFile { saved_ms: super::session_registry::unix_now_ms(), daemon_boot: *DAEMON_BOOT, sessions }.save(config_dir)?;
+    CheckpointFile { saved_ms: super::session_registry::unix_now_ms(), daemon_boot: *DAEMON_BOOT, sessions, ttys }.save(config_dir)?;
     Ok(n)
 }
 
@@ -93,6 +103,41 @@ pub struct CheckpointInput {
     /// The PTY's foreground process group leader, from `tcgetpgrp` on the master.
     pub fg_pid: Option<u32>,
     pub title: Option<String>,
+    /// The PTY slave name, from the master (see `CheckpointFile::ttys`).
+    pub tty: Option<String>,
+}
+
+/// The slave device name of the PTY whose master is `fd` (`ptsname`). The same
+/// name from the monitor's and any worker's copy of the master, so it ties a
+/// handed-over master back to its session.
+#[cfg(unix)]
+pub fn pty_slave_name(fd: std::os::fd::RawFd) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = [0 as libc::c_char; 128];
+        let rc = unsafe { libc::ptsname_r(fd, buf.as_mut_ptr(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        Some(s.to_string_lossy().into_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // TIOCPTYGNAME: the thread-safe form of ptsname(3) on Darwin.
+        let mut buf = [0 as libc::c_char; 128];
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCPTYGNAME as _, buf.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        Some(s.to_string_lossy().into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
 }
 
 /// Build the checkpoint entries by inspecting each session's process tree.
@@ -365,7 +410,7 @@ pub async fn restore(
         out.push(o);
     }
     if !dry_run {
-        CheckpointFile { saved_ms: super::session_registry::unix_now_ms(), daemon_boot: *DAEMON_BOOT, sessions: next }.save(config_dir)?;
+        CheckpointFile { saved_ms: super::session_registry::unix_now_ms(), daemon_boot: *DAEMON_BOOT, sessions: next, ttys: Default::default() }.save(config_dir)?;
     }
     Ok(out)
 }
@@ -454,7 +499,7 @@ mod tests {
     #[test]
     fn checkpoint_file_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let f = CheckpointFile { saved_ms: 5, daemon_boot: 1, sessions: vec![SessionCheckpoint { session_id: "a".into(), peer_id: "p".into(), username: Some("u".into()), cwd: Some("/x".into()), command: Some("vim".into()), fg_pid: Some(9), child_pid: Some(8), title: Some("t".into()) }] };
+        let f = CheckpointFile { saved_ms: 5, daemon_boot: 1, sessions: vec![SessionCheckpoint { session_id: "a".into(), peer_id: "p".into(), username: Some("u".into()), cwd: Some("/x".into()), command: Some("vim".into()), fg_pid: Some(9), child_pid: Some(8), title: Some("t".into()) }], ttys: Default::default() };
         f.save(dir.path()).unwrap();
         let back = CheckpointFile::load(dir.path()).unwrap().unwrap();
         assert_eq!(back.saved_ms, 5);

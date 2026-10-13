@@ -115,6 +115,18 @@ pub enum MonitorRequest {
         argv: Vec<String>,
         username: String,
     },
+    /// Hand this worker a dup of every live session's PTY master the monitor
+    /// retained from earlier `SpawnSession`s — the shells of a worker that
+    /// exited (self-restart, `hop recover`, crash). Replies `Fds { count }`
+    /// followed by that many fds. Sent only to a monitor that advertised
+    /// `HOP_PRIVSEP_CAPS=adopt-sessions` (an older monitor treats a request it
+    /// cannot decode as the worker exiting). Appended last: bincode variant order.
+    AdoptSessions,
+    /// The worker removed the session on PTY `tty` (idle timeout, eviction,
+    /// exit): drop the monitor's retained master so the last close hangs the
+    /// shell up, as it did before the monitor kept a copy. Replies `Ok`. Same
+    /// capability gate as `AdoptSessions`. Appended last.
+    ReleaseSession { tty: String },
 }
 
 /// The monitor's reply. On `OkFd` a file descriptor follows as ancillary data
@@ -126,6 +138,19 @@ pub enum MonitorReply {
     /// `ConfigureResolver`).
     Ok,
     Error { message: String },
+    /// `count` fds follow as ancillary data (`AdoptSessions`). Appended last.
+    Fds { count: u32 },
+}
+
+/// The capability a monitor advertises (in `HOP_PRIVSEP_CAPS`) when it keeps
+/// session PTY masters across worker restarts and answers `AdoptSessions`.
+pub const CAP_ADOPT_SESSIONS: &str = "adopt-sessions";
+
+/// Whether this worker's monitor advertised `cap`.
+pub fn monitor_has_cap(cap: &str) -> bool {
+    std::env::var("HOP_PRIVSEP_CAPS")
+        .map(|v| v.split(',').any(|c| c.trim() == cap))
+        .unwrap_or(false)
 }
 
 /// Cap on a single control message (defensive — these are tiny structs).
@@ -829,6 +854,7 @@ pub async fn acquire_tun(addr: std::net::Ipv4Addr) -> Result<tun::AsyncDevice> {
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::OkFd => worker_tun_from_fd(recv_fd(ctrl)?),
                 MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a TUN fd"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused CreateTun: {message}")
                 }
@@ -862,6 +888,7 @@ pub async fn acquire_priv_port(
                 match recv_msg::<MonitorReply>(ctrl)? {
                     MonitorReply::OkFd => std::net::UdpSocket::from(recv_fd(ctrl)?),
                     MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a socket fd"),
+                    MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                     MonitorReply::Error { message } => {
                         anyhow::bail!("privsep monitor refused BindPrivPort: {message}")
                     }
@@ -899,6 +926,7 @@ pub fn configure_resolver(domain: &str, vip: std::net::Ipv4Addr) -> Result<()> {
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ConfigureResolver"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused ConfigureResolver: {message}")
                 }
@@ -922,6 +950,7 @@ pub fn setup_gateway(routes: &[crate::vpn::gateway::GatewayRoute]) -> Result<()>
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for SetupGateway"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused SetupGateway: {message}")
                 }
@@ -952,6 +981,7 @@ pub fn add_tun_route(cidr: &str, dev: &str) -> Result<()> {
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ModifyClientRoute"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused ModifyClientRoute: {message}")
                 }
@@ -973,6 +1003,7 @@ pub fn configure_tun_v6(addr: std::net::Ipv6Addr, dev: &str) -> Result<()> {
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for ConfigureTunV6"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused ConfigureTunV6: {message}")
                 }
@@ -1060,6 +1091,7 @@ fn pin_host_route(dst: std::net::Ipv4Addr, via: std::net::Ipv4Addr, add: bool) -
             match recv_msg::<MonitorReply>(ctrl)? {
                 MonitorReply::Ok => Ok(()),
                 MonitorReply::OkFd => anyhow::bail!("monitor returned an fd for PinHostRoute"),
+                MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
                 MonitorReply::Error { message } => {
                     anyhow::bail!("privsep monitor refused PinHostRoute: {message}")
                 }
@@ -1141,9 +1173,43 @@ pub fn worker_spawn_session(
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fd(ctrl),
         MonitorReply::Ok => anyhow::bail!("monitor returned Ok without a PTY fd"),
+        MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnSession: {message}")
         }
+    }
+}
+
+/// Worker side of `AdoptSessions`: the PTY masters of sessions a previous
+/// worker left running, so this worker can serve them again instead of every
+/// shell dying with the old worker. Empty (not an error) when the monitor does
+/// not advertise the capability.
+pub fn worker_adopt_sessions() -> Result<Vec<OwnedFd>> {
+    if !monitor_has_cap(CAP_ADOPT_SESSIONS) {
+        return Ok(Vec::new());
+    }
+    let ctrl = worker_control_fd().context("worker_adopt_sessions called outside privsep worker")?;
+    let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    send_msg(ctrl, &MonitorRequest::AdoptSessions).context("requesting AdoptSessions from monitor")?;
+    match recv_msg::<MonitorReply>(ctrl)? {
+        MonitorReply::Fds { count: 0 } => Ok(Vec::new()),
+        MonitorReply::Fds { count } => recv_fds(ctrl, count as usize),
+        MonitorReply::Error { message } => anyhow::bail!("privsep monitor refused AdoptSessions: {message}"),
+        other => anyhow::bail!("unexpected AdoptSessions reply: {other:?}"),
+    }
+}
+
+/// Worker side of `ReleaseSession`: let the monitor close its copy of the
+/// master for PTY `tty`, so a removed session's shell is hung up. A no-op when
+/// the monitor does not retain masters.
+pub fn worker_release_session(tty: &str) {
+    if !monitor_has_cap(CAP_ADOPT_SESSIONS) {
+        return;
+    }
+    let Some(ctrl) = worker_control_fd() else { return };
+    let _guard = CTRL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if send_msg(ctrl, &MonitorRequest::ReleaseSession { tty: tty.to_string() }).is_ok() {
+        let _ = recv_msg::<MonitorReply>(ctrl);
     }
 }
 
@@ -1167,6 +1233,7 @@ pub fn worker_spawn_exec(
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fds(ctrl, 4),
         MonitorReply::Ok => anyhow::bail!("monitor returned Ok without exec fds"),
+        MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnExec: {message}")
         }
@@ -1186,6 +1253,7 @@ pub fn worker_spawn_helper(argv: &[String], username: &str) -> Result<Vec<OwnedF
     match recv_msg::<MonitorReply>(ctrl)? {
         MonitorReply::OkFd => recv_fds(ctrl, 3),
         MonitorReply::Ok => anyhow::bail!("monitor returned Ok without helper fds"),
+        MonitorReply::Fds { .. } => anyhow::bail!("privsep monitor sent an unexpected fd batch"),
         MonitorReply::Error { message } => {
             anyhow::bail!("privsep monitor refused SpawnHelper: {message}")
         }
@@ -1349,6 +1417,14 @@ pub fn run_monitor(
     // changes (macOS flushes it; Linux's kernel keeps it). No-op on Linux.
     crate::vpn::spawn_route_enforcer();
 
+    // PTY masters of live sessions, kept across worker generations so a
+    // worker restart no longer hangs up every shell (`AdoptSessions`). Keyed by
+    // a monitor-local id; each session's reaper removes its entry when the
+    // shell exits, which closes the monitor's copy.
+    let retained_sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, OwnedFd>>> =
+        Default::default();
+    let mut next_session_key: u64 = 0;
+
     loop {
     let spawn_instant = std::time::Instant::now();
     let (mon, wrk) = control_socketpair()?;
@@ -1369,7 +1445,8 @@ pub fn run_monitor(
         }
     }
     cmd.env("HOP_PRIVSEP_WORKER", "1")
-        .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string());
+        .env("HOP_PRIVSEP_CTRL_FD", wrk.as_raw_fd().to_string())
+        .env("HOP_PRIVSEP_CAPS", CAP_ADOPT_SESSIONS);
 
     // Liveness pipe (anti-lockout, the OpenSSH invariant: the worker must never
     // outlive its monitor). The worker inherits the READ end and blocks on it in
@@ -1611,22 +1688,53 @@ pub fn run_monitor(
                     if send_msg(mon_fd, &MonitorReply::OkFd).is_ok()
                         && send_fd(mon_fd, master.as_raw_fd()).is_ok()
                     {
-                        // The worker now owns its own dup of the master; the
-                        // monitor reaps the child off-thread so zombies don't
-                        // accumulate and the request loop never blocks on wait().
+                        // Keep the monitor's copy of the master for as long as
+                        // the shell lives: a worker that exits then no longer
+                        // closes the last master (which hung up every shell),
+                        // and its successor adopts the session. The reaper
+                        // drops the copy when the shell exits.
+                        let key = next_session_key;
+                        next_session_key += 1;
+                        retained_sessions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key, master);
+                        let retained = retained_sessions.clone();
                         std::thread::spawn(move || {
                             let mut child = child;
                             let _ = child.wait();
+                            retained.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
                         });
                     }
-                    // `master` (the monitor's dup) drops here, closing its copy;
-                    // the fd we passed to the worker keeps the PTY master open.
                 }
                 Err(e) => {
                     tracing::warn!("privsep monitor: SpawnSession denied: {e:#}");
                     let _ = send_msg(mon_fd, &MonitorReply::Error { message: format!("{e:#}") });
                 }
             },
+            MonitorRequest::ReleaseSession { tty } => {
+                let mut retained = retained_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let key = retained
+                    .iter()
+                    .find(|(_, f)| crate::shell::checkpoint::pty_slave_name(f.as_raw_fd()).as_deref() == Some(tty.as_str()))
+                    .map(|(k, _)| *k);
+                if let Some(k) = key {
+                    retained.remove(&k);
+                }
+                let _ = send_msg(mon_fd, &MonitorReply::Ok);
+            }
+            MonitorRequest::AdoptSessions => {
+                let retained = retained_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let raws: Vec<RawFd> = retained.values().map(|f| f.as_raw_fd()).collect();
+                if send_msg(mon_fd, &MonitorReply::Fds { count: raws.len() as u32 }).is_ok()
+                    && (raws.is_empty() || send_fds(mon_fd, &raws).is_ok())
+                {
+                    tracing::info!(
+                        "privsep monitor: handed {} live session(s) to the new worker",
+                        raws.len()
+                    );
+                }
+            }
             MonitorRequest::SpawnExec {
                 cmd,
                 policy,
@@ -1705,7 +1813,12 @@ pub fn run_monitor(
         let _ = std::process::Command::new("ip").args(["route", "del", &pin]).status();
     }
 
-    if uptime < HEALTHY_UPTIME {
+    // A clean exit (status 0) is a requested restart — `hop recover`, or the
+    // daemon's own self-healing (reachability probe, VPN ladder) — not a crash.
+    // Counting those as fast failures pushed three quick operator restarts
+    // into the crash-loop fallback, which drops privilege separation.
+    let requested_restart = status.success();
+    if uptime < HEALTHY_UPTIME && !requested_restart {
         fast_failures += 1;
         tracing::warn!(
             "privsep worker exited ({status:?}) after {uptime:?} — fast failure \

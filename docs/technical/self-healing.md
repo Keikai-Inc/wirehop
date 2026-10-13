@@ -120,8 +120,8 @@ Rules for every probe:
 
 | Item | Detail |
 |---|---|
-| Monitor keeps PTY masters | The privsep monitor retains each session's PTY master and hands the set back to a fresh worker over the existing fd channel, with the session registry rebuilt from the checkpoint. Shells survive `hop recover`, self-restart and upgrade. |
-| Non-privsep hosts | A small fd-holder helper process, or re-exec with inherited fds, gives containers and simple root installs the same property. |
+| Monitor keeps PTY masters (**shipped**) | The privsep monitor keeps a dup of each session master (dropped when its reaper sees the shell exit, or on `ReleaseSession` when the worker removes the session). A new worker sends `AdoptSessions` (only when the monitor advertised `HOP_PRIVSEP_CAPS=adopt-sessions` — an older monitor treats an undecodable request as the worker exiting), matches each master to its checkpoint entry by PTY slave name (`CheckpointFile::ttys`, JSON-only), and registers it detached under its original id. With the capability, every persistent session is spawned through the monitor, including a root worker's (containers without a `hop` user). A clean worker exit no longer counts as a crash-loop fast failure. Proven by `session-resilience.sh`'s `worker_restart`: `hop recover` on the founder, and the client resumes the same shell. Limits: screen history is lost (the screen restarts empty); a session younger than the last checkpoint at an unclean exit is left running in the monitor, unreachable, until it exits. |
+| Non-privsep hosts (Planned) | A small fd-holder helper process, or re-exec with inherited fds, gives `HOP_PRIVSEP=0` installs the same property. Containers running `hop host` under privsep (as the harnesses do) already have it. |
 | In-process endpoint rebuild | Rebuilding the host or netdoc endpoint without a process restart, so most recoveries never touch sessions. Required where no supervisor exists. |
 
 ## Phase 4: Proof

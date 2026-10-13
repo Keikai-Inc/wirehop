@@ -17,6 +17,9 @@
 #   degraded_path member's link up but bad (netem 600ms delay, 10% loss) for 60s:
 #                no blackout, so no idle timeout or zombie watchdog — the
 #                2026-10-12 case. Also fails on agent churn (>1 replacement).
+#   worker_restart `hop recover` on the founder: the privsep worker restarts,
+#                the monitor stays. The session must come back as the SAME live
+#                shell (adopted by the new worker), not a fresh one.
 #   relay_pinned direct UDP to the founder dropped 30s (relay still reachable),
 #                then allowed: the session must ride the relay, and the pooled
 #                connection must be direct again within RELAY_BACK_BUDGET_MS.
@@ -35,13 +38,14 @@ IMG=hop-sessres-e2e
 NET=hop-sessres-net
 FOUNDER=hop-sessres-founder
 MEMBER=hop-sessres-member
-CYCLES="${CYCLES:-10}"
+CYCLES="${CYCLES:-12}"
 BACKSTOP_MS=90000
 
 BUDGET_net_flap=10000
 BUDGET_zombie_path=12000
 BUDGET_degraded_path=10000
 BUDGET_relay_pinned=10000
+BUDGET_worker_restart=15000
 RELAY_BACK_BUDGET_MS=120000
 BUDGET_host_restart=20000
 
@@ -293,11 +297,34 @@ measure_back_to_direct() {
     done' >"$out"
 }
 
+# worker_restart: only the privsep worker restarts (as on a self-restart or
+# `hop recover`); the monitor keeps the shells' PTY masters and the new worker
+# adopts them. Fails the run if the session did not survive as the same shell.
+d_worker_restart() {
+  ADOPT_BEFORE=$(docker exec "$FOUNDER" sh -c "grep -ac 'adopted [1-9][0-9]* live session' /cfg/log; true" | head -1)
+  docker exec "$FOUNDER" hop --config /cfg recover --quiet >/dev/null 2>&1 || true
+  sleep 2
+}
+r_worker_restart() {
+  local after
+  for _ in $(seq 1 20); do
+    after=$(docker exec "$FOUNDER" sh -c "grep -ac 'adopted [1-9][0-9]* live session' /cfg/log; true" | head -1)
+    [ "${after:-0}" -gt "${ADOPT_BEFORE:-0}" ] && break
+    sleep 1
+  done
+  if [ "${after:-0}" -gt "${ADOPT_BEFORE:-0}" ]; then
+    echo "    worker_restart: the new worker adopted the live session"
+  else
+    echo "    worker_restart: the session was NOT adopted (its shell died with the worker)"
+    echo "NOTADOPTED" >>"$RDIR/worker_restart.lost"
+  fi
+}
+
 d_host_restart() { stop_daemon "$FOUNDER"; sleep 3; }
 r_host_restart() { start_daemon "$FOUNDER"; }
 
 # PERTS env: space-separated subset for targeted soaks (default all).
-if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart degraded_path relay_pinned); fi
+if [ -n "${PERTS:-}" ]; then read -r -a PERTS <<<"$PERTS"; else PERTS=(net_flap zombie_path host_restart degraded_path relay_pinned worker_restart); fi
 RDIR=$(mktemp -d)
 
 say "SESSION SOAK: $CYCLES cycles"
@@ -408,6 +435,11 @@ if [ "$USER_AGENTS" != 0 ]; then
 fi
 
 # Extra assertions for the new perturbations.
+if [ -s "$RDIR/worker_restart.lost" ]; then
+  echo "  worker_restart: a session did not survive the worker restart -> FAIL"
+  echo "| worker_restart shells survive | | lost | | adopted | **FAIL** |" >>"$ART"
+  FAILED=1
+fi
 if [ -s "$RDIR/degraded_path.churn" ]; then
   echo "  degraded_path: agent replaced its connection more than once in a window -> FAIL"
   echo "| degraded_path churn | | | | ≤1 / window | **FAIL** |" >>"$ART"

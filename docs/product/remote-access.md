@@ -122,8 +122,16 @@ attach to a session your node owns; use `--view` to watch someone else's.
 
 ### Surviving a host restart
 
-Persistent sessions live in the host's memory, so a reboot or a daemon
-restart ends them. To bridge that, the daemon writes a **checkpoint** of its
+**A worker restart keeps your shells.** Under privilege separation (the
+default for an installed daemon) the root monitor holds a copy of every
+session's terminal, so when the worker restarts — `hop recover`, an upgrade's
+worker restart, or the daemon restarting itself to recover from a dead network
+path — the new worker takes the same shells back and a reconnecting client
+resumes them, running programs included. The screen history held by the old
+worker is gone; full-screen programs redraw on the resize the client sends.
+
+A reboot, or a restart of the whole daemon (monitor included), still ends
+them. To bridge that, the daemon writes a **checkpoint** of its
 live sessions every minute and on a clean shutdown: for each session it
 records the owning peer, the Unix user, the working directory and the
 foreground command (read from the terminal's foreground process group, so it

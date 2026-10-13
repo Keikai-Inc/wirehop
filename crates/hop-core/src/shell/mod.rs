@@ -241,9 +241,13 @@ fn acquire_session_pty(
 ) -> Result<(SessionPty, Option<Box<dyn portable_pty::Child + Send + Sync>>)> {
     let (bin, args) = crate::sandbox::sandboxed_shell(sandbox, shell, username, broker_config);
 
-    let via_monitor = username.is_some()
-        && !crate::unix_user::is_running_as_root()
-        && crate::privsep::is_privsep_worker();
+    // Through the monitor when the worker cannot become the user itself (a
+    // dropped worker) — and always when the monitor keeps session PTYs across
+    // worker restarts, so a root worker's shells (containers, embedded
+    // installs without a `hop` user) survive a worker restart too.
+    let via_monitor = crate::privsep::is_privsep_worker()
+        && ((username.is_some() && !crate::unix_user::is_running_as_root())
+            || crate::privsep::monitor_has_cap(crate::privsep::CAP_ADOPT_SESSIONS));
 
     if via_monitor {
         let mut argv = Vec::with_capacity(1 + args.len());
@@ -359,6 +363,27 @@ pub async fn host_shell_session(
 
     // Keep master alive so PTY doesn't close
     let _master = session_pty;
+    // One-shot sessions have no registry entry, so nothing else tells the
+    // privsep monitor (which keeps a copy of every master it spawns, for
+    // worker-restart adoption) that this one is over. Release it when this
+    // function returns, so a disconnect still hangs the shell up.
+    #[cfg(unix)]
+    let _release = {
+        use std::os::fd::AsRawFd;
+        struct ReleaseOnDrop(Option<String>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tty) = self.0.take() {
+                    crate::privsep::worker_release_session(&tty);
+                }
+            }
+        }
+        let tty = match &_master {
+            SessionPty::Passed(f) => checkpoint::pty_slave_name(f.as_raw_fd()),
+            SessionPty::Local(_) => None,
+        };
+        ReleaseOnDrop(tty)
+    };
 
     // Channel for PTY output -> network
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -892,6 +917,149 @@ fn spawn_persistent_pty(
     let (session_pty, child) =
         acquire_session_pty(sandbox, &shell, username, &env_pairs, size, broker_config)?;
 
+    build_persistent_session(session_id, session_pty, child, size, username, config_dir, attention)
+}
+
+/// The pieces of a live persistent session, as `spawn_persistent_pty` and
+/// `adopt_persistent_session` return them.
+type PersistentSessionParts = (
+    String,                                                          // session_id
+    mpsc::UnboundedSender<Vec<u8>>,                                  // input_tx
+    watch::Sender<Option<mpsc::Sender<Vec<u8>>>>,                    // output_route
+    watch::Sender<PtySize>,                                          // resize_tx (current size)
+    watch::Receiver<Option<i32>>,                                     // exit_rx
+    Arc<std::sync::Mutex<hop_vt::VtScreen>>,                          // screen
+    Option<u32>,                                                     // child pid (for kill-on-removal)
+    Arc<tokio::sync::Notify>,                                        // reader cancel (release master fd on removal)
+    Arc<std::sync::Mutex<Vec<mpsc::Sender<Vec<u8>>>>>,               // read-only viewers
+    Option<Arc<std::os::fd::OwnedFd>>,                               // PTY master (dup) for checkpoints
+);
+
+/// Serve a session whose shell a previous worker started: `master` is that
+/// session's PTY master, handed over by the privsep monitor (`AdoptSessions`).
+/// The shell never noticed the worker change. Its screen history is gone (it
+/// lived in the old worker), so the screen starts empty at `size`; the resize a
+/// reattaching client sends makes full-screen programs redraw.
+pub(crate) fn adopt_persistent_session(
+    session_id: String,
+    master: std::os::fd::OwnedFd,
+    size: PtySize,
+    username: Option<&str>,
+    config_dir: &std::path::Path,
+    attention: Option<tokio::sync::broadcast::Sender<session_registry::AttentionEvent>>,
+) -> Result<PersistentSessionParts> {
+    let session_pty = SessionPty::Passed(std::fs::File::from(master));
+    build_persistent_session(session_id, session_pty, None, size, username, config_dir, attention)
+}
+
+/// At worker start: take back the shells a previous worker left running.
+///
+/// Under privilege separation the root monitor keeps a copy of every session's
+/// PTY master, so a worker that exits — a self-restart from the VPN or
+/// reachability ladder, `hop recover`, a crash — no longer hangs up every
+/// shell. This asks the monitor for those masters (`AdoptSessions`), matches
+/// each to its checkpointed session by PTY slave name, and registers it as a
+/// detached session under its original id, so a client's ordinary
+/// reconnect-resume finds it. A master with no checkpoint entry (a session
+/// younger than the last checkpoint at an unclean exit) is left to the monitor.
+/// Returns how many sessions were adopted. A no-op outside privsep, or under a
+/// monitor too old to offer it.
+pub async fn adopt_sessions(registry: &RegistryHandle, config_dir: &std::path::Path) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if !crate::privsep::is_privsep_worker() {
+            return 0;
+        }
+        let masters = match tokio::task::spawn_blocking(crate::privsep::worker_adopt_sessions).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                tracing::warn!("session adoption unavailable: {e:#}");
+                return 0;
+            }
+            Err(_) => return 0,
+        };
+        if masters.is_empty() {
+            return 0;
+        }
+        let cp = checkpoint::CheckpointFile::load(config_dir).ok().flatten().unwrap_or_default();
+        let by_id: HashMap<&str, &checkpoint::SessionCheckpoint> =
+            cp.sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+        let mut adopted = 0;
+        let mut unmatched = 0;
+        for master in masters {
+            let tty = checkpoint::pty_slave_name(master.as_raw_fd());
+            let entry = tty.as_deref().and_then(|t| {
+                cp.ttys
+                    .iter()
+                    .find(|(_, v)| v.as_str() == t)
+                    .and_then(|(id, _)| by_id.get(id.as_str()).copied())
+            });
+            let Some(entry) = entry else {
+                unmatched += 1;
+                continue;
+            };
+            let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+            match adopt_persistent_session(
+                entry.session_id.clone(),
+                master,
+                size,
+                entry.username.as_deref(),
+                config_dir,
+                Some(registry.attention_sender()),
+            ) {
+                Ok((sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers, pty_master)) => {
+                    registry
+                        .insert(DetachedSession {
+                            session_id: sid,
+                            peer_id: entry.peer_id.clone(),
+                            username: entry.username.clone(),
+                            child_pid,
+                            reader_cancel,
+                            input_tx: itx,
+                            output_route,
+                            resize_tx: rtx,
+                            exit_rx: erx,
+                            detached_at: Some(std::time::Instant::now()),
+                            attached: false,
+                            started_unix_ms: crate::shell::session_registry::unix_now_ms(),
+                            attach_epoch: 0,
+                            broker_handle: None,
+                            viewers,
+                            pty_master,
+                            screen: scr,
+                        })
+                        .await;
+                    adopted += 1;
+                }
+                Err(e) => tracing::warn!("could not adopt session {}: {e:#}", &entry.session_id[..8.min(entry.session_id.len())]),
+            }
+        }
+        if unmatched > 0 {
+            tracing::warn!(
+                "{unmatched} session(s) from the previous worker have no checkpoint entry; left running in the monitor"
+            );
+        }
+        adopted
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (registry, config_dir);
+        0
+    }
+}
+
+/// Wire up a persistent session around an acquired PTY: reader, writer,
+/// resize tasks and (local path) the child-exit watcher.
+fn build_persistent_session(
+    session_id: String,
+    session_pty: SessionPty,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    size: PtySize,
+    username: Option<&str>,
+    config_dir: &std::path::Path,
+    attention: Option<tokio::sync::broadcast::Sender<session_registry::AttentionEvent>>,
+) -> Result<PersistentSessionParts> {
     let pty_writer = session_pty.take_writer().context("take PTY writer")?;
     let pty_writer = Arc::new(std::sync::Mutex::new(pty_writer));
 

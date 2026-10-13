@@ -508,7 +508,10 @@ fn cmd_recover(quiet: bool, config_override: Option<&std::path::Path>) -> Result
     //    socket is owned by the operator group, and an operator whose only
     //    route to the host was hop has no other lever.
     let daemon = match restart_host_daemon() {
-        DaemonRestart::NeedsRoot => match request_daemon_restart_via_socket(config_override) {
+        // No root, or no launchd/systemd unit (a container, an embedded device,
+        // a daemon under another supervisor): a running daemon can still be
+        // asked over its own socket.
+        DaemonRestart::NeedsRoot | DaemonRestart::NotInstalled => match request_daemon_restart_via_socket(config_override) {
             Ok(()) => DaemonRestart::RestartedViaSocket,
             Err(e) => {
                 tracing::debug!("daemon socket restart unavailable: {e:#}");
@@ -1366,6 +1369,12 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         Duration::from_secs(host_config.session_timeout_secs),
         host_config.max_sessions,
     );
+    // Shells a previous worker left running (privsep): serve them again before
+    // accepting clients, so a reconnecting client resumes its live shell.
+    let adopted = hop_core::shell::adopt_sessions(&registry, config_dir).await;
+    if adopted > 0 {
+        tracing::info!("adopted {adopted} live session(s) from the previous worker");
+    }
 
     // Spawn reaper task: every 30s, remove expired/exited sessions
     {

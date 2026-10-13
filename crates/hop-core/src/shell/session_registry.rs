@@ -113,6 +113,19 @@ impl DetachedSession {
         // (1) Always release the daemon's master fd, even if the shell or a
         // leftover job survives.
         self.reader_cancel.notify_one();
+        // Under privsep the monitor keeps its own copy of the master (so a
+        // worker restart doesn't hang up every shell); ask it to drop that copy
+        // too, or a removed session's shell would never be hung up.
+        #[cfg(unix)]
+        if self.child_pid.is_none()
+            && crate::privsep::is_privsep_worker()
+            && let Some(tty) = self.pty_master.as_deref().and_then(|m| {
+                use std::os::fd::AsRawFd;
+                super::checkpoint::pty_slave_name(m.as_raw_fd())
+            })
+        {
+            crate::privsep::worker_release_session(&tty);
+        }
 
         // (2) Terminate the shell process group unless it's already gone.
         if self.has_exited() {
@@ -233,6 +246,13 @@ impl SessionRegistry {
                 child_pid: s.child_pid,
                 fg_pid: s.pty_master.as_deref().and_then(super::checkpoint::foreground_pid),
                 title: s.screen.lock().ok().and_then(|scr| scr.title()),
+                #[cfg(unix)]
+                tty: s.pty_master.as_deref().and_then(|m| {
+                    use std::os::fd::AsRawFd;
+                    super::checkpoint::pty_slave_name(m.as_raw_fd())
+                }),
+                #[cfg(not(unix))]
+                tty: None,
             })
             .collect()
     }

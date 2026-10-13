@@ -71,7 +71,13 @@ The worker exits with status 0 after checkpointing sessions. Under privilege
 separation the monitor respawns it (a worker that ran ≥ 30 s is not a fast
 failure); a plain root daemon is respawned by launchd `KeepAlive` or systemd
 `Restart=`. The new worker binds a fresh iroh endpoint and relay session.
-Persistent sessions come back through the checkpoint/restore path.
+Persistent sessions survive it: the privsep monitor keeps a copy of each
+session's PTY master and hands them to the new worker (`AdoptSessions`), which
+matches each to its checkpoint entry by PTY slave name and serves it under its
+original session id (`shell::adopt_sessions`; see self-healing.md). Without
+privsep, or across a full daemon restart, they come back through the
+checkpoint/restore path. A requested restart (worker exit 0) is not counted as
+a fast failure, so repeated self-restarts never trip the crash-loop fallback.
 
 ---
 
