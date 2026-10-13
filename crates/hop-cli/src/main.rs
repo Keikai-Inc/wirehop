@@ -1161,9 +1161,12 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                                 .enable_vpn(&host_node_id, &host_tags, authored_policy.as_deref())
                                 .await
                             {
-                                Ok(ip) => tracing::info!(
-                                    "vpn: enabled, virtual IP {ip}, tags {host_tags:?}"
-                                ),
+                                Ok(ip) => {
+                                    tracing::info!(
+                                        "vpn: enabled, virtual IP {ip}, tags {host_tags:?}"
+                                    );
+                                    spawn_vpn_peer_probe(net.clone(), main_endpoint.clone());
+                                }
                                 Err(e) => tracing::warn!(
                                     "vpn: bringup failed, continuing without it (core access unaffected): {e:#}"
                                 ),
@@ -1936,6 +1939,60 @@ async fn announce_netdoc_author_with_retry(
             }
         }
     }
+}
+
+/// Probe every warren peer's VPN path about once a minute, whether or not the
+/// VPN is in use, and repair this node's VPN when it is the broken side
+/// (`docs/technical/self-healing.md`, "Pre-emptive detection"). On 2026-10-12
+/// a member's VPN endpoint failed every dial for days while hop shells over
+/// the host endpoint worked, and nothing noticed until a person tried to ping.
+/// `HOP_VPN_PROBE_SECS` overrides the interval (tests).
+fn spawn_vpn_peer_probe(net: std::sync::Arc<hop_core::netdoc::NetDoc>, host_endpoint: iroh::Endpoint) {
+    use hop_core::conn_quality::{VpnAction, VpnLadder};
+    hop_core::health::clear_fault_vpn_wedge();
+    let every = std::env::var("HOP_VPN_PROBE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(60));
+    tokio::spawn(async move {
+        let mut ladder = VpnLadder::default();
+        loop {
+            // ±20 % jitter so a fleet does not probe in lockstep.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            tokio::time::sleep(every * (80 + nanos % 41) / 100).await;
+            let (witnesses, failed) = net.vpn_probe_round(&host_endpoint).await;
+            let action = ladder.on_round(witnesses, failed);
+            hop_core::health::note_vpn_ladder(format!(
+                "{} witness(es), VPN failed to {failed}; {} bad round(s) in a row",
+                witnesses,
+                ladder.bad_rounds()
+            ));
+            match action {
+                VpnAction::None => {}
+                VpnAction::Rediscover => {
+                    tracing::warn!(
+                        "vpn: every reachable peer ({witnesses}) refuses this node's VPN dials; forcing re-discovery on the VPN endpoint"
+                    );
+                    net.rediscover().await;
+                }
+                VpnAction::Restart => {
+                    tracing::error!(
+                        "vpn: every reachable peer ({witnesses}) still refuses this node's VPN dials after re-discovery; restarting the worker for fresh endpoints"
+                    );
+                    if !hop_core::net::health::request_restart(
+                        "VPN unreachable from every reachable peer",
+                    ) {
+                        tracing::warn!("vpn: no restart handle installed; cannot self-restart");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// One announce round-trip over the main endpoint.

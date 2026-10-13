@@ -79,7 +79,10 @@ docker volume create "$VOL" >/dev/null
 COMMON=(--network "$NET" --cap-add=NET_ADMIN --device /dev/net/tun
         -v "$VOL:/shared" -e RUST_LOG="${HOP_E2E_LOG:-hop=info,hop_core=info}" -e HOP_VPN=1
         -e HOP_PRIVSEP=1 -e HOP_PRIVSEP_DROP=1
-        -e HOP_NETDOC_VALIDATION=enforce --user root)
+        -e HOP_NETDOC_VALIDATION=enforce --user root
+        # VPN peer probe every ~10 s (60 s in production) + the test-only wedge
+        # fault the SELF-REPAIR stage uses; inert while the file is absent.
+        -e HOP_VPN_PROBE_SECS=10 -e HOP_FAULT_VPN_WEDGE_FILE=/cfg/fault-vpn-wedge)
 
 echo "=== starting host-a (warren owner) ==="
 docker run -d --name hop-vpn-a "${COMMON[@]}" "$IMG" bash -c '
@@ -356,6 +359,55 @@ if [ "$RC" = "0" ]; then
         docker exec hop-vpn-b cat /cfg/log | tail -30 || true
         RC=1
     fi
+fi
+
+# ── Self-repair: wedge host-b's VPN data plane (outbound dials fail, VPN
+#    datagrams dropped both ways) while its host endpoint stays healthy — the
+#    2026-10-12 member. host-b must notice on its own (its peer probe: host-a's
+#    host endpoint answers, its VPN does not), escalate (re-discovery, then a
+#    worker restart, which clears the fault as a fresh endpoint did that day),
+#    and route to host-a again. No human step.
+if [ "$RC" = "0" ]; then
+    echo ""
+    echo "=== SELF-REPAIR TEST: host-b's VPN wedged; it must detect and repair itself ==="
+    count_b() { local n; n=$(docker exec hop-vpn-b grep -ac "$1" /cfg/log 2>/dev/null | head -1); echo "${n:-0}"; }
+    RESTART_BEFORE=$(count_b 'restarting the worker for fresh endpoints')
+    docker exec hop-vpn-b touch /cfg/fault-vpn-wedge
+    sleep 5
+    if docker exec hop-vpn-b ping -c 2 -W 2 "$VIP_A" >/dev/null 2>&1; then
+        echo "SELF-REPAIR FAILED: the injected wedge did not break host-b's VPN (fault hook inert?)"
+        RC=1
+    else
+        echo "  wedged: host-b cannot reach $VIP_A over the VPN"
+        SR_START=$(date +%s)
+        REPAIRED=0
+        for _ in $(seq 1 90); do
+            if [ "$(count_b 'restarting the worker for fresh endpoints')" -gt "$RESTART_BEFORE" ] \
+               && ! docker exec hop-vpn-b test -e /cfg/fault-vpn-wedge; then
+                REPAIRED=1; break
+            fi
+            sleep 2
+        done
+        if [ "$REPAIRED" = 1 ]; then
+            echo "  host-b escalated to a self-restart after $(( $(date +%s) - SR_START ))s"
+            PING_BACK=0
+            for _ in $(seq 1 12); do
+                if docker exec hop-vpn-b ping -c 2 -W 3 "$VIP_A" >/dev/null 2>&1; then PING_BACK=1; break; fi
+                sleep 5
+            done
+            if [ "$PING_BACK" = 1 ]; then
+                echo "SELF-REPAIR PASSED: host-b detected its dead VPN, restarted itself, and routes to host-a again ($(( $(date +%s) - SR_START ))s, no manual step)."
+            else
+                echo "SELF-REPAIR FAILED: host-b restarted but still cannot reach $VIP_A"
+                RC=1
+            fi
+        else
+            echo "SELF-REPAIR FAILED: host-b did not escalate within 180s. Its probe/ladder lines:"
+            docker exec hop-vpn-b sh -c "grep -aE 'vpn: every reachable|vpn: dial to|restarting the worker' /cfg/log | tail -15" || true
+            RC=1
+        fi
+    fi
+    docker exec hop-vpn-b rm -f /cfg/fault-vpn-wedge >/dev/null 2>&1 || true
 fi
 
 # ── #3b Phase 4: read-ticket member. host-c joins via a NODE-tier invite, whose

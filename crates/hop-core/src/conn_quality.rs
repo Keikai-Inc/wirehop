@@ -118,9 +118,119 @@ pub fn replacement_is_better(old_last_rtt: Option<Duration>, new_rtt: Duration) 
     }
 }
 
+/// What a VPN probe round asks the caller to do (`VpnLadder::on_round`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VpnAction {
+    None,
+    /// Force iroh re-discovery on this node's netdoc endpoint.
+    Rediscover,
+    /// Restart the worker (fresh endpoints). Rate-limited.
+    Restart,
+}
+
+/// Rounds in a row with every witnessed peer unreachable over the VPN before
+/// re-discovery, and before a restart.
+pub const VPN_REDISCOVER_AFTER: u32 = 3;
+pub const VPN_RESTART_AFTER: u32 = 5;
+
+/// Escalation for "this node's VPN is broken" (`docs/technical/self-healing.md`).
+///
+/// A round's *witnesses* are peers whose **host** endpoint answered a probe:
+/// they are up and reachable, so their VPN endpoint should answer too. If at
+/// least one witness exists and the VPN dial failed to **every** witness, the
+/// common factor is this node's netdoc endpoint — the 2026-10-12 laptop, whose
+/// VPN dials failed for days while hop shells over the host endpoint worked.
+/// Peers whose host does not answer either are just offline and say nothing,
+/// so a node whose peers are all powered off never escalates.
+#[derive(Debug, Default)]
+pub struct VpnLadder {
+    bad_rounds: u32,
+    rounds_since_restart: Option<u32>,
+}
+
+impl VpnLadder {
+    /// Rounds between restarts (at ~60 s per round, about 30 min).
+    pub const RESTART_COOLDOWN_ROUNDS: u32 = 30;
+
+    pub fn bad_rounds(&self) -> u32 {
+        self.bad_rounds
+    }
+
+    pub fn on_round(&mut self, witnesses: usize, vpn_failed_to_witnesses: usize) -> VpnAction {
+        if let Some(n) = self.rounds_since_restart.as_mut() {
+            *n += 1;
+        }
+        if witnesses == 0 || vpn_failed_to_witnesses < witnesses {
+            self.bad_rounds = 0;
+            return VpnAction::None;
+        }
+        self.bad_rounds += 1;
+        if self.bad_rounds >= VPN_RESTART_AFTER {
+            let cooled = self
+                .rounds_since_restart
+                .is_none_or(|n| n >= Self::RESTART_COOLDOWN_ROUNDS);
+            if cooled {
+                self.rounds_since_restart = Some(0);
+                self.bad_rounds = 0;
+                return VpnAction::Restart;
+            }
+            return VpnAction::None;
+        }
+        if self.bad_rounds == VPN_REDISCOVER_AFTER {
+            return VpnAction::Rediscover;
+        }
+        VpnAction::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_ladder_needs_a_witness() {
+        let mut l = VpnLadder::default();
+        for _ in 0..20 {
+            assert_eq!(l.on_round(0, 0), VpnAction::None, "all peers offline is not our fault");
+        }
+    }
+
+    #[test]
+    fn vpn_ladder_ignores_a_single_bad_peer() {
+        let mut l = VpnLadder::default();
+        for _ in 0..20 {
+            assert_eq!(l.on_round(2, 1), VpnAction::None, "one peer's own VPN is its problem");
+        }
+    }
+
+    #[test]
+    fn vpn_ladder_rediscovers_then_restarts_then_cools_down() {
+        let mut l = VpnLadder::default();
+        assert_eq!(l.on_round(1, 1), VpnAction::None);
+        assert_eq!(l.on_round(1, 1), VpnAction::None);
+        assert_eq!(l.on_round(1, 1), VpnAction::Rediscover);
+        assert_eq!(l.on_round(1, 1), VpnAction::None);
+        assert_eq!(l.on_round(1, 1), VpnAction::Restart);
+        // Still broken right after the restart: no second restart inside the cooldown.
+        for _ in 0..(VpnLadder::RESTART_COOLDOWN_ROUNDS - 2) {
+            assert_ne!(l.on_round(1, 1), VpnAction::Restart);
+        }
+        let mut restarted = false;
+        for _ in 0..10 {
+            restarted |= l.on_round(1, 1) == VpnAction::Restart;
+        }
+        assert!(restarted, "a restart is allowed again after the cooldown");
+    }
+
+    #[test]
+    fn vpn_ladder_resets_on_any_good_round() {
+        let mut l = VpnLadder::default();
+        l.on_round(1, 1);
+        l.on_round(1, 1);
+        l.on_round(1, 0);
+        assert_eq!(l.bad_rounds(), 0);
+    }
+
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)

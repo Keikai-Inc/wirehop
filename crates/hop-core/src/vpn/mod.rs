@@ -615,6 +615,9 @@ pub async fn pump_vpn_datagrams(
     // The authenticated identity of the remote node (QUIC/TLS-verified).
     let remote = conn.remote_id().to_string();
     while let Ok(dg) = conn.read_datagram().await {
+        if crate::health::fault_vpn_wedged() {
+            continue; // test-only fault: this node's VPN data plane is dead
+        }
         // Per-datagram handling timer (recorded on the path that reaches the TUN).
         let t0 = std::time::Instant::now();
         // Liveness signal: a datagram arrived from this peer, so the path is

@@ -3057,14 +3057,19 @@ impl NetDoc {
                             let ep = self.endpoint.clone();
                             tokio::spawn(async move { ep.reset_node(pubkey).await });
                         }
-                        match crate::net::connect_to_host_with_alpn_timeout(
-                            &self.endpoint,
-                            pubkey,
-                            relay.as_ref(),
-                            crate::vpn::VPN_ALPN,
-                            VPN_DIAL_TIMEOUT,
-                        )
-                        .await
+                        let dialed = if crate::health::fault_vpn_wedged() {
+                            Err(anyhow::anyhow!("injected fault: VPN endpoint wedged (HOP_FAULT_VPN_WEDGE_FILE)"))
+                        } else {
+                            crate::net::connect_to_host_with_alpn_timeout(
+                                &self.endpoint,
+                                pubkey,
+                                relay.as_ref(),
+                                crate::vpn::VPN_ALPN,
+                                VPN_DIAL_TIMEOUT,
+                            )
+                            .await
+                        };
+                        match dialed
                         {
                             Ok((c, _)) => {
                                 // Pump return datagrams on this dialed conn too:
@@ -3115,6 +3120,9 @@ impl NetDoc {
             // this single serial forwarder if one peer's path wedges: that packet
             // is dropped (a truly-dead path is caught by the rx-staleness gate +
             // keepalive) rather than stalling every other peer behind it.
+            if crate::health::fault_vpn_wedged() {
+                continue; // test-only fault: this node's VPN data plane is dead
+            }
             let payload = bytes::Bytes::copy_from_slice(&out_pkt);
             let send_started = std::time::Instant::now();
             match tokio::time::timeout(SEND_TIMEOUT, conn.send_datagram_wait(payload)).await {
@@ -3601,6 +3609,104 @@ impl NetDoc {
         let map = self.vpn_last_rx.read().await;
         let inst = map.get(id)?;
         Some(now.saturating_sub(inst.elapsed().as_secs()))
+    }
+
+    /// One round of the VPN peer probe (`docs/technical/self-healing.md`,
+    /// "Pre-emptive detection"). For every roster peer with a VPN endpoint whose
+    /// VPN traffic is not already fresh: dial its **host** endpoint with
+    /// `hop/probe/1` (is it up at all?) and its VPN endpoint with `hop/vpn/1`.
+    /// Returns `(witnesses, vpn_failed_to_witnesses)` for `VpnLadder`: a
+    /// witness is a peer whose host answered. Dials run concurrently with a
+    /// 10 s budget each. Runs whether or not anything uses the VPN, so a dead
+    /// VPN is found before the next ping/ssh needs it.
+    pub async fn vpn_probe_round(&self, host_endpoint: &Endpoint) -> (usize, usize) {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+        const DIAL: std::time::Duration = std::time::Duration::from_secs(10);
+        let own = self.own_host_node_id();
+        let mut targets = Vec::new();
+        for peer in self.list_peers().await.unwrap_or_default() {
+            if own.as_deref() == Some(peer.node_id.as_str()) {
+                continue;
+            }
+            let Some(val) = peer.vpn_endpoint.as_deref() else { continue };
+            let Some((vpn_pk, relay)) = parse_vpn_endpoint_value(val.as_bytes()) else { continue };
+            let Ok(host_pk) = peer.node_id.parse::<iroh::PublicKey>() else { continue };
+            let short = host_pk.fmt_short().to_string();
+            #[cfg(unix)]
+            let fresh = self
+                .vpn_last_rx
+                .read()
+                .await
+                .get(&vpn_pk.to_string())
+                .is_some_and(|t| t.elapsed() < FRESH);
+            #[cfg(not(unix))]
+            let fresh = false;
+            if fresh {
+                crate::health::note_vpn_probe(
+                    &short,
+                    crate::health::VpnProbeSnapshot { fresh: true, ..Default::default() },
+                );
+                continue;
+            }
+            targets.push((short, host_pk, vpn_pk, relay));
+        }
+        let mut probes = tokio::task::JoinSet::new();
+        for (short, host_pk, vpn_pk, relay) in targets {
+            let netdoc_ep = self.endpoint.clone();
+            let host_ep = host_endpoint.clone();
+            probes.spawn(async move {
+                let host = crate::net::connect_to_host_with_alpn_timeout(
+                    &host_ep, host_pk, relay.as_ref(), crate::proto::ALPN_PROBE, DIAL,
+                );
+                let vpn = async {
+                    if crate::health::fault_vpn_wedged() {
+                        anyhow::bail!("injected fault: VPN endpoint wedged (HOP_FAULT_VPN_WEDGE_FILE)");
+                    }
+                    crate::net::connect_to_host_with_alpn_timeout(
+                        &netdoc_ep, vpn_pk, relay.as_ref(), crate::vpn::VPN_ALPN, DIAL,
+                    )
+                    .await
+                };
+                let (host, vpn) = tokio::join!(host, vpn);
+                let host_ok = host.map(|(c, _)| c.close(0u32.into(), b"probe")).is_ok();
+                let vpn_ok = match vpn {
+                    Ok((c, _)) => {
+                        c.close(0u32.into(), b"probe");
+                        crate::health::note_vpn_dial_ok(&vpn_pk.fmt_short().to_string());
+                        true
+                    }
+                    Err(e) => {
+                        crate::health::note_vpn_dial_failed(&vpn_pk.fmt_short().to_string(), &format!("{e:#}"));
+                        false
+                    }
+                };
+                crate::health::note_vpn_probe(
+                    &short,
+                    crate::health::VpnProbeSnapshot {
+                        fresh: false,
+                        host_ok: Some(host_ok),
+                        vpn_ok: Some(vpn_ok),
+                        ..Default::default()
+                    },
+                );
+                (host_ok, vpn_ok)
+            });
+        }
+        let mut results: Vec<(bool, bool)> = Vec::new();
+        while let Some(r) = probes.join_next().await {
+            if let Ok(r) = r {
+                results.push(r);
+            }
+        }
+        let witnesses = results.iter().filter(|(h, _)| *h).count();
+        let failed = results.iter().filter(|(h, v)| *h && !*v).count();
+        (witnesses, failed)
+    }
+
+    /// Force iroh re-discovery on this node's netdoc (VPN) endpoint — the first
+    /// rung of the VPN repair ladder.
+    pub async fn rediscover(&self) {
+        self.endpoint.network_change().await;
     }
 
     /// Reverse map `vIP → bare hostname` from author-validated `name/<host> = <vIP>`

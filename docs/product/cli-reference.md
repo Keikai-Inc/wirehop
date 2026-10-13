@@ -1119,6 +1119,16 @@ pipeline, with no restart. Answers three operational questions:
   streak and every 5 min while it lasts (`vpn: dial to <peer> failed …`), and an
   INFO when it recovers. Omitted when the running daemon predates it.
 
+**VPN peer probe (self-repair).** Every ~60 s the daemon dials each warren peer
+whose VPN has been quiet for 30 s twice: its host endpoint (is it up?) and its
+VPN endpoint. If every peer that is up refuses this node's VPN, the fault is
+this node's: after 3 such rounds the daemon forces re-discovery on its VPN
+endpoint (WARN `vpn: every reachable peer … forcing re-discovery`), after 5 it
+restarts its worker for fresh endpoints (ERROR `… restarting the worker`), at
+most once per ~30 min. Peers that are simply offline never trigger it. The last
+round per peer is under `health.vpn_probes` in `--json`, the ladder under
+`health.vpn_ladder`.
+
 The counters are always-on, lock-free atomics in the worker (no measurable cost),
 served over the daemon socket. An operator-group user can read them **without
 sudo** (the socket is group-restricted, like other operator-admin ops).

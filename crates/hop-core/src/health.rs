@@ -29,6 +29,8 @@ struct Registry {
     vpn_peers: HashMap<String, PeerDial>,
     agent_conns: HashMap<String, AgentConnSnapshot>,
     agent_replacements: u64,
+    vpn_probes: HashMap<String, VpnProbeSnapshot>,
+    vpn_ladder: Option<String>,
 }
 
 #[derive(Default)]
@@ -62,6 +64,28 @@ pub struct HealthSnapshot {
     /// Client agent: degraded connections replaced since the agent started.
     #[serde(default)]
     pub agent_replacements: u64,
+    /// VPN peer probe: per peer node (short id), the last round's result.
+    #[serde(default)]
+    pub vpn_probes: BTreeMap<String, VpnProbeSnapshot>,
+    /// VPN peer probe: the escalation ladder's state, human-readable.
+    #[serde(default)]
+    pub vpn_ladder: Option<String>,
+}
+
+/// One peer in the last VPN probe round.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VpnProbeSnapshot {
+    /// Its VPN traffic was fresh, so it was not dialed.
+    #[serde(default)]
+    pub fresh: bool,
+    /// Its host endpoint answered a `hop/probe/1` dial (it is up).
+    #[serde(default)]
+    pub host_ok: Option<bool>,
+    /// Its VPN endpoint accepted a `hop/vpn/1` dial.
+    #[serde(default)]
+    pub vpn_ok: Option<bool>,
+    #[serde(default)]
+    pub at_ms: Option<u64>,
 }
 
 /// One pooled agent connection, as its quality probe last saw it.
@@ -176,6 +200,36 @@ pub fn note_agent_event(host: &str, event: String, replaced: bool) {
     reg.agent_conns.entry(host.to_string()).or_default().last_event = Some(event);
 }
 
+/// The VPN peer probe's result for `peer` this round.
+pub fn note_vpn_probe(peer: &str, mut probe: VpnProbeSnapshot) {
+    let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    probe.at_ms = Some(now_ms());
+    reg.vpn_probes.insert(peer.to_string(), probe);
+}
+
+/// The VPN escalation ladder's state after a round.
+pub fn note_vpn_ladder(state: String) {
+    let mut reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    reg.vpn_ladder = Some(state);
+}
+
+/// Test-only fault: while the file named by `HOP_FAULT_VPN_WEDGE_FILE` exists,
+/// this node's outbound VPN dials fail — "this node's VPN endpoint is broken,
+/// its host endpoint fine", the 2026-10-12 member. The worker deletes the file
+/// when it starts, so a restart "fixes" it, as a fresh endpoint did that day.
+/// Inert unless the variable is set (`tests/e2e/vpn-e2e.sh`).
+pub fn fault_vpn_wedged() -> bool {
+    std::env::var_os("HOP_FAULT_VPN_WEDGE_FILE")
+        .is_some_and(|p| std::path::Path::new(&p).exists())
+}
+
+/// Clear the VPN wedge fault (worker start).
+pub fn clear_fault_vpn_wedge() {
+    if let Some(p) = std::env::var_os("HOP_FAULT_VPN_WEDGE_FILE") {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// A copy of the registry at one instant.
 pub fn snapshot() -> HealthSnapshot {
     let reg = HEALTH.lock().unwrap_or_else(|e| e.into_inner());
@@ -201,6 +255,8 @@ pub fn snapshot() -> HealthSnapshot {
             .collect(),
         agent_conns: reg.agent_conns.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         agent_replacements: reg.agent_replacements,
+        vpn_probes: reg.vpn_probes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        vpn_ladder: reg.vpn_ladder.clone(),
     }
 }
 
