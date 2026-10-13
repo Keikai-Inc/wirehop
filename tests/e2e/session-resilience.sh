@@ -344,7 +344,11 @@ RDIR=$(mktemp -d)
 
 say "SESSION SOAK: $CYCLES cycles"
 for c in $(seq 1 "$CYCLES"); do
-  name="${PERTS[$(( (c-1) % ${#PERTS[@]} ))]}"
+  if [ "${SOAK_RANDOM:-0}" = 1 ]; then
+    name="${PERTS[$(( RANDOM % ${#PERTS[@]} ))]}"
+  else
+    name="${PERTS[$(( (c-1) % ${#PERTS[@]} ))]}"
+  fi
   if ! ensure_session; then
     echo "  cycle $c  $name  -> SKIPPED (session baseline unrecoverable)"
     echo "  --- driver.err:"; docker exec "$MEMBER" cat /cfg/driver.err 2>/dev/null || true
@@ -401,7 +405,7 @@ percentile() { # file pct -> value (ms) of sorted numeric lines
     i=int((p/100)*NR); if (i<1) i=1; if (i>NR) i=NR; print a[i] }'
 }
 
-ART="$SCRIPT_DIR/session-results.md"
+ART="${SESS_ARTIFACT:-$SCRIPT_DIR/session-results.md}"
 FAILED=0
 {
   echo "# Interactive-session recovery SLA (session-recovery-parity)"
@@ -447,6 +451,30 @@ echo "  topology: $USER_AGENTS user agent(s) on the member (want 0)"
 if [ "$USER_AGENTS" != 0 ]; then
   echo "| topology: user agents on member | | $USER_AGENTS | | 0 | **FAIL** |" >>"$ART"
   FAILED=1
+fi
+
+# Long soak (SOAK_HEALTH=1, set by long-soak.sh): after hours of perturbations,
+# neither node may show slow rot — a steady memory climb (hop status flags
+# >= 20 MB/h over >= 3 h) — and the founder must never have fallen back from
+# privsep after a crash loop.
+if [ "${SOAK_HEALTH:-0}" = 1 ]; then
+  for node in "$FOUNDER" "$MEMBER"; do
+    leak=$(docker exec "$node" hop --config /cfg --json status 2>/dev/null \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(p["detail"] for p in d.get("problems",[]) if p.get("component")=="memory"))' 2>/dev/null)
+    rss=$(docker exec "$node" hop --config /cfg --json status 2>/dev/null \
+      | python3 -c 'import json,sys; h=json.load(sys.stdin).get("host") or {}; print(h.get("rss_mb"), h.get("rss_slope_mb_per_hour"), h.get("rss_window_hours"))' 2>/dev/null)
+    echo "  soak health $node: rss_mb / slope MB/h / window h = $rss"
+    if [ -n "$leak" ]; then
+      echo "  soak health $node: $leak"
+      echo "| soak memory $node | | leak | | <20 MB/h | **FAIL** |" >>"$ART"
+      FAILED=1
+    fi
+  done
+  if docker exec "$FOUNDER" grep -aq "crash-looped" /cfg/log 2>/dev/null; then
+    echo "  soak health: the founder's monitor fell back after a crash loop"
+    echo "| soak crash-loop fallback | | yes | | never | **FAIL** |" >>"$ART"
+    FAILED=1
+  fi
 fi
 
 # Extra assertions for the new perturbations.

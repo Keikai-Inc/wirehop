@@ -1201,7 +1201,17 @@ async fn proxy_quic(
     let mut h2c = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
-            match quic_recv.read(&mut buf).await {
+            // Also end when the client process is gone (its socket fully
+            // closed): a host that never sends again would otherwise park this
+            // read forever, and the leaked proxy kept the host's session count
+            // up, which turns every reconnect's evict-and-dial-fresh into a
+            // no-op. A client that only finished its input (`hop exec cmd <
+            // /dev/null`) is still reading and keeps its output flowing.
+            let read = tokio::select! {
+                r = quic_recv.read(&mut buf) => r,
+                () = client_gone(&ipc_write) => break Ended::Errored,
+            };
+            match read {
                 Ok(Some(0)) | Ok(None) => break Ended::Eof,
                 Ok(Some(n)) => {
                     if ipc_write.write_all(&buf[..n]).await.is_err() {
@@ -1269,6 +1279,20 @@ async fn proxy_quic(
     }
 
     Ok(())
+}
+
+/// Resolves once the client end of an IPC socket has closed completely (the
+/// client process exited): its write side reports closed or errored. Polled
+/// every 2 s; `ready` itself returns at once on a writable socket.
+async fn client_gone(ipc_write: &tokio::net::unix::OwnedWriteHalf) {
+    use tokio::io::Interest;
+    loop {
+        match ipc_write.as_ref().ready(Interest::WRITABLE | Interest::ERROR).await {
+            Ok(r) if r.is_write_closed() || r.is_error() => return,
+            Ok(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+            Err(_) => return,
+        }
+    }
 }
 
 /// Generic bidirectional byte proxy between two async stream pairs.
@@ -1707,6 +1731,78 @@ mod tests {
         let (pooled, _, _) = handle.get_connection(host.id(), None).await.unwrap();
         assert_eq!(pooled.stable_id(), conn.stable_id());
         assert!(conn.close_reason().is_none());
+    }
+
+    /// A local hop/4 "host" whose streams send `reply` after `delay` (or never,
+    /// with `None`) and otherwise just hold the stream open.
+    async fn holding_host(reply: Option<(Duration, &'static [u8])>) -> iroh::Endpoint {
+        let host = iroh::endpoint::Builder::empty()
+            .alpns(vec![hop_core::proto::ALPN_V4.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let h = host.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = h.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, recv)) = conn.accept_bi().await {
+                        tokio::spawn(async move {
+                            let _recv = recv;
+                            if let Some((delay, bytes)) = reply {
+                                tokio::time::sleep(delay).await;
+                                let _ = send.write_all(bytes).await;
+                            }
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        host
+    }
+
+    /// The client process is gone and the host never sends again: the proxy
+    /// must end (it used to park forever, holding the host's session count).
+    #[tokio::test]
+    async fn proxy_ends_when_the_client_is_gone_and_the_host_is_silent() {
+        let host = holding_host(None).await;
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let conn = client.connect(host.addr(), hop_core::proto::ALPN_V4).await.unwrap();
+        let (mut qs, qr) = conn.open_bi().await.unwrap();
+        qs.write_all(b"hello").await.unwrap(); // make the stream exist for the host
+        let (agent_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let (ir, iw) = agent_side.into_split();
+        let proxy = tokio::spawn(proxy_quic(ir, iw, qs, qr));
+        drop(client_side); // the client process exits
+        tokio::time::timeout(Duration::from_secs(10), proxy)
+            .await
+            .expect("proxy still running after the client went away")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A client that finished its input but still reads (`hop exec cmd <
+    /// /dev/null`) keeps getting the host's output.
+    #[tokio::test]
+    async fn proxy_keeps_a_half_closed_client_reading() {
+        let host = holding_host(Some((Duration::from_secs(5), b"late output"))).await;
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let conn = client.connect(host.addr(), hop_core::proto::ALPN_V4).await.unwrap();
+        let (mut qs, qr) = conn.open_bi().await.unwrap();
+        qs.write_all(b"x").await.unwrap();
+        let (agent_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let (ir, iw) = agent_side.into_split();
+        let _proxy = tokio::spawn(proxy_quic(ir, iw, qs, qr));
+        let (mut cr, mut cw) = client_side.into_split();
+        cw.shutdown().await.unwrap(); // input done, still reading
+        let mut buf = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(15), cr.read(&mut buf))
+            .await
+            .expect("late output never arrived")
+            .unwrap();
+        assert_eq!(&buf[..n], b"late output");
     }
 
     #[test]
