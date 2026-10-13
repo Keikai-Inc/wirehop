@@ -11,7 +11,9 @@
 #   footprint     resident memory after settling stays under MEM_BUDGET_MB
 #   status        `hop status` reports healthy (exit 0)
 #   recover       `hop recover` re-executes PID 1 in place (no supervisor would
-#                 restart it); the container stays up and routes again
+#                 restart it); the container stays up, routes again, and a live
+#                 shell session on it survives as the SAME shell (its PTY master
+#                 is carried through the exec)
 #   self-repair   a wedged VPN (test-only fault) is detected and repaired by a
 #                 self-restart, again with no supervisor
 #   churn         EPHEMERAL members join, ping the founder and are deleted; the
@@ -62,7 +64,7 @@ say "building image"
 docker build -t "$IMG" -f - "$SCRIPT_DIR" >/dev/null <<'DOCKERFILE'
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates iputils-ping iproute2 && \
+        ca-certificates iputils-ping iproute2 python3 && \
     rm -rf /var/lib/apt/lists/* && useradd -m -s /bin/bash ubuntu2
 COPY hop /usr/local/bin/hop
 RUN chmod +x /usr/local/bin/hop
@@ -136,6 +138,42 @@ else
 fi
 rm -f /tmp/hop-emb-status.$$
 
+say "session: an interactive shell on the member, driven from the founder"
+MEMBER_INVITE=$(docker exec "$MEMBER" hop --config /cfg invite --user ubuntu2 2>&1 | grep -E '^  [A-Za-z0-9_-]{40,}$' | head -1 | tr -d ' ')
+docker exec -i "$FOUNDER" tee /root/drive.py >/dev/null <<'PYEOF'
+import os, pty, sys, time
+inv = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execvp("hop", ["hop", "--config", "/cfgc", inv])
+log = open("/root/drive.log", "ab", buffering=0)
+while True:
+    r = __import__("select").select([fd], [], [], 0.2)[0]
+    if r:
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        log.write(data)
+    for name in ("pid1", "pid2"):
+        if os.path.exists(f"/root/type-{name}"):
+            os.remove(f"/root/type-{name}")
+            os.write(fd, f"echo $$ > /tmp/{name}\n".encode())
+PYEOF
+docker exec "$FOUNDER" mkdir -p /cfgc
+docker exec -d "$FOUNDER" python3 /root/drive.py "$MEMBER_INVITE"
+SHELL1=""
+for _ in $(seq 1 30); do
+  docker exec "$FOUNDER" touch /root/type-pid1
+  sleep 2
+  SHELL1=$(docker exec "$MEMBER" cat /tmp/pid1 2>/dev/null | tr -d '[:space:]')
+  [ -n "$SHELL1" ] && break
+done
+if [ -n "$SHELL1" ]; then echo "  session open on the member (shell pid $SHELL1)"; else fail "could not open a session on the member"; fi
+
 say "recover: re-exec in place with no supervisor"
 STARTS_BEFORE=$(docker logs "$MEMBER" 2>&1 | grep -c "Hosting as")
 docker exec "$MEMBER" hop --config /cfg recover --quiet >/dev/null 2>&1 || true
@@ -154,6 +192,20 @@ elif [ "$(docker logs "$MEMBER" 2>&1 | grep -c "re-executing")" -eq 0 ]; then
   fail "no re-exec logged after hop recover"
 elif wait_ping "$MEMBER" 60; then
   echo "  PID 1 re-executed in place and routes again"
+  if [ -n "$SHELL1" ]; then
+    SHELL2=""
+    for _ in $(seq 1 30); do
+      docker exec "$FOUNDER" touch /root/type-pid2
+      sleep 2
+      SHELL2=$(docker exec "$MEMBER" cat /tmp/pid2 2>/dev/null | tr -d '[:space:]')
+      [ -n "$SHELL2" ] && break
+    done
+    if [ "$SHELL2" = "$SHELL1" ]; then
+      echo "  the session resumed on the SAME shell (pid $SHELL2) across the re-exec"
+    else
+      fail "the session's shell did not survive the re-exec (before ${SHELL1}, after ${SHELL2:-none})"
+    fi
+  fi
 else
   fail "re-executed member does not route"; docker logs "$MEMBER" 2>&1 | tail -15
 fi

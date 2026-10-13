@@ -968,16 +968,20 @@ pub async fn adopt_sessions(registry: &RegistryHandle, config_dir: &std::path::P
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        if !crate::privsep::is_privsep_worker() {
-            return 0;
-        }
-        let masters = match tokio::task::spawn_blocking(crate::privsep::worker_adopt_sessions).await {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => {
-                tracing::warn!("session adoption unavailable: {e:#}");
-                return 0;
+        // Masters come from the privsep monitor (a worker restart), or through
+        // our own exec (`HOP_INHERITED_PTYS`, an unsupervised daemon that
+        // re-executed itself in place — its shells are still its children).
+        let (masters, inherited) = if crate::privsep::is_privsep_worker() {
+            match tokio::task::spawn_blocking(crate::privsep::worker_adopt_sessions).await {
+                Ok(Ok(m)) => (m, false),
+                Ok(Err(e)) => {
+                    tracing::warn!("session adoption unavailable: {e:#}");
+                    return 0;
+                }
+                Err(_) => return 0,
             }
-            Err(_) => return 0,
+        } else {
+            (take_inherited_ptys(), true)
         };
         if masters.is_empty() {
             return 0;
@@ -1009,6 +1013,18 @@ pub async fn adopt_sessions(registry: &RegistryHandle, config_dir: &std::path::P
                 Some(registry.attention_sender()),
             ) {
                 Ok((sid, itx, output_route, rtx, erx, scr, child_pid, reader_cancel, viewers, pty_master)) => {
+                    // Through our own exec the shell is still our child: keep its
+                    // pid (so removal can signal it) and reap it when it exits.
+                    let child_pid = if inherited {
+                        entry.child_pid.inspect(|&pid| {
+                            std::thread::spawn(move || {
+                                let mut status = 0;
+                                unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                            });
+                        })
+                    } else {
+                        child_pid
+                    };
                     registry
                         .insert(DetachedSession {
                             session_id: sid,
@@ -1047,6 +1063,30 @@ pub async fn adopt_sessions(registry: &RegistryHandle, config_dir: &std::path::P
         let _ = (registry, config_dir);
         0
     }
+}
+
+/// The env var an in-place re-exec uses to hand its sessions' PTY masters to
+/// the new image: comma-separated fd numbers, left open across the exec.
+pub const INHERITED_PTYS_ENV: &str = "HOP_INHERITED_PTYS";
+
+/// Take the PTY masters handed over through our own exec (and forget the
+/// variable, so a later child process does not see stale fd numbers).
+#[cfg(unix)]
+fn take_inherited_ptys() -> Vec<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let Ok(list) = std::env::var(INHERITED_PTYS_ENV) else { return Vec::new() };
+    unsafe { std::env::remove_var(INHERITED_PTYS_ENV) };
+    list.split(',')
+        .filter_map(|s| s.trim().parse::<i32>().ok())
+        // Only fds that are really open: never wrap a number some other open
+        // file got in the meantime blindly — it must still be a terminal master.
+        .filter(|&fd| fd > 2 && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+        .filter(|&fd| checkpoint::pty_slave_name(fd).is_some())
+        .map(|fd| {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+        })
+        .collect()
 }
 
 /// Wire up a persistent session around an acquired PTY: reader, writer,

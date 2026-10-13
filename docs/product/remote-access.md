@@ -129,8 +129,11 @@ worker restart, or the daemon restarting itself to recover from a dead network
 path — the new worker takes the same shells back and a reconnecting client
 resumes them, running programs included. The screen history held by the old
 worker is gone; full-screen programs redraw on the resize the client sends.
+Without privilege separation (a container's PID 1, an embedded device with no
+init), the daemon restarts by re-executing itself in place and carries the
+terminals through, with the same result.
 
-A reboot, or a restart of the whole daemon (monitor included), still ends
+A reboot, a crash, or killing the whole daemon (monitor included) still ends
 them. To bridge that, the daemon writes a **checkpoint** of its
 live sessions every minute and on a clean shutdown: for each session it
 records the owning peer, the Unix user, the working directory and the

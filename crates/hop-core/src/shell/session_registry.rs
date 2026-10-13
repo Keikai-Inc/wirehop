@@ -413,6 +413,11 @@ pub enum RegistryCommand {
     Checkpoint {
         reply: oneshot::Sender<Vec<super::checkpoint::CheckpointInput>>,
     },
+    /// The PTY master of every live session (for handing them across an
+    /// in-place re-exec).
+    ExportMasters {
+        reply: oneshot::Sender<Vec<Arc<std::os::fd::OwnedFd>>>,
+    },
     SetBrokerHandle {
         session_id: String,
         handle: tokio::task::JoinHandle<()>,
@@ -578,6 +583,13 @@ impl RegistryHandle {
         let _ = self.tx.send(RegistryCommand::Checkpoint { reply }).await;
         rx.await.unwrap_or_default()
     }
+
+    /// The PTY masters of all live sessions (see `RegistryCommand::ExportMasters`).
+    pub async fn export_masters(&self) -> Vec<Arc<std::os::fd::OwnedFd>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(RegistryCommand::ExportMasters { reply }).await;
+        rx.await.unwrap_or_default()
+    }
 }
 
 /// Spawn the registry actor task and return a handle to it.
@@ -654,6 +666,15 @@ async fn run_registry_actor(
             }
             RegistryCommand::Checkpoint { reply } => {
                 let _ = reply.send(registry.checkpoint_inputs());
+            }
+            RegistryCommand::ExportMasters { reply } => {
+                let masters = registry
+                    .sessions
+                    .values()
+                    .filter(|s| s.exit_rx.borrow().is_none())
+                    .filter_map(|s| s.pty_master.clone())
+                    .collect();
+                let _ = reply.send(masters);
             }
             RegistryCommand::List { reply } => {
                 let _ = reply.send(registry.summaries());

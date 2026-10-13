@@ -1573,6 +1573,21 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
                 tracing::warn!("Restarting daemon: {reason}");
                 checkpoint_sessions_on_exit(&registry, config_dir).await;
                 restart_requested = true;
+                // Re-executing in place (no monitor to hold the shells): keep a
+                // copy of every session's PTY master open across the exec, so
+                // the new image adopts the same shells instead of hanging them up.
+                #[cfg(unix)]
+                if !hop_core::privsep::is_privsep_worker() {
+                    let masters = registry.export_masters().await;
+                    let mut keep = INHERIT_FDS.lock().unwrap_or_else(|e| e.into_inner());
+                    for master in masters {
+                        use std::os::fd::AsRawFd;
+                        let fd = unsafe { libc::dup(master.as_raw_fd()) };
+                        if fd >= 0 {
+                            keep.push(fd); // owned by the exec now; never closed here
+                        }
+                    }
+                }
                 RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
@@ -1617,6 +1632,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     Ok(())
 }
 
+/// PTY masters to carry across an in-place re-exec (see the restart branch).
+static INHERIT_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
 /// Set once the daemon is shutting down for a requested restart.
 static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1643,17 +1661,28 @@ fn finish_requested_restart() {
         // re-exec left the old tun0 (and its 100.64/10 route) alive in the new
         // image, unread — a black hole that took routing with it. Mark every fd
         // above stdio close-on-exec so the new image starts clean.
+        // Except the sessions' PTY masters, which the new image adopts.
+        let inherit: Vec<i32> = INHERIT_FDS.lock().map(|v| v.clone()).unwrap_or_default();
         let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         let max_fd = if max_fd > 0 { (max_fd as i32).min(65_536) } else { 4096 };
         for fd in 3..max_fd {
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    let flags = if inherit.contains(&fd) { flags & !libc::FD_CLOEXEC } else { flags | libc::FD_CLOEXEC };
+                    libc::fcntl(fd, libc::F_SETFD, flags);
                 }
             }
         }
-        let err = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(std::env::args_os().skip(1));
+        if inherit.is_empty() {
+            cmd.env_remove(hop_core::shell::INHERITED_PTYS_ENV);
+        } else {
+            let list = inherit.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
+            cmd.env(hop_core::shell::INHERITED_PTYS_ENV, list);
+        }
+        let err = cmd.exec();
         eprintln!("hop: re-executing {} failed: {err}", exe.display());
         std::process::exit(1);
     }
