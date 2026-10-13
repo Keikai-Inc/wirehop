@@ -1651,7 +1651,17 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
         }
     }
 
-    endpoint.close().await;
+    // Bounded: `close` waits for every connection to finish closing, and one on
+    // a dead path never acknowledges — that wait ran to the 60 s idle timeout,
+    // so a restart while a client sat on a black-holed path took a minute and
+    // its shells sat unreachable meanwhile (found by long-soak.sh). Peers learn
+    // of the close or time out on their own; exiting drops what is left.
+    if tokio::time::timeout(ENDPOINT_CLOSE_BUDGET, endpoint.close()).await.is_err() {
+        tracing::info!(
+            "endpoint close still waiting on unacknowledged connections after {}s; exiting anyway",
+            ENDPOINT_CLOSE_BUDGET.as_secs()
+        );
+    }
 
     // A requested restart (self-repair, `hop recover`) relies on something
     // starting us again (finish_requested_restart). Under privsep the monitor does; otherwise — a
@@ -1665,6 +1675,9 @@ async fn cmd_host(secret_key: iroh::SecretKey, config_dir: &std::path::Path, qui
     }
     Ok(())
 }
+
+/// How long shutdown waits for the endpoint's connections to close cleanly.
+const ENDPOINT_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// PTY masters to carry across an in-place re-exec (see the restart branch).
 static INHERIT_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
