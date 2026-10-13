@@ -477,7 +477,18 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                         conn.close(0u32.into(), b"evicted-idle");
                     }
                 } else {
-                    tracing::debug!("actor: skip evicting connection for {} — {} active session(s) still using it", host_id.fmt_short(), state.active.get(&host_id).copied().unwrap_or(0));
+                    // ...but an active session is NOT proof the connection works:
+                    // `open_bi` succeeds locally without the peer, so the session
+                    // may never have received a byte. That happened right after a
+                    // blackout: a dial completed its handshake, its data went
+                    // nowhere, and each retry's evict was skipped on account of
+                    // the previous retry's stuck session — every reconnect joined
+                    // the dud until the host's 20 s auth deadline closed it
+                    // (found by long-soak.sh). The caller just saw a failure, so
+                    // withdraw the connection's vouching: the next hand-out pings
+                    // it, and a dud is force-removed with its dead sessions.
+                    tracing::debug!("actor: skip evicting connection for {} — {} active session(s) still using it; it is pinged before the next hand-out", host_id.fmt_short(), state.active.get(&host_id).copied().unwrap_or(0));
+                    state.verified.remove(&host_id);
                 }
             }
 
@@ -746,6 +757,9 @@ fn spawn_quality_probe(
                 return; // evicted or replaced while the probe was in flight
             }
             let path = conn.to_info().selected_path();
+            // Keep the host's direct path on file for the next dial (the path
+            // usually goes direct some time after the handshake).
+            hop_core::net::note_direct_path(host_id, &conn);
             let on_relay = path.as_ref().map(|p| p.is_relay());
             // Loss on the selected path since the last probe (reset when the
             // selected path changes: its counters are per path).
@@ -1693,6 +1707,30 @@ mod tests {
             }
         });
         host
+    }
+
+    /// A client's evict request skipped because a session is active must still
+    /// make the next hand-out verify the connection: the "active" session may be
+    /// stuck on a dud that never carried a byte.
+    #[tokio::test]
+    async fn a_skipped_evict_makes_the_next_hand_out_check_liveness() {
+        let host = ping_host().await;
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let host_id = host.id();
+        let conn = client.connect(host.addr(), hop_core::proto::ALPN_V4).await.unwrap();
+        let handle = spawn_agent_actor(client.clone());
+        handle
+            .tx
+            .send(AgentCommand::ConnectDone { host_id, result: Ok(conn.clone()) })
+            .await
+            .unwrap();
+        let (_, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
+        assert!(!needs_check, "a fresh dial vouches for itself");
+        handle.session_started(host_id).await;
+        handle.remove_connection(host_id).await; // skipped: a session is active
+        let (pooled, _, needs_check) = handle.get_connection(host_id, None).await.unwrap();
+        assert_eq!(pooled.stable_id(), conn.stable_id(), "not evicted");
+        assert!(needs_check, "but no longer vouched for");
     }
 
     /// The quality probe's swap: only the connection it measured may be

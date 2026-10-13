@@ -302,6 +302,41 @@ pub async fn connect_to_host_with_alpn(
     .await
 }
 
+/// The last direct (IP) path each host was reached on. A dial carries it next
+/// to the relay URL, so reaching a host again does not depend on the relay.
+/// After a blackout that took the relay connection down too, the relay actor
+/// reconnects with backoff, and a dial with only the relay URL (and an endpoint
+/// that had forgotten the host's paths) timed out for ~20 s while the LAN path
+/// was open again (found by long-soak.sh). A stale entry costs nothing: iroh
+/// tries every address of a dial at once.
+static LAST_DIRECT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PublicKey, std::net::SocketAddr>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Bound on [`LAST_DIRECT`] (a host talks to few peers; this only stops growth).
+const LAST_DIRECT_MAX: usize = 1024;
+
+/// Record `conn`'s selected path for its host if it is a direct one. Called on
+/// every successful dial and by callers that watch a connection's path.
+pub fn note_direct_path(remote_id: PublicKey, conn: &Connection) {
+    let Some(path) = conn.to_info().selected_path() else { return };
+    if let TransportAddr::Ip(addr) = path.remote_addr() {
+        remember_direct(remote_id, *addr);
+    }
+}
+
+fn remember_direct(remote_id: PublicKey, addr: std::net::SocketAddr) {
+    let mut map = LAST_DIRECT.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= LAST_DIRECT_MAX && !map.contains_key(&remote_id) {
+        map.clear();
+    }
+    map.insert(remote_id, addr);
+}
+
+/// The last direct address `remote_id` was reached on, if any.
+pub fn last_direct_addr(remote_id: &PublicKey) -> Option<std::net::SocketAddr> {
+    LAST_DIRECT.lock().unwrap_or_else(|e| e.into_inner()).get(remote_id).copied()
+}
+
 /// Like [`connect_to_host_with_alpn`] but with an explicit dial timeout. The VPN
 /// data plane uses a SHORT timeout so a dial to a peer whose address is briefly
 /// stale (e.g. just after it restarted/roamed, before discovery catches up) fails
@@ -314,11 +349,14 @@ pub async fn connect_to_host_with_alpn_timeout(
     alpn: &[u8],
     dial_timeout: std::time::Duration,
 ) -> Result<(Connection, bool)> {
-    let addr = if let Some(relay) = relay_url {
+    let mut addr = if let Some(relay) = relay_url {
         EndpointAddr::from(remote_id).with_relay_url(relay.clone())
     } else {
         EndpointAddr::from(remote_id)
     };
+    if let Some(direct) = last_direct_addr(&remote_id) {
+        addr = addr.with_ip_addr(direct);
+    }
 
     tracing::debug!("EndpointAddr for {}: relay_urls={:?}, direct_addrs={:?}",
         remote_id.fmt_short(),
@@ -340,6 +378,7 @@ pub async fn connect_to_host_with_alpn_timeout(
 
     tracing::info!("Connected to {} ({})", remote_id.fmt_short(),
         std::str::from_utf8(conn.alpn()).unwrap_or("?"));
+    note_direct_path(remote_id, &conn);
 
     Ok((conn, false))
 }
@@ -370,6 +409,20 @@ pub fn endpoint_id(endpoint: &Endpoint) -> EndpointId {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn a_dial_remembers_the_last_direct_path_per_host() {
+        let a = SecretKey::generate(&mut rand::rng()).public();
+        let b = SecretKey::generate(&mut rand::rng()).public();
+        assert_eq!(last_direct_addr(&a), None);
+        let addr: SocketAddr = "172.22.0.2:47868".parse().unwrap();
+        remember_direct(a, addr);
+        assert_eq!(last_direct_addr(&a), Some(addr));
+        assert_eq!(last_direct_addr(&b), None);
+        let moved: SocketAddr = "10.0.0.5:1234".parse().unwrap();
+        remember_direct(a, moved);
+        assert_eq!(last_direct_addr(&a), Some(moved), "the latest path wins");
+    }
 
     #[test]
     fn overlay_range_detection() {
