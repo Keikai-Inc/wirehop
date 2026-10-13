@@ -1821,6 +1821,10 @@ async fn detect_sleep_wake() {
     }
 }
 
+/// Set once the host has answered a mid-session `Ping` in this process, so
+/// later sessions (reconnects) arm the heartbeat echo from their first second.
+static HOST_ECHOES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn client_shell_loop<S>(
     send: S,
     recv: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -1905,11 +1909,18 @@ where
     // Heartbeat: periodic empty Input to probe the connection
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Heartbeat echo state (see the heartbeat branch below).
-    const ONE_WAY_STALL: std::time::Duration = std::time::Duration::from_secs(30);
-    let mut echo_armed = false;
+    // Heartbeat echo state (see the heartbeat branch below). Armed from the
+    // start once any earlier session in this process got a `Pong`: a stream
+    // that is dead from its first byte never delivers the `Pong` that would
+    // otherwise arm the check (seen after a path change: the host resumed the
+    // session, then never received another client message).
+    const ONE_WAY_STALL: std::time::Duration = std::time::Duration::from_secs(12);
+    let mut echo_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    echo_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut echo_armed = HOST_ECHOES.load(std::sync::atomic::Ordering::Relaxed);
     let mut echo_probes_left: u32 = 3;
     let mut last_pong = tokio::time::Instant::now();
+    let mut last_host_msg = tokio::time::Instant::now();
 
     // Read deadline: backstop for cases where QUIC fails to report a dead connection
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
@@ -1954,6 +1965,7 @@ where
             msg = framed.next::<HostMessage>() => {
                 // Any message from the host means the connection is alive
                 read_deadline.as_mut().reset(tokio::time::Instant::now() + READ_DEADLINE);
+                last_host_msg = tokio::time::Instant::now();
 
                 match msg {
                     Ok(HostMessage::Output(data)) => {
@@ -1977,6 +1989,7 @@ where
                     }
                     Ok(HostMessage::Pong) => {
                         echo_armed = true;
+                        HOST_ECHOES.store(true, std::sync::atomic::Ordering::Relaxed);
                         last_pong = tokio::time::Instant::now();
                     }
                     Ok(HostMessage::AdminResponse(_))
@@ -2020,19 +2033,29 @@ where
                 // fresh stream (reconnect) is the fix. An older host never answers,
                 // so after a few unanswered probes we stop sending them (it logs
                 // each one as unexpected).
-                if echo_armed {
-                    if last_pong.elapsed() >= ONE_WAY_STALL {
-                        tracing::info!(
-                            "Host has not answered a heartbeat for {}s while its output still arrives; reconnecting",
-                            last_pong.elapsed().as_secs()
-                        );
-                        break Ok(SessionOutcome::Disconnected);
-                    }
-                    let _ = send_tx.send(ClientMessage::Ping);
-                } else if echo_probes_left > 0 {
+                if !echo_armed && echo_probes_left > 0 {
                     echo_probes_left -= 1;
                     let _ = send_tx.send(ClientMessage::Ping);
                 }
+            }
+            // Armed echo runs on its own, faster cadence: reliable stream data
+            // makes a `Pong` arrive within a few seconds even on a lossy link
+            // (degraded_path: 600 ms, 10 % loss), so ONE_WAY_STALL of silence
+            // means our direction is stuck, not slow.
+            _ = echo_tick.tick(), if echo_armed => {
+                // One-way only: the host's output/heartbeats (every ≤10 s) still
+                // arrive but our `Ping`s go unanswered. If the host has gone
+                // silent too, the whole path is down — reconnecting cannot help
+                // until it returns, and starting early only lands the reconnect
+                // in its slower, backed-off tier. That case is READ_DEADLINE's.
+                if last_pong.elapsed() >= ONE_WAY_STALL && last_host_msg.elapsed() < ONE_WAY_STALL {
+                    tracing::info!(
+                        "Host has not answered a heartbeat for {}s while its output still arrives; reconnecting",
+                        last_pong.elapsed().as_secs()
+                    );
+                    break Ok(SessionOutcome::Disconnected);
+                }
+                let _ = send_tx.send(ClientMessage::Ping);
             }
             // Read deadline: no data from host for too long
             () = &mut read_deadline => {

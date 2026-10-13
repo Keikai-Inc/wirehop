@@ -398,7 +398,9 @@ done
 # session must go through the daemon's mux (mux.sock). A user agent here is a
 # second endpoint under the same node id — the harness then tests the wrong
 # path (it did, unnoticed, until 2026-10-12).
-USER_AGENTS=$(docker exec "$MEMBER" sh -c "ps -eo args | grep -c '^/usr/local/bin/hop agent --daemon'" 2>/dev/null || echo "?")
+# (`grep -c` prints 0 AND exits 1 on no match; take its first line, default ?.)
+USER_AGENTS=$(docker exec "$MEMBER" sh -c "ps -eo args | grep -c '^/usr/local/bin/hop agent --daemon'; true" 2>/dev/null | head -1)
+USER_AGENTS="${USER_AGENTS:-?}"
 echo "  topology: $USER_AGENTS user agent(s) on the member (want 0)"
 if [ "$USER_AGENTS" != 0 ]; then
   echo "| topology: user agents on member | | $USER_AGENTS | | 0 | **FAIL** |" >>"$ART"
