@@ -43,16 +43,25 @@ AWS_LC_SYS_CMAKE_BUILDER=1 cross build --release --target aarch64-unknown-linux-
 
 ```bash
 cargo test                    # all workspace tests
-./tests/e2e/run.sh            # full e2e suite (Docker; REBUILD=1 after Rust changes)
+./tests/e2e/gate.sh           # the merge gate (Docker; REBUILD=1 after Rust changes)
 ```
 
-**Run e2e before merging changes** that touch networking (`hop-core/src/net/`),
+**Run the gate before merging changes** that touch networking (`hop-core/src/net/`),
 auth, protocol (`hop-core/src/proto/`), shell/exec, transfer, sandbox, MCP/JS
-bindings, agent/mux, fleet, or CLI dispatch. The suite spins up Docker
-containers and exercises the full connection/auth/exec/transfer/fleet surface.
+bindings, agent/mux, fleet, VPN/netdoc, privsep, or CLI dispatch. `gate.sh` runs
+three suites and fails if any fails:
 
-After Rust changes ALWAYS use `REBUILD=1 ./tests/e2e/run.sh` — the harness
-skips the cross-build otherwise and you'd test a stale binary.
+| Suite | Covers |
+|---|---|
+| `run.sh` | the connection/auth/exec/transfer/fleet surface (55 tests) |
+| `vpn-e2e.sh` | the only suite with a real TUN: routing, reboot, read-ticket members, VPN self-repair |
+| `session-resilience.sh` | interactive-session recovery SLA through the daemon mux (net flap, zombie path, host and worker restart, degraded path, relay-pinned) |
+
+`run.sh` alone is not enough: `vpn-e2e.sh`'s reboot stage failed on every build
+up to 0.9.40 unnoticed because only `run.sh` was in this gate.
+
+After Rust changes ALWAYS use `REBUILD=1 ./tests/e2e/gate.sh` — the harnesses
+skip the cross-build otherwise and you'd test a stale binary.
 
 ### Continuous integration
 
