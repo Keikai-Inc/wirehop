@@ -487,11 +487,18 @@ fi
 # privsep after a crash loop.
 if [ "${SOAK_HEALTH:-0}" = 1 ]; then
   for node in "$FOUNDER" "$MEMBER"; do
-    leak=$(docker exec "$node" hop --config /cfg --json status 2>/dev/null \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(p["detail"] for p in d.get("problems",[]) if p.get("component")=="memory"))' 2>/dev/null)
-    rss=$(docker exec "$node" hop --config /cfg --json status 2>/dev/null \
-      | python3 -c 'import json,sys; h=json.load(sys.stdin).get("host") or {}; print(h.get("rss_mb"), h.get("rss_slope_mb_per_hour"), h.get("rss_window_hours"))' 2>/dev/null)
+    # `hop status` exits 1 when it reports any problem; under `set -e` and
+    # pipefail that ended the whole run here (seen in CI), so read it once and
+    # tolerate the status. Its problems are printed below either way.
+    st=$(docker exec "$node" hop --config /cfg --json status 2>/dev/null || true)
+    leak=$(printf '%s' "$st" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(p["detail"] for p in d.get("problems",[]) if p.get("component")=="memory"))' 2>/dev/null || true)
+    rss=$(printf '%s' "$st" \
+      | python3 -c 'import json,sys; h=json.load(sys.stdin).get("host") or {}; print(h.get("rss_mb"), h.get("rss_slope_mb_per_hour"), h.get("rss_window_hours"))' 2>/dev/null || true)
+    others=$(printf '%s' "$st" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print("; ".join("["+p["component"]+"] "+p["detail"] for p in d.get("problems",[]) if p.get("component")!="memory"))' 2>/dev/null || true)
     echo "  soak health $node: rss_mb / slope MB/h / window h = $rss"
+    [ -n "$others" ] && echo "  soak health $node: other problems at the end (informational): $others"
     if [ -n "$leak" ]; then
       echo "  soak health $node: $leak"
       echo "| soak memory $node | | leak | | <20 MB/h | **FAIL** |" >>"$ART"
