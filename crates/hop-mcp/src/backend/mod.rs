@@ -17,6 +17,9 @@ use hop_core::sandbox::SandboxPolicy;
 
 pub type BoxedBackend = Arc<dyn OrchestratorBackend>;
 
+// `async_trait` marks each generated method `#[must_use]` although it returns a
+// boxed future, which already is; clippy 1.99's `double_must_use` flags every one.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
     /// List fleet hosts, optionally filtered by tag.
