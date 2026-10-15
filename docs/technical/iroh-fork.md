@@ -86,7 +86,8 @@ cargo test --manifest-path vendor/iroh-docs/Cargo.toml --lib actor_tasks_joinset
 
 | Branch | SHA | Base | Purpose |
 |---|---|---|---|
-| `hop-relay-fix-0.97` | | v0.97.0 | **What WireHop currently pins.** Original commits |
+| `hop-relay-fix-0.97-closedrain` | `98b08a4` | `hop-relay-fix-0.97` | **What WireHop currently pins.** The branch below plus one commit: the relay actor's `close_all_active_relays` drains with `join_next` and logs cancelled/panicked tasks, instead of `JoinSet::join_all`, which panicked ("task N was cancelled") when an endpoint closed during a runtime shutdown — a SIGABRT under `panic = "abort"` |
+| `hop-relay-fix-0.97` | `ff74c6b` | v0.97.0 | The previous pin. Original commits |
 | `wirehop-patches-0.97` | `6a9360fc1e` | v0.97.0 | Same code, cleaned-up messages. Drop-in replacement for the above |
 | `relay-cascade-fix` | `493faadda5` | `main` (1.1) | Upstream PR #1 |
 | `addr-filter-direct-addrs` | `82f9f465d8` | `main` (1.1) | Upstream PR #2 |

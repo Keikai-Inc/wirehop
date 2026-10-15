@@ -67,7 +67,7 @@ The core library providing networking, authentication, protocol, file transfer, 
 **Key dependencies:**
 
 ```toml
-iroh          # QUIC-based P2P networking (custom fork: thedracle/iroh@hop-relay-fix-0.97, iroh 0.97)
+iroh          # QUIC-based P2P networking (custom fork: thedracle/iroh@hop-relay-fix-0.97-closedrain, iroh 0.97)
 iroh-docs     # CRDT document replication for the warren network document (0.97)
 iroh-gossip   # Gossip overlay backing iroh-docs (0.97)
 iroh-blobs    # Content-addressed blob store backing iroh-docs (0.99)
@@ -82,7 +82,7 @@ landlock      # Linux filesystem sandbox (cfg(target_os = "linux"))
 ```
 
 > The custom iroh fork is wired in via `[patch.crates-io]` in the root
-> `Cargo.toml` (iroh + iroh-base + iroh-relay → `thedracle/iroh@hop-relay-fix-0.97`,
+> `Cargo.toml` (iroh + iroh-base + iroh-relay → `thedracle/iroh@hop-relay-fix-0.97-closedrain`,
 > which is iroh 0.97.0 plus a macOS relay-cascade fix).
 
 ### Crate: hop-cli
