@@ -99,7 +99,9 @@ COMMON_ENV=(--cap-add=NET_ADMIN --device /dev/net/tun
         -e RUST_LOG="${SESS_LOG:-hop=info,hop_core=warn}" --user root
         -e HOP_AGENT_PROBE_SECS="${HOP_AGENT_PROBE_SECS:-}")
 
-start_daemon() { docker exec -d "$1" bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'; }
+# SESS_LOG_DAEMON: a log filter for both daemons only — the interactive client
+# keeps SESS_LOG, so debugging the daemons does not change the client's timing.
+start_daemon() { docker exec -d ${SESS_LOG_DAEMON:+-e RUST_LOG="$SESS_LOG_DAEMON"} "$1" bash -lc 'hop --config /cfg host --quiet >>/cfg/log 2>&1'; }
 # The whole daemon: the monitor runs as `hop --config /cfg host`, its worker as
 # `hop host --config /cfg` — a pattern matching only the latter left the monitor
 # up, and every "restart" then started a second daemon next to it.
@@ -107,7 +109,10 @@ stop_daemon()  { docker exec "$1" pkill -9 -f 'hop (--config [^ ]+ )?host' >/dev
 
 say "starting containers"
 docker network create "$NET" >/dev/null
-docker run -d --name "$FOUNDER" --network "$NET" "${COMMON_ENV[@]}" "$IMG" sleep infinity >/dev/null
+# SESS_LOG_FOUNDER: a log filter for the founder alone (debugging the host side
+# without changing the timing of the member and the interactive client).
+docker run -d --name "$FOUNDER" --network "$NET" "${COMMON_ENV[@]}" \
+  ${SESS_LOG_FOUNDER:+-e RUST_LOG="$SESS_LOG_FOUNDER"} "$IMG" sleep infinity >/dev/null
 docker run -d --name "$MEMBER"  --network "$NET" "${COMMON_ENV[@]}" "$IMG" sleep infinity >/dev/null
 docker exec "$FOUNDER" mkdir -p /cfg; docker exec "$MEMBER" mkdir -p /cfg
 

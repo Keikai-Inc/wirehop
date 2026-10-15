@@ -1309,6 +1309,11 @@ async fn run_attached_loop<R: AsyncReadExt + Unpin>(
                 let _ = resize_tx.send(PtySize { rows, cols, pixel_width, pixel_height });
                 let _ = host_tx.send(HostMessage::WindowSizeAck);
             }
+            // A client's first-echo probe can be the message the setup read
+            // stopped at; it must be answered like any other `Ping`.
+            ClientMessage::Ping => {
+                let _ = host_tx.send(HostMessage::Pong);
+            }
             _ => {}
         }
     }
@@ -2119,6 +2124,22 @@ where
     let mut echo_probes_left: u32 = 3;
     let mut last_pong = tokio::time::Instant::now();
     let mut last_host_msg = tokio::time::Instant::now();
+    // First echo: once a host has proven it answers `Ping` (`echo_armed`), a
+    // fresh attachment sends one BEFORE any replayed input and expects the
+    // `Pong` within FIRST_ECHO. A stream can be dead from birth while its
+    // connection stays healthy — seen after a host restart, when the resumed
+    // stream's first packets went out while the new connection moved from the
+    // relay to the direct path: our input (a 64 KB replayed paste, and every
+    // heartbeat `Ping` queued behind it) never arrived, and only the 12 s
+    // one-way rule ended it ~15 s in. Sent ahead of the replay, the probe is not
+    // stuck behind a large paste on a healthy but slow link.
+    const FIRST_ECHO: std::time::Duration = std::time::Duration::from_secs(4);
+    let first_echo = tokio::time::sleep(FIRST_ECHO);
+    tokio::pin!(first_echo);
+    let mut echoed_since_attach = false;
+    if echo_armed {
+        let _ = send_tx.send(ClientMessage::Ping);
+    }
 
     // Read deadline: backstop for cases where QUIC fails to report a dead connection
     let read_deadline = tokio::time::sleep(READ_DEADLINE);
@@ -2196,6 +2217,7 @@ where
                         // Late SessionInfo — ignore
                     }
                     Ok(HostMessage::Pong) => {
+                        echoed_since_attach = true;
                         echo_armed = true;
                         HOST_ECHOES.store(true, std::sync::atomic::Ordering::Relaxed);
                         last_pong = tokio::time::Instant::now();
@@ -2264,6 +2286,13 @@ where
                     break Ok(SessionOutcome::Disconnected);
                 }
                 let _ = send_tx.send(ClientMessage::Ping);
+            }
+            () = &mut first_echo, if echo_armed && !echoed_since_attach => {
+                tracing::info!(
+                    "The host did not answer within {}s of attaching; this stream is dead, reconnecting",
+                    FIRST_ECHO.as_secs()
+                );
+                break Ok(SessionOutcome::Disconnected);
             }
             // Read deadline: no data from host for too long
             () = &mut read_deadline => {
