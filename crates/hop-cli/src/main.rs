@@ -1904,6 +1904,16 @@ async fn handle_incoming_inner(
     let peer_id = remote_id.to_string();
 
     let (username, role, sandbox) = match outcome {
+        AuthOutcome::Authorized { username, role, sandbox } if matches!(_first_msg, Some(ClientMessage::Ping)) => {
+            // A liveness ping on a fresh connection (the agent vetting a
+            // replacement for a degraded one): answer it and keep the
+            // connection for the sessions that will move onto it.
+            tracing::debug!("Authorized peer {} with a liveness ping", remote_id.fmt_short());
+            let mut send = send;
+            let _ = proto::write_message(&mut send, &HostMessage::Pong).await;
+            let _ = send.finish();
+            (username, role, sandbox)
+        }
         AuthOutcome::Authorized { username, role, sandbox } => {
             tracing::info!("Authorized peer {} (role: {:?})", remote_id.fmt_short(), role);
             // Spawn first session

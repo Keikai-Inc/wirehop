@@ -201,7 +201,8 @@ fn record_unauthorized(remote_id: &PublicKey) {
 /// Host-side: authenticate an incoming connection.
 ///
 /// Reads the first message from the client. If it's an `AuthResponse` (invite flow),
-/// verifies the secret. If it's a `RequestShell`, checks the authorized peers list.
+/// verifies the secret. If it's a session request or a liveness `Ping`, checks the
+/// authorized peers list; the message is handed back for the caller to serve.
 /// `protocol_version` is the negotiated ALPN version; on hop/4+ a successful
 /// invite redemption answers with `AuthResultV2` carrying the invite's grant.
 pub async fn authenticate_client(
@@ -354,7 +355,11 @@ pub async fn authenticate_client(
         | ClientMessage::RequestExecV2 { .. }
         | ClientMessage::RequestTunnel { .. }
         | ClientMessage::AnnounceNetdocAuthor { .. }
-        | ClientMessage::RequestAdmin(_) => {
+        | ClientMessage::RequestAdmin(_)
+        // A client agent pings a connection it just dialed to replace a
+        // degraded one, before any session has used it. Rejecting that ping
+        // closed every replacement, so the agent kept the bad path forever.
+        | ClientMessage::Ping => {
             // Authorization order:
             //   0. An *explicit* doc revocation (tombstone) rejects even a
             //      locally-authorized peer. Revocation is an intentional admin
@@ -459,6 +464,59 @@ mod tests {
 
     fn node(n: u8) -> PublicKey {
         iroh::SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    /// Dial `host` and send `msg` as the first message of the first stream;
+    /// return what the host's `authenticate_client` makes of it.
+    async fn first_message_outcome(
+        authorize_client: bool,
+        msg: ClientMessage,
+    ) -> (AuthOutcome, Option<ClientMessage>) {
+        let config = tempfile::tempdir().unwrap();
+        let host = iroh::endpoint::Builder::empty()
+            .alpns(vec![proto::ALPN_V4.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        if authorize_client {
+            let mut peers = PeersStore::default();
+            peers.add_peer(&client.id(), "laptop".into(), None, PeerRole::Peer, SandboxPolicy::default());
+            peers.save(config.path()).unwrap();
+        }
+        let accept = async {
+            let conn = host.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            authenticate_client(&mut send, &mut recv, &conn.remote_id(), config.path(), None, 4)
+                .await
+                .unwrap()
+        };
+        let dial = async {
+            let conn = client.connect(host.addr(), proto::ALPN_V4).await.unwrap();
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            proto::write_message(&mut send, &msg).await.unwrap();
+            (conn, recv) // held open until the host has read the message
+        };
+        let (outcome, _held) = tokio::join!(accept, dial);
+        outcome
+    }
+
+    /// The agent vets a replacement for a degraded pooled connection by pinging
+    /// it before any session has used it, so the ping is the connection's first
+    /// message. Rejecting it closed every replacement and left sessions on the
+    /// degraded path until `hop agent stop` (2026-10-27).
+    #[tokio::test]
+    async fn an_authorized_peer_may_open_with_a_ping() {
+        let (outcome, first) = first_message_outcome(true, ClientMessage::Ping).await;
+        assert!(matches!(outcome, AuthOutcome::Authorized { .. }));
+        assert!(matches!(first, Some(ClientMessage::Ping)));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_peer_opening_with_a_ping_is_rejected() {
+        let (outcome, first) = first_message_outcome(false, ClientMessage::Ping).await;
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(first.is_none());
     }
 
     #[test]
