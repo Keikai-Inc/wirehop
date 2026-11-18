@@ -585,6 +585,20 @@ async fn run_agent_actor(mut rx: mpsc::Receiver<AgentCommand>, mut state: AgentS
                         }
                     })
                     .collect();
+                // ...but "dialed recently" is not "dialed on the new network": a
+                // dial that started during the outage can finish its handshake on
+                // the client while the host never completes it (the long soak's
+                // net_flap outliers: the host logged the handshake as pending, then
+                // dropped it after 30 s). Sparing that dud kept every session on it
+                // until the 8 s liveness ping at the next hand-out, ~17 s in all.
+                // So a spared connection must still answer a ping, now.
+                for (h, conn) in &spared {
+                    spawn_spared_connection_probe(
+                        conn.clone(),
+                        *h,
+                        AgentHandle { tx: state.tx.clone() },
+                    );
+                }
                 state.connections = spared;
                 state.dialed.retain(|h, _| state.connections.contains_key(h));
                 // Per-host semaphores are recreated on demand; a handle_client
@@ -855,6 +869,14 @@ const OPEN_BI_TIMEOUT: Duration = Duration::from_secs(10);
 /// A network-change flush leaves connections dialed more recently than this.
 const FLUSH_SPARES_YOUNGER_THAN: Duration = Duration::from_secs(5);
 
+/// How long a connection the flush spared has to answer a ping before it is
+/// dropped as a dud. Shorter than `POOL_LIVENESS_TIMEOUT` because the cost of a
+/// false positive is small and bounded: it runs once per flush, only on
+/// connections a few seconds old, and a wrong call costs their sessions one
+/// redial. Too generous a budget defeats it: from the flush, 8 s is already past
+/// net_flap's 10 s session budget.
+const FLUSH_SPARED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Budget for the pooled-connection liveness check. A dead connection never
 /// answers, so the only cost of a generous budget is how long the rare zombie
 /// case waits before re-dialing; a tight one turns every ordinary stall on a
@@ -902,6 +924,38 @@ async fn check_pooled_liveness(conn: &Connection, budget: Duration) -> Result<Du
         .await
         .map_err(|_| anyhow::anyhow!("no pong within {}s", budget.as_secs()))??;
     Ok(started.elapsed())
+}
+
+/// Ping a connection the network-change flush spared, and drop it if it does
+/// not answer within `FLUSH_SPARED_PROBE_TIMEOUT` (see `AgentCommand::FlushAll`).
+/// Dropping it closes it, which is what makes its sessions reconnect now rather
+/// than at their next hand-out. Hosts older than hop/4 cannot answer `Ping`, so
+/// their connections are left as they were.
+fn spawn_spared_connection_probe(conn: Connection, host_id: PublicKey, handle: AgentHandle) {
+    if conn.alpn() != hop_core::proto::ALPN_V4 {
+        return;
+    }
+    tokio::spawn(async move {
+        match check_pooled_liveness(&conn, FLUSH_SPARED_PROBE_TIMEOUT).await {
+            Ok(rtt) => {
+                tracing::debug!(
+                    "mux: connection to {} spared by the flush answered ping in {} ms",
+                    host_id.fmt_short(),
+                    rtt.as_millis()
+                );
+                handle.note_pool_verified(host_id, conn.stable_id()).await;
+            }
+            // Closed meanwhile (a later flush, an eviction): nothing to drop.
+            Err(_) if conn.close_reason().is_some() => {}
+            Err(e) => {
+                tracing::info!(
+                    "mux: connection to {} spared by the network-change flush failed its liveness check ({e:#}); dropping it",
+                    host_id.fmt_short()
+                );
+                handle.force_remove_connection(host_id, conn.stable_id()).await;
+            }
+        }
+    });
 }
 
 /// True if the dial error was a timeout (dead/stale path) rather than a
@@ -1808,6 +1862,52 @@ mod tests {
         let (pooled, _, _) = handle.get_connection(host.id(), None).await.unwrap();
         assert_eq!(pooled.stable_id(), conn.stable_id());
         assert!(conn.close_reason().is_none());
+        // It answers the spared-connection probe, so it stays past that budget.
+        tokio::time::sleep(FLUSH_SPARED_PROBE_TIMEOUT + Duration::from_millis(500)).await;
+        assert!(conn.close_reason().is_none(), "a live spared connection was dropped");
+        let (pooled, _, _) = handle.get_connection(host.id(), None).await.unwrap();
+        assert_eq!(pooled.stable_id(), conn.stable_id());
+    }
+
+    /// ...but a spared connection whose data goes nowhere is dropped within the
+    /// probe budget, not left to its sessions until the next hand-out's 8 s
+    /// ping (the long soak's ~17 s net_flap outliers: a dial that completed on
+    /// the client during the flap while the host never finished the handshake).
+    #[tokio::test]
+    async fn flush_drops_a_spared_connection_that_never_answers() {
+        let host = holding_host(None).await; // streams open, nothing ever comes back
+        let client = iroh::endpoint::Builder::empty().bind().await.unwrap();
+        let host_id = host.id();
+        let conn = client.connect(host.addr(), hop_core::proto::ALPN_V4).await.unwrap();
+        let handle = spawn_agent_actor(client.clone());
+        handle
+            .tx
+            .send(AgentCommand::ConnectDone { host_id, result: Ok(conn.clone()) })
+            .await
+            .unwrap();
+        handle.session_started(host_id).await; // a session is stuck on it
+        handle.flush_all().await;
+        assert!(conn.close_reason().is_none(), "spared by the flush itself");
+        tokio::time::timeout(FLUSH_SPARED_PROBE_TIMEOUT + Duration::from_secs(2), conn.closed())
+            .await
+            .expect("the dud was still pooled after the probe budget");
+        // Gone from the pool (a swap of it is refused), so the next hand-out
+        // dials instead of reusing it.
+        let state_has_it = {
+            let (reply, rx) = oneshot::channel();
+            handle
+                .tx
+                .send(AgentCommand::ReplaceConnection {
+                    host_id,
+                    old_stable_id: conn.stable_id(),
+                    new: conn.clone(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        };
+        assert!(!state_has_it, "the dud is no longer the pooled connection");
     }
 
     /// A local hop/4 "host" whose streams send `reply` after `delay` (or never,
