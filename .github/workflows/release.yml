@@ -231,8 +231,9 @@ jobs:
   macos:
     # Never on the private mirror; see ci.yml for why. macOS bills at 10x.
     if: github.repository != 'thedracle/hop'
-    # macos-14 is Apple Silicon; both slices cross-compile from it.
-    runs-on: macos-14
+    # macos-15 is Apple Silicon; both slices cross-compile from it. (GitHub
+    # retired the macos-14 image: jobs on it are cancelled before they start.)
+    runs-on: macos-15
     # Secrets are scoped to this environment. Configure it in repo Settings →
     # Environments → "release" with a REQUIRED REVIEWER (you): the job then
     # pauses for explicit approval before any signing credential is exposed.
